@@ -59,6 +59,22 @@ class WorkflowPolicyTests(unittest.TestCase):
             with self.subTest(unsafe=unsafe):
                 self.assertTrue(self.errors(unsafe))
 
+    def test_fork_tests_allow_automatic_runs_with_read_only_permissions(self):
+        text = ("on:\n  pull_request:\n  push:\n    branches: [main]\n  workflow_dispatch:\n"
+                "permissions:\n  contents: read\n"
+                f"jobs:\n  core-tests:\n    if: {policy.FORK}\n    runs-on: ubuntu-24.04\n")
+        self.assertEqual(self.errors(text, "linux-fork-tests.yml"), [])
+        for unsafe in [text.replace(policy.FORK, "true"),
+                       text.replace("contents: read", "contents: write"),
+                       text.replace("    runs-on:", "    permissions:\n      contents: write\n    runs-on:"),
+                       text.replace("  workflow_dispatch:", "  schedule:\n  workflow_dispatch:")]:
+            with self.subTest(unsafe=unsafe):
+                self.assertTrue(self.errors(unsafe, "linux-fork-tests.yml"))
+
+    def test_only_fork_test_workflow_can_run_automatically_in_fork(self):
+        text = f"jobs:\n  publish:\n    if: {policy.FORK}\n    runs-on: ubuntu-latest\n"
+        self.assertTrue(self.errors(text, "deploy.yml"))
+
 
 if __name__ == "__main__":
     unittest.main()

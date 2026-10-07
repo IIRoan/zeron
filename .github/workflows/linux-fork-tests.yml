@@ -1,0 +1,90 @@
+name: Linux fork tests
+
+on:
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'crates/**'
+      - 'apps/zeron/**'
+      - 'assets/**'
+      - 'scripts/**'
+      - '.github/**'
+  push:
+    branches: [main]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'crates/**'
+      - 'apps/zeron/**'
+      - 'assets/**'
+      - 'scripts/**'
+      - '.github/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-fork-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_MIN_STACK: '16777216'
+
+jobs:
+  fork-checks:
+    if: github.repository == 'IIRoan/zeron'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Workflow isolation and updater regressions
+        run: |
+          python3 scripts/tests/test_fork_workflows.py
+          python3 scripts/check-fork-workflows.py
+          python3 scripts/tests/test_update_upstream.py
+
+  core-tests:
+    if: github.repository == 'IIRoan/zeron'
+    needs: fork-checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/linux-ci
+        with:
+          rust-cache: core
+          save-rust-cache: 'true'
+      - name: Harness, engine, sync, update, doc and preview tests
+        run: scripts/ci/test-core.sh
+
+  ui-tests:
+    if: github.repository == 'IIRoan/zeron'
+    needs: fork-checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/linux-ci
+        with:
+          rust-cache: ui
+          save-rust-cache: 'true'
+          apt-cache: gpui
+          apt-packages: >-
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev
+            libx11-dev libxcb1-dev libx11-xcb-dev
+            libfontconfig1-dev libfreetype-dev libasound2-dev
+            libvulkan-dev pkg-config cmake libwebkit2gtk-4.1-dev libjson-glib-dev
+      - name: UI, source control, editor and headless layout regressions
+        run: cargo nextest run --config-file scripts/ci/nextest.toml --locked --no-fail-fast -p zeron-ui --lib --test voice_orb_geometry
+      - name: Build the Linux desktop
+        run: cargo build --locked -p zeron

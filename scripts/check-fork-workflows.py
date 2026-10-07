@@ -6,6 +6,7 @@ import sys
 
 
 UPSTREAM = "github.repository == 'zeronsh/zeron'"
+FORK = "github.repository == 'IIRoan/zeron'"
 MANUAL = ("github.repository == 'IIRoan/zeron' && github.ref == 'refs/heads/main'"
           " && github.event_name == 'workflow_dispatch'")
 
@@ -49,23 +50,26 @@ def errors_for(path):
         return [f"{path.name}: expected jobs in the project's YAML format"]
     errors = []
     manual = path.name == "update-linux-fork.yml"
-    if manual:
+    tests = path.name == "linux-fork-tests.yml"
+    fork_owned = manual or tests
+    if fork_owned:
         events = re.findall(r"^  ([A-Za-z_]+):", section(text, "on"), re.M)
-        if events != ["workflow_dispatch"]:
+        if manual and events != ["workflow_dispatch"]:
             errors.append(f"{path.name}: the fork updater must be manually triggered only")
+        if tests and sorted(events) != ["pull_request", "push", "workflow_dispatch"]:
+            errors.append(f"{path.name}: fork tests may only run for pushes, pull requests or manual dispatch")
         if section(text, "permissions").strip() != "contents: read":
-            errors.append(f"{path.name}: the fork updater must have read-only token permissions")
+            errors.append(f"{path.name}: fork workflows must have read-only token permissions")
     for index, name in enumerate(names):
         end = names[index + 1].start() if index + 1 < len(names) else len(jobs)
         block = jobs[name.end():end]
         conditions = re.findall(r"^    if: (.+)$", block, re.M)
+        expected = MANUAL if manual else FORK if tests else UPSTREAM
         valid = len(conditions) == 1 and (
-            conditions[0].strip() == MANUAL if manual else upstream_only(conditions[0].strip())
-        )
+            conditions[0].strip() == expected if fork_owned else upstream_only(conditions[0].strip()))
         if not valid:
-            expected = MANUAL if manual else UPSTREAM
             errors.append(f"{path.name}/{name.group(1)}: requires repository guard {expected}")
-        if manual and re.search(r"^    permissions:", block, re.M):
+        if fork_owned and re.search(r"^    permissions:", block, re.M):
             errors.append(f"{path.name}/{name.group(1)}: cannot override read-only permissions")
     return errors
 
@@ -74,6 +78,8 @@ def check(directory):
     paths = sorted([*directory.glob("*.yml"), *directory.glob("*.yaml")])
     if not (directory / "update-linux-fork.yml").is_file():
         return ["Missing the manually triggered Linux fork updater"]
+    if not (directory / "linux-fork-tests.yml").is_file():
+        return ["Missing the Linux fork test workflow"]
     return [error for path in paths for error in errors_for(path)]
 
 
@@ -82,4 +88,4 @@ if __name__ == "__main__":
     if failures:
         print("Fork workflow isolation check failed:\n" + "\n".join(failures), file=sys.stderr)
         sys.exit(1)
-    print("Fork workflow isolation verified: upstream jobs are guarded; updater is manual and read-only.")
+    print("Fork workflow isolation verified: upstream jobs are guarded; fork tests and manual updater are read-only.")

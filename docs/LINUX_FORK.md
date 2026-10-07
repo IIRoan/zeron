@@ -60,9 +60,16 @@ Review the local result, push with `git push origin main`, and restart with
 key; its API token remains read-only. This also handles releases that change
 workflow files, which GitHub's built-in Action token cannot push. Existing
 upstream CI files are preserved with job guards that restrict them to
-`zeronsh/zeron`. Their inherited workflows are disabled in `IIRoan/zeron`; only
-the manual Linux updater is enabled. This avoids automatic macOS/Windows builds,
-edge deployments, official releases, and scheduled SDK updates in your fork.
+`zeronsh/zeron`. Their inherited workflows are disabled in `IIRoan/zeron`.
+The fork enables its own Linux tests and the manual Linux updater. This avoids
+automatic macOS/Windows builds, edge deployments, official releases, and
+scheduled SDK updates in your fork.
+
+**Linux fork tests** runs on relevant pushes to `main` and pull requests, and
+can also be started manually. It checks workflow isolation and updater safety,
+runs the native Linux core and UI suites, and builds the desktop. It uses
+read-only repository permissions and has no publishing step. New commits cancel
+older runs for the same branch. Documentation-only changes skip the builds.
 
 Both the manual Action and the Linux check command validate workflow isolation.
 If a future merge introduces an unguarded upstream job, the checks fail before
@@ -77,11 +84,15 @@ git remote set-url origin https://github.com/IIRoan/zeron.git
 git remote add upstream https://github.com/zeronsh/zeron.git
 git remote set-url --push upstream DISABLED
 git config remote.pushDefault origin
+git config user.name IIRoan
+git config user.email 82589897+IIRoan@users.noreply.github.com
 ```
 
 If `upstream` already exists, use `git remote set-url upstream` instead of adding
 it. Authenticate pushes with the GitHub account that owns the fork. The local
 updater only fetches upstream; it does not need permission to push there.
+Commit identity is repository-local so the fork uses IIRoan rather than a work
+account. Use a signing key registered for this identity if you sign commits.
 
 Keep custom UI and Git behavior in the existing `shell/workbench`,
 `source_control`, `checkout_changes`, `checkout_discard`, and `checkout_git`
