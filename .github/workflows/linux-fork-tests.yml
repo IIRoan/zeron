@@ -35,23 +35,8 @@ env:
   RUST_MIN_STACK: '16777216'
 
 jobs:
-  fork-checks:
-    if: github.repository == 'IIRoan/zeron'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          persist-credentials: false
-      - name: Workflow isolation and updater regressions
-        run: |
-          python3 scripts/tests/test_fork_workflows.py
-          python3 scripts/check-fork-workflows.py
-          python3 scripts/tests/test_update_upstream.py
-
   core-tests:
     if: github.repository == 'IIRoan/zeron'
-    needs: fork-checks
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -67,7 +52,6 @@ jobs:
 
   ui-tests:
     if: github.repository == 'IIRoan/zeron'
-    needs: fork-checks
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:

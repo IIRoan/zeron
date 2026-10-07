@@ -66,8 +66,8 @@ automatic macOS/Windows builds, edge deployments, official releases, and
 scheduled SDK updates in your fork.
 
 **Linux fork tests** runs on relevant pushes to `main` and pull requests, and
-can also be started manually. It checks workflow isolation and updater safety,
-runs the native Linux core and UI suites, and builds the desktop. It uses
+can also be started manually. It runs the native Linux core and UI suites
+directly, and builds the desktop. It uses
 read-only repository permissions and has no publishing step. New commits cancel
 older runs for the same branch. Documentation-only changes skip the builds.
 
