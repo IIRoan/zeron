@@ -54,11 +54,26 @@ class UpdateUpstreamTests(unittest.TestCase):
         self.commit(self.upstream, "release")
         self.git(self.upstream, "tag", "v9.9.9")
 
-    def update(self):
+    def update(self, *args):
         # Disable signing locally in these temporary repositories only.
         self.git(self.fork, "config", "commit.gpgsign", "false")
         return self.run_command(self.fork, "bash", "scripts/update-upstream.sh",
-                                "v9.9.9", check=False)
+                                *(args or ("v9.9.9",)), check=False)
+
+    def mock_action(self, bundle, conclusion="success"):
+        commands = self.root / "bin"
+        commands.mkdir()
+        gh = commands / "gh"
+        gh.write_text("#!/usr/bin/env python3\n"
+                      "import pathlib, shutil, sys\n"
+                      "if sys.argv[1] == 'api':\n"
+                      f"    print({(conclusion + '\tworkflow_dispatch\t.github/workflows/update-linux-fork.yml\tmain')!r})\n"
+                      "elif sys.argv[1:3] == ['run', 'download']:\n"
+                      "    dest = pathlib.Path(sys.argv[sys.argv.index('--dir') + 1])\n"
+                      f"    shutil.copyfile({str(bundle)!r}, dest / 'linux-fork-update.bundle')\n"
+                      "else: sys.exit(1)\n")
+        gh.chmod(0o755)
+        self.env["PATH"] = str(commands) + os.pathsep + self.env["PATH"]
 
     def test_merge_preserves_customizations_and_repeat_is_noop(self):
         self.release()
@@ -103,6 +118,35 @@ class UpdateUpstreamTests(unittest.TestCase):
         self.assertEqual(self.git(self.fork, "rev-parse", "HEAD"), head)
         self.git(self.fork, "rev-parse", "--verify", "MERGE_HEAD")
         self.assertNotEqual(self.update().returncode, 0)
+
+    def test_checked_action_bundle_preserves_new_local_commits(self):
+        self.release()
+        ci = self.root / "ci"
+        self.git(self.root, "clone", "-q", str(self.fork), str(ci))
+        self.git(ci, "switch", "-qc", "maintenance/upstream-42-1")
+        self.git(ci, "fetch", str(self.upstream), "main")
+        self.git(ci, "merge", "--no-ff", "--no-edit", "FETCH_HEAD")
+        bundle = self.root / "checked.bundle"
+        self.git(ci, "bundle", "create", str(bundle), "maintenance/upstream-42-1", "^main")
+        self.mock_action(bundle)
+        (self.fork / "new-local.txt").write_text("new local customization\n")
+        self.commit(self.fork, "local work since the Action")
+        result = self.update("--from-run", "42")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual((self.fork / "new-local.txt").read_text(), "new local customization\n")
+        self.assertEqual((self.fork / "upstream.txt").read_text(), "upstream update\n")
+        self.assertEqual(self.git(self.fork, "status", "--porcelain"), "")
+        head = self.git(self.fork, "rev-parse", "HEAD")
+        self.assertEqual(self.update("--from-run", "42").returncode, 0)
+        self.assertEqual(self.git(self.fork, "rev-parse", "HEAD"), head)
+
+    def test_failed_action_cannot_be_imported(self):
+        self.mock_action(self.root / "missing.bundle", conclusion="failure")
+        head = self.git(self.fork, "rev-parse", "HEAD")
+        result = self.update("--from-run", "42")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("successful manual Linux fork update", result.stdout)
+        self.assertEqual(self.git(self.fork, "rev-parse", "HEAD"), head)
 
 
 if __name__ == "__main__":

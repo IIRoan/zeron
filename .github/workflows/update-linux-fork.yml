@@ -9,8 +9,7 @@ on:
         type: string
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 concurrency:
   group: update-linux-fork
@@ -69,19 +68,25 @@ jobs:
         run: |
           set -euo pipefail
           scripts/update-upstream.sh "$UPSTREAM_RELEASE" 2>&1 | tee "$RUNNER_TEMP/upstream-update.log"
-      - name: Open a reviewed update pull request
+      - name: Package the checked update for local review
         if: steps.prepare.outputs.needed == 'true'
         run: |
           set -euo pipefail
-          git -c push.followTags=false push origin "HEAD:refs/heads/$UPDATE_BRANCH"
-          cat > "$RUNNER_TEMP/upstream-pr.md" <<BODY
-          Merge upstream $UPSTREAM_RELEASE into the Linux fork, preserving its custom workbench, Source Control, and editor behavior.
-
-          Validation: scripts/update-upstream.sh ran the updater safety tests, engine Git regressions, syntax tests, Source Control and file-close modal tests, and the Linux desktop build. Native desktop behavior still needs review before merging. This update was requested manually and will not merge automatically.
-          BODY
-          gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$UPDATE_BRANCH" \
-            --title "Merge upstream $UPSTREAM_RELEASE into Linux fork" --body-file "$RUNNER_TEMP/upstream-pr.md" \
-            | tee -a "$GITHUB_STEP_SUMMARY"
+          git bundle create "$RUNNER_TEMP/linux-fork-update.bundle" "$UPDATE_BRANCH" ^main
+          {
+            echo "Merged and checked upstream $UPSTREAM_RELEASE. Download the linux-fork-update artifact, or apply it locally with:"
+            echo
+            echo "    scripts/update-upstream.sh --from-run $GITHUB_RUN_ID"
+            echo
+            echo 'Checks passed: updater safety, engine Git, syntax, Source Control, file-close modals, and Linux desktop build.'
+            echo 'Review the result locally before pushing. This action does not update main automatically.'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: steps.prepare.outputs.needed == 'true'
+        with:
+          name: linux-fork-update
+          path: ${{ runner.temp }}/linux-fork-update.bundle
+          if-no-files-found: error
       - name: Save failed update diagnostics
         if: failure()
         run: |

@@ -48,15 +48,18 @@ installed official app do not update this custom build.
 
 Open **Actions → Update Linux fork from upstream → Run workflow**, select
 `main`, and optionally enter a release tag. This workflow has no schedule or
-push trigger. It runs the same updater command on a temporary branch and opens
-a pull request only after the Linux checks and build pass. It never merges or
-pushes directly to `main`. If already up to date, it exits without creating a PR.
+push trigger. It runs the same updater command on a temporary branch and provides
+a Git bundle artifact only after the Linux checks and build pass. Apply its
+checked result locally with the one command printed in the run summary:
+`scripts/update-upstream.sh --from-run RUN_ID`. It never pushes or merges directly
+to `main` on GitHub. If already up to date, it exits without creating an artifact.
 Conflicts and failed checks produce diagnostic artifacts for manual repair.
 
-After merging an update PR, run `git pull --ff-only origin main` locally and
-restart with `scripts/dev-linux.sh`. Keep fork Actions allowed to create pull
-requests in **Settings → Actions → General**; this checkout's fork is configured
-for that. Upstream's inherited deployment and scheduled workflows are disabled
+Review the local result, push with `git push origin main`, and restart with
+`scripts/dev-linux.sh`. The Action needs no additional secret or write deploy
+key; its API token remains read-only. This also handles releases that change
+workflow files, which GitHub's built-in Action token cannot push. Upstream's
+inherited deployment and scheduled workflows are disabled
 in this fork so they do not run against your account.
 
 ## Remote setup on another checkout
