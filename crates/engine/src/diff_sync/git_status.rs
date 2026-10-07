@@ -18,7 +18,7 @@ fn state(code: u8) -> Option<GitFileState> {
 
 /// Porcelain -z paths are literal (including spaces/newlines), destination first
 /// for renames. Never turn a truncated record or invalid UTF-8 into a clean row.
-pub(super) fn parse(bytes: &[u8], truncated: bool) -> (Vec<GitFileStatus>, bool) {
+pub(crate) fn parse(bytes: &[u8], truncated: bool) -> (Vec<GitFileStatus>, bool) {
     let mut complete = !truncated && (bytes.is_empty() || bytes.ends_with(&[0]));
     let mut records = bytes.split(|b| *b == 0).peekable();
     let mut files = Vec::new();

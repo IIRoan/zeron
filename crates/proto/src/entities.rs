@@ -789,6 +789,138 @@ pub struct WorkspaceGitStatusFrame {
     pub status: Option<CheckoutGitStatus>,
 }
 
+/// Metadata for the source-control list, including initialized submodules.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryChanges {
+    /// Repository path relative to the selected checkout; empty for its root.
+    pub path: String,
+    pub name: String,
+    pub files: Vec<GitFileStatus>,
+    pub submodules: Vec<String>,
+    pub complete: bool,
+    #[serde(default)]
+    pub git: Option<RepositoryGitState>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryGitState {
+    pub head: Option<String>,
+    pub branch: Option<String>,
+    pub upstream: Option<String>,
+    pub ahead: Option<u32>,
+    pub behind: Option<u32>,
+    /// merge, rebase, cherryPick, or revert, when Git is awaiting completion.
+    pub operation: Option<String>,
+    pub conflicts: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryGitBranch {
+    pub name: String,
+    pub remote: bool,
+    pub current: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryGitRemote {
+    pub name: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryGitStash {
+    pub sha: String,
+    pub selector: String,
+    pub subject: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryGitDetails {
+    pub state: RepositoryGitState,
+    pub branches: Vec<RepositoryGitBranch>,
+    pub remotes: Vec<RepositoryGitRemote>,
+    pub stashes: Vec<RepositoryGitStash>,
+    pub incoming: Vec<GitHistoryCommit>,
+    pub outgoing: Vec<GitHistoryCommit>,
+    pub recent: Vec<GitHistoryCommit>,
+    pub last_message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum RepositoryGitAction {
+    Fetch,
+    Pull { rebase: Option<bool> },
+    Push,
+    Publish { remote: String },
+    Sync,
+    SwitchBranch { branch: String },
+    CreateBranch { name: String, start: Option<String> },
+    RenameBranch { name: String },
+    DeleteBranch { name: String },
+    Merge { branch: String },
+    Rebase { branch: String },
+    RevertCommit { sha: String },
+    CherryPick { sha: String },
+    UndoCommit,
+    Stash { message: String, include_untracked: bool },
+    ApplyStash { sha: String },
+    PopStash { sha: String },
+    DropStash { sha: String },
+    AddRemote { name: String, url: String },
+    RemoveRemote { name: String },
+    Continue,
+    Abort,
+    ResolveConflict { path: String, incoming: bool },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryGitActionResult {
+    pub notice: String,
+    pub commit_message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckoutDiscardPreview {
+    pub paths: Vec<String>,
+    pub include_staged: bool,
+    pub checksum: String,
+    pub file_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckoutDiscardResult {
+    pub recovery_id: String,
+    pub checksum: String,
+    pub file_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckoutChanges {
+    pub repositories: Vec<RepositoryChanges>,
+}
+
+/// A specific side of one file's changes. Staged compares HEAD to the index;
+/// unstaged compares the index to the working tree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckoutChangeSelection {
+    pub cwd: String,
+    pub repository: String,
+    pub path: String,
+    pub staged: bool,
+}
+
 /// Working-tree diff for a checkout — latest-only sidecar, 3MiB patch cap.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

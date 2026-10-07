@@ -95,6 +95,8 @@ impl Shell {
                 self.navigation_focus.right.clone(),
                 self.navigation_focus.right.clone(),
             )
+        } else if self.main_file.is_some() || self.main_diff.is_some() {
+            (self.navigation_focus.main.clone(), self.unfocused.clone())
         } else {
             (self.composer.focus_handle(cx), self.unfocused.clone())
         }

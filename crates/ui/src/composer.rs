@@ -1764,6 +1764,15 @@ pub fn init(cx: &mut App, send_behavior: ComposerSendBehavior) {
     cx.bind_keys(palette_bindings);
     cx.bind_keys(generic_bindings);
     cx.bind_keys(message_bindings);
+    let commit_context = "GitCommitMessage";
+    let mut commit_bindings = input_bindings(commit_context);
+    commit_bindings.push(KeyBinding::new("enter", Newline, Some(commit_context)));
+    commit_bindings.push(KeyBinding::new(
+        &platform_combo("mod-enter"),
+        Submit,
+        Some(commit_context),
+    ));
+    cx.bind_keys(commit_bindings);
 }
 
 /// Events the composer wrapper listens for.
@@ -2131,6 +2140,14 @@ impl ComposerInput {
         self.configured_line_height = line_height;
         self.line_height = px(line_height);
         self.content_height = line_height;
+        self
+    }
+
+    /// Bound a multiline field while keeping its caret and scrolling visible.
+    pub fn with_max_height(mut self, height: f32) -> Self {
+        let height = height.max(self.configured_line_height);
+        self.viewport_height = Some(height);
+        self.settled_viewport_height = Some(height);
         self
     }
 

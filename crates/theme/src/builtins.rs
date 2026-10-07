@@ -162,10 +162,14 @@ fn variant(seed: Seeds<'_>) -> ThemeVariant {
     // Hash the checked-in resolved definition itself (with the hash field
     // blanked), not merely its source URL. This makes provenance sensitive to
     // curation edits as well as upstream revision changes.
+    update_asset_hash(&mut variant);
+    variant
+}
+
+fn update_asset_hash(variant: &mut ThemeVariant) {
     variant.source.asset_hash.clear();
     let encoded = serde_json::to_vec(&variant).expect("built-in theme serializes");
     variant.source.asset_hash = format!("sha256:{:x}", Sha256::digest(encoded));
-    variant
 }
 
 fn syntax(colors: [&str; 12]) -> BTreeMap<String, Color> {
@@ -305,7 +309,7 @@ fn zeron_light() -> ThemeVariant {
 }
 
 fn vscode_dark() -> ThemeVariant {
-    variant(Seeds {
+    let mut theme = variant(Seeds {
         id: "vscode-dark-plus",
         family_id: "vscode-default",
         name: "Dark+",
@@ -328,7 +332,7 @@ fn vscode_dark() -> ThemeVariant {
             "#666666", "#f14c4c", "#23d18b", "#f5f543", "#3b8eea", "#d670d6", "#29b8db", "#e5e5e5",
         ],
         syntax: [
-            "#6a9955", "#c586c0", "#ce9178", "#b5cea8", "#4ec9b0", "#dcdcaa", "#9cdcfe", "#d4d4d4",
+            "#6a9955", "#c586c0", "#ce9178", "#b5cea8", "#4ec9b0", "#dcdcaa", "#9cdcfe", "#9cdcfe",
             "#d4d4d4", "#569cd6", "#9cdcfe", "#f44747",
         ],
         source: source(
@@ -338,11 +342,27 @@ fn vscode_dark() -> ThemeVariant {
             "e33d147d4c0fa65ce17cb73ec9d798f064b4bf1f",
             "MIT",
         ),
-    })
+    });
+    for (role, color) in [
+        ("keywordStorage", "#569cd6"),
+        ("boolean", "#569cd6"),
+        ("variableSpecial", "#569cd6"),
+        ("typeBuiltin", "#569cd6"),
+        ("operator", "#d4d4d4"),
+        ("bracket1", "#ffd700"),
+        ("bracket2", "#da70d6"),
+        ("bracket3", "#179fff"),
+    ] {
+        theme.syntax.insert(role.into(), c(color));
+    }
+    theme.colors.diff_hunk = Color::BLACK.with_alpha(0.0);
+    theme.colors.input = c("#3c3c3c");
+    update_asset_hash(&mut theme);
+    theme
 }
 
 fn vscode_light() -> ThemeVariant {
-    variant(Seeds {
+    let mut theme = variant(Seeds {
         id: "vscode-light-plus",
         family_id: "vscode-default",
         name: "Light+",
@@ -372,7 +392,22 @@ fn vscode_light() -> ThemeVariant {
             "e33d147d4c0fa65ce17cb73ec9d798f064b4bf1f",
             "MIT",
         ),
-    })
+    });
+    for (role, color) in [
+        ("keywordStorage", "#0000ff"),
+        ("boolean", "#0000ff"),
+        ("variableSpecial", "#0000ff"),
+        ("typeBuiltin", "#0000ff"),
+        ("variable", "#001080"),
+        ("bracket1", "#8b6500"),
+        ("bracket2", "#910091"),
+        ("bracket3", "#005bbe"),
+    ] {
+        theme.syntax.insert(role.into(), c(color));
+    }
+    theme.colors.diff_hunk = Color::BLACK.with_alpha(0.0);
+    update_asset_hash(&mut theme);
+    theme
 }
 
 fn catppuccin_mocha() -> ThemeVariant {

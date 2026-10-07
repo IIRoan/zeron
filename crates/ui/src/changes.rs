@@ -32,6 +32,8 @@
 //!   code plane: gutters, comment affordances, and sticky headers stay fixed,
 //!   while the virtual list measures each logical row's resulting height.
 
+mod intraline;
+
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -1637,6 +1639,9 @@ struct CommentDraft {
 /// (the shell calls it when the pane first opens).
 pub struct Changes {
     state: Entity<AppState>,
+    source_control: Option<Entity<crate::source_control::SourceControl>>,
+    source_control_events: Option<Subscription>,
+    file_selection: Option<zeron_proto::CheckoutChangeSelection>,
     diffs: Vec<CheckoutDiff>,
     started: bool,
     error: Option<SharedString>,
@@ -1648,6 +1653,7 @@ pub struct Changes {
     watch_task: Option<Task<()>>,
     parsed: Option<ParsedDiff>,
     parse_task: Option<Task<()>>,
+    intraline: intraline::Changes,
     folds: HashMap<String, FileFold>,
     highlights: HashMap<String, HighlightSlot>,
     /// The flattened row model the list virtualizes over (line granularity;
@@ -1693,6 +1699,7 @@ pub struct Changes {
     /// Pinned commit for a [`DiffScope::Commit`] pane (sha + subject drive
     /// the fetch and the surface-tab title).
     commit: Option<GitHistoryCommit>,
+    commit_repository: Option<String>,
     _observe: Subscription,
 }
 
@@ -1707,8 +1714,10 @@ pub struct DiscardWorkingTreeRequest {
 }
 
 pub enum ChangesEvent {
+    OpenChange(zeron_proto::CheckoutChangeSelection),
     /// A History row was clicked — open this commit as its own diff tab.
     OpenCommit(GitHistoryCommit),
+    OpenRepositoryCommit { cwd: String, repository: String, commit: GitHistoryCommit },
     /// Open the post-change path in the workspace file browser.
     OpenFile(String),
     /// The working-tree trash button was clicked. The shell owns the global
@@ -1744,6 +1753,9 @@ impl Changes {
         let mode = DiffMode::from_split(settings.diff_split);
         Self {
             state,
+            source_control: None,
+            source_control_events: None,
+            file_selection: None,
             mode,
             wrap_lines: settings.diff_wrap,
             diffs: Vec::new(),
@@ -1753,6 +1765,7 @@ impl Changes {
             watch_task: None,
             parsed: None,
             parse_task: None,
+            intraline: Default::default(),
             folds: HashMap::new(),
             highlights: HashMap::new(),
             rows: Vec::new(),
@@ -1783,6 +1796,7 @@ impl Changes {
             history_view_button: None,
             history_events: None,
             commit: None,
+            commit_repository: None,
             _observe: observe,
         }
     }
@@ -1800,6 +1814,115 @@ impl Changes {
         changes
     }
 
+    pub fn for_file(
+        state: Entity<AppState>,
+        selection: zeron_proto::CheckoutChangeSelection,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut changes = Self::new(state, cx);
+        changes.mode = DiffMode::Split;
+        changes.file_selection = Some(selection);
+        changes
+    }
+
+    pub fn for_repository_commit(state: Entity<AppState>, repository: String, commit: GitHistoryCommit, cx: &mut Context<Self>) -> Self {
+        let mut changes = Self::for_commit(state, commit, cx);
+        changes.mode = DiffMode::Split;
+        changes.commit_repository = Some(repository);
+        changes
+    }
+
+    fn source_control(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Entity<crate::source_control::SourceControl> {
+        if let Some(view) = &self.source_control {
+            return view.clone();
+        }
+        let view = cx.new(|cx| crate::source_control::SourceControl::new(self.state.clone(), cx));
+        self.source_control_events = Some(cx.subscribe(&view, |_, _, event, cx| {
+            match event {
+                crate::source_control::SourceControlEvent::OpenDiff(selection) => cx.emit(ChangesEvent::OpenChange(selection.clone())),
+                crate::source_control::SourceControlEvent::OpenFile(path) => cx.emit(ChangesEvent::OpenFile(path.clone())),
+                crate::source_control::SourceControlEvent::OpenCommit { cwd, repository, commit } => cx.emit(ChangesEvent::OpenRepositoryCommit { cwd: cwd.clone(), repository: repository.clone(), commit: commit.clone() }),
+            }
+        }));
+        self.source_control = Some(view.clone());
+        view
+    }
+
+    pub(crate) fn source_control_surface(&mut self, content: gpui::Div, cx: &mut Context<Self>) -> AnyElement {
+        if self.scope == DiffScope::WorkingTree && self.file_selection.is_none() {
+            self.source_control(cx).update(cx, |view, cx| view.selection_surface(content, cx))
+        } else {
+            content.into_any_element()
+        }
+    }
+
+    #[cfg(feature = "source-control-fixture")]
+    pub fn fixture_source_control_state(&self, cx: &App) -> serde_json::Value {
+        self.source_control
+            .as_ref()
+            .map_or(serde_json::Value::Null, |view| {
+                view.read(cx).fixture_commit_state(cx)
+            })
+    }
+
+    fn ensure_file_watch(&mut self, cx: &mut Context<Self>) {
+        if self.watch_task.is_some() {
+            return;
+        }
+        let Some(selection) = self.file_selection.clone() else {
+            return;
+        };
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let target = self.desired_target(cx);
+        self.watch_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let mut params = serde_json::to_value(&selection).unwrap();
+                params["targetDeviceId"] = serde_json::json!(target);
+                let result = engine
+                    .client()
+                    .call(methods::GET_CHECKOUT_CHANGE_DIFF, params)
+                    .await;
+                if this
+                    .update(cx, |view, cx| {
+                        match result.and_then(|v| {
+                            serde_json::from_value::<CheckoutDiff>(v)
+                                .map_err(|e| zeron_rpc::RpcError::Failed(e.to_string()))
+                        }) {
+                            Ok(diff) => {
+                                let recovered = view.error.take().is_some();
+                                let changed = view
+                                    .scoped
+                                    .as_ref()
+                                    .is_none_or(|old| old.checksum != diff.checksum);
+                                if changed {
+                                    view.scoped = Some(diff);
+                                    view.sync(cx);
+                                    cx.notify();
+                                } else if recovered {
+                                    cx.notify();
+                                }
+                            }
+                            Err(error) => {
+                                view.error =
+                                    Some(format!("Unable to load file diff: {error}").into());
+                                cx.notify();
+                            }
+                        }
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                cx.background_executor().timer(Duration::from_secs(2)).await;
+            }
+        }));
+    }
+
     /// A dedicated History surface. It shares the commit-opening event path
     /// with diffs, but is never offered as an item in a Diff tab's scope menu.
     pub fn for_history(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
@@ -1815,6 +1938,9 @@ impl Changes {
     /// The surface-tab title (contextual, user request): the pinned commit's
     /// subject (short sha for subject-less commits), else the scope's label.
     pub fn tab_title(&self) -> gpui::SharedString {
+        if self.scope == DiffScope::WorkingTree && self.file_selection.is_none() {
+            return "Source Control".into();
+        }
         if let Some(commit) = &self.commit {
             let subject = commit.subject.trim();
             if !subject.is_empty() {
@@ -1941,6 +2067,9 @@ impl Changes {
     /// The diff the pane currently displays: the watch stream for the working
     /// tree, the one-shot scoped capture otherwise.
     fn active_diff(&self, cx: &App) -> Option<CheckoutDiff> {
+        if self.file_selection.is_some() {
+            return self.scoped.clone();
+        }
         match self.scope {
             DiffScope::WorkingTree => self.resolved(cx),
             DiffScope::Branch | DiffScope::LatestTurn | DiffScope::Commit => self.scoped.clone(),
@@ -2090,13 +2219,14 @@ impl Changes {
         };
         let target = self.desired_target(cx);
         let context = format!(
-            "{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}",
             target.as_deref().unwrap_or("local"),
             chat_id,
             cwd,
             self.scope.mode(),
             base.as_deref().unwrap_or(""),
             commit_sha.as_deref().unwrap_or("")
+            ,self.commit_repository.as_deref().unwrap_or("")
         );
         let watch_sum = self.resolved(cx).map(|d| d.checksum).unwrap_or_default();
         let key = format!("{context}|{watch_sum}");
@@ -2117,12 +2247,14 @@ impl Changes {
             return;
         };
         let mode = self.scope.mode();
+        let repository = self.commit_repository.clone();
         self.scoped_inflight = Some(key.clone());
         self.scoped_task = Some(cx.spawn(async move |this, cx| {
             let mut params = serde_json::Map::new();
             params.insert("cwd".into(), serde_json::Value::String(cwd));
             params.insert("mode".into(), serde_json::Value::String(mode.to_string()));
             params.insert("chatId".into(), serde_json::Value::String(chat_id));
+            if let Some(repository) = repository { params.insert("repository".into(), repository.into()); }
             if let Some(base) = base {
                 params.insert("baseRef".into(), serde_json::Value::String(base));
             }
@@ -2278,19 +2410,30 @@ impl Changes {
 
     /// Reconcile parsed content with the currently-active diff.
     fn sync(&mut self, cx: &mut Context<Self>) {
+        if self.scope == DiffScope::WorkingTree && self.file_selection.is_none() {
+            self.source_control(cx)
+                .update(cx, |view, cx| view.ensure_loaded(cx));
+            return;
+        }
         self.discard_stale_draft(cx);
         // The watch follows the selected chat's host device (idempotent when
         // the target is unchanged); a boot-deferred attempt retries here too.
-        self.ensure_watch(cx);
+        if self.file_selection.is_some() {
+            self.ensure_file_watch(cx);
+        } else {
+            self.ensure_watch(cx);
+        }
         if self.scope == DiffScope::History {
             self.history_pane(cx)
                 .update(cx, |history, cx| history.ensure_loaded(cx));
             return;
         }
-        if self.scope != DiffScope::Commit {
+        if self.scope != DiffScope::Commit && self.file_selection.is_none() {
             self.ensure_branches(cx);
         }
-        self.ensure_scoped(cx);
+        if self.file_selection.is_none() {
+            self.ensure_scoped(cx);
+        }
         let Some(diff) = self.active_diff(cx) else {
             if self.parsed.take().is_some() {
                 self.rows.clear();
@@ -2298,6 +2441,7 @@ impl Changes {
                 self.list.reset(0);
                 self.folds.clear();
                 self.highlights.clear();
+                self.intraline.clear();
                 cx.notify();
             }
             return;
@@ -2313,10 +2457,29 @@ impl Changes {
         let additions = diff.additions;
         let deletions = diff.deletions;
         let file_count = diff.files.len();
+        let repository = self
+            .file_selection
+            .as_ref()
+            .map(|selection| selection.repository.clone())
+            .or_else(|| self.commit_repository.clone())
+            .unwrap_or_default();
         self.parse_task = Some(cx.spawn(async move |this, cx| {
-            let files = cx
+            let (files, inline) = cx
                 .background_executor()
-                .spawn(async move { parse_patch(&patch) })
+                .spawn(async move {
+                    let mut files = parse_patch(&patch);
+                    if !repository.is_empty() {
+                        for file in &mut files {
+                            file.path = format!("{repository}/{}", file.path);
+                            file.old_path = file
+                                .old_path
+                                .take()
+                                .map(|path| format!("{repository}/{path}"));
+                        }
+                    }
+                    let inline = intraline::collect(&files);
+                    (files, inline)
+                })
                 .await;
             this.update(cx, |changes, cx| {
                 // Late results for a superseded diff are re-checked by key.
@@ -2353,6 +2516,7 @@ impl Changes {
                     .reset_with_uniform_height(rows.len(), row_height);
                 changes.rows = rows;
                 changes.row_ranges = ranges;
+                changes.intraline = inline;
                 changes.parsed = Some(ParsedDiff {
                     key,
                     truncated,
@@ -2954,9 +3118,20 @@ impl Changes {
         }
     }
 
+    pub(crate) fn has_git_confirmation(&self, cx: &App) -> bool {
+        self.source_control
+            .as_ref()
+            .is_some_and(|view| view.read(cx).has_confirmation())
+    }
+
     /// Handle Escape before focused descendants such as a terminal receive it.
     /// A popup in its exit animation remains a blocker until it unmounts.
     pub(crate) fn handle_escape(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.source_control.as_ref().is_some_and(|view| {
+            view.update(cx, |view, cx| view.handle_escape(cx))
+        }) {
+            return true;
+        }
         if self.ref_menu.is_open() {
             self.close_ref_menu(cx);
             return true;
@@ -3107,7 +3282,11 @@ impl Changes {
             .ok();
         });
 
-        let active = self.active_diff(cx);
+        let active = if self.file_selection.is_some() {
+            None
+        } else {
+            self.active_diff(cx)
+        };
         let engine = self.state.read(cx).engine().cloned();
         let target = self.desired_target(cx);
         let chat_id = self
@@ -3270,6 +3449,10 @@ impl Changes {
                     gutter_px,
                     code_width,
                     Some(code_scroll.slot("unified")),
+                    intraline::key(file, line)
+                        .and_then(|key| self.intraline.get(&key))
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
                 );
                 let Some((side, line_no)) = line_anchor(line) else {
                     return row;
@@ -3343,6 +3526,9 @@ impl Changes {
                         let runs = shared_runs
                             .clone()
                             .unwrap_or_else(|| line_runs(line, highlight.as_deref(), &theme));
+                        let runs = intraline::paint(runs,
+                            intraline::key(file, line).and_then(|key| self.intraline.get(&key)).map(Vec::as_slice).unwrap_or(&[]),
+                            intraline::background(&theme, !old, true));
                         let number = if old { line.old_no } else { line.new_no };
                         split_line_cell(
                             line,
@@ -3799,6 +3985,15 @@ impl Changes {
     /// alongside, shell-owned (they mutate shell state).
     pub fn render_header_controls(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
+        if self.file_selection.is_some() {
+            return div()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .child(self.split_toggle(&theme, cx))
+                .child(self.wrap_toggle(&theme, cx))
+                .into_any_element();
+        }
         // Commit-pinned pane: the pin never changes, so a fixed identity
         // chip (mono short sha + subject) replaces the scope dropdown;
         // fold-all still trails.
@@ -3945,7 +4140,9 @@ impl Changes {
             scope_trigger.into_any_element()
         };
 
-        let trailing: AnyElement = if scope == DiffScope::History {
+        let trailing: AnyElement = if scope == DiffScope::WorkingTree {
+            div().into_any_element()
+        } else if scope == DiffScope::History {
             div()
                 .min_w_0()
                 .flex_shrink(1.0)
@@ -4010,12 +4207,24 @@ impl Changes {
                 .into_any_element()
         };
 
+        let source_actions = (scope == DiffScope::WorkingTree).then(|| self.source_control(cx).update(cx, |view, cx| view.render_header_actions(cx)));
         div()
             .size_full()
             .flex()
             .flex_row()
             .items_center()
             .gap(px(crate::surface_chrome::CONTROL_GAP))
+            .when(scope == DiffScope::WorkingTree, |element| {
+                element.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(11.0))
+                        .text_color(theme.text_muted)
+                        .child("SOURCE CONTROL"),
+                )
+            })
             .child(trigger)
             .when_some(history_count, |element, count| {
                 element.child(
@@ -4030,10 +4239,12 @@ impl Changes {
                 )
             })
             .children(self.render_ref_selector(&theme, cx))
-            .when(scope != DiffScope::History, |element| {
-                element.child(div().flex_1())
-            })
+            .when(
+                scope != DiffScope::History && scope != DiffScope::WorkingTree,
+                |element| element.child(div().flex_1()),
+            )
             .child(trailing)
+            .when_some(source_actions, |element, actions| element.child(actions))
             .into_any_element()
     }
 
@@ -4287,11 +4498,17 @@ impl Changes {
                         .truncate()
                         .text_size(px(12.0))
                         .text_color(theme.text_muted)
-                        .child(SharedString::from(scope_label(
-                            self.scope,
-                            parsed.file_count,
-                            self.base_ref.as_deref(),
-                        ))),
+                        .child(SharedString::from(
+                            if let Some(selection) = &self.file_selection {
+                                if selection.staged {
+                                    "Staged changes".to_string()
+                                } else {
+                                    "Working tree changes".to_string()
+                                }
+                            } else {
+                                scope_label(self.scope, parsed.file_count, self.base_ref.as_deref())
+                            },
+                        )),
                 )
                 .child(
                     div()
@@ -4434,6 +4651,7 @@ fn diff_line_row(
     gutter_px: f32,
     code_width: DiffCodeWidth,
     scroll: Option<DiffCodeScroll>,
+    changed_ranges: &[std::ops::Range<usize>],
 ) -> AnyElement {
     if line.kind == LineKind::Meta {
         return meta_line_row(
@@ -4443,11 +4661,9 @@ fn diff_line_row(
         );
     }
 
-    // Row tints sampled from the reference: ~5–6% washes over the pane tone.
-    let mut add_bg = add_color(theme);
-    add_bg.a = 0.055;
-    let mut del_bg = del_color(theme);
-    del_bg.a = 0.055;
+    // Subtle row wash with a stronger tint behind changed characters.
+    let add_bg = intraline::background(theme, true, false);
+    let del_bg = intraline::background(theme, false, false);
 
     let (marker, marker_color, row_bg, accent, number_color) = match line.kind {
         LineKind::Add => (
@@ -4494,6 +4710,11 @@ fn diff_line_row(
         &mono,
         theme.text.opacity(0.92),
         theme,
+    );
+    let runs = intraline::paint(
+        runs,
+        changed_ranges,
+        intraline::background(theme, line.kind == LineKind::Add, true),
     );
     let content_width = match code_width {
         DiffCodeWidth::Clipped => None,
@@ -4615,10 +4836,8 @@ fn split_line_cell(
     code_width: DiffCodeWidth,
     scroll: Option<DiffCodeScroll>,
 ) -> gpui::Div {
-    let mut add_bg = add_color(theme);
-    add_bg.a = 0.055;
-    let mut del_bg = del_color(theme);
-    del_bg.a = 0.055;
+    let add_bg = intraline::background(theme, true, false);
+    let del_bg = intraline::background(theme, false, false);
     let (marker, marker_color, row_bg, accent, number_color) = match line.kind {
         LineKind::Add => (
             "+",
@@ -4826,6 +5045,7 @@ pub(crate) fn render_file_body_with_syntax(
                 gutter_px,
                 DiffCodeWidth::Clipped,
                 None,
+                &[],
             ));
         }
     }
@@ -4888,6 +5108,7 @@ fn render_file_body_upto(
                             scroll
                                 .as_ref()
                                 .map(|scroll| scroll.slot(format_args!("{hunk_ix}-{line_ix}"))),
+                            &[],
                         ));
                         y += diff_line_height(theme);
                     }
@@ -4955,6 +5176,15 @@ fn render_file_body_upto(
 
 impl Render for Changes {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.scope == DiffScope::WorkingTree && self.file_selection.is_none() {
+            return div()
+                .size_full()
+                .child(
+                    self.source_control(cx)
+                        .cached(gpui::StyleRefinement::default().size_full()),
+                )
+                .into_any_element();
+        }
         if self.scope == DiffScope::History {
             let history = self.history_pane(cx);
             history.update(cx, |history, cx| history.ensure_loaded(cx));
@@ -5046,7 +5276,17 @@ impl Render for Changes {
                     .justify_center()
                     .text_size(px(12.0))
                     .text_color(theme.text_faint)
-                    .child(SharedString::from(clean_message(scope, base.as_deref())))
+                    .child(SharedString::from(
+                        if let Some(selection) = &self.file_selection {
+                            if selection.staged {
+                                "No staged changes in this file".to_string()
+                            } else {
+                                "No unstaged changes in this file".to_string()
+                            }
+                        } else {
+                            clean_message(scope, base.as_deref())
+                        },
+                    ))
                     .into_any_element(),
                 DiffPhase::List => {
                     if self.parsed.is_some() {

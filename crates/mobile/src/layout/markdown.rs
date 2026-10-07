@@ -292,7 +292,7 @@ fn syntax_color(kind: zeron_syntax::HighlightKind) -> ColorRole {
     use zeron_syntax::HighlightKind as K;
     match kind {
         K::Comment => ColorRole::SyntaxComment,
-        K::Keyword => ColorRole::SyntaxKeyword,
+        K::Keyword | K::KeywordStorage => ColorRole::SyntaxKeyword,
         K::String | K::StringSpecial => ColorRole::SyntaxString,
         K::Escape => ColorRole::SyntaxEscape,
         K::Number | K::Boolean => ColorRole::SyntaxNumber,
@@ -302,7 +302,7 @@ fn syntax_color(kind: zeron_syntax::HighlightKind) -> ColorRole {
         K::Constant => ColorRole::SyntaxConstant,
         K::Variable | K::VariableSpecial | K::Parameter => ColorRole::SyntaxVariable,
         K::Operator => ColorRole::SyntaxOperator,
-        K::Punctuation => ColorRole::SyntaxPunctuation,
+        K::Punctuation | K::Bracket1 | K::Bracket2 | K::Bracket3 => ColorRole::SyntaxPunctuation,
         K::Tag | K::Label => ColorRole::SyntaxTag,
         K::Attribute => ColorRole::SyntaxAttribute,
         _ => ColorRole::CodeText,

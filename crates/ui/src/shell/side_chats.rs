@@ -12,7 +12,9 @@ impl Shell {
         let empty = if key == self.panel_key(cx) {
             self.right_surface_rows(cx).is_empty()
         } else {
-            self.right_tabs.get(key).is_none_or(Vec::is_empty)
+            self.right_tabs
+                .get(key)
+                .is_none_or(|tabs| tabs.iter().all(|surface| !self.is_tool_surface(*surface)))
         };
         if empty {
             if key == self.panel_key(cx) && self.right_pane_open(cx) {

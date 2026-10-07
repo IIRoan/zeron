@@ -51,6 +51,19 @@ macro_rules! icon_assets {
 }
 
 icon_assets![
+    // Microsoft VS Code Codicons, CC BY 4.0; attribution and license in assets/icons.
+    (VSC_DISCARD, "vscode-discard"),
+    (VSC_SYNC, "vscode-sync"),
+    (VSC_BRANCH, "vscode-git-branch"),
+    (VSC_COMMIT, "vscode-git-commit"),
+    (VSC_REFRESH, "vscode-refresh"),
+    (VSC_MORE, "vscode-ellipsis"),
+    (VSC_CHEVRON, "vscode-chevron-down"),
+    (VSC_PUBLISH, "vscode-cloud-upload"),
+    (VSC_OPEN_FILE, "vscode-go-to-file"),
+    (VSC_ADD, "vscode-add"),
+    (VSC_REMOVE, "vscode-remove"),
+    (VSC_CHECK, "vscode-check"),
     (MICROPHONE, "microphone"),
     (PROJECT_DEFAULT, "project-default"),
     (REMOTE_SERVER, "remote-server"),

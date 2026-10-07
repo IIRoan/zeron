@@ -26,13 +26,14 @@ fn sidebar_width(cx: &gpui::App) -> f32 {
         .map_or(crate::settings::SIDEBAR_DEFAULT, |w| w.0)
 }
 
-/// The page pane: right of the section column, below the titlebar strip.
+/// The page pane beside the section column, below the titlebar strip.
 pub fn pane_bounds(viewport: gpui::Size<Pixels>, sidebar_width: f32) -> gpui::Bounds<Pixels> {
-    let left = px(sidebar_width).min(viewport.width);
+    let reserved = px(sidebar_width).max(px(0.0)).min(viewport.width);
+    let left = if cfg!(target_os = "linux") { px(0.0) } else { reserved };
     let top = px(Theme::TITLEBAR_HEIGHT).min(viewport.height);
     gpui::Bounds::new(
         gpui::point(left, top),
-        gpui::size(viewport.width - left, viewport.height - top),
+        gpui::size(viewport.width - reserved, viewport.height - top),
     )
 }
 
@@ -908,8 +909,14 @@ mod switch_tests {
             let viewport = gpui::size(px(width), px(700.0));
             let pane = pane_bounds(viewport, sidebar);
             let limits = dropdown_limits(viewport, sidebar);
-            assert_eq!(pane.left(), px(sidebar));
-            assert_eq!(pane.right(), px(width));
+            assert_eq!(pane.size.width, px(width - sidebar));
+            if cfg!(target_os = "linux") {
+                assert_eq!(pane.left(), px(0.0));
+                assert_eq!(pane.right(), px(width - sidebar));
+            } else {
+                assert_eq!(pane.left(), px(sidebar));
+                assert_eq!(pane.right(), px(width));
+            }
             assert!(limits.left() >= pane.left());
             assert!(limits.right() <= pane.right());
             assert!(limits.top() >= px(Theme::TITLEBAR_HEIGHT));

@@ -44,6 +44,10 @@ fn main() {
         String::from_utf8_lossy(&flags.stderr)
     );
     let status = Command::new(env::var("CC").unwrap_or_else(|_| "cc".into()))
+        // WebKit is system-managed. Cargo may need Homebrew's library path,
+        // but using it to resolve GTK's dependencies mixes incompatible ABIs.
+        .env_remove("LD_LIBRARY_PATH")
+        .env_remove("LIBRARY_PATH")
         .args([
             "-std=c11",
             "-O2",

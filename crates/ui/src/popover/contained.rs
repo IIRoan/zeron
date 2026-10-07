@@ -15,12 +15,25 @@ pub(crate) fn contained_menu(
     trigger_height: f32,
     limits: Bounds<Pixels>,
 ) -> AnyElement {
-    let exit = closing.map(super::exit_progress);
     // Half the usable height guarantees room on at least one side, even
     // when the trigger sits in the middle of a small dialog.
     let max_height = ((f32::from(limits.size.height) - trigger_height) / 2.0 - 6.0)
         .max(1.0)
         .min(320.0);
+    contained_menu_with_height(id, content, closing, trigger_height, limits, max_height)
+}
+
+/// A caller with a bounded scroll area can use more of the window than a
+/// dialog picker. Keep its frame and its scroll area within the same budget.
+pub(crate) fn contained_menu_with_height(
+    id: SharedString,
+    content: gpui::Div,
+    closing: Option<Instant>,
+    trigger_height: f32,
+    limits: Bounds<Pixels>,
+    max_height: f32,
+) -> AnyElement {
+    let exit = closing.map(super::exit_progress);
     let card = content
         .id(SharedString::from(format!("{id}-scroll")))
         .debug_selector(|| "contained-menu-scroll".into())

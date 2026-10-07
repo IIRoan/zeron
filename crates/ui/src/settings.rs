@@ -1030,7 +1030,14 @@ impl Default for UiSettings {
             terminal_font_size: crate::typography::TERMINAL_FONT_SIZE_DEFAULT,
             code_font_family: crate::typography::UiFontFamily::GeistMono,
             code_font_size: crate::typography::CODE_FONT_SIZE_DEFAULT,
-            theme_selection: zeron_theme::ThemeSelection::default(),
+            theme_selection: if cfg!(target_os = "linux") {
+                zeron_theme::ThemeSelection {
+                    dark: "vscode-dark-plus".into(),
+                    light: "vscode-light-plus".into(),
+                }
+            } else {
+                zeron_theme::ThemeSelection::default()
+            },
             diff_split: false,
             diff_wrap: false,
             code_fences_fit_content: false,

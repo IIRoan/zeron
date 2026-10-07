@@ -230,6 +230,13 @@ pub enum FilesCloseDisposition {
     Blocked,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum FileCloseChoice {
+    Cancel,
+    Discard,
+    Save,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FilesPresentation {
     Explorer,
@@ -304,6 +311,11 @@ pub struct FilesSurface {
 
 impl Render for FilesSurface {
     fn render(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::transcript::record_view_frame(if self.presentation.is_editor() {
+            "file-editor"
+        } else {
+            "explorer"
+        });
         if !cx.has_active_drag() || !self.is_current_target(cx) {
             self.clear_tree_drag(window, cx);
         }
@@ -341,6 +353,11 @@ impl Render for FilesSurface {
             .flex()
             .bg(crate::theme::ink(0.0))
             .flex_col()
+            .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" && this.cancel_close_confirmation(cx) {
+                    cx.stop_propagation();
+                }
+            }))
             .children(header)
             .child(div().flex_1().min_h_0().w_full().child(body))
             .children(

@@ -187,6 +187,15 @@ pub mod methods {
     /// Current pull request for one checkout, resolved on the checkout's host device.
     pub const WATCH_CHECKOUT_CHANGE_REQUEST: &str = "WatchCheckoutChangeRequest";
     pub const GET_CHECKOUT_DIFF: &str = "GetCheckoutDiff";
+    pub const GET_CHECKOUT_CHANGES: &str = "GetCheckoutChanges";
+    pub const SET_CHECKOUT_STAGED: &str = "SetCheckoutStaged";
+    pub const COMMIT_CHECKOUT_STAGED: &str = "CommitCheckoutStaged";
+    pub const GET_CHECKOUT_GIT_DETAILS: &str = "GetCheckoutGitDetails";
+    pub const RUN_CHECKOUT_GIT_ACTION: &str = "RunCheckoutGitAction";
+    pub const PREVIEW_CHECKOUT_DISCARD: &str = "PreviewCheckoutDiscard";
+    pub const DISCARD_CHECKOUT_CHANGES: &str = "DiscardCheckoutChanges";
+    pub const RESTORE_CHECKOUT_DISCARD: &str = "RestoreCheckoutDiscard";
+    pub const GET_CHECKOUT_CHANGE_DIFF: &str = "GetCheckoutChangeDiff";
     /// Permanently restore one chat-owned checkout to its current HEAD and
     /// remove only its untracked, non-ignored paths.
     pub const DISCARD_WORKING_TREE: &str = "DiscardWorkingTree";

@@ -1,4 +1,4 @@
-//! Session-owned explorer chrome, independent of the surface tab host.
+//! Session-owned explorer state and the independently docked explorer chrome.
 
 use super::*;
 use crate::settings::{FILES_PANEL_DEFAULT, FILES_PANEL_MAX, FILES_PANEL_MIN};
@@ -153,7 +153,7 @@ impl Shell {
         }
     }
 
-    pub(super) fn add_files_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn ensure_files_explorer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_chat.is_empty() {
             return;
         }
@@ -206,7 +206,11 @@ impl Shell {
                     FilesEvent::OpenFile(path)
                         if this.accepts_file_navigation(&owner, &source, cx) =>
                     {
-                        this.add_file_surface(path.clone(), window, cx);
+                        if cfg!(target_os = "linux") {
+                            this.open_workbench_file(path.clone(), window, cx);
+                        } else {
+                            this.add_file_surface(path.clone(), window, cx);
+                        }
                     }
                     FilesEvent::OpenWebLink(activation) => {
                         if let crate::markdown::render::LinkOutcome::External(url) =
@@ -252,6 +256,14 @@ impl Shell {
             self.files.insert(key.clone(), files);
             self.files_subs.insert(key.clone(), sub);
         }
+    }
+
+    pub(super) fn add_files_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_chat.is_empty() {
+            return;
+        }
+        self.ensure_files_explorer(window, cx);
+        let key = self.panel_key(cx);
         let from = self.files_visible_width(cx);
         let was_open = self.files_panel_open(cx);
         self.panels.update(&key, |p| p.files_open = true);
@@ -308,7 +320,11 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let requested = f32::from(window.viewport_size().width) - f32::from(event.event.position.x);
+        let requested = if cfg!(target_os = "linux") {
+            f32::from(event.event.position.x) - ACTIVITY_WIDTH
+        } else {
+            f32::from(window.viewport_size().width) - f32::from(event.event.position.x)
+        };
         self.settings.files_panel_width = requested.clamp(FILES_PANEL_MIN, FILES_PANEL_MAX);
         self.pane_resize_dragging = Some(PaneResizeKind::Files);
         self.pane_resize_active = (requested > FILES_PANEL_MIN && requested < FILES_PANEL_MAX)
@@ -325,7 +341,10 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let active = self.panel_key(cx);
-        let visible = matches!(self.route, Route::Chat) && self.files_panel_open(cx);
+        let visible = matches!(self.route, Route::Chat)
+            && (self.files_panel_open(cx)
+                || (self.right_pane_open(cx)
+                    && self.resolved_right_active(cx) == RightSurface::Explorer));
         for (key, files) in &self.files {
             if !visible || *key != active {
                 files.update(cx, |files, _| files.release_git_status());
@@ -361,10 +380,11 @@ impl Shell {
             .h_full()
             .pt(px(Theme::TITLEBAR_HEIGHT))
             .occlude()
-            .border_l_1()
+            .when(cfg!(target_os = "linux"), |el| el.border_r_1())
+            .when(!cfg!(target_os = "linux"), |el| el.border_l_1())
             .border_color(theme.border)
             .bg(theme.panel_bg())
-            .when(corner > 0.0, |el| {
+            .when(!cfg!(target_os = "linux") && corner > 0.0, |el| {
                 el.rounded_tr(px(corner)).rounded_br(px(corner))
             })
             .overflow_hidden()
@@ -392,7 +412,12 @@ impl Shell {
                             |shell, _| shell.settings.files_panel_width = FILES_PANEL_DEFAULT,
                             cx,
                         )
-                        .left(px(-PANE_RESIZE_HITBOX_HALF_WIDTH)),
+                        .when(cfg!(target_os = "linux"), |el| {
+                            el.right(px(-PANE_RESIZE_HITBOX_HALF_WIDTH))
+                        })
+                        .when(!cfg!(target_os = "linux"), |el| {
+                            el.left(px(-PANE_RESIZE_HITBOX_HALF_WIDTH))
+                        }),
                     )
                 },
             )

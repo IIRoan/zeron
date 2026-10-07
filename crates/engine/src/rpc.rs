@@ -1396,6 +1396,15 @@ fn forwardable(method: &str) -> bool {
             | methods::WATCH_WORKSPACE_GIT_STATUS
             | methods::WATCH_CHECKOUT_CHANGE_REQUEST
             | methods::GET_CHECKOUT_DIFF
+            | methods::GET_CHECKOUT_CHANGES
+            | methods::SET_CHECKOUT_STAGED
+            | methods::COMMIT_CHECKOUT_STAGED
+            | methods::GET_CHECKOUT_GIT_DETAILS
+            | methods::RUN_CHECKOUT_GIT_ACTION
+            | methods::PREVIEW_CHECKOUT_DISCARD
+            | methods::DISCARD_CHECKOUT_CHANGES
+            | methods::RESTORE_CHECKOUT_DISCARD
+            | methods::GET_CHECKOUT_CHANGE_DIFF
             | methods::DISCARD_WORKING_TREE
             | methods::GET_CHECKOUT_FILE_DIFF_TEXT
             // Terminals live on the chat's host device.
@@ -2453,6 +2462,124 @@ impl RpcService for EngineRpc {
             // working tree against merge-base(baseRef, HEAD); `turn` diffs the
             // turn-start tree snapshot against the current tree; anything else
             // is the plain working-tree capture.
+            methods::GET_CHECKOUT_CHANGES
+            | methods::SET_CHECKOUT_STAGED
+            | methods::COMMIT_CHECKOUT_STAGED
+            | methods::GET_CHECKOUT_GIT_DETAILS
+            | methods::RUN_CHECKOUT_GIT_ACTION
+            | methods::PREVIEW_CHECKOUT_DISCARD
+            | methods::DISCARD_CHECKOUT_CHANGES
+            | methods::RESTORE_CHECKOUT_DISCARD
+            | methods::GET_CHECKOUT_CHANGE_DIFF => {
+                Box::pin(async move {
+                    let cwd = params
+                        .get("cwd")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| RpcError::BadParams("cwd required".into()))?;
+                    let known = self.change_request_root(cwd).await?;
+                    let identity = self
+                        .repos
+                        .checkout_identity(&known)
+                        .await
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    if method == methods::GET_CHECKOUT_CHANGES {
+                        let changes = crate::checkout_changes::list(&identity.root)
+                            .await
+                            .map_err(|e| RpcError::Failed(e.to_string()))?;
+                        return RpcReply::value(&changes);
+                    }
+                    let repository = params
+                        .get("repository")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    let root = crate::checkout_changes::repository(&identity.root, repository)
+                        .await
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    if method == methods::GET_CHECKOUT_GIT_DETAILS {
+                        return RpcReply::value(&crate::checkout_git::details(&root).await.map_err(|e| RpcError::Failed(e.to_string()))?);
+                    }
+                    if method == methods::RUN_CHECKOUT_GIT_ACTION {
+                        if !matches!(params.get("action").and_then(|a| a.get("kind")).and_then(|k| k.as_str()), Some("fetch")) && params.get("expectedBranch").is_some() {
+                            let branch = crate::checkout_git::state(&root).await.map_err(|e| RpcError::Failed(e.to_string()))?.branch;
+                            if branch.as_deref() != params.get("expectedBranch").and_then(|v| v.as_str()) { return Err(RpcError::Failed("The branch changed; refresh before running this action".into())); }
+                        }
+                        #[derive(Deserialize)]
+                        struct P {
+                            action: zeron_proto::RepositoryGitAction,
+                            #[serde(rename = "expectedHead")] expected_head: Option<String>,
+                        }
+                        let p: P = parse_params(params)?;
+                        let result = crate::checkout_git::perform(&root, p.action, p.expected_head.as_deref()).await;
+                        self.diff_sync.sync_all();
+                        return RpcReply::value(&result.map_err(|e| RpcError::Failed(e.to_string()))?);
+                    }
+                    if method == methods::PREVIEW_CHECKOUT_DISCARD {
+                        #[derive(Deserialize)]
+                        struct P { paths: Vec<String>, #[serde(default, rename = "includeStaged")] include_staged: bool }
+                        let p: P = parse_params(params)?;
+                        return RpcReply::value(&crate::checkout_discard::preview(&root, &p.paths, p.include_staged).await.map_err(|e| RpcError::Failed(e.to_string()))?);
+                    }
+                    if method == methods::DISCARD_CHECKOUT_CHANGES {
+                        #[derive(Deserialize)] struct P { preview: zeron_proto::CheckoutDiscardPreview }
+                        let p: P = parse_params(params)?;
+                        let result = crate::checkout_discard::discard(&root, p.preview).await;
+                        self.diff_sync.sync_all();
+                        return RpcReply::value(&result.map_err(|e| RpcError::Failed(e.to_string()))?);
+                    }
+                    if method == methods::RESTORE_CHECKOUT_DISCARD {
+                        #[derive(Deserialize)]
+                        struct P { #[serde(rename = "recoveryId")] recovery_id: String, checksum: String }
+                        let p: P = parse_params(params)?;
+                        crate::checkout_discard::undo(&root, &p.recovery_id, &p.checksum).await.map_err(|e| RpcError::Failed(e.to_string()))?;
+                        self.diff_sync.sync_all();
+                        return RpcReply::value(&serde_json::json!({ "restored": true }));
+                    }
+                    if method == methods::COMMIT_CHECKOUT_STAGED {
+                        #[derive(Deserialize)]
+                        struct P {
+                            message: String,
+                            #[serde(default)] amend: bool,
+                            #[serde(rename = "expectedHead")] expected_head: Option<String>,
+                        }
+                        let p: P = parse_params(params)?;
+                        crate::checkout_changes::commit(&root, &p.message, p.amend, p.expected_head.as_deref())
+                            .await
+                            .map_err(|e| RpcError::Failed(e.to_string()))?;
+                        self.diff_sync.sync_all();
+                        // Report Git's successful commit independently of metadata
+                        // refreshes, so a failed refresh never invites a duplicate commit.
+                        return RpcReply::value(&serde_json::json!({ "committed": true, "git": crate::checkout_git::state(&root).await.ok() }));
+                    }
+                    if method == methods::SET_CHECKOUT_STAGED {
+                        #[derive(Deserialize)]
+                        struct P {
+                            paths: Vec<String>,
+                            staged: bool,
+                        }
+                        let p: P = parse_params(params)?;
+                        crate::checkout_changes::set_staged(&root, &p.paths, p.staged)
+                            .await
+                            .map_err(|e| RpcError::Failed(e.to_string()))?;
+                        self.diff_sync.sync_all();
+                        return RpcReply::value(
+                            &crate::checkout_changes::list(&identity.root)
+                                .await
+                                .map_err(|e| RpcError::Failed(e.to_string()))?,
+                        );
+                    }
+                    let selection: zeron_proto::CheckoutChangeSelection = parse_params(params)?;
+                    RpcReply::value(
+                        &crate::checkout_changes::file_diff(
+                            &root,
+                            &selection,
+                            self.doc_host.device_id(),
+                        )
+                        .await
+                        .map_err(|e| RpcError::Failed(e.to_string()))?,
+                    )
+                })
+                .await
+            }
             methods::GET_CHECKOUT_DIFF => {
                 // Keep the scoped-diff future off the dispatcher's stack. The
                 // per-commit path adds another nested git-capture future.
@@ -2466,6 +2593,7 @@ impl RpcService for EngineRpc {
                         base_ref: Option<String>,
                         chat_id: Option<String>,
                         commit_sha: Option<String>,
+                        #[serde(default)] repository: Option<String>,
                     }
                     let p: P = parse_params(params)?;
                     let identity = self
@@ -2473,7 +2601,11 @@ impl RpcService for EngineRpc {
                         .checkout_identity(std::path::Path::new(&p.cwd))
                         .await
                         .map_err(|e| RpcError::Failed(e.to_string()))?;
-                    let root = identity.root.as_path();
+                    let selected_root = if let Some(repository) = &p.repository {
+                        self.change_request_root(&p.cwd).await?;
+                        crate::checkout_changes::repository(&identity.root, repository).await.map_err(|e| RpcError::Failed(e.to_string()))?
+                    } else { identity.root.clone() };
+                    let root = selected_root.as_path();
                     let snapshot = match p.mode.as_str() {
                         "branch" => {
                             let base_ref = p
@@ -3823,6 +3955,20 @@ mod tests {
         assert!(forwardable(methods::WATCH_CHECKOUT_CHANGE_REQUEST));
         assert!(is_stream_method(methods::WATCH_CHECKOUT_CHANGE_REQUEST));
         assert!(forwardable(methods::DISCARD_WORKING_TREE));
+        for method in [
+            methods::GET_CHECKOUT_CHANGES,
+            methods::SET_CHECKOUT_STAGED,
+            methods::COMMIT_CHECKOUT_STAGED,
+            methods::GET_CHECKOUT_GIT_DETAILS,
+            methods::RUN_CHECKOUT_GIT_ACTION,
+            methods::PREVIEW_CHECKOUT_DISCARD,
+            methods::DISCARD_CHECKOUT_CHANGES,
+            methods::RESTORE_CHECKOUT_DISCARD,
+            methods::GET_CHECKOUT_CHANGE_DIFF,
+        ] {
+            assert!(forwardable(method));
+            assert!(!is_stream_method(method));
+        }
         assert!(forwardable(methods::LIST_WORKSPACE_DIRECTORY));
         assert!(forwardable(methods::SEARCH_WORKSPACE_FILES));
         assert!(forwardable(methods::READ_WORKSPACE_FILE));

@@ -110,6 +110,7 @@ pub(super) struct FilePreviewState {
     autosave_delay_ms: u64,
     reload_confirmation: Option<String>,
     close_requested: bool,
+    close_confirmation: bool,
     comment_anchors: HashMap<String, HashMap<String, EditorCommentAnchor>>,
     comment_draft: Option<EditorCommentDraft>,
     active_comment: Option<String>,
@@ -138,6 +139,7 @@ impl FilePreviewState {
             autosave_delay_ms,
             reload_confirmation: None,
             close_requested: false,
+            close_confirmation: false,
             comment_anchors: HashMap::new(),
             comment_draft: None,
             active_comment: None,
@@ -153,6 +155,7 @@ impl FilePreviewState {
         self.list.reset(0);
         self.reload_confirmation = None;
         self.close_requested = false;
+        self.close_confirmation = false;
         self.comment_anchors.clear();
         self.comment_draft = None;
         self.active_comment = None;
@@ -1393,12 +1396,13 @@ impl FilesSurface {
             return;
         };
         let source = editor.read(cx).value().to_string();
-        let revision = {
+        let (revision, dirty_changed) = {
             let Some(document) = self.preview.documents.get_mut(path) else {
                 return;
             };
+            let was_dirty = document.is_dirty();
             document.mark_user_edit();
-            document.revision
+            (document.revision, document.is_dirty() != was_dirty)
         };
         self.sync_editor_comment_lines(path, &editor, cx);
         if !self.staged_file_comments(path, cx).is_empty() {
@@ -1406,7 +1410,11 @@ impl FilesSurface {
         }
         self.request_editor_highlight(path.to_string(), source, revision, cx);
         self.schedule_autosave(path.to_string(), cx);
-        cx.emit(FilesEvent::TitleChanged);
+        // Once the unsaved indicator is visible, further edits only need to
+        // update this editor, not every shell and project-sidebar title.
+        if dirty_changed {
+            cx.emit(FilesEvent::TitleChanged);
+        }
         cx.notify();
     }
 
@@ -1617,7 +1625,9 @@ impl FilesSurface {
                     document.review_comment_flush_pending = false;
                 }
                 if save_again {
-                    if surface.preview.close_requested || surface.target_change_pending {
+                    if (surface.preview.close_requested && !surface.preview.close_confirmation)
+                        || surface.target_change_pending
+                    {
                         surface.save_document(task_path.clone(), cx);
                     } else {
                         surface.schedule_autosave(task_path.clone(), cx);
@@ -1648,10 +1658,20 @@ impl FilesSurface {
     pub fn prepare_close(&mut self, cx: &mut Context<Self>) -> FilesCloseDisposition {
         let dirty_paths = self.preview.dirty_paths();
         if dirty_paths.is_empty() {
+            self.preview.close_confirmation = false;
             self.suspend_images(cx);
             return FilesCloseDisposition::Allow;
         }
+        // Manual-save documents must not be written just because their tab
+        // closes. A repeated close request must retain the user's decision.
+        if !self.preview.close_requested && !self.preview.autosave_enabled {
+            self.preview.close_confirmation = true;
+        }
         self.preview.close_requested = true;
+        if self.preview.close_confirmation {
+            cx.notify();
+            return FilesCloseDisposition::Blocked;
+        }
         let blocked = dirty_paths.iter().any(|path| {
             self.preview
                 .documents
@@ -1677,6 +1697,7 @@ impl FilesSurface {
     }
 
     fn retry_pending_close(&mut self, cx: &mut Context<Self>) {
+        self.preview.close_confirmation = false;
         let paths = self.preview.dirty_paths();
         for path in paths {
             if self
@@ -1688,12 +1709,43 @@ impl FilesSurface {
                 self.save_document(path, cx);
             }
         }
+        cx.notify();
+    }
+
+    pub(crate) fn close_confirmation_paths(&self) -> Option<Vec<String>> {
+        self.preview
+            .close_confirmation
+            .then(|| self.preview.dirty_paths())
+    }
+
+    pub(crate) fn resolve_close_confirmation(
+        &mut self,
+        choice: super::FileCloseChoice,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.preview.close_confirmation {
+            return;
+        }
+        match choice {
+            super::FileCloseChoice::Save => self.retry_pending_close(cx),
+            super::FileCloseChoice::Discard => self.discard_changes_and_close(cx),
+            super::FileCloseChoice::Cancel => self.keep_open(cx),
+        }
     }
 
     fn keep_open(&mut self, cx: &mut Context<Self>) {
         self.preview.close_requested = false;
+        self.preview.close_confirmation = false;
         cx.emit(FilesEvent::CloseCancelled);
         cx.notify();
+    }
+
+    pub(super) fn cancel_close_confirmation(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.preview.close_confirmation {
+            return false;
+        }
+        self.keep_open(cx);
+        true
     }
 
     fn discard_changes_and_close(&mut self, cx: &mut Context<Self>) {
@@ -1703,6 +1755,7 @@ impl FilesSurface {
         }
         self.cancel_review_comment_flush(cx);
         self.preview.close_requested = false;
+        self.preview.close_confirmation = false;
         if closing {
             cx.emit(FilesEvent::CloseReady);
         } else if self.target_change_pending {
@@ -1717,6 +1770,7 @@ impl FilesSurface {
     fn finish_pending_lifecycle(&mut self, cx: &mut Context<Self>) {
         if self.preview.close_requested && !self.preview.has_unsaved_changes() {
             self.preview.close_requested = false;
+            self.preview.close_confirmation = false;
             cx.emit(FilesEvent::CloseReady);
         }
         if self.target_change_pending && !self.preview.has_unsaved_changes() {
@@ -2126,6 +2180,7 @@ impl FilesSurface {
         });
         let confirming_reload = self.preview.reload_confirmation.as_deref() == Some(&active);
         let lifecycle_pending = self.preview.close_requested || self.target_change_pending;
+        let close_confirmation = self.preview.close_confirmation;
         let lifecycle_blocked = lifecycle_pending
             && self
                 .preview
@@ -2138,7 +2193,7 @@ impl FilesSurface {
             .min_w_0()
             .flex()
             .flex_col()
-            .when(lifecycle_pending, |element| {
+            .when(lifecycle_pending && !close_confirmation, |element| {
                 element.child(
                     div()
                         .min_h(px(32.0))
@@ -2163,43 +2218,50 @@ impl FilesSurface {
                                 "Saving changes before closing…"
                             },
                         ))
-                        .when(lifecycle_blocked || self.target_change_pending, |banner| {
-                            banner
-                                .child(
-                                    div()
-                                        .id("files-retry-close-save")
-                                        .when(self.target_change_pending, |button| button.hidden())
-                                        .ml_auto()
-                                        .cursor_pointer()
-                                        .text_color(theme.text)
-                                        .child("Retry")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.retry_pending_close(cx)
-                                        })),
-                                )
-                                .when(!self.target_change_pending, |banner| {
-                                    banner.child(
+                        .when(
+                            lifecycle_blocked || self.target_change_pending,
+                            |banner| {
+                                banner
+                                    .child(
                                         div()
-                                            .id("files-keep-open")
+                                            .id("files-retry-close-save")
+                                            .when(self.target_change_pending, |button| {
+                                                button.hidden()
+                                            })
+                                            .ml_auto()
                                             .cursor_pointer()
-                                            .text_color(theme.text_muted)
-                                            .child("Keep Open")
-                                            .on_click(
-                                                cx.listener(|this, _, _, cx| this.keep_open(cx)),
-                                            ),
+                                            .text_color(theme.text)
+                                            .child("Retry")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.retry_pending_close(cx)
+                                            })),
                                     )
-                                })
-                                .child(
-                                    div()
-                                        .id("files-discard-close-changes")
-                                        .cursor_pointer()
-                                        .text_color(theme.danger_muted)
-                                        .child("Discard Changes")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.discard_changes_and_close(cx)
-                                        })),
-                                )
-                        }),
+                                    .when(!self.target_change_pending, |banner| {
+                                        banner.child(
+                                            div()
+                                                .id("files-keep-open")
+                                                .cursor_pointer()
+                                                .text_color(theme.text_muted)
+                                                .child("Keep Open")
+                                                .on_click(
+                                                    cx.listener(|this, _, _, cx| {
+                                                        this.keep_open(cx)
+                                                    }),
+                                                ),
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .id("files-discard-close-changes")
+                                            .cursor_pointer()
+                                            .text_color(theme.danger_muted)
+                                            .child("Discard Changes")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.discard_changes_and_close(cx)
+                                            })),
+                                    )
+                            },
+                        ),
                 )
             })
             .when(
@@ -3361,6 +3423,285 @@ fn read_only_message(reason: Option<WorkspaceReadOnlyReason>) -> SharedString {
 mod tests {
     use super::*;
     use gpui::TestAppContext;
+
+    #[gpui::test]
+    fn manual_save_close_requires_a_decision_and_only_save_writes(cx: &mut TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let (out, mut requests) = tokio::sync::mpsc::channel(16);
+        let (replies, inbound) = tokio::sync::mpsc::channel(16);
+        let finish_write = |request: &serde_json::Value, hash: &str| {
+            runtime.block_on(async {
+                replies.send(serde_json::json!({
+                    "id": request["id"], "ok": { "status": "written", "file": {
+                        "path": ".gitignore", "contentHash": hash,
+                        "size": request["params"]["text"].as_str().unwrap().len(), "modifiedAt": null
+                    }}
+                }).to_string()).await.unwrap();
+                while replies.capacity() < replies.max_capacity() {
+                    tokio::task::yield_now().await;
+                }
+            });
+        };
+        let engine =
+            crate::state::EngineHandle::from_test_client(zeron_rpc::RpcClient::new(out, inbound));
+        let (files, cx) = super::super::test_support::setup(cx);
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let recorded = events.clone();
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&files, move |_, event, _| {
+                recorded.borrow_mut().push(event.clone())
+            })
+        });
+        files.update_in(cx, |files, window, cx| {
+            files
+                .state
+                .update(cx, |state, _| state.set_test_engine(engine));
+            files.presentation = super::super::FilesPresentation::Editor;
+            files.editor_path = Some(".gitignore".into());
+            files.preview.active = Some(".gitignore".into());
+            let mut document = cached_document(".gitignore", "node_modules\n");
+            document.set_loaded(zeron_proto::WorkspaceFileText {
+                checkout_id: "checkout".into(),
+                path: ".gitignore".into(),
+                text: Some("node_modules\n".into()),
+                content_hash: Some("original-hash".into()),
+                size: 13,
+                modified_at: None,
+                encoding: zeron_proto::WorkspaceTextEncoding::Utf8,
+                line_ending: Some(zeron_proto::WorkspaceLineEnding::Lf),
+                read_only_reason: None,
+                truncated: false,
+            });
+            files
+                .preview
+                .documents
+                .insert(".gitignore".into(), document);
+            let editor = files
+                .ensure_editor(".gitignore", &Theme::of(cx).clone(), window, cx)
+                .unwrap();
+            editor.update(cx, |editor, cx| editor.focus(window, cx));
+        });
+        cx.run_until_parked();
+        cx.simulate_input("\n\n\n");
+        files.update(cx, |files, cx| {
+            assert_eq!(files.prepare_close(cx), FilesCloseDisposition::Blocked);
+            assert_eq!(files.prepare_close(cx), FilesCloseDisposition::Blocked);
+            assert!(files.preview.close_confirmation);
+            assert!(matches!(
+                files.preview.documents[".gitignore"].phase,
+                DocumentPhase::Ready
+            ));
+        });
+        cx.run_until_parked();
+        assert!(
+            requests.try_recv().is_err(),
+            "closing must not start a write"
+        );
+
+        cx.simulate_keystrokes("escape");
+        assert!(files.read_with(cx, |files, _| {
+            files.has_unsaved_changes()
+                && !files.preview.close_requested
+                && !files.preview.close_confirmation
+        }));
+        assert!(
+            events
+                .borrow()
+                .iter()
+                .any(|event| matches!(event, FilesEvent::CloseCancelled))
+        );
+        files.update(cx, |files, cx| {
+            assert_eq!(files.prepare_close(cx), FilesCloseDisposition::Blocked);
+            files.discard_changes_and_close(cx);
+            assert!(!files.has_unsaved_changes());
+            assert!(!files.preview.close_requested);
+            assert_eq!(
+                files.preview.documents[".gitignore"]
+                    .file
+                    .as_ref()
+                    .unwrap()
+                    .text
+                    .as_deref(),
+                Some("node_modules\n")
+            );
+        });
+        cx.run_until_parked();
+        assert!(requests.try_recv().is_err(), "Don't Save must not write");
+        assert!(
+            events
+                .borrow()
+                .iter()
+                .any(|event| matches!(event, FilesEvent::CloseReady))
+        );
+        events.borrow_mut().clear();
+
+        cx.simulate_input("\n");
+        files.update(cx, |files, cx| {
+            assert_eq!(files.prepare_close(cx), FilesCloseDisposition::Blocked);
+            files.retry_pending_close(cx);
+            assert!(!files.preview.close_confirmation);
+            // Another close while the explicit save runs must not prompt again.
+            assert_eq!(files.prepare_close(cx), FilesCloseDisposition::Pending);
+        });
+        cx.run_until_parked();
+        let request: serde_json::Value =
+            serde_json::from_str(&requests.try_recv().unwrap()).unwrap();
+        assert_eq!(request["method"], zeron_rpc::methods::WRITE_WORKSPACE_FILE);
+        assert_eq!(request["params"]["path"], ".gitignore");
+        assert_eq!(request["params"]["expectedContentHash"], "original-hash");
+        assert_eq!(request["params"]["text"], "\n\n\n\nnode_modules\n");
+        assert!(
+            !events
+                .borrow()
+                .iter()
+                .any(|event| matches!(event, FilesEvent::CloseReady))
+        );
+        finish_write(&request, "saved-hash");
+        cx.run_until_parked();
+        assert!(
+            events
+                .borrow()
+                .iter()
+                .any(|event| matches!(event, FilesEvent::CloseReady))
+        );
+        assert!(files.read_with(cx, |files, _| !files.has_unsaved_changes()));
+
+        // An explicit Ctrl+S already in flight may finish while the user is
+        // deciding whether to save newer edits. It must not save those too.
+        events.borrow_mut().clear();
+        cx.simulate_input("\n");
+        files.update(cx, |files, cx| files.save_active_document(cx));
+        cx.run_until_parked();
+        let earlier_save: serde_json::Value =
+            serde_json::from_str(&requests.try_recv().unwrap()).unwrap();
+        cx.simulate_input("\n");
+        files.update(cx, |files, cx| {
+            assert_eq!(files.prepare_close(cx), FilesCloseDisposition::Blocked);
+        });
+        finish_write(&earlier_save, "earlier-save-hash");
+        cx.run_until_parked();
+        assert!(
+            requests.try_recv().is_err(),
+            "newer edits must wait for the close decision"
+        );
+        assert!(
+            !events
+                .borrow()
+                .iter()
+                .any(|event| matches!(event, FilesEvent::CloseReady))
+        );
+        files.update(cx, |files, cx| {
+            assert!(files.has_unsaved_changes());
+            assert!(files.preview.close_confirmation);
+            files.keep_open(cx);
+            // With autosave enabled, closing still saves automatically.
+            files.preview.autosave_enabled = true;
+            assert_eq!(files.prepare_close(cx), FilesCloseDisposition::Pending);
+            assert!(!files.preview.close_confirmation);
+        });
+        cx.run_until_parked();
+        let autosave: serde_json::Value =
+            serde_json::from_str(&requests.try_recv().unwrap()).unwrap();
+        assert_eq!(autosave["method"], zeron_rpc::methods::WRITE_WORKSPACE_FILE);
+        assert_eq!(
+            autosave["params"]["expectedContentHash"],
+            "earlier-save-hash"
+        );
+        finish_write(&autosave, "autosave-hash");
+        cx.run_until_parked();
+        assert!(
+            events
+                .borrow()
+                .iter()
+                .any(|event| matches!(event, FilesEvent::CloseReady))
+        );
+        assert!(files.read_with(cx, |files, _| !files.has_unsaved_changes()));
+    }
+
+    #[gpui::test]
+    fn typing_updates_title_only_when_document_becomes_dirty(cx: &mut TestAppContext) {
+        let (files, cx) = super::super::test_support::setup(cx);
+        let titles = std::rc::Rc::new(std::cell::Cell::new(0));
+        let recorded = titles.clone();
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&files, move |_, event, _| {
+                if matches!(event, FilesEvent::TitleChanged) {
+                    recorded.set(recorded.get() + 1);
+                }
+            })
+        });
+        let editor = files.update_in(cx, |files, window, cx| {
+            let editor = super::super::editor::new_file_editor(
+                "original",
+                "note.txt",
+                false,
+                &Theme::of(cx).clone(),
+                window,
+                cx,
+            );
+            let mut document = cached_document("note.txt", "original");
+            document.set_loaded(zeron_proto::WorkspaceFileText {
+                checkout_id: "checkout".into(),
+                path: "note.txt".into(),
+                text: Some("original".into()),
+                content_hash: Some("saved-hash".into()),
+                size: 8,
+                modified_at: None,
+                encoding: zeron_proto::WorkspaceTextEncoding::Utf8,
+                line_ending: Some(zeron_proto::WorkspaceLineEnding::Lf),
+                read_only_reason: None,
+                truncated: false,
+            });
+            document.editor_events = Some(super::super::editor::subscribe_to_changes(
+                &editor,
+                "note.txt".into(),
+                cx,
+            ));
+            document.editor = Some(editor.clone());
+            files.preview.documents.insert("note.txt".into(), document);
+            files.preview.active = Some("note.txt".into());
+            files.editor_path = Some("note.txt".into());
+            files.presentation = super::super::FilesPresentation::Editor;
+            editor.update(cx, |editor, cx| {
+                editor.set_selected_range(8..8, cx);
+                editor.focus(window, cx);
+            });
+            editor
+        });
+        cx.run_until_parked();
+        cx.simulate_input(" one");
+        assert_eq!(titles.get(), 1, "the first edit must show the unsaved dot");
+        cx.simulate_input(" two");
+        assert_eq!(titles.get(), 1, "typing in a dirty editor must stay local");
+        assert_eq!(
+            editor.read_with(cx, |editor, _| editor.value().to_string()),
+            "original one two"
+        );
+        files.update(cx, |files, cx| {
+            let text = editor.read(cx).value().to_string();
+            let document = files.preview.documents.get_mut("note.txt").unwrap();
+            assert_eq!(
+                document.revision, 8,
+                "each typed character must still be tracked"
+            );
+            let save = document.begin_save(text).unwrap();
+            assert!(document.finish_save(save.revision, "new-hash".into()));
+            assert!(!document.is_dirty());
+        });
+        cx.simulate_input(" three");
+        assert_eq!(
+            titles.get(),
+            2,
+            "editing after saving must show the dot again"
+        );
+        assert!(files.read_with(cx, |files, _| {
+            files.preview.documents["note.txt"].is_dirty()
+        }));
+    }
 
     #[gpui::test]
     fn renaming_markdown_to_text_keeps_dirty_editor_and_undo(cx: &mut TestAppContext) {

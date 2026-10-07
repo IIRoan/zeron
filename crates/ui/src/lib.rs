@@ -57,6 +57,7 @@ mod roll_text;
 pub mod settings;
 pub mod shell;
 pub mod sound;
+pub mod source_control;
 pub mod state;
 pub(crate) mod surface_chrome;
 pub mod syntax_cache;
@@ -131,7 +132,7 @@ pub fn run_app(config: UiConfig) {
     let runtime = tokio::runtime::Runtime::new().expect("desktop Tokio runtime");
     let runtime_handle = runtime.handle().clone();
     let app = gpui_platform::application().with_assets(icons::Assets);
-    let (url_tx, mut url_rx) = futures::channel::mpsc::unbounded::<String>();
+    let (url_tx, url_rx) = futures::channel::mpsc::unbounded::<String>();
     let callback_tx = url_tx.clone();
     app.on_open_urls(move |urls| {
         for url in urls {
@@ -155,6 +156,7 @@ pub fn run_app(config: UiConfig) {
     app.run(move |cx: &mut App| {
         gpui_tokio::init_from_handle(cx, runtime_handle);
         gpui_base::init(cx);
+        start_ui_lag_monitor(cx);
         let data_dir = config.boot().data_dir.clone();
         let ui_settings = settings::UiSettings::load(&data_dir);
         settings::init(ui_settings.clone(), data_dir.clone(), cx);
@@ -199,13 +201,7 @@ pub fn run_app(config: UiConfig) {
         cx.register_url_scheme("zeron").detach();
 
         let state = cx.new(|_| state::AppState::new());
-        let url_state = state.clone();
-        cx.spawn(async move |cx| {
-            while let Some(url) = url_rx.next().await {
-                url_state.update(cx, |state, cx| state.open_deep_link(&url, cx));
-            }
-        })
-        .detach();
+        start_url_listener(&state, url_rx, cx);
         // Banner clicks land on the notified chat. The AppKit delegate fires
         // mid-event, so hop through a channel rather than updating inline.
         let (click_tx, mut click_rx) = futures::channel::mpsc::unbounded::<String>();
@@ -256,6 +252,91 @@ pub fn run_app(config: UiConfig) {
         cx.set_menus(app_menus::app_menus());
         cx.activate(true);
     });
+}
+
+/// Opt-in timing without attaching a debugger, which itself pauses native input.
+fn start_ui_lag_monitor(cx: &mut App) {
+    if !std::env::var("ZERON_UI_LAG_STATS").is_ok_and(|value| !value.is_empty() && value != "0") {
+        return;
+    }
+    gpui::profiler::set_frame_trace_enabled(true);
+    let mut frames = gpui::profiler::FrameTimingCollector::new();
+    cx.spawn(async move |cx| {
+        loop {
+            let started = std::time::Instant::now();
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(100))
+                .await;
+            let elapsed = started.elapsed();
+            if elapsed > std::time::Duration::from_millis(300) {
+                tracing::warn!(
+                    delayed_ms = elapsed.as_millis().saturating_sub(100),
+                    "UI event loop delayed"
+                );
+            }
+            for frame in frames.collect_unseen() {
+                if frame.draw_duration() > std::time::Duration::from_millis(100) {
+                    tracing::warn!(
+                        window = ?frame.window_id,
+                        draw_ms = frame.draw_duration().as_millis(),
+                        dirty_to_draw_ms = frame.dirty_to_draw_duration().map(|duration| duration.as_millis()),
+                        "Slow UI frame"
+                    );
+                }
+            }
+        }
+    })
+    .detach();
+}
+
+/// The platform keeps its URL callback alive past application teardown. A
+/// waiting listener must not own the app state while that channel stays open.
+fn start_url_listener(
+    state: &gpui::Entity<state::AppState>,
+    mut urls: futures::channel::mpsc::UnboundedReceiver<String>,
+    cx: &mut App,
+) {
+    let state = state.downgrade();
+    cx.spawn(async move |cx| {
+        while let Some(url) = urls.next().await {
+            if state
+                .update(cx, |state, cx| state.open_deep_link(&url, cx))
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
+    .detach();
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[gpui::test]
+    fn pending_url_listener_releases_state_while_the_platform_callback_stays_alive(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let state = cx.new(|_| state::AppState::new());
+        let weak = state.downgrade();
+        let (sender, urls) = futures::channel::mpsc::unbounded();
+        cx.update(|cx| start_url_listener(&state, urls, cx));
+        sender.unbounded_send("invalid-url".into()).unwrap();
+        cx.run_until_parked();
+        state.update(cx, |state, _| {
+            assert!(state.take_deep_link_notice().is_some());
+        });
+
+        drop(state);
+        cx.run_until_parked();
+        cx.update(|_| assert!(weak.upgrade().is_none()));
+        // A late platform event must stop the listener without updating a
+        // released entity or retaining it until the sender itself is dropped.
+        sender.unbounded_send("late-url".into()).unwrap();
+        cx.run_until_parked();
+        assert!(sender.is_closed());
+    }
 }
 
 /// Bring Zeron forward, reopening the main window first if ⌘W closed it.
@@ -391,7 +472,8 @@ fn open_main_window(
                 // Linux/Windows `appears_transparent` hides the system titlebar
                 // for our custom-drawn chrome; harmless where unsupported.
                 titlebar: Some(TitlebarOptions {
-                    title: cfg!(target_os = "windows").then(|| "Zeron".into()),
+                    title: std::env::var("ZERON_WINDOW_TITLE").ok().map(Into::into)
+                        .or_else(|| cfg!(target_os = "windows").then(|| "Zeron".into())),
                     appears_transparent: true,
                     // Native lights are 14px tall: top 14 → center 21, matching
                     // the 38px titlebar row with 4px top-only content padding.

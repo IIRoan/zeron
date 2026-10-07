@@ -196,6 +196,7 @@ fn name_for_kind(kind: HighlightKind) -> &'static str {
     match kind {
         HighlightKind::Comment => "comment",
         HighlightKind::Keyword => "keyword",
+        HighlightKind::KeywordStorage => "keyword_storage",
         HighlightKind::String => "string",
         HighlightKind::StringSpecial => "string_special",
         HighlightKind::Escape => "escape",
@@ -214,6 +215,9 @@ fn name_for_kind(kind: HighlightKind) -> &'static str {
         HighlightKind::Parameter => "parameter",
         HighlightKind::Operator => "operator",
         HighlightKind::Punctuation => "punctuation",
+        HighlightKind::Bracket1 => "bracket1",
+        HighlightKind::Bracket2 => "bracket2",
+        HighlightKind::Bracket3 => "bracket3",
         HighlightKind::Tag => "tag",
         HighlightKind::Attribute => "attribute",
         HighlightKind::Label => "label",
@@ -229,9 +233,10 @@ fn name_for_kind(kind: HighlightKind) -> &'static str {
 }
 
 fn kind_for_name(name: &str) -> Option<HighlightKind> {
-    const KINDS: [HighlightKind; 31] = [
+    const KINDS: [HighlightKind; 35] = [
         HighlightKind::Comment,
         HighlightKind::Keyword,
+        HighlightKind::KeywordStorage,
         HighlightKind::String,
         HighlightKind::StringSpecial,
         HighlightKind::Escape,
@@ -250,6 +255,9 @@ fn kind_for_name(name: &str) -> Option<HighlightKind> {
         HighlightKind::Parameter,
         HighlightKind::Operator,
         HighlightKind::Punctuation,
+        HighlightKind::Bracket1,
+        HighlightKind::Bracket2,
+        HighlightKind::Bracket3,
         HighlightKind::Tag,
         HighlightKind::Attribute,
         HighlightKind::Label,

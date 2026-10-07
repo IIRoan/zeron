@@ -284,8 +284,8 @@ fn files_panel_workspace_navigation_and_external_updates() {
                 frame(window, cx, output.as_deref(), "01b-picker-files-compact").await;
                 window
                     .update(cx, |shell, window, cx| {
-                        assert_eq!(shell.files_visible_width(cx), 284.0);
-                        assert_eq!(shell.files_reserved_width(cx), 284.0);
+                        assert_eq!(shell.files_visible_width(cx), 284.0 - ACTIVITY_WIDTH);
+                        assert_eq!(shell.files_reserved_width(cx), 284.0 - ACTIVITY_WIDTH);
                         assert_eq!(shell.right_visible_width(cx), RIGHT_PANE_MIN);
                         assert_eq!(shell.settings.files_panel_width, FILES_PANEL_MAX);
                         assert!(shell.right_surface_rows(cx).is_empty());
@@ -387,7 +387,7 @@ fn files_panel_workspace_navigation_and_external_updates() {
                         assert_eq!(shell.files_visible_width(cx), FILES_PANEL_DEFAULT);
                         assert_eq!(
                             shell.right_visible_width(cx),
-                            1000.0 - 256.0 - FILES_PANEL_DEFAULT
+                            1000.0 - ACTIVITY_WIDTH - 256.0 - FILES_PANEL_DEFAULT
                         );
                         shell.toggle_right_pane_expand(cx);
                     })

@@ -65,6 +65,8 @@ mod chat_dropzone_tests;
 #[cfg(test)]
 mod chat_rename_tests;
 mod command_palette;
+mod file_close_dialog;
+use file_close_dialog::FileCloseDialog;
 mod file_mutations;
 mod files_panel;
 mod harness_updates;
@@ -78,6 +80,8 @@ mod sidebar_sections;
 pub(crate) mod spaces;
 use side_chats::SideChatTab;
 mod tabs;
+mod workbench;
+use workbench::ACTIVITY_WIDTH;
 
 use spaces::{AddSpaceFlow, RenameSpaceDialog};
 
@@ -700,6 +704,7 @@ fn right_pane_takeover_width(viewport: f32, sidebar: f32) -> f32 {
 pub enum RightSurface {
     #[default]
     Picker,
+    Explorer,
     File(u64),
     Browser(u64),
     Diff(u64),
@@ -1881,10 +1886,15 @@ pub struct Shell {
     file_surface_subs: std::collections::HashMap<u64, Subscription>,
     file_surface_seq: u64,
     pending_file_closes: std::collections::HashSet<RightSurface>,
+    file_close_dialog: Option<FileCloseDialog>,
     pending_exit: Option<PendingExit>,
     /// Event hookups for [`Self::diffs`] (History rows opening commit tabs).
     diff_subs: std::collections::HashMap<u64, Subscription>,
     diff_seq: u64,
+    main_diff: Option<(String, String, Entity<Changes>)>,
+    main_diff_sub: Option<Subscription>,
+    main_file: Option<(String, u64)>,
+    workbench_files: std::collections::HashSet<u64>,
     /// Subagent transcript surfaces by id — each tab a read-only
     /// [`Transcript`] pinned to its subagent doc.
     subagent_tabs: std::collections::HashMap<u64, SubagentTab>,
@@ -2334,6 +2344,7 @@ impl Shell {
             files: std::collections::HashMap::new(),
             files_subs: std::collections::HashMap::new(),
             file_surfaces: std::collections::HashMap::new(),
+            file_close_dialog: None,
             file_surface_paths: std::collections::HashMap::new(),
             file_surface_keys: std::collections::HashMap::new(),
             file_surface_subs: std::collections::HashMap::new(),
@@ -2342,6 +2353,10 @@ impl Shell {
             pending_exit: None,
             diff_subs: std::collections::HashMap::new(),
             diff_seq: 0,
+            main_diff: None,
+            main_diff_sub: None,
+            main_file: None,
+            workbench_files: std::collections::HashSet::new(),
             subagent_tabs: std::collections::HashMap::new(),
             subagent_seq: 0,
             side_chats: std::collections::HashMap::new(),
@@ -3028,10 +3043,8 @@ impl Shell {
         cx.notify();
     }
 
-    /// The user's pane toggle (titlebar button, keyboard). It drives only the
-    /// surface host portion of the right pane: with just the explorer docked
-    /// it opens the surface host beside it, and it never hides the explorer —
-    /// only the explorer's own toggle undocks that portion.
+    /// Toggle the tool host. An independently docked explorer on other
+    /// platforms retains its own open state.
     fn toggle_right_pane(&mut self, cx: &mut Context<Self>) {
         self.set_surfaces_open(!self.right_pane_open(cx), cx);
     }
@@ -3039,9 +3052,7 @@ impl Shell {
     /// Closing the last surface tab closes the surface host; a docked
     /// explorer keeps the pane open on its own.
     fn collapse_surfaces_if_empty(&mut self, panel_key: &str, cx: &mut Context<Self>) {
-        if panel_key == self.panel_key(cx)
-            && self.right_tabs.get(panel_key).is_none_or(Vec::is_empty)
-        {
+        if panel_key == self.panel_key(cx) && self.right_surface_rows(cx).is_empty() {
             self.set_surfaces_open(false, cx);
         }
     }
@@ -3126,6 +3137,10 @@ impl Shell {
         stored
             .iter()
             .filter_map(|surface| match surface {
+                RightSurface::Explorer => self
+                    .files
+                    .get(&key)
+                    .map(|_| (*surface, "Explorer".into(), false, None)),
                 RightSurface::File(id) => self.file_surfaces.get(id).map(|file| {
                     let path = self.file_surface_paths.get(id);
                     let title = path
@@ -3172,7 +3187,13 @@ impl Shell {
                 }),
                 RightSurface::Picker => None,
             })
+            .filter(|(surface, ..)| self.is_tool_surface(*surface))
             .collect()
+    }
+
+    pub(super) fn is_tool_surface(&self, surface: RightSurface) -> bool {
+        !cfg!(target_os = "linux")
+            || !matches!(surface, RightSurface::File(id) if self.workbench_files.contains(&id))
     }
 
     /// Attach a workspace path only while the surface it came from still
@@ -3216,6 +3237,7 @@ impl Shell {
         let path = match surface {
             RightSurface::File(id) => self.file_surface_paths.get(&id)?.clone(),
             RightSurface::Picker
+            | RightSurface::Explorer
             | RightSurface::Diff(_)
             | RightSurface::Terminal(_)
             | RightSurface::SideChat(_)
@@ -3238,6 +3260,31 @@ impl Shell {
     /// Drag-reorder a surface tab within this chat's strip.
     fn reorder_right_tabs(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
         let key = self.panel_key(cx);
+        let (from, to) = if cfg!(target_os = "linux") && !self.workbench_files.is_empty() {
+            let visible = self
+                .right_surface_rows(cx)
+                .into_iter()
+                .map(|(surface, ..)| surface)
+                .collect::<Vec<_>>();
+            let Some(tabs) = self.right_tabs.get(&key) else {
+                return;
+            };
+            let Some(from) = visible
+                .get(from)
+                .and_then(|surface| tabs.iter().position(|tab| tab == surface))
+            else {
+                return;
+            };
+            let Some(to) = visible
+                .get(to)
+                .and_then(|surface| tabs.iter().position(|tab| tab == surface))
+            else {
+                return;
+            };
+            (from, to)
+        } else {
+            (from, to)
+        };
         if let Some(tabs) = self.right_tabs.get_mut(&key)
             && from < tabs.len()
             && to < tabs.len()
@@ -3293,7 +3340,18 @@ impl Shell {
     }
 
     fn suspend_file_images(&mut self, cx: &mut Context<Self>) {
-        for files in self.files.values().chain(self.file_surfaces.values()) {
+        let selected = self.state.read(cx).selected_chat.as_deref();
+        let central = self
+            .main_file
+            .as_ref()
+            .filter(|(chat, _)| Some(chat.as_str()) == selected)
+            .map(|(_, id)| *id);
+        for files in self.files.values().chain(
+            self.file_surfaces
+                .iter()
+                .filter(|(id, _)| Some(**id) != central)
+                .map(|(_, file)| file),
+        ) {
             files.update(cx, |files, cx| files.suspend_images(cx));
         }
     }
@@ -3312,6 +3370,11 @@ impl Shell {
         let key = self.panel_key(cx);
         self.panels.update(&key, |p| p.right_active = surface);
         match surface {
+            RightSurface::Explorer => {
+                if let Some(files) = self.files.get(&key).cloned() {
+                    files.update(cx, |files, cx| files.ensure_loaded(cx));
+                }
+            }
             RightSurface::File(id) => {
                 if let Some(file) = self.file_surfaces.get(&id).cloned() {
                     file.update(cx, |file, cx| file.ensure_loaded(cx));
@@ -3354,6 +3417,14 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if surface == RightSurface::Explorer {
+            if let Some(files) = self.files.get(&self.panel_key(cx)).cloned() {
+                window.defer(cx, move |window, cx| {
+                    files.update(cx, |files, cx| files.focus_explorer(window, cx))
+                });
+            }
+            return;
+        }
         if let RightSurface::Browser(id) = surface {
             if let Some(browser) = self.browsers.get(&id).cloned() {
                 browser.update(cx, |browser, cx| browser.focus_address(window, cx));
@@ -3685,10 +3756,14 @@ impl Shell {
                     // Navigation from an editor stays in its own chat.
                     FilesEvent::OpenFile(path) => {
                         let owner = (source.read(cx).chat_id().to_owned(), owner_state.clone());
-                        this.add_file_surface_at(owner, path.clone(), None, window, cx)
+                        if cfg!(target_os = "linux") && owner.0 == this.active_chat {
+                            this.open_workbench_file(path.clone(), window, cx);
+                        } else {
+                            this.add_file_surface_at(owner, path.clone(), None, window, cx);
+                        }
                     }
                     FilesEvent::RevealFile(path) => {
-                        this.add_files_surface(window, cx);
+                        this.open_explorer(window, cx);
                         if let Some(files) = this.files.get(&this.panel_key(cx)).cloned() {
                             files.update(cx, |files, cx| {
                                 files.reveal_file_explicit(path.clone(), cx)
@@ -3875,11 +3950,22 @@ impl Shell {
                 &changes,
                 window,
                 |this: &mut Self, _, event, window, cx| match event {
+                    ChangesEvent::OpenChange(selection) => {
+                        this.open_change_diff(selection.clone(), window, cx);
+                    }
                     ChangesEvent::OpenCommit(commit) => {
                         this.add_commit_diff_surface(commit.clone(), window, cx);
                     }
+                    ChangesEvent::OpenRepositoryCommit { cwd, repository, commit } => {
+                        if this.state.read(cx).selected_chat_row().and_then(|chat| chat.cwd.as_ref()) != Some(cwd) { return; }
+                        this.open_repository_commit(repository.clone(), commit.clone(), window, cx);
+                    }
                     ChangesEvent::OpenFile(path) => {
-                        this.add_file_surface(path.clone(), window, cx);
+                        if cfg!(target_os = "linux") {
+                            this.open_workbench_file(path.clone(), window, cx);
+                        } else {
+                            this.add_file_surface(path.clone(), window, cx);
+                        }
                     }
                     ChangesEvent::DiscardWorkingTree(request) => {
                         if this.discard_working_tree_task.is_none() {
@@ -3898,6 +3984,64 @@ impl Shell {
             .or_default()
             .push(RightSurface::Diff(id));
         self.set_right_active(RightSurface::Diff(id), cx);
+    }
+
+    fn open_repository_commit(&mut self, repository: String, commit: zeron_proto::GitHistoryCommit, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(chat) = self.state.read(cx).selected_chat.clone() else { return; };
+        let title = format!("{} {}", &commit.sha[..7.min(commit.sha.len())], commit.subject);
+        let view = cx.new(|cx| Changes::for_repository_commit(self.state.clone(), repository, commit, cx));
+        view.update(cx, |view, cx| view.ensure_content(cx));
+        self.main_diff_sub = Some(cx.subscribe_in(&view, window, |this: &mut Self, _, event, window, cx| {
+            if let ChangesEvent::OpenFile(path) = event { this.open_workbench_file(path.clone(), window, cx); }
+        }));
+        self.main_diff = Some((chat, title, view));
+        self.main_file = None;
+        if self.right_pane_expanded { self.toggle_right_pane_expand(cx); }
+        cx.notify();
+    }
+
+    fn open_change_diff(
+        &mut self,
+        selection: zeron_proto::CheckoutChangeSelection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(chat) = self.state.read(cx).selected_chat.clone() else {
+            return;
+        };
+        let title = format!(
+            "{} ({})",
+            if selection.repository.is_empty() {
+                selection.path.clone()
+            } else {
+                format!("{}/{}", selection.repository, selection.path)
+            },
+            if selection.staged {
+                "Index"
+            } else {
+                "Working Tree"
+            }
+        );
+        let view = cx.new(|cx| Changes::for_file(self.state.clone(), selection, cx));
+        view.update(cx, |view, cx| view.ensure_content(cx));
+        self.main_diff_sub =
+            Some(
+                cx.subscribe_in(&view, window, |this: &mut Self, _, event, window, cx| {
+                    if let ChangesEvent::OpenFile(path) = event {
+                        if cfg!(target_os = "linux") {
+                            this.open_workbench_file(path.clone(), window, cx);
+                        } else {
+                            this.add_file_surface(path.clone(), window, cx);
+                        }
+                    }
+                }),
+            );
+        self.main_diff = Some((chat, title, view));
+        self.main_file = None;
+        if self.right_pane_expanded {
+            self.toggle_right_pane_expand(cx);
+        }
+        cx.notify();
     }
 
     /// The picker's Terminal card / the `+` menu's Terminal row: every click
@@ -4120,7 +4264,10 @@ impl Shell {
                 }
                 FilesCloseDisposition::Pending | FilesCloseDisposition::Blocked => {
                     self.pending_file_closes.insert(surface);
-                    self.set_right_active(surface, cx);
+                    if self.is_tool_surface(surface) {
+                        self.set_right_active(surface, cx);
+                    }
+                    cx.notify();
                 }
             }
             return;
@@ -4163,13 +4310,18 @@ impl Shell {
                         .update(cx, |s, _| s.unwatch_subagent_doc(&tab.doc_id));
                 }
             }
-            RightSurface::Picker => {}
+            RightSurface::Picker | RightSurface::Explorer => {}
         }
         self.close_empty_right_pane(&key, cx);
         self.panels.forget_right_surface(&key, surface);
         let fallback = self.panels.right_surface_fallback(
             &key,
-            self.right_tabs.get(&key).into_iter().flatten().copied(),
+            self.right_tabs
+                .get(&key)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|surface| self.is_tool_surface(*surface)),
         );
         self.panels.update(&key, |p| {
             if p.right_active == surface {
@@ -4219,6 +4371,14 @@ impl Shell {
     /// closes — the same cascade browsers use. The native traffic-light close
     /// deliberately skips this rung: it always closes the window.
     pub fn close_active_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if let Some((chat, id)) = &self.main_file
+            && self.state.read(cx).selected_chat.as_ref() == Some(chat)
+            && (!self.right_pane_open(cx)
+                || self.navigation_focus.main.contains_focused(window, cx))
+        {
+            self.close_right_surface(RightSurface::File(*id), window, cx);
+            return true;
+        }
         let Some(surface) = self.closable_right_surface(cx) else {
             return false;
         };
@@ -4271,21 +4431,30 @@ impl Shell {
         let editors = self
             .file_surface_keys
             .iter()
-            .filter_map(|((key, _, _), id)| {
+            .filter_map(|((key, owner, _), id)| {
                 self.file_surfaces
                     .get(id)
                     .filter(|files| files.read(cx).has_unsaved_changes())
-                    .map(|_| (key.clone(), RightSurface::File(*id)))
+                    .map(|_| (key.clone(), owner.clone(), *id))
             });
         let current = self.panel_key(cx);
         let mut dirty = editors.collect::<Vec<_>>();
-        dirty.sort_by_key(|(key, _)| (key != &current, key.clone()));
-        if let Some((key, surface)) = dirty.into_iter().next() {
-            self.panels.update(&key, |panel| {
-                panel.changes_open = true;
-                panel.right_active = surface;
-            });
+        dirty.sort_by_key(|(key, _, id)| (key != &current, key.clone(), *id));
+        if let Some((key, owner, id)) = dirty.into_iter().next() {
+            if !self.workbench_files.contains(&id) {
+                self.panels.update(&key, |panel| {
+                    panel.changes_open = true;
+                    panel.right_active = RightSurface::File(id);
+                });
+            }
             self.apply_nav(NavEntry::Chat(key), cx);
+            if self.workbench_files.contains(&id) {
+                // Central editors are deliberately absent from the tool tabs.
+                // Bring their close decision into the visible editor outlet.
+                self.main_file = Some((owner, id));
+                self.main_diff = None;
+                self.main_diff_sub = None;
+            }
         }
     }
 
@@ -4306,6 +4475,10 @@ impl Shell {
         }
         match surface {
             RightSurface::File(id) => {
+                if self.main_file.as_ref().is_some_and(|(_, main)| *main == id) {
+                    self.main_file = None;
+                }
+                self.workbench_files.remove(&id);
                 self.file_surfaces.remove(&id);
                 self.file_surface_paths.remove(&id);
                 self.file_surface_subs.remove(&id);
@@ -4322,7 +4495,8 @@ impl Shell {
                 .get(panel_key)
                 .into_iter()
                 .flatten()
-                .copied(),
+                .copied()
+                .filter(|surface| self.is_tool_surface(*surface)),
         );
         self.panels.update(panel_key, |panel| {
             if panel.right_active == surface {
@@ -4424,7 +4598,11 @@ impl Shell {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let x = f32::from(event.event.position.x);
+        let x = if cfg!(target_os = "linux") {
+            f32::from(_window.viewport_size().width) - f32::from(event.event.position.x)
+        } else {
+            f32::from(event.event.position.x)
+        };
         let sample = sidebar_drag_sample(x, self.sidebar_resize_edge, self.reduced_motion);
         self.settings.sidebar_width = sample.width;
         self.settings.sidebar_collapsed = false;
@@ -4486,7 +4664,11 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         let viewport = f32::from(window.viewport_size().width);
-        let width = viewport - self.files_reserved_width(cx) - f32::from(event.event.position.x);
+        let width = if cfg!(target_os = "linux") {
+            f32::from(event.event.position.x) - ACTIVITY_WIDTH - self.files_reserved_width(cx)
+        } else {
+            viewport - self.files_reserved_width(cx) - f32::from(event.event.position.x)
+        };
         // Use the same shared budget as rendering, including compact windows.
         let max = self.surface_max_width(cx);
         let sample = if max >= RIGHT_PANE_MIN {
@@ -6288,7 +6470,8 @@ impl Shell {
                 div()
                     .absolute()
                     .top_0()
-                    .right_0()
+                    .when(cfg!(target_os = "linux"), |el| el.left_0())
+                    .when(!cfg!(target_os = "linux"), |el| el.right_0())
                     .h_full()
                     .w(px(content_width))
                     .child(inner),
@@ -6333,6 +6516,9 @@ impl Shell {
 
     /// The session titlebar remains mounted beneath the settings modal.
     fn render_title_bar(&mut self, viewport_height: Pixels, cx: &mut Context<Self>) -> AnyElement {
+        if cfg!(target_os = "linux") {
+            return self.render_workbench_titlebar(cx);
+        }
         self.render_session_title_bar(viewport_height, cx)
     }
 
@@ -6433,7 +6619,11 @@ impl Shell {
         div()
             .absolute()
             .top_0()
-            .left_0()
+            .left(px(if cfg!(target_os = "linux") {
+                (self.viewport_width + ACTIVITY_WIDTH - self.sidebar_now().max(160.0)).max(0.0)
+            } else {
+                0.0
+            }))
             .h(px(Theme::TITLEBAR_HEIGHT))
             .flex()
             .flex_row()
@@ -6904,18 +7094,25 @@ impl Shell {
             .absolute()
             .top_0()
             .bottom_0()
-            .left_0()
+            .when(cfg!(target_os = "linux"), |el| el.right_0())
+            .when(!cfg!(target_os = "linux"), |el| el.left_0())
             .w(px(width))
             .when(window_corner > 0.0, |el| {
                 if width >= 2.0 * window_corner {
-                    el.rounded_tl(px(window_corner))
-                        .rounded_bl(px(window_corner))
+                    if cfg!(target_os = "linux") {
+                        el.rounded_tr(px(window_corner))
+                            .rounded_br(px(window_corner))
+                    } else {
+                        el.rounded_tl(px(window_corner))
+                            .rounded_bl(px(window_corner))
+                    }
                 } else {
                     el.top(px(window_corner)).bottom(px(window_corner))
                 }
             })
             .bg(crate::theme::wash(0.05))
-            .border_r_1()
+            .when(cfg!(target_os = "linux"), |el| el.border_l_1())
+            .when(!cfg!(target_os = "linux"), |el| el.border_r_1())
             .border_color(border_color)
     }
 
@@ -6956,6 +7153,7 @@ impl Shell {
             .size_full()
             .flex()
             .flex_row()
+            .when(cfg!(target_os = "linux"), |el| el.flex_row_reverse())
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
                 let key = &event.keystroke.key;
                 if key == "escape" {
@@ -9565,6 +9763,14 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.file_close_dialog.is_some()
+            || self
+                .active_changes(cx)
+                .is_some_and(|changes| changes.read(cx).has_git_confirmation(cx))
+        {
+            cx.stop_propagation();
+            return;
+        }
         if event.keystroke.key == "escape" && self.sidebar_session_transfer.is_some() {
             cx.stop_active_drag(window);
             self.cancel_sidebar_session_transfer(cx);
@@ -9690,7 +9896,7 @@ impl Shell {
                                 // under the file tree: dock the explorer
                                 // when the menu came from its tab.
                                 if is_side_chat && !this.files_panel_open(cx) {
-                                    this.add_files_surface(window, cx);
+                                    this.open_explorer(window, cx);
                                 }
                                 this.open_rename_chat(rename_id.clone(), cx)
                             }))
@@ -10033,6 +10239,9 @@ impl Shell {
         if let Some(update) = self.render_update_prompt(viewport, cx) {
             overlays.push(update);
         }
+        if let Some(dialog) = self.render_file_close_dialog(viewport, cx) {
+            overlays.push(dialog);
+        }
 
         overlays
     }
@@ -10142,6 +10351,86 @@ impl Shell {
         transcript_width: f32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if let Some(editor) = self.render_workbench_file(window, cx) {
+            return editor;
+        }
+        if self
+            .main_diff
+            .as_ref()
+            .is_some_and(|(chat, _, _)| self.state.read(cx).selected_chat.as_ref() != Some(chat))
+        {
+            self.main_diff = None;
+            self.main_diff_sub = None;
+        }
+        if let Some((_, title, view)) = self.main_diff.clone() {
+            let theme = Theme::of(cx).clone();
+            let controls = view.update(cx, |view, cx| view.render_header_controls(cx));
+            return div()
+                .id("main-file-diff")
+                .track_focus(&self.navigation_focus.main)
+                .capture_any_mouse_down(cx.listener(|this, _, window, cx| {
+                    this.capture_navigation_focus(false, false, window, cx);
+                }))
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .pt(px(Theme::TITLEBAR_HEIGHT))
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .h(px(36.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .px(px(12.0))
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .child(
+                            icons::icon(icons::FILE_CODE)
+                                .size(px(15.0))
+                                .text_color(theme.text_muted),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(12.0))
+                                .text_color(theme.text)
+                                .child(SharedString::from(title)),
+                        )
+                        .child(controls)
+                        .child(
+                            div()
+                                .id("close-main-file-diff")
+                                .size(px(24.0))
+                                .rounded(px(4.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .hover(|s| s.bg(theme.glass_hover()))
+                                .tooltip(crate::settings::widgets::text_tooltip(
+                                    "Close diff and return to conversation",
+                                ))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.main_diff = None;
+                                    this.main_diff_sub = None;
+                                    cx.notify();
+                                }))
+                                .child(
+                                    icons::icon(icons::CLOSE)
+                                        .size(px(13.0))
+                                        .text_color(theme.text_muted),
+                                ),
+                        ),
+                )
+                .child(div().flex_1().min_h_0().overflow_hidden().child(view))
+                .into_any_element();
+        }
         let theme_owned = Theme::of(cx).clone();
         let theme = &theme_owned;
         let (border, text, faint) = (theme.border, theme.text, theme.text_faint);
@@ -10825,6 +11114,23 @@ impl Shell {
         let content: AnyElement = if self.right_pane_open(cx) || self.tween_active(self.right_tween)
         {
             match self.resolved_right_active(cx) {
+                RightSurface::Explorer => {
+                    if let Some(files) = self.files.get(&self.panel_key(cx)).cloned() {
+                        files.update(cx, |files, cx| {
+                            files.ensure_loaded(cx);
+                            if self.right_pane_open(cx) {
+                                files.ensure_git_status(cx);
+                            }
+                        });
+                        // Editor caret and typing frames must not rebuild the
+                        // independent explorer. Its own updates invalidate this cache.
+                        files
+                            .cached(gpui::StyleRefinement::default().size_full())
+                            .into_any_element()
+                    } else {
+                        self.render_surface_picker(cx)
+                    }
+                }
                 // Rendering a Files surface activates its image. Keep it unmounted
                 // throughout the closing animation after suspending its resources.
                 RightSurface::File(_) if !self.right_pane_open(cx) => {
@@ -10848,13 +11154,13 @@ impl Shell {
                     // buttons stayed up there (user request).
                     let controls =
                         changes.update(cx, |changes, cx| changes.render_header_controls(cx));
-                    div()
+                    let content = div()
                         .size_full()
                         .flex()
                         .flex_col()
                         .child(crate::surface_chrome::toolbar(&theme).child(controls))
-                        .child(div().flex_1().min_h_0().child(changes))
-                        .into_any_element()
+                        .child(div().flex_1().min_h_0().child(changes.clone()));
+                    changes.update(cx, |changes, cx| changes.source_control_surface(content, cx))
                 }
                 RightSurface::Browser(id) => self
                     .browsers
@@ -10936,7 +11242,11 @@ impl Shell {
             // already carries the sidebar tone's right hairline — a second
             // border there doubled up (user report).
             .when(!self.right_pane_expanded, |el| {
-                el.border_l_1().border_color(theme.border)
+                if cfg!(target_os = "linux") {
+                    el.border_r_1().border_color(theme.border)
+                } else {
+                    el.border_l_1().border_color(theme.border)
+                }
             })
             // With the explorer undocked the panel's right edge IS the
             // window's right edge: it carries the CSD window's rounded corners
@@ -10944,7 +11254,9 @@ impl Shell {
             // layer rounds itself; see [`Self::window_corner_radius`]). Docked,
             // the explorer column is the rightmost layer and rounds instead.
             .when(
-                Self::window_corner_radius(window) > 0.0 && self.files_visible_width(cx) <= 0.0,
+                !cfg!(target_os = "linux")
+                    && Self::window_corner_radius(window) > 0.0
+                    && self.files_visible_width(cx) <= 0.0,
                 |el| {
                     let corner = Self::window_corner_radius(window);
                     el.rounded_tr(px(corner)).rounded_br(px(corner))
@@ -11021,6 +11333,13 @@ impl Shell {
                     .flex()
                     .flex_col()
                     .gap(px(8.0))
+                    .child(
+                        row("surface-card-explorer", icons::FILE_TREE, "Explorer").on_click(
+                            cx.listener(|this, _, window, cx| {
+                                this.open_explorer(window, cx);
+                            }),
+                        ),
+                    )
                     .child(
                         row("surface-card-browser", icons::GLOBE, "Browser").on_click(cx.listener(
                             |this, _, window, cx| this.add_browser_surface(None, window, cx),
@@ -11245,6 +11564,7 @@ impl Shell {
                 RightSurface::Terminal(_) => icons::TERMINAL,
                 RightSurface::Browser(_) => icons::GLOBE,
                 RightSurface::Picker => icons::PLUS,
+                RightSurface::Explorer => icons::FILE_TREE,
             };
             // A live subagent tab swaps its icon for the mini working
             // spinner (the history fetch button's in-flight recipe) — the
@@ -11588,7 +11908,7 @@ impl Shell {
                             popover::menu_row(&theme, false, "right-plus-files")
                                 .id("right-plus-files-row")
                                 .on_click(cx.listener(|this, _, window, cx| {
-                                    this.add_files_surface(window, cx);
+                                    this.open_explorer(window, cx);
                                     this.close_right_plus(cx);
                                 }))
                                 .child(
@@ -12437,6 +12757,7 @@ fn header_icon_button_with(
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_file_close_dialog(window, cx);
         let active_files_key = self.panel_key(cx);
         let hidden_explorers = self
             .files
@@ -12465,7 +12786,7 @@ impl Render for Shell {
                     self.add_diff_surface(window, cx)
                 }
                 WorkspaceCommand::Files if !self.active_chat.is_empty() => {
-                    self.add_files_surface(window, cx)
+                    self.open_explorer(window, cx)
                 }
                 WorkspaceCommand::Terminal if !self.active_chat.is_empty() => {
                     self.add_terminal_surface(cx)
@@ -12509,13 +12830,13 @@ impl Render for Shell {
         }
         crate::transcript::record_view_frame("shell");
         let viewport = f32::from(window.viewport_size().width);
-        if (self.viewport_width - viewport).abs() > 1.0 {
+        if (self.viewport_width - (viewport - ACTIVITY_WIDTH).max(0.0)).abs() > 1.0 {
             self.files_tween = None;
             self.right_tween = None;
             self.right_takeover_content_tween = None;
             self.main_takeover_tween = None;
         }
-        self.viewport_width = viewport;
+        self.viewport_width = (viewport - ACTIVITY_WIDTH).max(0.0);
         // Appearance actions persist independently of the shell. Mirror the
         // globals before any later debounced settings save can overwrite them.
         self.settings.appearance = crate::appearance::mode(cx);
@@ -12737,11 +13058,23 @@ impl Render for Shell {
                 }
             }))
             .on_action(cx.listener(|this, _: &SaveFile, _, cx| {
-                if matches!(this.route, Route::Chat) && this.right_pane_open(cx) {
-                    let file = match this.resolved_right_active(cx) {
-                        RightSurface::File(id) => this.file_surfaces.get(&id).cloned(),
-                        _ => None,
-                    };
+                if matches!(this.route, Route::Chat) {
+                    let file = this
+                        .main_file
+                        .as_ref()
+                        .filter(|(chat, _)| {
+                            this.state.read(cx).selected_chat.as_ref() == Some(chat)
+                        })
+                        .and_then(|(_, id)| this.file_surfaces.get(id).cloned())
+                        .or_else(|| {
+                            if this.right_pane_open(cx)
+                                && let RightSurface::File(id) = this.resolved_right_active(cx)
+                            {
+                                this.file_surfaces.get(&id).cloned()
+                            } else {
+                                None
+                            }
+                        });
                     if let Some(file) = file {
                         file.update(cx, |file, cx| file.save_active_document(cx));
                     }
@@ -12781,7 +13114,7 @@ impl Render for Shell {
             // undocks the explorer portion without touching the surface host.
             .on_action(cx.listener(|this, _: &ToggleFiles, window, cx| {
                 if matches!(this.route, Route::Chat) {
-                    this.toggle_files_panel(window, cx);
+                    this.toggle_explorer(window, cx);
                 }
             }))
             // Chat-scoped like the panel toggles: Settings has no current
@@ -12880,7 +13213,7 @@ impl Render for Shell {
                 self.viewport_height = f32::from(window.viewport_size().height);
                 // Stamped for `right_target` — the expanded changes panel
                 // sizes itself to the viewport.
-                self.viewport_width = viewport;
+                self.viewport_width = (viewport - ACTIVITY_WIDTH).max(0.0);
                 // Settings replaces the whole workspace, sidebar included. The
                 // chat layout stays unmounted; its entities keep their state
                 // for the return trip.
@@ -12926,7 +13259,7 @@ impl Render for Shell {
                     self.motion_active.set(true);
                 }
                 let main_target_width = conversation_width(
-                    viewport - self.files_reserved_width(cx),
+                    viewport - ACTIVITY_WIDTH - self.files_reserved_width(cx),
                     self.sidebar_target(),
                     right_target_width,
                 );
@@ -13054,7 +13387,8 @@ impl Render for Shell {
                         .h_full()
                         .flex_none()
                         .absolute()
-                        .left_0()
+                        .when(cfg!(target_os = "linux"), |el| el.right_0())
+                        .when(!cfg!(target_os = "linux"), |el| el.left_0())
                         .top_0()
                         .child(handle)
                         .into_any_element()
@@ -13072,37 +13406,52 @@ impl Render for Shell {
                 // under the header and fade out at its edge. Columns that
                 // must NOT underlap (sidebar content, the changes panel,
                 // settings) pad themselves down by the titlebar height.
+                let columns = if cfg!(target_os = "linux") {
+                    div()
+                        .size_full()
+                        .flex()
+                        .flex_row()
+                        .child(self.render_activity_bar(cx))
+                        .child(files_panel)
+                        .child(
+                            div()
+                                .h_full()
+                                .flex_none()
+                                .relative()
+                                .child(right)
+                                .child(right_seam),
+                        )
+                        .child(card)
+                        .child(sidebar_seam)
+                        .child(sidebar)
+                } else {
+                    div()
+                        .size_full()
+                        .flex()
+                        .flex_row()
+                        .child(sidebar)
+                        .child(sidebar_seam)
+                        .child(card)
+                        .child(
+                            div()
+                                .h_full()
+                                .flex_none()
+                                .relative()
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .flex()
+                                        .flex_row()
+                                        .child(right)
+                                        .child(files_panel),
+                                )
+                                .child(right_seam),
+                        )
+                };
                 let page = div()
                     .size_full()
                     .relative()
-                    .child(
-                        div()
-                            .size_full()
-                            .flex()
-                            .flex_row()
-                            .child(sidebar)
-                            .child(sidebar_seam)
-                            .child(card)
-                            // The right pane is ONE container: the surface
-                            // host column and the docked explorer column
-                            // sit side by side under a shared titlebar
-                            // strip; the resize seam straddles its left edge.
-                            .child(
-                                div()
-                                    .h_full()
-                                    .flex_none()
-                                    .relative()
-                                    .child(
-                                        div()
-                                            .h_full()
-                                            .flex()
-                                            .flex_row()
-                                            .child(right)
-                                            .child(files_panel),
-                                    )
-                                    .child(right_seam),
-                            ),
-                    )
+                    .child(columns)
                     .child(div().absolute().top_0().left_0().right_0().child(title_bar))
                     .child(self.render_titlebar_cluster(cx))
                     .children(overlays);
@@ -16268,6 +16617,34 @@ impl Shell {
     }
 }
 
+#[cfg(feature = "source-control-fixture")]
+impl Shell {
+    pub fn fixture_open_source_control(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_surfaces_open(true, cx);
+        self.add_diff_surface(window, cx);
+    }
+
+    pub fn fixture_workbench_state(&self, cx: &App) -> serde_json::Value {
+        serde_json::json!({
+            "sourceControl": match self.resolved_right_active(cx) {
+                RightSurface::Diff(id) => self.diffs.get(&id).map_or(serde_json::Value::Null, |view| view.read(cx).fixture_source_control_state(cx)),
+                _ => serde_json::Value::Null,
+            },
+            "mainDiff": self.main_diff.is_some(),
+            "mainEditor": self.main_file.as_ref().and_then(|(_, id)| self.file_surface_paths.get(id)),
+            "editorDirty": self.main_file.as_ref().and_then(|(_, id)| self.file_surfaces.get(id)).is_some_and(|file| file.read(cx).has_unsaved_changes()),
+            "closeConfirmationOpen": self.file_close_dialog.is_some(),
+            "toolsOpen": self.right_pane_open(cx),
+            "explorerOpen": self.files_panel_open(cx) || (self.right_pane_open(cx) && self.resolved_right_active(cx) == RightSurface::Explorer),
+            "activeTool": format!("{:?}", self.resolved_right_active(cx)),
+            "toolTabs": self.right_surface_rows(cx).into_iter().map(|(_, title, ..)| title.to_string()).collect::<Vec<_>>(),
+            "toolsWidth": self.right_visible_width(cx),
+            "explorerWidth": self.files_visible_width(cx),
+            "projectsWidth": self.sidebar_now(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod right_tab_mouse_regressions {
     use super::*;
@@ -16278,22 +16655,46 @@ mod right_tab_mouse_regressions {
     struct TabHost {
         shell: Entity<Shell>,
         _data_dir: tempfile::TempDir,
+        with_file_close_dialog: bool,
     }
 
     impl Render for TabHost {
-        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             self.shell.update(cx, |shell, cx| {
+                let dialog = if self.with_file_close_dialog {
+                    shell.sync_file_close_dialog(window, cx);
+                    shell.render_file_close_dialog(window.viewport_size(), cx)
+                } else {
+                    None
+                };
                 let tabs = shell.render_right_tab_strip(cx);
                 shell.titlebar_drag_region(
                     "right-tab-test-titlebar",
                     div().w(px(400.)).h(px(40.)).child(tabs),
                     cx,
                 )
+                .when(self.with_file_close_dialog, |el| {
+                    el.size_full()
+                        .track_focus(&shell.shortcut_focus)
+                        .capture_key_down(cx.listener(Shell::on_key_down_capture))
+                        .on_action(cx.listener(|_, _: &SaveFile, _, _| {
+                            panic!("a save shortcut bypassed the file close modal")
+                        }))
+                        .child(div().track_focus(&shell.unfocused))
+                })
+                .children(dialog)
             })
         }
     }
 
     fn setup(cx: &mut TestAppContext) -> (Entity<Shell>, &mut VisualTestContext) {
+        setup_host(cx, false)
+    }
+
+    fn setup_host(
+        cx: &mut TestAppContext,
+        with_file_close_dialog: bool,
+    ) -> (Entity<Shell>, &mut VisualTestContext) {
         let dir = tempfile::tempdir().unwrap();
         cx.update(|cx| {
             gpui_base::init(cx);
@@ -16325,11 +16726,197 @@ mod right_tab_mouse_regressions {
             TabHost {
                 shell,
                 _data_dir: dir,
+                with_file_close_dialog,
             }
         });
         let shell = host.read_with(cx, |host, _| host.shell.clone());
         cx.update(|window, cx| window.draw(cx).clear());
         (shell, cx)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    fn explorer_uses_the_shared_tabs_and_retains_its_tree(cx: &mut TestAppContext) {
+        let (shell, cx) = setup(cx);
+        cx.update(|window, cx| {
+            shell.update(cx, |shell, cx| shell.open_explorer(window, cx));
+            window.draw(cx).clear();
+        });
+        let explorer = shell.read_with(cx, |shell, cx| {
+            assert!(!shell.files_panel_open(cx));
+            assert!(shell.right_pane_open(cx));
+            assert_eq!(shell.resolved_right_active(cx), RightSurface::Explorer);
+            assert_eq!(shell.right_surface_rows(cx)[2].1.as_ref(), "Explorer");
+            shell.files[&shell.panel_key(cx)].entity_id()
+        });
+        let first_tab = cx.debug_bounds("right-surface-tab-0").unwrap().center();
+        cx.simulate_click(first_tab, gpui::Modifiers::default());
+        shell.read_with(cx, |shell, cx| {
+            assert_eq!(shell.resolved_right_active(cx), RightSurface::Subagent(1));
+        });
+        let explorer_tab = cx.debug_bounds("right-surface-tab-2").unwrap().center();
+        cx.simulate_click(explorer_tab, gpui::Modifiers::default());
+        shell.read_with(cx, |shell, cx| {
+            assert_eq!(shell.resolved_right_active(cx), RightSurface::Explorer);
+        });
+        cx.update(|window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.open_explorer(window, cx);
+                assert_eq!(shell.right_surface_rows(cx).len(), 3);
+            });
+            window.draw(cx).clear();
+        });
+        let close = cx.debug_bounds("right-surface-close-2").unwrap().center();
+        cx.simulate_click(close, gpui::Modifiers::default());
+        shell.read_with(cx, |shell, cx| {
+            assert_eq!(shell.resolved_right_active(cx), RightSurface::Subagent(1));
+            assert_eq!(shell.right_surface_rows(cx).len(), 2);
+        });
+        cx.update(|window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.open_explorer(window, cx);
+                assert_eq!(shell.files[&shell.panel_key(cx)].entity_id(), explorer);
+                assert_eq!(shell.resolved_right_active(cx), RightSurface::Explorer);
+            });
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    fn file_close_modal_blocks_background_and_supports_keyboard_choices(cx: &mut TestAppContext) {
+        let (shell, cx) = setup_host(cx, true);
+        let id = cx.update(|window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.open_workbench_file(".gitignore".into(), window, cx);
+                let id = shell.main_file.as_ref().unwrap().1;
+                shell.file_surfaces[&id]
+                    .update(cx, |files, _| files.seed_pending_exit_test_document(true));
+                window.focus(&shell.unfocused, cx);
+                shell.close_right_surface(RightSurface::File(id), window, cx);
+                id
+            })
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(cx.debug_bounds("file-close-dialog-card").is_some());
+        cx.update(|_, cx| cx.bind_keys([gpui::KeyBinding::new("ctrl-s", SaveFile, None)]));
+        cx.simulate_keystrokes("ctrl-s");
+        cx.update(|window, cx| {
+            assert!(
+                shell.read(cx).file_close_dialog.as_ref().unwrap().buttons[2].is_focused(window)
+            );
+        });
+        let background = cx.debug_bounds("right-surface-tab-0").unwrap().center();
+        cx.simulate_click(background, gpui::Modifiers::default());
+        shell.read_with(cx, |shell, cx| {
+            assert_eq!(shell.resolved_right_active(cx), RightSurface::Subagent(2));
+            assert!(shell.file_surfaces[&id].read(cx).has_unsaved_changes());
+        });
+        for (keys, selected) in [("tab", 0), ("tab", 1), ("shift-tab", 0), ("shift-tab", 2)] {
+            cx.simulate_keystrokes(keys);
+            cx.update(|window, cx| {
+                assert!(
+                    shell.read(cx).file_close_dialog.as_ref().unwrap().buttons[selected]
+                        .is_focused(window)
+                );
+            });
+        }
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, cx| {
+            assert!(shell.file_close_dialog.is_none());
+            assert!(shell.pending_file_closes.is_empty());
+            assert!(shell.file_surfaces[&id].read(cx).has_unsaved_changes());
+        });
+        cx.update(|window, cx| assert!(shell.read(cx).unfocused.is_focused(window)));
+        cx.update(|window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.close_right_surface(RightSurface::File(id), window, cx)
+            });
+            window.draw(cx).clear();
+        });
+        let discard = cx.debug_bounds("file-close-discard").unwrap().center();
+        cx.simulate_click(discard, gpui::Modifiers::default());
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| {
+            assert!(!shell.file_surfaces.contains_key(&id))
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    fn file_close_modal_cancel_aborts_all_window_close_decisions(cx: &mut TestAppContext) {
+        let (shell, cx) = setup_host(cx, true);
+        cx.update(|window, cx| {
+            shell.update(cx, |shell, cx| {
+                for path in [".gitignore", "other.txt"] {
+                    shell.open_workbench_file(path.into(), window, cx);
+                    let id = shell.main_file.as_ref().unwrap().1;
+                    shell.file_surfaces[&id]
+                        .update(cx, |files, _| files.seed_pending_exit_test_document(true));
+                }
+                assert!(!shell.prepare_window_close(cx));
+            });
+            window.draw(cx).clear();
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, cx| {
+            assert!(shell.pending_exit.is_none());
+            assert!(shell.file_close_dialog.is_none());
+            assert!(shell.file_surfaces.values().all(|files| {
+                files.read(cx).has_unsaved_changes()
+                    && files.read(cx).close_confirmation_paths().is_none()
+            }));
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    fn closing_window_reveals_an_unsaved_central_editor(cx: &mut TestAppContext) {
+        let (shell, cx) = setup(cx);
+        cx.update(|window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.open_explorer(window, cx);
+                shell.open_workbench_file(".gitignore".into(), window, cx);
+                let dirty_id = shell.main_file.as_ref().unwrap().1;
+                shell.file_surfaces[&dirty_id].update(cx, |files, _| {
+                    files.seed_pending_exit_test_document(false);
+                });
+                shell.open_workbench_file("other.txt".into(), window, cx);
+                assert_ne!(shell.main_file.as_ref().unwrap().1, dirty_id);
+                assert!(!shell.prepare_window_close(cx));
+                assert_eq!(shell.main_file.as_ref().unwrap().1, dirty_id);
+                assert_eq!(shell.resolved_right_active(cx), RightSurface::Explorer);
+                shell.cancel_file_close(RightSurface::File(dirty_id), cx);
+                assert!(shell.pending_exit.is_none());
+            });
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    fn central_files_do_not_enter_the_tool_tabs_or_close_fallback(cx: &mut TestAppContext) {
+        let (shell, cx) = setup(cx);
+        cx.update(|window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.open_explorer(window, cx);
+                shell.open_workbench_file("src/example.ts".into(), window, cx);
+                let id = shell.main_file.as_ref().unwrap().1;
+                assert!(shell.file_surfaces.contains_key(&id));
+                assert_eq!(shell.right_surface_rows(cx).len(), 3);
+                assert_eq!(shell.resolved_right_active(cx), RightSurface::Explorer);
+                shell.reorder_right_tabs(2, 0, cx);
+                assert_eq!(shell.right_surface_rows(cx)[0].0, RightSurface::Explorer);
+                shell.close_right_surface(RightSurface::Explorer, window, cx);
+                assert_eq!(shell.resolved_right_active(cx), RightSurface::Subagent(2));
+                shell.close_right_surface(RightSurface::Subagent(2), window, cx);
+                shell.close_right_surface(RightSurface::Subagent(1), window, cx);
+                assert!(shell.right_surface_rows(cx).is_empty());
+                assert!(!shell.right_pane_open(cx));
+                assert_eq!(shell.main_file.as_ref().unwrap().1, id);
+                assert!(shell.file_surfaces.contains_key(&id));
+            });
+        });
     }
 
     #[gpui::test]

@@ -52,7 +52,7 @@ use crate::doc_host::EdgeConfig;
 use crate::repos::{CheckoutIdentity, Repos};
 use crate::workspace_host::WorkspaceHost;
 
-mod git_status;
+pub(crate) mod git_status;
 
 /// Hard cap on the unified patch (plus untracked hunks) — "Partial snapshot".
 pub const MAX_PATCH_BYTES: usize = 3 * 1024 * 1024;
@@ -824,14 +824,18 @@ async fn diff_sync_task(
 // Diff capture (exposed for tests)
 // ---------------------------------------------------------------------------
 
-struct Capture {
-    stdout: Vec<u8>,
-    truncated: bool,
+pub(crate) struct Capture {
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) truncated: bool,
 }
 
 /// Run git capturing stdout under a hard byte ceiling — the child is killed once
 /// the cap is hit, so an arbitrarily large repository diff never buffers fully.
-async fn capture_git(cwd: &Path, args: &[&str], max_bytes: usize) -> Result<Capture, EngineError> {
+pub(crate) async fn capture_git(
+    cwd: &Path,
+    args: &[&str],
+    max_bytes: usize,
+) -> Result<Capture, EngineError> {
     let mut cmd = tokio::process::Command::new("git");
     #[cfg(windows)]
     {
@@ -840,6 +844,7 @@ async fn capture_git(cwd: &Path, args: &[&str], max_bytes: usize) -> Result<Capt
     }
     cmd.arg("-C").arg(cwd).args(args);
     cmd.stdin(std::process::Stdio::null());
+    cmd.kill_on_drop(true);
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     let mut child = cmd
@@ -925,7 +930,7 @@ fn has_non_utf8_status_path(value: &[u8]) -> bool {
     false
 }
 
-fn parse_name_status(value: &[u8]) -> Vec<DiffFileSummary> {
+pub(crate) fn parse_name_status(value: &[u8]) -> Vec<DiffFileSummary> {
     let fields = split_z(value);
     let mut out = Vec::new();
     let mut i = 0usize;
@@ -965,7 +970,7 @@ fn parse_name_status(value: &[u8]) -> Vec<DiffFileSummary> {
     out
 }
 
-fn apply_numstat(files: &mut [DiffFileSummary], value: &[u8]) {
+pub(crate) fn apply_numstat(files: &mut [DiffFileSummary], value: &[u8]) {
     // With -z, a rename record is `adds<TAB>dels<TAB><NUL>old<NUL>new<NUL>`.
     let records: Vec<String> = value
         .split(|b| *b == 0)
@@ -999,7 +1004,7 @@ fn apply_numstat(files: &mut [DiffFileSummary], value: &[u8]) {
     }
 }
 
-fn quote_patch_path(path: &str) -> String {
+pub(crate) fn quote_patch_path(path: &str) -> String {
     if path
         .chars()
         .any(|c| c.is_whitespace() || c == '"' || c == '\\')
@@ -1011,7 +1016,7 @@ fn quote_patch_path(path: &str) -> String {
 }
 
 /// Synthesize a new-file hunk for an untracked file (git diff never shows them).
-fn untracked_patch(path: &str, content: &str) -> String {
+pub(crate) fn untracked_patch(path: &str, content: &str) -> String {
     let mut lines: Vec<&str> = content.split('\n').collect();
     if lines.last() == Some(&"") {
         lines.pop();

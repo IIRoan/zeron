@@ -61,6 +61,7 @@ pub enum LanguageId {
 pub enum HighlightKind {
     Comment,
     Keyword,
+    KeywordStorage,
     String,
     StringSpecial,
     Escape,
@@ -79,6 +80,9 @@ pub enum HighlightKind {
     Parameter,
     Operator,
     Punctuation,
+    Bracket1,
+    Bracket2,
+    Bracket3,
     Tag,
     Attribute,
     Label,
@@ -103,9 +107,18 @@ impl HighlightKind {
             Self::FunctionBuiltin | Self::TypeBuiltin | Self::VariableSpecial => 80,
             Self::StringSpecial | Self::Constructor | Self::Parameter => 75,
             Self::Function | Self::Type | Self::Constant | Self::Tag | Self::Label => 70,
-            Self::Comment | Self::Keyword | Self::String | Self::Number | Self::Boolean => 60,
+            Self::Comment
+            | Self::Keyword
+            | Self::KeywordStorage
+            | Self::String
+            | Self::Number
+            | Self::Boolean => 60,
             Self::Variable | Self::Operator => 50,
-            Self::Punctuation | Self::Embedded => 40,
+            Self::Punctuation
+            | Self::Bracket1
+            | Self::Bracket2
+            | Self::Bracket3
+            | Self::Embedded => 40,
             // Markdown block captures can wrap more specific inline captures,
             // and fenced-code captures can wrap an injected language. Keep
             // markup below programming-language tokens while preserving the
@@ -372,7 +385,64 @@ pub fn highlight_with_limits(
             }
         }
     }
-    HighlightedDocument::from_absolute_spans(language, request.source, spans)
+    let mut document = HighlightedDocument::from_absolute_spans(language, request.source, spans)?;
+    if matches!(
+        language,
+        LanguageId::JavaScript | LanguageId::Jsx | LanguageId::TypeScript | LanguageId::Tsx
+    ) {
+        color_brackets(&mut document, request.source);
+        if document.lines.iter().map(Vec::len).sum::<usize>() > limits.max_spans {
+            return Err(HighlightError::TooManySpans);
+        }
+    }
+    Ok(document)
+}
+
+/// Only parser-classified punctuation participates: brackets in comments,
+/// strings and regular expressions never change the nesting colors.
+fn color_brackets(document: &mut HighlightedDocument, source: &str) {
+    let mut stack = Vec::new();
+    for (spans, line) in document.lines.iter_mut().zip(source.lines()) {
+        let mut colored = Vec::new();
+        for span in std::mem::take(spans) {
+            if span.kind != HighlightKind::Punctuation {
+                colored.push(span);
+                continue;
+            }
+            for (offset, character) in line[span.range.clone()].char_indices() {
+                let depth = match character {
+                    '(' | '[' | '{' => {
+                        let depth = stack.len();
+                        stack.push(character);
+                        Some(depth)
+                    }
+                    ')' | ']' | '}' => {
+                        let opening = match character {
+                            ')' => '(',
+                            ']' => '[',
+                            _ => '{',
+                        };
+                        if stack.last() == Some(&opening) {
+                            stack.pop();
+                        }
+                        Some(stack.len())
+                    }
+                    _ => None,
+                };
+                colored.push(HighlightSpan {
+                    range: span.range.start + offset
+                        ..span.range.start + offset + character.len_utf8(),
+                    kind: match depth.map(|d| d % 3) {
+                        Some(0) => HighlightKind::Bracket1,
+                        Some(1) => HighlightKind::Bracket2,
+                        Some(_) => HighlightKind::Bracket3,
+                        None => HighlightKind::Punctuation,
+                    },
+                });
+            }
+        }
+        *spans = colored;
+    }
 }
 
 fn injected_languages(parent: LanguageId) -> Vec<LanguageId> {
@@ -516,7 +586,16 @@ fn javascript_family_highlights(language: LanguageId) -> String {
         ][..],
         _ => unreachable!("JavaScript query composition requires a JavaScript-family language"),
     };
-    queries.join("\n")
+    // Storage declarations are blue, control keywords purple, and punctuation
+    // brackets retain their parser role for the nesting-color pass.
+    let mut highlights = format!(
+        "{}\n[\"const\" \"let\" \"var\" \"function\" \"class\" \"new\"] @keyword.storage\n[\"(\" \")\" \"[\" \"]\" \"{{\" \"}}\"] @punctuation.bracket",
+        queries.join("\n")
+    );
+    if matches!(language, TypeScript | Tsx) {
+        highlights.push_str("\n[\"type\" \"interface\" \"enum\" \"namespace\" \"declare\" \"abstract\" \"readonly\" \"implements\" \"private\" \"public\" \"protected\"] @keyword.storage");
+    }
+    highlights
 }
 
 fn javascript_family_configuration(
@@ -718,6 +797,7 @@ fn configuration(language: LanguageId) -> Result<HighlightConfiguration, Highlig
 // Ordered from generic to specific. `HighlightConfiguration::configure`
 // resolves dotted captures to the best recognized name in this table.
 const CAPTURE_NAMES: &[&str] = &[
+    "keyword.storage",
     "comment",
     "keyword",
     "string",
@@ -752,6 +832,7 @@ const CAPTURE_NAMES: &[&str] = &[
 ];
 
 const CAPTURE_KINDS: &[HighlightKind] = &[
+    HighlightKind::KeywordStorage,
     HighlightKind::Comment,
     HighlightKind::Keyword,
     HighlightKind::String,
@@ -1243,6 +1324,54 @@ fn build(value: usize) -> Widget {
     }
 
     #[test]
+    fn typescript_semantic_roles_and_brackets_ignore_strings_and_comments() {
+        let source = "type Participant = { id: string; active: boolean };\nexport function assignMembers(members: Participant[]) {\n  const message = \"brackets } )\"; // [ }\n  if (true) { return members.map((member) => member.id); }\n}\n";
+        let document = highlight(HighlightRequest {
+            source,
+            path: Some("participants.ts"),
+            fence_tag: None,
+        })
+        .unwrap();
+        let lines = source.lines().collect::<Vec<_>>();
+        let kind_at = |line: usize, token: &str| {
+            let offset = lines[line].find(token).unwrap();
+            document.lines[line]
+                .iter()
+                .find(|span| span.range.contains(&offset))
+                .map(|span| span.kind)
+        };
+        assert_eq!(kind_at(0, "type"), Some(HighlightKind::KeywordStorage));
+        assert_eq!(kind_at(0, "Participant"), Some(HighlightKind::Type));
+        assert_eq!(kind_at(0, "string"), Some(HighlightKind::TypeBuiltin));
+        assert_eq!(kind_at(1, "export"), Some(HighlightKind::Keyword));
+        assert_eq!(kind_at(1, "function"), Some(HighlightKind::KeywordStorage));
+        assert_eq!(kind_at(1, "assignMembers"), Some(HighlightKind::Function));
+        assert_eq!(kind_at(2, "const"), Some(HighlightKind::KeywordStorage));
+        assert_eq!(kind_at(2, "message"), Some(HighlightKind::Variable));
+        assert_eq!(kind_at(2, "} )"), Some(HighlightKind::String));
+        assert_eq!(kind_at(2, "[ }"), Some(HighlightKind::Comment));
+        assert_eq!(kind_at(3, "return"), Some(HighlightKind::Keyword));
+        let mut stack = Vec::new();
+        let mut colors = std::collections::HashSet::new();
+        for (line, spans) in lines.into_iter().zip(&document.lines) {
+            for span in spans {
+                if matches!(
+                    span.kind,
+                    HighlightKind::Bracket1 | HighlightKind::Bracket2 | HighlightKind::Bracket3
+                ) {
+                    colors.insert(span.kind);
+                    match &line[span.range.clone()] {
+                        "(" | "[" | "{" => stack.push(span.kind),
+                        _ => assert_eq!(stack.pop(), Some(span.kind)),
+                    }
+                }
+            }
+        }
+        assert!(stack.is_empty());
+        assert_eq!(colors.len(), 3);
+    }
+
+    #[test]
     fn html_injects_javascript_and_css_with_a_bounded_registry() {
         let source = r#"<main id="app">
 <style>.item { color: red; }</style>
@@ -1262,7 +1391,7 @@ fn build(value: usize) -> Widget {
             .collect::<Vec<_>>();
         assert!(kinds.contains(&HighlightKind::Tag));
         assert!(kinds.contains(&HighlightKind::Attribute));
-        assert!(kinds.contains(&HighlightKind::Keyword));
+        assert!(kinds.contains(&HighlightKind::KeywordStorage));
         assert!(kinds.contains(&HighlightKind::Number));
     }
 
