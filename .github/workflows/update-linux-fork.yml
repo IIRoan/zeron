@@ -1,0 +1,97 @@
+name: Update Linux fork from upstream
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Stable upstream tag (leave empty for latest)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: update-linux-fork
+  cancel-in-progress: false
+
+jobs:
+  update:
+    if: github.repository == 'IIRoan/zeron' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_INPUT: ${{ inputs.release }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - name: Prepare the update branch
+        id: prepare
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream https://github.com/zeronsh/zeron.git
+          git remote set-url --push upstream DISABLED
+          release="$RELEASE_INPUT"
+          if [[ -z "$release" ]]; then
+            release="$(gh api repos/zeronsh/zeron/releases/latest --jq .tag_name)"
+          fi
+          [[ "$release" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'Expected a stable release tag'; exit 1; }
+          echo "UPSTREAM_RELEASE=$release" >> "$GITHUB_ENV"
+          git fetch upstream "refs/tags/$release:refs/tags/$release"
+          if git merge-base --is-ancestor "refs/tags/$release^{commit}" HEAD; then
+            scripts/update-upstream.sh "$release"
+            echo 'needed=false' >> "$GITHUB_OUTPUT"
+            echo "$release is already included in main." >> "$GITHUB_STEP_SUMMARY"
+          else
+            branch="maintenance/upstream-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            git switch -c "$branch"
+            echo "UPDATE_BRANCH=$branch" >> "$GITHUB_ENV"
+            echo 'needed=true' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: ./.github/actions/linux-ci
+        if: steps.prepare.outputs.needed == 'true'
+        with:
+          rust-cache: linux-fork
+          save-rust-cache: 'true'
+          apt-cache: gpui
+          apt-packages: >-
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev
+            libx11-dev libxcb1-dev libx11-xcb-dev libfontconfig1-dev
+            libfreetype-dev libasound2-dev libvulkan-dev pkg-config cmake
+            libwebkit2gtk-4.1-dev libjson-glib-dev
+      - name: Merge and check with the local command
+        if: steps.prepare.outputs.needed == 'true'
+        run: |
+          set -euo pipefail
+          scripts/update-upstream.sh "$UPSTREAM_RELEASE" 2>&1 | tee "$RUNNER_TEMP/upstream-update.log"
+      - name: Open a reviewed update pull request
+        if: steps.prepare.outputs.needed == 'true'
+        run: |
+          set -euo pipefail
+          git -c push.followTags=false push origin "HEAD:refs/heads/$UPDATE_BRANCH"
+          cat > "$RUNNER_TEMP/upstream-pr.md" <<BODY
+          Merge upstream $UPSTREAM_RELEASE into the Linux fork, preserving its custom workbench, Source Control, and editor behavior.
+
+          Validation: scripts/update-upstream.sh ran the updater safety tests, engine Git regressions, syntax tests, Source Control and file-close modal tests, and the Linux desktop build. Native desktop behavior still needs review before merging. This update was requested manually and will not merge automatically.
+          BODY
+          gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$UPDATE_BRANCH" \
+            --title "Merge upstream $UPSTREAM_RELEASE into Linux fork" --body-file "$RUNNER_TEMP/upstream-pr.md" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Save failed update diagnostics
+        if: failure()
+        run: |
+          git status --short > "$RUNNER_TEMP/upstream-status.txt"
+          git diff > "$RUNNER_TEMP/upstream-merge.patch"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: failure()
+        with:
+          name: upstream-update-diagnostics
+          path: |
+            ${{ runner.temp }}/upstream-update.log
+            ${{ runner.temp }}/upstream-status.txt
+            ${{ runner.temp }}/upstream-merge.patch

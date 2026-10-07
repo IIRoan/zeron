@@ -62,8 +62,8 @@ command in **…**, to stage or unstage the selection together. Selections stay
 within one repository and its staged or unstaged group.
 Clicking outside Source Control clears its file selection and leaves the open
 diff visible.
-The Linux activity bar switches between Explorer, Source Control, Browser,
-Terminal, History, and the view picker on the left. Projects and settings sit on
+The Linux activity bar switches between Explorer, Source Control, Terminal,
+History, and the view picker on the left. Projects and settings sit on
 the right. Explorer shares the tool tab strip and keeps its file tree when its
 tab is closed and reopened. Explorer files open in the center editor. Dark+ and
 Light+ are the Linux defaults, with TypeScript syntax colors, bracket colors, and changed-text
@@ -107,5 +107,9 @@ activity bar to show changes; `Ctrl+R` also toggles the tool panel.
 On this Homebrew-equipped Linux host
 the launcher configures the native library paths automatically. See
 [CONTRIBUTORS.md](CONTRIBUTORS.md#setup) for system dependencies on other hosts.
+
+To incorporate a new upstream release, run `scripts/update-upstream.sh` from a
+clean checkout. See [Maintaining the Linux fork](docs/LINUX_FORK.md) for the
+checks, conflict recovery, and fork remotes.
 
 Licensed under the [MIT License](LICENSE).
