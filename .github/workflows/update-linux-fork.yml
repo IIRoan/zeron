@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   update:
-    if: github.repository == 'IIRoan/zeron' && github.ref == 'refs/heads/main'
+    if: github.repository == 'IIRoan/zeron' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
@@ -27,6 +27,10 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
+      - name: Verify workflow isolation
+        run: |
+          python3 scripts/tests/test_fork_workflows.py
+          python3 scripts/check-fork-workflows.py
       - name: Prepare the update branch
         id: prepare
         run: |

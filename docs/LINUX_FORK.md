@@ -59,7 +59,16 @@ Review the local result, push with `git push origin main`, and restart with
 `scripts/dev-linux.sh`. The Action needs no additional secret or write deploy
 key; its API token remains read-only. This also handles releases that change
 workflow files, which GitHub's built-in Action token cannot push. Existing
-upstream CI files are preserved to keep future source merges small.
+upstream CI files are preserved with job guards that restrict them to
+`zeronsh/zeron`. Their inherited workflows are disabled in `IIRoan/zeron`; only
+the manual Linux updater is enabled. This avoids automatic macOS/Windows builds,
+edge deployments, official releases, and scheduled SDK updates in your fork.
+
+Both the manual Action and the Linux check command validate workflow isolation.
+If a future merge introduces an unguarded upstream job, the checks fail before
+the updater commits or packages it. Add the same upstream repository guard to
+the new job, rerun the checks, and finish the merge. Deployment configuration
+still belongs to the official project; keep its jobs guarded when merging.
 
 ## Remote setup on another checkout
 

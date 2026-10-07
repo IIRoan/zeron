@@ -19,6 +19,7 @@ concurrency:
 
 jobs:
   core-tests:
+    if: github.repository == 'zeronsh/zeron'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -30,6 +31,7 @@ jobs:
         run: scripts/ci/test-core.sh --release
 
   ui-tests:
+    if: github.repository == 'zeronsh/zeron'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:

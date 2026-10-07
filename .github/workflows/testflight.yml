@@ -22,7 +22,7 @@ concurrency:
 
 jobs:
   upload:
-    if: github.ref == 'refs/heads/main'
+    if: github.repository == 'zeronsh/zeron' && (github.ref == 'refs/heads/main')
     runs-on: macos-latest
     # Cold Rust core build (release profile, thin LTO) + archive + processing.
     timeout-minutes: 90

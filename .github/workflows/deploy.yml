@@ -19,6 +19,7 @@ concurrency:
 
 jobs:
   edge:
+    if: github.repository == 'zeronsh/zeron'
     runs-on: ubuntu-latest
     env:
       # `secrets` is not a valid context in step `if:` expressions — surface
@@ -68,6 +69,7 @@ jobs:
 
   # Static landing page (zeron.sh) — assets-only worker, no build step.
   landing:
+    if: github.repository == 'zeronsh/zeron'
     runs-on: ubuntu-latest
     env:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -104,6 +106,7 @@ jobs:
 
   # www.zeron.sh → zeron.sh 301 (see apps/www-redirect/wrangler.jsonc).
   www-redirect:
+    if: github.repository == 'zeronsh/zeron'
     runs-on: ubuntu-latest
     env:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

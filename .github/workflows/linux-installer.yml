@@ -31,6 +31,7 @@ concurrency:
 
 jobs:
   desktop-entry:
+    if: github.repository == 'zeronsh/zeron'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:

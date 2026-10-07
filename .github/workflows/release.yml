@@ -23,9 +23,11 @@ permissions:
 
 jobs:
   cursor-compatibility:
+    if: github.repository == 'zeronsh/zeron'
     uses: ./.github/workflows/cursor-compatibility.yml
 
   linux:
+    if: github.repository == 'zeronsh/zeron'
     strategy:
       fail-fast: false
       matrix:
@@ -64,6 +66,7 @@ jobs:
   #     key (raw .p8 contents), for notarytool. All three present → the package
   #     script notarizes and staples the app + dmg (no Gatekeeper warning).
   macos:
+    if: github.repository == 'zeronsh/zeron'
     runs-on: macos-latest # Apple silicon
     env:
       MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
@@ -116,6 +119,7 @@ jobs:
           if-no-files-found: error
 
   windows:
+    if: github.repository == 'zeronsh/zeron'
     runs-on: windows-2022
     timeout-minutes: 90
     defaults:
@@ -143,7 +147,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: github.repository == 'zeronsh/zeron' && (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
     needs: [cursor-compatibility, linux, macos, windows]
     runs-on: ubuntu-latest
     env:
