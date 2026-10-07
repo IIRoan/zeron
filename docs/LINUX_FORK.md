@@ -58,9 +58,8 @@ Conflicts and failed checks produce diagnostic artifacts for manual repair.
 Review the local result, push with `git push origin main`, and restart with
 `scripts/dev-linux.sh`. The Action needs no additional secret or write deploy
 key; its API token remains read-only. This also handles releases that change
-workflow files, which GitHub's built-in Action token cannot push. Upstream's
-inherited deployment and scheduled workflows are disabled
-in this fork so they do not run against your account.
+workflow files, which GitHub's built-in Action token cannot push. Existing
+upstream CI files are preserved to keep future source merges small.
 
 ## Remote setup on another checkout
 
