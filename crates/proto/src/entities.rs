@@ -775,6 +775,17 @@ pub struct GitFileStatus {
     pub worktree: GitFileState,
 }
 
+impl GitFileStatus {
+    /// All seven porcelain conflict states, including AA and DD which do not
+    /// contain a U in either column.
+    pub fn is_conflicted(&self) -> bool {
+        [self.index, self.worktree].contains(&GitFileState::Unmerged)
+            || matches!((self.index, self.worktree),
+                (GitFileState::Added, GitFileState::Added)
+                | (GitFileState::Deleted, GitFileState::Deleted))
+    }
+}
+
 /// Latest status only: never contains file content or a patch. `complete = false`
 /// means unavailable/partial, not clean. Revision covers only these statuses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -835,6 +846,8 @@ pub struct RepositoryGitBranch {
 pub struct RepositoryGitRemote {
     pub name: String,
     pub url: String,
+    #[serde(default)]
+    pub push_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -851,6 +864,8 @@ pub struct RepositoryGitDetails {
     pub state: RepositoryGitState,
     pub branches: Vec<RepositoryGitBranch>,
     pub remotes: Vec<RepositoryGitRemote>,
+    #[serde(default)]
+    pub publish_remote: Option<String>,
     pub stashes: Vec<RepositoryGitStash>,
     pub incoming: Vec<GitHistoryCommit>,
     pub outgoing: Vec<GitHistoryCommit>,
@@ -876,8 +891,8 @@ pub enum RepositoryGitAction {
     CherryPick { sha: String },
     UndoCommit,
     Stash { message: String, include_untracked: bool },
-    ApplyStash { sha: String },
-    PopStash { sha: String },
+    ApplyStash { sha: String, #[serde(default)] reinstate_staged: bool },
+    PopStash { sha: String, #[serde(default)] reinstate_staged: bool },
     DropStash { sha: String },
     AddRemote { name: String, url: String },
     RemoveRemote { name: String },
@@ -1645,6 +1660,15 @@ pub enum WorkspaceMutationRejection {
 #[cfg(test)]
 mod mutation_contract_tests {
     use super::*;
+    #[test]
+    fn stash_actions_from_older_peers_do_not_reinstate_the_index() {
+        for kind in ["applyStash", "popStash"] {
+            let action: RepositoryGitAction = serde_json::from_value(serde_json::json!({"kind": kind, "sha": "abc"})).unwrap();
+            assert!(matches!(action, RepositoryGitAction::ApplyStash { reinstate_staged: false, .. } | RepositoryGitAction::PopStash { reinstate_staged: false, .. }));
+            let action: RepositoryGitAction = serde_json::from_value(serde_json::json!({"kind": kind, "sha": "abc", "reinstateStaged": true})).unwrap();
+            assert_eq!(serde_json::to_value(action).unwrap()["reinstateStaged"], true);
+        }
+    }
     #[test]
     fn old_peers_remain_readable_without_mutation_support() {
         let page: WorkspaceDirectoryPage = serde_json::from_value(serde_json::json!({

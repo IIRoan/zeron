@@ -4893,16 +4893,8 @@ impl DocHost {
                 if c.status == SessionCommandStatus::Pending
                     && !skipped.contains(&c.id)
                     && is_processed(&c.id)
-                    && !lock(&self.inner.executing).contains(&c.id)
+                    && self.reject_dead_command(handle, &c.id)
                 {
-                    tracing::warn!(chat = %handle.chat_id, command = %c.id,
-                        "command consumed but never resolved (crash mid-execute?); rejecting");
-                    self.resolve_command(
-                        handle,
-                        &c.id,
-                        SessionCommandStatus::Rejected,
-                        Some("interrupted before completion — retry to send again"),
-                    );
                     skipped.insert(c.id.clone());
                 }
             }
@@ -4981,10 +4973,21 @@ impl DocHost {
             }
             // Mark BEFORE executing: a crash mid-execution must never double-run a
             // command whose side effect may already have happened.
-            if let Err(err) = self.inner.store.mark_processed(&entry.id) {
-                tracing::error!(chat = %handle.chat_id, error = %err, "processed-ledger write failed; halting drain");
-                lock(&self.inner.executing).remove(&entry.id);
-                return;
+            match self.inner.store.mark_processed(&entry.id) {
+                Ok(true) => {}
+                Ok(false) => {
+                    // A competing drain may have finished after our snapshot
+                    // was read. Its ledger claim wins even after it releases
+                    // `executing`; never execute the stale entry again.
+                    lock(&self.inner.executing).remove(&entry.id);
+                    skipped.insert(entry.id.clone());
+                    continue;
+                }
+                Err(err) => {
+                    tracing::error!(chat = %handle.chat_id, error = %err, "processed-ledger write failed; halting drain");
+                    lock(&self.inner.executing).remove(&entry.id);
+                    return;
+                }
             }
             match disposition {
                 CommandDisposition::Skip => {
@@ -5139,6 +5142,33 @@ impl DocHost {
         out
     }
 
+    /// Recheck a suspected crash against the live doc while excluding new
+    /// claims. A drain's old Pending snapshot can outlive another drain's
+    /// successful outcome and its removal from `executing`.
+    fn reject_dead_command(&self, handle: &ChatDocHandle, command_id: &str) -> bool {
+        let executing = lock(&self.inner.executing);
+        if executing.contains(command_id) {
+            return false;
+        }
+        let Ok(commands) = handle.doc.read_commands() else {
+            return false;
+        };
+        if !commands.iter().any(|command| {
+            command.id == command_id && command.status == SessionCommandStatus::Pending
+        }) || !self.inner.store.is_processed(command_id).unwrap_or(false) {
+            return false;
+        }
+        tracing::warn!(chat = %handle.chat_id, command = %command_id,
+            "command consumed but never resolved (crash mid-execute?); rejecting");
+        self.resolve_command(
+            handle,
+            command_id,
+            SessionCommandStatus::Rejected,
+            Some("interrupted before completion — retry to send again"),
+        );
+        true
+    }
+
     /// Host-only outcome write (ledger rule 2).
     fn resolve_command(
         &self,
@@ -5188,7 +5218,24 @@ impl DocHost {
                 let worktree_spec = request.worktree.take();
                 let fresh_worktree = match &worktree_spec {
                     Some(spec) => {
-                        let (cwd, fresh) = self.materialize_worktree(chat_id, &spec).await?;
+                        let (cwd, fresh) = match self.materialize_worktree(chat_id, &spec).await {
+                            Ok(worktree) => worktree,
+                            Err(error) => {
+                                if spec.space_id.is_some()
+                                    && let Some((actions, _)) = self.inner.project_action_runtime.get()
+                                {
+                                    actions.complete_setup_handoff(
+                                        &entry.id,
+                                        chat_id,
+                                        ProjectActionSetupHandoff {
+                                            setup_action: None,
+                                            setup_error: Some(error.to_string()),
+                                        },
+                                    );
+                                }
+                                return Err(error);
+                            }
+                        };
                         request.cwd = cwd;
                         fresh
                     }
@@ -5527,6 +5574,10 @@ impl DocHost {
         request: zeron_proto::RunRequest,
         message_id: Option<String>,
     ) -> Result<String, EngineError> {
+        if let Some(repos)=self.inner.repos.get()
+            && let Some(root)=crate::workspace_host::linked_worktree_root(std::path::Path::new(&request.cwd)) {
+            repos.worktree_settings().prepare(std::path::Path::new(&root),std::path::Path::new(&request.cwd),false).await?;
+        }
         if let Some(workspace) = self.workspace()
             && let Some(context) = self.capture_source_context(&request.cwd).await
             && let Err(err) = workspace.set_chat_source_context(chat_id, &context)
@@ -5626,6 +5677,10 @@ impl DocHost {
             return Err(EngineError::Other(
                 "Project path does not match worktree repository".into(),
             ));
+        }
+        if let Some(repos) = self.inner.repos.get()
+            && !repos.worktree_settings().effective(&project_root,std::path::Path::new(&worktree.path))?.setup_command.trim().is_empty() {
+            return Ok(ProjectActionSetupHandoff { setup_action: None, setup_error: None });
         }
         // The store keys configuration by the original Space path, which may
         // be a symlink. Keep canonical paths for validation and execution only.
@@ -5788,6 +5843,60 @@ fn encode_part_segment(part_id: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod command_sweep_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stale_pending_snapshot_cannot_reject_a_completed_or_live_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let host = DocHost::new(store.clone(), DocHostConfig {
+            device_id: "host".into(), default_harness: HarnessId::Mock, edge: None,
+        });
+        let handle = host.open_local("sweep-race").unwrap();
+        handle.doc.queue_command(&SessionCommandEntry {
+            id: "answer".into(),
+            payload: SessionCommandPayload::RespondInput { request_id: "question".into(), answers: vec![] },
+            issued_by: "viewer".into(), issued_at: now_ms(), based_on: None, expires_at: None,
+            status: SessionCommandStatus::Pending, resolution: None,
+        }).unwrap();
+        let stale = handle.doc.read_commands().unwrap().remove(0);
+        assert!(store.mark_processed(&stale.id).unwrap());
+        lock(&host.inner.executing).insert(stale.id.clone());
+        assert!(!host.reject_dead_command(&handle, &stale.id), "Live commands must not be swept");
+        host.resolve_command(&handle, &stale.id, SessionCommandStatus::Applied, None);
+        lock(&host.inner.executing).remove(&stale.id);
+        assert!(!host.reject_dead_command(&handle, &stale.id), "A stale Pending snapshot must not overwrite a completed answer");
+        assert_eq!(handle.doc.read_commands().unwrap()[0].status, SessionCommandStatus::Applied);
+        assert!(!store.mark_processed(&stale.id).unwrap(), "A later drain must respect the winning ledger claim");
+        host.shutdown_workers().await;
+    }
+
+    #[tokio::test]
+    async fn genuinely_unresolved_processed_commands_still_reject_for_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let host = DocHost::new(store.clone(), DocHostConfig {
+            device_id: "host".into(), default_harness: HarnessId::Mock, edge: None,
+        });
+        let handle = host.open_local("crashed-command").unwrap();
+        handle.doc.queue_command(&SessionCommandEntry {
+            id: "dead".into(),
+            payload: SessionCommandPayload::RespondInput { request_id: "question".into(), answers: vec![] },
+            issued_by: "viewer".into(), issued_at: now_ms(), based_on: None, expires_at: None,
+            status: SessionCommandStatus::Pending, resolution: None,
+        }).unwrap();
+        assert!(!host.reject_dead_command(&handle, "dead"), "Unprocessed commands are still eligible to execute");
+        assert!(store.mark_processed("dead").unwrap());
+        assert!(host.reject_dead_command(&handle, "dead"));
+        let command = handle.doc.read_commands().unwrap().remove(0);
+        assert_eq!(command.status, SessionCommandStatus::Rejected);
+        assert_eq!(command.resolution.as_deref(), Some("interrupted before completion — retry to send again"));
+        host.shutdown_workers().await;
+    }
 }
 
 #[cfg(test)]

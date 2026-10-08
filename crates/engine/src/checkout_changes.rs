@@ -171,6 +171,42 @@ pub async fn list(root: &Path) -> Result<CheckoutChanges, EngineError> {
 /// File lists come from the current porcelain status. Literal, NUL-separated
 /// pathspecs handle renames, wildcard names and large stage-all selections.
 pub async fn set_staged(root: &Path, paths: &[String], staged: bool) -> Result<(), EngineError> {
+    set_staged_checked(root, paths, staged, false).await
+}
+
+/// Read only conflicted regular files. Never follow a symlink or load an
+/// unbounded file into memory. Deleted conflicts have no text to inspect.
+pub async fn conflict_markers(root: &Path, paths: &[String]) -> Result<Vec<String>, EngineError> {
+    let (files, complete) = status(root).await?;
+    if !complete { return Err(EngineError::Other("Git status is incomplete; refresh before staging".into())); }
+    let mut result = Vec::new();
+    for path in paths {
+        relative(path)?;
+        let Some(file) = files.iter().find(|file| &file.path == path) else { return Err(EngineError::Other("File changes have moved; refresh the list".into())); };
+        if !file.is_conflicted() { continue; }
+        let location = crate::checkout_discard::validate_path(root, path).await?;
+        let metadata = match tokio::fs::symlink_metadata(&location).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.is_file() || metadata.file_type().is_symlink() { continue; }
+        if metadata.len() > LIMIT as u64 {
+            return Err(EngineError::Other("Conflicted file is too large to check; resolve and stage it with Git".into()));
+        }
+        let mut bytes = Vec::new();
+        let mut options = tokio::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)] options.custom_flags(libc::O_NOFOLLOW);
+        options.open(&location).await?.take(LIMIT as u64 + 1).read_to_end(&mut bytes).await?;
+        if bytes.len() > LIMIT { return Err(EngineError::Other("Conflicted file grew while checking; try again".into())); }
+        if bytes.split(|b| *b == b'\n').any(|line| line.starts_with(b"<<<<<<<")) { result.push(path.clone()); }
+    }
+    result.sort(); result.dedup();
+    Ok(result)
+}
+
+pub async fn set_staged_checked(root: &Path, paths: &[String], staged: bool, allow_conflict_markers: bool) -> Result<(), EngineError> {
     if paths.is_empty() {
         return Ok(());
     }
@@ -179,6 +215,12 @@ pub async fn set_staged(root: &Path, paths: &[String], staged: bool) -> Result<(
         return Err(EngineError::Other(
             "Git status is incomplete; refresh before staging".into(),
         ));
+    }
+    if staged && !allow_conflict_markers
+        && files.iter().any(|file| file.is_conflicted() && paths.contains(&file.path))
+        && !conflict_markers(root, paths).await?.is_empty()
+    {
+        return Err(EngineError::Other("Files still contain merge conflict markers; review them before staging".into()));
     }
     let mut arguments = Vec::new();
     for path in paths {
@@ -249,6 +291,32 @@ pub async fn commit_staged(root: &Path, message: &str) -> Result<(), EngineError
     commit(root, message, false, None).await
 }
 
+/// VS Code's suggested smart commit stages only after the user confirms.
+/// Validate the captured checkout before touching its index, including unborn branches.
+pub async fn commit_with_staging(
+    root: &Path,
+    message: &str,
+    amend: bool,
+    expected_head: Option<&str>,
+    expected_branch: Option<&str>,
+    paths: &[String],
+) -> Result<(), EngineError> {
+    if message.trim().is_empty() || message.len() > 32 * 1024 || message.contains('\0') {
+        return Err(EngineError::Other("Enter a valid commit message".into()));
+    }
+    let state = crate::checkout_git::state(root).await?;
+    if (expected_head.is_some() || expected_branch.is_some())
+        && (state.head.as_deref() != expected_head || expected_branch.is_some_and(|branch| state.branch.as_deref() != Some(branch)))
+    {
+        return Err(EngineError::Other("The branch changed; review changes before committing".into()));
+    }
+    if state.conflicts > 0 {
+        return Err(EngineError::Other("Resolve and stage all conflicts before committing".into()));
+    }
+    if !paths.is_empty() { set_staged(root, paths, true).await?; }
+    commit(root, message, amend, expected_head).await
+}
+
 pub async fn commit(
     root: &Path,
     message: &str,
@@ -268,6 +336,9 @@ pub async fn commit(
         return Err(EngineError::Other(
             "Git status is incomplete; refresh before committing".into(),
         ));
+    }
+    if files.iter().any(GitFileStatus::is_conflicted) {
+        return Err(EngineError::Other("Resolve and stage all conflicts before committing".into()));
     }
     if expected_head.is_some() || amend {
         let state = crate::checkout_git::state(root).await?;
@@ -504,6 +575,59 @@ mod tests {
                 root.join("hooks").to_str().unwrap(),
             ],
         );
+    }
+
+    #[tokio::test]
+    async fn smart_commit_checks_the_branch_before_staging_and_supports_initial_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        run(root, &["init", "-q", "-b", "main"]);
+        configure_commit(root);
+        std::fs::write(root.join("file.txt"), "initial\n").unwrap();
+        let paths = vec!["file.txt".into()];
+        assert!(commit_with_staging(root, "Initial", false, None, Some("other"), &paths).await.is_err());
+        assert_eq!(run(root, &["ls-files"]), "");
+        assert!(commit_with_staging(root, " ", false, None, Some("main"), &paths).await.is_err());
+        assert_eq!(run(root, &["ls-files"]), "");
+        commit_with_staging(root, "Initial", false, None, Some("main"), &paths).await.unwrap();
+        let head = run(root, &["rev-parse", "HEAD"]);
+        std::fs::write(root.join("file.txt"), "working\n").unwrap();
+        run(root, &["switch", "-qc", "other"]);
+        assert!(commit_with_staging(root, "Next", false, Some(head.trim()), Some("main"), &paths).await.is_err());
+        assert_eq!(run(root, &["diff", "--cached", "--name-only"]), "");
+        assert_eq!(std::fs::read_to_string(root.join("file.txt")).unwrap(), "working\n");
+        // Older peers send expectedHead without the optional branch field.
+        commit_with_staging(root, "Legacy peer", false, Some(head.trim()), None, &paths).await.unwrap();
+        assert_eq!(run(root, &["show", "HEAD:file.txt"]), "working\n");
+    }
+
+    #[tokio::test]
+    async fn conflicted_staging_requires_confirmation_without_partially_staging_other_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        run(root, &["init", "-q", "-b", "main"]);
+        configure_commit(root);
+        std::fs::write(root.join("file.txt"), "base\n").unwrap();
+        commit(root);
+        run(root, &["switch", "-qc", "other"]);
+        std::fs::write(root.join("file.txt"), "incoming\n").unwrap();
+        commit(root);
+        run(root, &["switch", "-q", "main"]);
+        std::fs::write(root.join("file.txt"), "current\n").unwrap();
+        commit(root);
+        assert!(!std::process::Command::new("git").arg("-C").arg(root).args(["merge", "other"]).output().unwrap().status.success());
+        std::fs::write(root.join("new.txt"), "untracked\n").unwrap();
+        let paths = vec!["file.txt".into(), "new.txt".into()];
+        assert_eq!(conflict_markers(root, &paths).await.unwrap(), ["file.txt"]);
+        assert!(set_staged(root, &paths, true).await.is_err());
+        assert!(!run(root, &["ls-files"]).contains("new.txt"));
+        assert!(super::commit(root, "Conflict", false, None).await.unwrap_err().to_string().contains("conflicts"));
+        std::fs::write(root.join("file.txt"), "resolved\n").unwrap();
+        assert!(conflict_markers(root, &paths).await.unwrap().is_empty());
+        set_staged(root, &paths, true).await.unwrap();
+        assert_eq!(crate::checkout_git::state(root).await.unwrap().conflicts, 0);
+        super::commit(root, "Resolved", false, None).await.unwrap();
+        assert_eq!(run(root, &["show", "HEAD:file.txt"]), "resolved\n");
     }
 
     #[tokio::test]

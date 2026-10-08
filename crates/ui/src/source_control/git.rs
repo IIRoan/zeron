@@ -6,6 +6,34 @@ use zeron_proto::{
 mod dialog;
 pub(super) use dialog::ConfirmationDialog;
 
+fn action_label(action: &Action) -> &'static str {
+    match action {
+        Action::Fetch => "Fetching changes…",
+        Action::Pull { .. } => "Pulling changes…",
+        Action::Push => "Pushing commits…",
+        Action::Publish { .. } => "Publishing branch…",
+        Action::Sync => "Syncing changes…",
+        Action::SwitchBranch { .. } => "Switching branch…",
+        Action::CreateBranch { .. } => "Creating branch…",
+        Action::RenameBranch { .. } => "Renaming branch…",
+        Action::DeleteBranch { .. } => "Deleting branch…",
+        Action::Merge { .. } => "Merging branch…",
+        Action::Rebase { .. } => "Rebasing branch…",
+        Action::RevertCommit { .. } => "Reverting commit…",
+        Action::CherryPick { .. } => "Cherry-picking commit…",
+        Action::UndoCommit => "Undoing last commit…",
+        Action::Stash { .. } => "Stashing changes…",
+        Action::ApplyStash { .. } => "Applying stash…",
+        Action::PopStash { .. } => "Popping stash…",
+        Action::DropStash { .. } => "Dropping stash…",
+        Action::AddRemote { .. } => "Adding remote…",
+        Action::RemoveRemote { .. } => "Removing remote…",
+        Action::Continue => "Continuing Git operation…",
+        Action::Abort => "Aborting Git operation…",
+        Action::ResolveConflict { .. } => "Resolving conflict…",
+    }
+}
+
 #[derive(IntoElement)]
 struct GitDropdown {
     id: SharedString,
@@ -174,6 +202,8 @@ pub(super) enum GitPanel {
     Stashes,
     Remotes,
     History,
+    CommitPublish,
+    Sort,
 }
 #[derive(Clone)]
 pub(super) enum GitForm {
@@ -183,19 +213,21 @@ pub(super) enum GitForm {
     AddRemote,
 }
 #[derive(Clone)]
-enum Command {
+pub(super) enum Command {
     Git(Action),
     Discard(CheckoutDiscardPreview),
+    StageAndCommit(Vec<String>),
+    StageConflicts(Vec<String>),
 }
 #[derive(Clone)]
 pub(super) struct Confirmation {
-    target: Target,
-    repository: String,
-    head: Option<String>,
-    branch: Option<String>,
-    title: String,
-    body: String,
-    command: Command,
+    pub(super) target: Target,
+    pub(super) repository: String,
+    pub(super) head: Option<String>,
+    pub(super) branch: Option<String>,
+    pub(super) title: String,
+    pub(super) body: String,
+    pub(super) command: Command,
 }
 #[derive(Clone)]
 pub(super) struct UndoDiscard {
@@ -277,7 +309,7 @@ impl SourceControl {
                 serde_json::json!({ "cwd": target.cwd, "targetDeviceId": target.device, "repository": repository })).await;
             this.update(cx, |view, cx| {
                 if view.details_key.as_ref() != Some(&key) { return; }
-                match result { Ok(details) => view.git_details = Some(details), Err(error) => view.error = Some(format!("Unable to load Git details: {error}").into()) }
+                match result { Ok(details) => view.git_details = Some(details), Err(error) => view.notify_error(&repository, format!("Unable to load Git details: {error}"), cx) }
                 cx.notify();
             }).ok();
         }));
@@ -289,11 +321,7 @@ impl SourceControl {
         }
         let head = self.git_state().and_then(|s| s.head.clone());
         let branch = self.git_state().and_then(|s| s.branch.clone());
-        let label = if matches!(action, Action::Sync) {
-            "Syncing changes…"
-        } else {
-            "Running Git action…"
-        };
+        let label = action_label(&action);
         self.dispatch(
             methods::RUN_CHECKOUT_GIT_ACTION,
             serde_json::json!({ "action": action, "expectedHead": head, "expectedBranch": branch }),
@@ -318,6 +346,7 @@ impl SourceControl {
             return;
         };
         let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.notify_error(&self.active_repository.clone(), "Repository is unavailable", cx);
             return;
         };
         let repository = self.active_repository.clone();
@@ -337,12 +366,29 @@ impl SourceControl {
         self.details_key = None;
         self.mutation_epoch += 1;
         let epoch = self.mutation_epoch;
+        let notification = self.begin_notification(&repository, label, cx);
+        let notified = notification.is_some();
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = engine.client().call(method, params).await;
+            let outcome: Result<SharedString, SharedString> = match &result {
+                Err(error) => Err(SharedString::from(format!("{error}"))),
+                Ok(value) if method == methods::DISCARD_CHECKOUT_CHANGES => {
+                    Ok(serde_json::from_value::<CheckoutDiscardResult>(value.clone())
+                        .map(|result| format!("Discarded changes in {} {}", result.file_count, if result.file_count == 1 { "file" } else { "files" }).into())
+                        .unwrap_or_else(|_| "Changes discarded".into()))
+                }
+                Ok(_) if method == methods::RESTORE_CHECKOUT_DISCARD => Ok("Discarded files restored".into()),
+                Ok(value) => Ok(value.get("notice").and_then(|v| v.as_str())
+                    .unwrap_or("Git action completed").to_owned().into()),
+            };
             this.update(cx, |view, cx| {
                 if view.target.as_ref() != Some(&target) {
                     return;
+                }
+                if let Ok(message) = &outcome {
+                    if notified { view.notice = Some(message.clone()); }
+                    else { view.notify_success(&repository, message.clone(), cx); }
                 }
                 match &result {
                     Ok(value) => {
@@ -350,8 +396,6 @@ impl SourceControl {
                             if let Ok(result) =
                                 serde_json::from_value::<CheckoutDiscardResult>(value.clone())
                             {
-                                view.notice =
-                                    Some(format!("Discarded {} file(s)", result.file_count).into());
                                 view.undo_discard = Some(UndoDiscard {
                                     target: target.clone(),
                                     repository: repository.clone(),
@@ -360,11 +404,9 @@ impl SourceControl {
                             }
                         } else if method == methods::RESTORE_CHECKOUT_DISCARD {
                             view.undo_discard = None;
-                            view.notice = Some("Discarded files restored".into());
                         } else if let Ok(result) =
                             serde_json::from_value::<RepositoryGitActionResult>(value.clone())
                         {
-                            view.notice = Some(result.notice.into());
                             if let Some(text) = result.commit_message
                                 && view.active_repository == repository
                                 && view.commit_input.read(cx).text() == message
@@ -396,6 +438,12 @@ impl SourceControl {
                     serde_json::json!({ "cwd": target.cwd, "targetDeviceId": target.device }),
                 )
                 .await;
+            let feedback = match (&outcome, &refreshed) {
+                (Ok(message), Err(error)) => Err(SharedString::from(format!("{message}. Unable to refresh changes: {error}"))),
+                _ => outcome.clone(),
+            };
+            // Finish independently of the view, including refresh failures.
+            if let Some(notification) = notification { notification.finish(feedback, cx); }
             this.update(cx, |view, cx| {
                 if view.target.as_ref() != Some(&target) || view.mutation_epoch != epoch {
                     return;
@@ -434,6 +482,7 @@ impl SourceControl {
             return;
         };
         let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.notify_error(&repository, "Repository is unavailable", cx);
             return;
         };
         self.close_actions_menu(cx);
@@ -444,10 +493,19 @@ impl SourceControl {
         self.mutation_epoch += 1;
         self.git_panel = None;
         self.git_form = None;
+        self.details_task = None;
+        self.details_key = None;
+        let notification = self.begin_notification(&repository, "Checking changes to discard…", cx);
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = engine.client().call_as::<CheckoutDiscardPreview>(methods::PREVIEW_CHECKOUT_DISCARD,
                 serde_json::json!({ "cwd": target.cwd, "targetDeviceId": target.device, "repository": repository, "paths": paths, "includeStaged": include_staged })).await;
+            if let Some(notification) = notification {
+                match &result {
+                    Ok(_) => notification.dismiss(cx),
+                    Err(error) => notification.finish(Err(format!("Unable to discard changes: {error}").into()), cx),
+                }
+            }
             this.update(cx, |view, cx| {
                 if view.target.as_ref() != Some(&target) { return; }
                 view.busy = false;
@@ -479,7 +537,7 @@ impl SourceControl {
             .files
             .iter()
             .filter(|f| {
-                !repo.submodules.contains(&f.path) && (include_staged || in_group(f, false))
+                !repo.submodules.contains(&f.path) && !f.is_conflicted() && (include_staged || in_group(f, false))
             })
             .map(|f| f.path.clone())
             .collect();
@@ -525,18 +583,32 @@ impl SourceControl {
             return;
         }
         match confirmation.command {
+            Command::StageConflicts(paths) => {
+                if self.git_state().is_none_or(|state| state.head != confirmation.head || state.branch != confirmation.branch) {
+                    self.notify_error(&confirmation.repository, "The branch changed; review conflicts before staging", cx);
+                    return;
+                }
+                self.set_staged_checked(confirmation.repository, paths, true, true, cx);
+            }
+            Command::StageAndCommit(paths) => {
+                if self.git_state().is_none_or(|state| state.head != confirmation.head || state.branch != confirmation.branch) {
+                    self.notify_error(&confirmation.repository, "The branch changed; review changes before committing", cx);
+                    return;
+                }
+                self.commit_with_paths(paths, cx);
+            }
             Command::Discard(preview) => self.dispatch(
                 methods::DISCARD_CHECKOUT_CHANGES,
                 serde_json::json!({ "preview": preview }),
                 "Discarding changes…",
                 cx,
             ),
-            Command::Git(action) => self.dispatch(
-                methods::RUN_CHECKOUT_GIT_ACTION,
-                serde_json::json!({ "action": action, "expectedHead": confirmation.head, "expectedBranch": confirmation.branch }),
-                "Running Git action…",
-                cx,
-            ),
+            Command::Git(action) => {
+                let label = action_label(&action);
+                self.dispatch(methods::RUN_CHECKOUT_GIT_ACTION,
+                    serde_json::json!({ "action": action, "expectedHead": confirmation.head, "expectedBranch": confirmation.branch }),
+                    label, cx);
+            }
         }
     }
 
@@ -554,10 +626,12 @@ impl SourceControl {
         if !self.git_enabled() {
             return;
         }
+        if matches!(panel, GitPanel::Branches | GitPanel::History | GitPanel::Remotes | GitPanel::CommitPublish) {
+            self.details_key = None;
+        }
         self.git_panel = Some(panel);
         self.actions_menu.open(());
         self.git_form = None;
-        self.details_key = None;
         cx.notify();
     }
     pub(super) fn start_form(
@@ -638,28 +712,10 @@ impl SourceControl {
         }
         self.git_panel = None;
         self.close_actions_menu(cx);
+        self.notify_success(&self.active_repository.clone(), if self.amend {
+            "Amend enabled. The next commit will update the last commit."
+        } else { "Amend disabled. The next commit will create a new commit." }, cx);
         cx.notify();
-    }
-
-    pub(super) fn render_git_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = Theme::of(cx).clone();
-        let operation = self.git_state().and_then(|s| s.operation.as_ref());
-        if self.operation_label.is_none() && operation.is_none() && !self.amend {
-            return gpui::Empty.into_any_element();
-        }
-        div()
-            .px(px(12.0))
-            .py(px(5.0))
-            .text_size(px(12.0))
-            .text_color(theme.text_muted)
-            .when_some(self.operation_label.clone(), |el, label| el.child(label))
-            .when_some(operation.cloned(), |el, operation| {
-                el.child(SharedString::from(format!(
-                    "{operation} in progress · resolve and stage conflicts"
-                )))
-            })
-            .when(self.amend, |el| el.child("Amending last commit"))
-            .into_any_element()
     }
 
     pub(super) fn close_actions_menu(&mut self, cx: &mut Context<Self>) {
@@ -737,7 +793,6 @@ impl SourceControl {
                     this.git_panel = Some(GitPanel::Actions);
                     this.git_form = None;
                     this.actions_menu.open(());
-                    this.details_key = None;
                     cx.notify();
                 }
             }));
@@ -830,30 +885,41 @@ impl SourceControl {
                 .map(|h| h[..7.min(h.len())].into())
                 .unwrap_or_else(|| "No commits".into())
         });
+        let issue = self.error.clone().or(self.load_error.clone());
+        let context = issue.as_ref().map(|message| message.to_string())
+            .or_else(|| state.operation.as_ref().map(|operation| format!("{operation} in progress. Resolve and stage conflicts, then Continue or Abort from More Actions.")))
+            .or_else(|| (state.conflicts > 0).then(|| "Resolve and stage conflicts before continuing.".into()))
+            .or_else(|| self.amend.then(|| "Amend enabled. The next commit will update the last commit.".into()))
+            .unwrap_or_else(|| branch.clone());
+        let status_icon = if issue.is_some() { icons::DANGER_TRIANGLE } else { icons::VSC_BRANCH };
+        let status_color = if issue.is_some() { theme.danger } else if state.operation.is_some() || state.conflicts > 0 || self.amend { theme.warning } else { theme.text_muted };
+        let branch = if self.amend { format!("{branch} · amend") } else if let Some(operation) = &state.operation { format!("{branch} · {operation}") } else { branch };
         let published = state.upstream.is_some();
-        let enabled = self.can_sync();
+        let enabled = if published { self.can_sync() } else { self.git_enabled() && state.head.is_some() && state.branch.is_some() };
         let syncing = self.operation_label.as_deref() == Some("Syncing changes…");
         let label = match (state.behind, state.ahead) {
             (Some(behind), Some(ahead)) if published => format!("{behind}↓ {ahead}↑"),
-            _ => "Not published".into(),
+            _ => "Publish Branch".into(),
         };
         let tooltip = if syncing {
             "Syncing incoming and outgoing commits…".into()
         } else if !published {
-            "Publish this branch from More Actions to sync changes".into()
+            "Publish Branch to a remote and set its upstream".into()
         } else if state.conflicts > 0 || state.operation.is_some() {
             "Resolve the current Git operation before syncing changes".into()
         } else {
             format!(
                 "Sync Changes ({} incoming, {} outgoing)",
-                state.behind.unwrap_or(0), state.ahead.unwrap_or(0)
+                state.behind.unwrap_or(0),
+                state.ahead.unwrap_or(0)
             )
         };
         let icon = icons::icon(icons::VSC_SYNC)
             .size(px(14.0))
             .text_color(theme.text_muted);
         let icon = if syncing {
-            let phase = crate::motion::pulse_delta(&crate::motion::GRADIENT_SPIN, cx.entity_id(), cx);
+            let phase =
+                crate::motion::pulse_delta(&crate::motion::GRADIENT_SPIN, cx.entity_id(), cx);
             icon.with_transformation(gpui::Transformation::rotate(gpui::percentage(phase)))
         } else {
             icon
@@ -871,15 +937,20 @@ impl SourceControl {
             .text_size(px(12.0))
             .text_color(theme.text_muted)
             .child(
-                icons::icon(icons::VSC_BRANCH)
+                icons::icon(status_icon)
                     .size(px(14.0))
-                    .text_color(theme.text_muted),
+                    .text_color(status_color),
             )
             .child(
                 div()
+                    .id("git-status-branch")
+                    .debug_selector(|| "git-status-branch".into())
                     .flex_1()
                     .min_w_0()
                     .truncate()
+                    .tooltip(crate::settings::widgets::text_tooltip(context))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| this.open_git_panel(GitPanel::Branches, cx)))
                     .child(SharedString::from(branch)),
             )
             .child(
@@ -897,19 +968,22 @@ impl SourceControl {
                     .when(published, |el| el.child(icon))
                     .child(SharedString::from(label))
                     .when(enabled, |el| {
-                        el.cursor_pointer().hover(|style| style.bg(theme.glass_hover()))
+                        el.cursor_pointer()
+                            .hover(|style| style.bg(theme.glass_hover()))
                     })
                     .when(!enabled, |el| el.opacity(0.5))
                     .on_click(cx.listener(|this, _, _, cx| {
                         if this.can_sync() {
                             this.run_git(Action::Sync, cx);
+                        } else if this.git_state().is_some_and(|state| state.upstream.is_none() && state.head.is_some() && state.branch.is_some()) {
+                            this.publish_branch(cx);
                         }
                     })),
             )
             .into_any_element()
     }
 
-    fn can_sync(&self) -> bool {
+    pub(super) fn can_sync(&self) -> bool {
         self.git_enabled()
             && self.git_state().is_some_and(|state| {
                 state.upstream.is_some()
@@ -921,13 +995,61 @@ impl SourceControl {
     }
 
     pub(super) fn commit_with_followup(&mut self, action: Option<Action>, cx: &mut Context<Self>) {
-        if !self.can_commit(cx) {
+        if !self.can_request_commit(cx) {
             return;
         }
         self.close_commit_menu(cx);
         self.close_actions_menu(cx);
+        self.commit_primary = match &action {
+            Some(Action::Publish { .. }) => Some(Action::Push),
+            _ => action.clone(),
+        };
+        let action = if matches!(action, Some(Action::Push | Action::Sync))
+            && self
+                .git_state()
+                .is_some_and(|state| state.upstream.is_none())
+        {
+            let Some(details) = &self.git_details else {
+                self.notify_error(&self.active_repository.clone(), "Loading remotes; try Commit & Push again shortly", cx);
+                self.details_key = None;
+                self.ensure_git_details(cx);
+                cx.notify();
+                return;
+            };
+            if details.state.branch.is_none() {
+                self.notify_error(&self.active_repository.clone(), "Switch to a branch before committing and pushing", cx);
+                cx.notify();
+                return;
+            }
+            if let Some(remote) = &details.publish_remote {
+                Some(Action::Publish {
+                    remote: remote.clone(),
+                })
+            } else {
+                self.open_git_panel(GitPanel::CommitPublish, cx);
+                return;
+            }
+        } else {
+            action
+        };
         self.commit_followup = action;
-        self.commit_staged(cx);
+        if self.staged_count() == 0 && !self.amend {
+            let Some(target) = self.target.clone() else { return; };
+            let paths: Vec<_> = self.snapshot.as_ref().into_iter().flat_map(|s| &s.repositories)
+                .filter(|repo| repo.path == self.active_repository).flat_map(|repo| &repo.files)
+                .filter(|file| !file.is_conflicted()).map(|file| file.path.clone()).collect();
+            self.confirmation = Some(Confirmation {
+                target, repository: self.active_repository.clone(),
+                head: self.git_state().and_then(|state| state.head.clone()),
+                branch: self.git_state().and_then(|state| state.branch.clone()),
+                title: "Stage all changes and commit?".into(),
+                body: format!("There are no staged changes. Stage all {} changed files in this repository and commit them with your message? Submodule contents stay in their own repository.", paths.len()),
+                command: Command::StageAndCommit(paths),
+            });
+            cx.notify();
+        } else {
+            self.commit_staged(cx);
+        }
     }
 
     pub(super) fn render_commit_button(
@@ -937,6 +1059,22 @@ impl SourceControl {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = Theme::of(cx).clone();
+        let primary = self.primary_action();
+        let label = match primary {
+            super::interaction::PrimaryAction::Continue => "Continue",
+            super::interaction::PrimaryAction::Publish => "Publish Branch",
+            super::interaction::PrimaryAction::Sync => "Sync Changes",
+            _ if committing => "Committing…",
+            _ if self.amend => "Commit (Amend)",
+            _ if matches!(self.commit_primary, Some(Action::Push)) => if self.git_state().is_some_and(|s| s.upstream.is_none()) { "Commit & Publish" } else { "Commit & Push" },
+            _ if matches!(self.commit_primary, Some(Action::Sync)) => "Commit & Sync",
+            _ => "Commit",
+        };
+        let primary_icon = match primary {
+            super::interaction::PrimaryAction::Publish => icons::VSC_PUBLISH,
+            super::interaction::PrimaryAction::Sync => icons::VSC_SYNC,
+            _ => icons::VSC_CHECK,
+        };
         let foreground = if enabled {
             theme.on_solid
         } else {
@@ -969,28 +1107,24 @@ impl SourceControl {
                     .text_size(px(13.0))
                     .text_color(foreground)
                     .role(gpui::Role::Button)
-                    .aria_label("Commit staged changes")
+                    .aria_label(label)
                     .when(enabled, |el| {
                         el.cursor_pointer()
                             .hover(|s| s.bg(foreground.opacity(0.08)))
                     })
                     .when(!enabled, |el| el.opacity(0.45))
                     .tooltip(crate::settings::widgets::text_tooltip(
-                        "Commit staged changes (Ctrl+Enter)",
+                        label,
                     ))
-                    .on_click(cx.listener(|this, _, _, cx| this.commit_with_followup(None, cx)))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.run_primary_action(cx)
+                    }))
                     .child(
-                        icons::icon(icons::VSC_CHECK)
+                        icons::icon(primary_icon)
                             .size(px(16.0))
                             .text_color(foreground),
                     )
-                    .child(if committing {
-                        "Committing…"
-                    } else if self.amend {
-                        "Commit (Amend)"
-                    } else {
-                        "Commit"
-                    }),
+                    .child(label),
             )
             .child(dropdown)
             .into_any_element()
@@ -1045,7 +1179,7 @@ impl SourceControl {
                     .text_color(foreground),
             );
         if self.commit_menu.get().is_some() {
-            let can_commit = self.can_commit(cx);
+            let can_commit = self.can_request_commit(cx);
             let card = popover::popover_card(&theme.for_popup())
                 .id("git-commit-menu-card")
                 .rounded(px(4.0))
@@ -1053,12 +1187,12 @@ impl SourceControl {
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_commit_menu(cx)))
                 .on_click(|_, _, cx| cx.stop_propagation());
             let menu = div().flex().flex_col().flex_none()
-                .child(button("git-commit-only", "Commit Staged", can_commit, &theme).on_click(cx.listener(|this, _, _, cx| this.commit_with_followup(None, cx))))
-                .child(button("git-commit-push", "Commit & Push", can_commit, &theme).on_click(cx.listener(|this, _, _, cx| this.commit_with_followup(Some(Action::Push), cx))))
+                .child(button("git-commit-only", "Commit", can_commit, &theme).on_click(cx.listener(|this, _, _, cx| this.commit_with_followup(None, cx))))
+                .child(button("git-commit-push", if self.git_state().is_some_and(|s| s.upstream.is_none()) { "Commit & Publish Branch" } else { "Commit & Push" }, can_commit, &theme).on_click(cx.listener(|this, _, _, cx| this.commit_with_followup(Some(Action::Push), cx))))
                 .child(button("git-commit-sync", "Commit & Sync", can_commit, &theme).on_click(cx.listener(|this, _, _, cx| this.commit_with_followup(Some(Action::Sync), cx))))
                 .child(div().my(px(4.0)).border_b_1().border_color(theme.border))
                 .child(button("git-amend", if self.amend { "Cancel Amend" } else { "Commit (Amend)…" }, enabled, &theme).on_click(cx.listener(|this, _, _, cx| { this.close_commit_menu(cx); this.toggle_amend(cx); })))
-                .child(button("git-undo-commit", "Undo Last Commit…", enabled, &theme).on_click(cx.listener(|this, _, _, cx| { this.close_commit_menu(cx); this.confirm_git(Action::UndoCommit, "Undo last local commit?".into(), "Its changes will remain staged and its message will return to the commit input.".into(), cx); })));
+                .child(button("git-undo-commit", "Undo Last Commit…", enabled, &theme).on_click(cx.listener(|this, _, _, cx| { this.close_commit_menu(cx); this.confirm_git(Action::UndoCommit, "Undo last local commit?".into(), "Your files will be kept and its message will return to the commit input.".into(), cx); })));
             trigger = trigger.child(GitDropdown {
                 id: "git-commit-options".into(),
                 card,
@@ -1116,14 +1250,6 @@ impl SourceControl {
                             .child(self.form_second.clone()),
                     )
                 })
-                .when_some(self.error.clone(), |el, error| {
-                    el.child(
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(theme.danger)
-                            .child(error),
-                    )
-                })
                 .child(
                     div()
                         .flex()
@@ -1165,6 +1291,61 @@ impl SourceControl {
                 )
             });
         match panel {
+            GitPanel::Sort => {
+                for (id, label, order) in [("path", "Path", super::interaction::SortOrder::Path), ("name", "File Name", super::interaction::SortOrder::Name), ("status", "Status", super::interaction::SortOrder::Status)] {
+                    body = body.child(button(format!("git-sort-{id}"), format!("{}{}", if self.sort_order == order { "✓ " } else { "" }, label), enabled, &theme)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.sort_order = order;
+                            this.rebuild();
+                            this.close_actions_menu(cx);
+                            cx.notify();
+                        })));
+                }
+            }
+            GitPanel::CommitPublish => {
+                body = body.child(
+                    div()
+                        .p(px(8.0))
+                        .text_color(theme.text_muted)
+                        .child("Choose a remote to commit and publish this branch:"),
+                );
+                if let Some(details) = &self.git_details {
+                    let remotes = details
+                        .remotes
+                        .iter()
+                        .filter(|r| r.push_url.as_deref() != Some("DISABLED"))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if remotes.is_empty() {
+                        body = body.child(
+                            button("commit-publish-add-remote", "Add Remote…", enabled, &theme)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.start_form(GitForm::AddRemote, window, cx)
+                                })),
+                        );
+                    }
+                    for (index, remote) in remotes.into_iter().enumerate() {
+                        body = body.child(
+                            button(
+                                format!("commit-publish-{index}"),
+                                format!("Commit & Publish to {}", remote.name),
+                                self.can_request_commit(cx),
+                                &theme,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.commit_with_followup(
+                                        Some(Action::Publish {
+                                            remote: remote.name.clone(),
+                                        }),
+                                        cx,
+                                    )
+                                },
+                            )),
+                        );
+                    }
+                }
+            }
             GitPanel::Actions => {
                 for (id, label, action) in [
                     ("git-fetch", "Fetch", Action::Fetch),
@@ -1213,16 +1394,18 @@ impl SourceControl {
                                 enabled && complete && !discard_paths.is_empty(),
                                 &theme,
                             )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if complete && this.git_enabled() {
-                                    this.request_discard(
-                                        discard_repository.clone(),
-                                        discard_paths.clone(),
-                                        false,
-                                        cx,
-                                    );
-                                }
-                            })),
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    if complete && this.git_enabled() {
+                                        this.request_discard(
+                                            discard_repository.clone(),
+                                            discard_paths.clone(),
+                                            false,
+                                            cx,
+                                        );
+                                    }
+                                },
+                            )),
                         );
                     }
                 }
@@ -1235,7 +1418,7 @@ impl SourceControl {
                         }),
                     ),
                 );
-                if self.undo_discard.is_some() {
+                if self.undo_discard.as_ref().is_some_and(|undo| self.target.as_ref() == Some(&undo.target) && self.active_repository == undo.repository) {
                     body = body.child(
                         button("git-undo-discard", "Undo Discard", enabled, &theme)
                             .on_click(cx.listener(|this, _, _, cx| this.undo_discard(cx))),
@@ -1247,7 +1430,8 @@ impl SourceControl {
                 }
                 if let Some(selection) = self.selected.clone()
                     && selection.repository == self.active_repository
-                    && self.git_state().is_some_and(|s| s.conflicts > 0)
+                    && self.snapshot.as_ref().is_some_and(|snapshot| snapshot.repositories.iter()
+                        .any(|repo| repo.path == selection.repository && repo.files.iter().any(|file| file.path == selection.path && file.is_conflicted())))
                 {
                     let current = selection.path.clone();
                     let incoming = current.clone();
@@ -1300,6 +1484,7 @@ impl SourceControl {
                     ),
                     ("stashes", "Stashes…", GitPanel::Stashes),
                     ("remotes", "Remotes / Publish Branch…", GitPanel::Remotes),
+                    ("sort", "Sort Changes By…", GitPanel::Sort),
                 ] {
                     body = body.child(button(id, label, enabled, &theme).on_click(
                         cx.listener(move |this, _, _, cx| this.open_git_panel(panel.clone(), cx)),
@@ -1307,7 +1492,7 @@ impl SourceControl {
                 }
                 body = body
                     .child(button("git-amend", "Amend Last Commit…", enabled, &theme).on_click(cx.listener(|this, _, _, cx| this.toggle_amend(cx))))
-                    .child(button("git-undo-commit", "Undo Last Commit…", enabled, &theme).on_click(cx.listener(|this, _, _, cx| this.confirm_git(Action::UndoCommit, "Undo last local commit?".into(), "Its changes will remain staged and its message will return to the commit input. Git keeps a recovery reference.".into(), cx))))
+                    .child(button("git-undo-commit", "Undo Last Commit…", enabled, &theme).on_click(cx.listener(|this, _, _, cx| this.confirm_git(Action::UndoCommit, "Undo last local commit?".into(), "Your files will be kept and its message will return to the commit input. Git keeps a recovery reference.".into(), cx))))
                     .child(button("git-pull-merge", "Pull (Merge)", enabled, &theme).on_click(cx.listener(|this, _, _, cx| this.run_git(Action::Pull { rebase: Some(false) }, cx))))
                     .child(button("git-pull-rebase", "Pull (Rebase)", enabled, &theme).on_click(cx.listener(|this, _, _, cx| this.run_git(Action::Pull { rebase: Some(true) }, cx))))
                     .child(button("git-discard-everything", "Discard Staged and Unstaged Changes…", enabled, &theme).text_color(theme.danger).on_click(cx.listener(|this, _, _, cx| { if this.git_enabled() { this.discard_all(true, cx); } })))
@@ -1368,28 +1553,21 @@ impl SourceControl {
                             this.start_form(GitForm::Stash(true), window, cx)
                         })),
                     );
-                if let Some(details) = self.git_details.clone() {
-                    if details.stashes.is_empty() {
-                        body = body.child(
-                            div()
-                                .p(px(8.0))
-                                .text_size(px(11.0))
-                                .text_color(theme.text_faint)
-                                .child("No stashes"),
-                        );
-                    }
-                    for (i, stash) in details.stashes.into_iter().enumerate() {
-                        let apply = stash.sha.clone();
-                        let pop = apply.clone();
-                        let drop = apply.clone();
-                        body = body.child(div().py(px(5.0)).border_b_1().border_color(theme.border).flex().flex_col()
-                            .child(div().text_size(px(11.0)).text_color(theme.text_muted).child(SharedString::from(stash.subject)))
-                            .child(div().flex()
-                                .child(button(format!("git-stash-apply-{i}"), "Apply", enabled, &theme).on_click(cx.listener(move |this, _, _, cx| this.run_git(Action::ApplyStash { sha: apply.clone() }, cx))))
-                                .child(button(format!("git-stash-pop-{i}"), "Pop", enabled, &theme).on_click(cx.listener(move |this, _, _, cx| this.run_git(Action::PopStash { sha: pop.clone() }, cx))))
-                                .child(button(format!("git-stash-drop-{i}"), "Drop…", enabled, &theme).on_click(cx.listener(move |this, _, _, cx| this.confirm_git(Action::DropStash { sha: drop.clone() }, "Delete stash?".into(), "This removes the saved stash without applying it.".into(), cx))))));
-                    }
+                body = body.child(div().my(px(4.0)).border_b_1().border_color(theme.border));
+                for (id, label, command, latest) in [
+                    ("apply-latest", "Apply Latest Stash", super::stash::StashCommand::Apply, true),
+                    ("apply", "Apply Stash…", super::stash::StashCommand::Apply, false),
+                    ("pop-latest", "Pop Latest Stash", super::stash::StashCommand::Pop, true),
+                    ("pop", "Pop Stash…", super::stash::StashCommand::Pop, false),
+                    ("drop", "Drop Stash…", super::stash::StashCommand::Drop, false),
+                ] {
+                    body = body.child(button(format!("git-stash-{id}"), label, enabled, &theme)
+                        .debug_selector(move || format!("git-stash-{id}"))
+                        .on_click(cx.listener(move |this, _, window, cx| this.open_stash_picker(command, latest, window, cx))));
                 }
+                body = body.child(div().my(px(4.0)).border_b_1().border_color(theme.border))
+                    .child(button("git-stash-restore", "Apply Stash & Restore Staging…", enabled, &theme)
+                        .on_click(cx.listener(|this, _, window, cx| this.open_stash_picker(super::stash::StashCommand::Restore, false, window, cx))));
             }
             GitPanel::Remotes => {
                 body = body.child(
@@ -1490,7 +1668,7 @@ impl SourceControl {
                 }
             }
         }
-        if self.git_details.is_none() {
+        if self.git_details.is_none() && matches!(panel, GitPanel::Branches | GitPanel::History | GitPanel::Remotes | GitPanel::CommitPublish) {
             body = body.child(
                 div()
                     .p(px(8.0))

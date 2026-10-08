@@ -19,7 +19,7 @@ impl FileKey {
         }
     }
 
-    fn same_group(&self, other: &Self) -> bool {
+    pub(super) fn same_group(&self, other: &Self) -> bool {
         self.repository == other.repository && self.staged == other.staged
     }
 }
@@ -42,6 +42,7 @@ impl SourceControl {
                 let in_menu = [
                     (this.actions_menu.get().is_some(), &this.actions_menu_bounds),
                     (this.commit_menu.get().is_some(), &this.commit_menu_bounds),
+                    (this.file_menu.get().is_some(), &this.file_menu_bounds),
                 ]
                 .iter()
                 .any(|(open, bounds)| {
@@ -60,7 +61,7 @@ impl SourceControl {
             .into_any_element()
     }
 
-    fn visible_file_keys(&self) -> Vec<FileKey> {
+    pub(super) fn visible_file_keys(&self) -> Vec<FileKey> {
         let Some(snapshot) = &self.snapshot else {
             return Vec::new();
         };
@@ -96,11 +97,12 @@ impl SourceControl {
     }
 
     pub(super) fn select_files(&mut self, key: FileKey, extend: bool, toggle: bool) {
-        // Git stages one repository and one side of its index at a time.
+        // Keep the repository's input/draft active. Mixed index/worktree
+        // selections are allowed; each resource action filters its own side.
         if self
             .selected_files
             .iter()
-            .any(|selected| !selected.same_group(&key))
+            .any(|selected| selected.repository != key.repository)
         {
             self.selected_files.clear();
             self.selection_anchor = None;
@@ -110,7 +112,7 @@ impl SourceControl {
             let range = self
                 .selection_anchor
                 .as_ref()
-                .filter(|anchor| anchor.same_group(&key))
+                .filter(|anchor| anchor.repository == key.repository)
                 .and_then(|anchor| {
                     Some((
                         rows.iter().position(|row| row == anchor)?,
@@ -118,10 +120,11 @@ impl SourceControl {
                     ))
                 });
             if let Some((start, end)) = range {
+                if !toggle { self.selected_files.clear(); }
                 self.selected_files.extend(
                     rows[start.min(end)..=start.max(end)]
                         .iter()
-                        .filter(|row| row.same_group(&key))
+                        .filter(|row| row.repository == key.repository)
                         .cloned(),
                 );
             } else {
@@ -165,7 +168,8 @@ impl SourceControl {
         }) {
             // A parent gitlink describes a separate checkout. Like Discard
             // All, a multi-selection only discards this repository's files.
-            paths.retain(|path| !repo.submodules.contains(path));
+            paths.retain(|path| !repo.submodules.contains(path)
+                && repo.files.iter().any(|file| &file.path == path && !file.is_conflicted()));
         }
         paths
     }

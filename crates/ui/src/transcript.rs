@@ -6591,6 +6591,17 @@ impl Transcript {
             (false, false, elapsed, flavour_seed(doc_id), last.created_at)
         } else {
             let chat_id = self.chat_id.clone()?;
+            if self.state.read(cx).worktree_setup_pending(&chat_id) {
+                let theme = Theme::of(cx).clone();
+                let detail = if self.state.read(cx).chat_delivery_degraded(&chat_id) {
+                    "Waiting for the project's device to connect."
+                } else {
+                    "Creating the checkout and preparing env files and dependencies. Your agent starts when it’s ready."
+                };
+                return Some(div().pt(px(Theme::SPACE_LG)).child(crate::loaders::worktree_setup_indicator(
+                    "worktree-setup-progress", &theme, detail, cx.entity_id(), cx,
+                )).into_any_element());
+            }
             // Failed-send state first: past the grace window the trailer IS
             // the retry affordance, whatever the indicator fell back to.
             if self.state.read(cx).send_undelivered(&chat_id, now) {

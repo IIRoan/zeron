@@ -259,6 +259,7 @@ fn selection_scroll_lines(geometry: GridGeometry, position: gpui::Point<Pixels>)
 struct TerminalTab {
     key: u64,
     title: SharedString,
+    fixed_title: bool,
     terminal_id: Option<String>,
     target_device_id: Option<String>,
     emulator: Emulator,
@@ -319,6 +320,7 @@ impl Render for TabGhost {
 }
 
 pub struct TerminalPanel {
+    session_scope: Option<String>,
     state: Entity<AppState>,
     focus_handle: FocusHandle,
     focus_pending: bool,
@@ -365,6 +367,7 @@ impl TerminalPanel {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
         Self {
+            session_scope: None,
             state,
             focus_handle: cx.focus_handle(),
             focus_pending: false,
@@ -443,6 +446,9 @@ impl TerminalPanel {
     /// command — the contextual name, user request), else the fixed
     /// "Terminal N".
     fn display_title(tab: &TerminalTab) -> SharedString {
+        if tab.fixed_title {
+            return tab.title.clone();
+        }
         match tab.emulator.title().map(str::trim) {
             Some(title) if !title.is_empty() => title.to_string().into(),
             _ => tab.title.clone(),
@@ -462,6 +468,19 @@ impl TerminalPanel {
                 tabs.tabs
                     .iter()
                     .map(|t| (t.key, Self::display_title(t), t.exited.is_some()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[cfg(feature = "source-control-fixture")]
+    pub fn fixture_session_ids(&self, cx: &App) -> Vec<String> {
+        self.chats
+            .get(&self.selected_chat(cx))
+            .map(|tabs| {
+                tabs.tabs
+                    .iter()
+                    .filter_map(|tab| tab.terminal_id.clone())
                     .collect()
             })
             .unwrap_or_default()
@@ -489,6 +508,7 @@ impl TerminalPanel {
         entry.tabs.push(TerminalTab {
             key,
             title: title.into(),
+            fixed_title: false,
             terminal_id: None,
             target_device_id: None,
             emulator: Emulator::new(80, 24),
@@ -514,6 +534,18 @@ impl TerminalPanel {
         target_device_id: Option<String>,
         cx: &mut Context<Self>,
     ) -> bool {
+        if let Some(tab) = self.tab_mut(chat, key)
+            && tab.terminal_id.as_deref() != Some(session.id.as_str())
+        {
+            tab._run = None;
+            if tab.fixed_title {
+                tab.flush_task = None;
+                tab.resize_task = None;
+                tab.coalescer.take();
+            }
+            tab.last_seq = 0;
+            tab.exited = None;
+        }
         if self.tab_mut(chat, key).is_none() {
             return false;
         }
@@ -619,7 +651,63 @@ impl TerminalPanel {
     }
 
     fn selected_chat(&self, cx: &App) -> String {
-        self.state.read(cx).panel_session_key()
+        self.session_scope
+            .clone()
+            .unwrap_or_else(|| self.state.read(cx).panel_session_key())
+    }
+
+    /// A project-owned service panel uses a stable scope across chat switches.
+    /// Regular shell panels continue using their selected chat's scope.
+    pub fn set_session_scope(&mut self, scope: String, cx: &mut Context<Self>) {
+        if self.session_scope.as_ref() != Some(&scope) {
+            self.session_scope = Some(scope);
+            cx.notify();
+        }
+    }
+
+    pub fn set_service_title(
+        &mut self,
+        scope: &str,
+        key: u64,
+        title: String,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(tab) = self.tab_mut(scope, key) {
+            if tab.fixed_title && tab.title.as_ref() == title {
+                return;
+            }
+            tab.title = title.into();
+            tab.fixed_title = true;
+            if tab.terminal_id.is_none() {
+                tab.exited = Some(0);
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn detach_service_view(&mut self, scope: &str, key: u64) {
+        if let Some(tab) = self.tab_mut(scope, key) {
+            tab._run = None;
+            tab.flush_task = None;
+            tab.resize_task = None;
+            tab.coalescer.take();
+            if tab.terminal_id.take().is_some() {
+                tab.emulator.feed(b"\r\n\x1b[90m[service stopped]\x1b[0m\r\n");
+            }
+            tab.exited = Some(0);
+        }
+    }
+
+    /// Removing a view does not stop a managed service; its engine owns that
+    /// lifetime. This also cancels subscriptions for deleted profile entries.
+    pub fn remove_service_view(&mut self, scope: &str, key: u64, cx: &mut Context<Self>) {
+        if let Some(tabs) = self.chats.get_mut(scope)
+            && let Some(index) = tabs.tabs.iter().position(|tab| tab.key == key)
+        {
+            tabs.tabs.remove(index);
+            tabs.active = active_after_close(tabs.active, index, tabs.tabs.len());
+            cx.notify();
+        }
     }
 
     fn ensure_tab(&mut self, cx: &mut Context<Self>) {
@@ -1656,33 +1744,36 @@ impl TerminalPanel {
             )
             // Collapse chevron pinned right (zeron "Hide terminal" ⌘J).
             .child(div().flex_1())
-            .child(
-                div()
-                    .id("terminal-collapse")
-                    .size(px(28.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(8.0))
-                    .cursor_pointer()
-                    .bg(motion::hover_blend(
-                        "term-collapse",
-                        gpui::transparent_black(),
-                        crate::theme::ink(0.05),
-                    ))
-                    .on_hover(motion::hover_listener("term-collapse"))
-                    .on_click(|_, window, cx| {
-                        window.dispatch_action(Box::new(ToggleTerminal), cx);
-                    })
-                    .tooltip(crate::settings::widgets::text_tooltip("Hide terminal"))
-                    .child(
-                        crate::icons::icon(crate::icons::ALT_ARROW_DOWN)
-                            .size(px(13.0))
-                            .text_color(theme.text_muted.opacity(0.55)),
-                    ),
-            )
+            .when(!cfg!(target_os = "linux"), |bar| {
+                bar.child(
+                    div()
+                        .id("terminal-collapse")
+                        .size(px(28.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(8.0))
+                        .cursor_pointer()
+                        .bg(motion::hover_blend(
+                            "term-collapse",
+                            gpui::transparent_black(),
+                            crate::theme::ink(0.05),
+                        ))
+                        .on_hover(motion::hover_listener("term-collapse"))
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(Box::new(ToggleTerminal), cx);
+                        })
+                        .tooltip(crate::settings::widgets::text_tooltip("Hide terminal"))
+                        .child(
+                            crate::icons::icon(crate::icons::ALT_ARROW_DOWN)
+                                .size(px(13.0))
+                                .text_color(theme.text_muted.opacity(0.55)),
+                        ),
+                )
+            })
     }
+
 }
 
 impl ScrollRailHost for TerminalPanel {
@@ -1822,6 +1913,91 @@ impl Render for TerminalPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn service_tabs_keep_the_project_scope_and_name_across_chat_changes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::AppContext;
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+        });
+        let (panel, cx) = cx.add_window_view(|_, cx| {
+            let state = cx.new(|_| {
+                let mut state = AppState::new();
+                state.selected_chat = Some("first-chat".into());
+                state
+            });
+            TerminalPanel::new_embedded(state, cx)
+        });
+        panel.update(cx, |panel, cx| {
+            let scope = "project-services:local:project";
+            panel.set_session_scope(scope.into(), cx);
+            let first = panel.reserve_tab_for_chat(scope.into(), "Backend", cx);
+            let second = panel.reserve_tab_for_chat(scope.into(), "Frontend", cx);
+            panel.set_service_title(scope, first, "Backend".into(), cx);
+            panel.select_tab_by_key(first, cx);
+            panel.queue_input(b"must not reach a future service", cx);
+            assert!(panel.active_tab(cx).unwrap().coalescer.is_empty());
+            assert!(panel.active_tab(cx).unwrap().flush_task.is_none());
+            let tab = panel.tab_mut(scope, first).unwrap();
+            tab.exited = None;
+            tab.terminal_id = Some("previous-run".into());
+            panel.queue_input(b"pending input", cx);
+            assert!(panel.active_tab(cx).unwrap().flush_task.is_some());
+            panel.detach_service_view(scope, first);
+            panel.queue_input(b"input after stop", cx);
+            let stopped = panel.active_tab(cx).unwrap();
+            assert!(stopped.terminal_id.is_none());
+            assert!(stopped.exited.is_some());
+            assert!(stopped.coalescer.is_empty());
+            assert!(stopped.flush_task.is_none());
+            let stopped_output = stopped
+                .emulator
+                .lines()
+                .iter()
+                .map(|line| line.iter().map(|cell| cell.ch).collect::<String>())
+                .collect::<Vec<_>>();
+            assert!(
+                stopped_output
+                    .iter()
+                    .any(|line| line.contains("[service stopped]"))
+            );
+            panel.detach_service_view(scope, first);
+            assert_eq!(
+                panel
+                    .active_tab(cx)
+                    .unwrap()
+                    .emulator
+                    .lines()
+                    .iter()
+                    .map(|line| { line.iter().map(|cell| cell.ch).collect::<String>() })
+                    .collect::<Vec<_>>(),
+                stopped_output,
+                "polling must not repeat the stopped marker"
+            );
+            panel
+                .tab_mut(scope, first)
+                .unwrap()
+                .emulator
+                .feed(b"\x1b]0;temporary shell title\x07");
+            assert_eq!(
+                TerminalPanel::display_title(panel.tab_mut(scope, first).unwrap()).as_ref(),
+                "Backend"
+            );
+            panel.state.update(cx, |state, cx| {
+                state.selected_chat = Some("second-chat".into());
+                cx.notify();
+            });
+            assert_eq!(panel.selected_chat(cx), scope);
+            panel.select_tab_by_key(second, cx);
+            assert_eq!(panel.active_tab(cx).unwrap().key, second);
+            panel.remove_service_view(scope, first, cx);
+            assert_eq!(panel.active_tab(cx).unwrap().key, second);
+            assert_eq!(panel.chats[scope].tabs.len(), 1);
+        });
+    }
 
     #[gpui::test]
     fn slow_trackpad_scroll_accumulates_per_terminal(cx: &mut gpui::TestAppContext) {

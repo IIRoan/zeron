@@ -11,8 +11,8 @@
 //! and background pause keep them still.
 
 use gpui::{
-    AnyElement, App, AppContext, Context, Entity, EntityId, IntoElement, ParentElement,
-    PathBuilder, Render, RenderOnce, SharedString, Styled, Window, canvas, div, point, px,
+    AnyElement, App, AppContext, Context, Entity, EntityId, InteractiveElement, IntoElement,
+    ParentElement, PathBuilder, Render, RenderOnce, SharedString, Styled, Window, canvas, div, point, px,
 };
 
 use crate::motion::{self, GRADIENT_SPIN, PULSE_STAGGER, SPLASH_OUT, ZERON_PULSE};
@@ -146,6 +146,46 @@ pub fn gradient_spinner(
                         .opacity(pulse.opacity(phase, GSPIN_DIM))
                 }))
         }))
+}
+
+pub fn worktree_setup_indicator(
+    key: impl Into<SharedString>,
+    theme: &Theme,
+    detail: impl Into<SharedString>,
+    view: EntityId,
+    cx: &mut App,
+) -> AnyElement {
+    div()
+        .id(key.into())
+        .flex()
+        .items_start()
+        .gap(px(12.0))
+        .child(
+            div()
+                .pt(px(3.0))
+                .child(gradient_spinner("worktree-setup", theme, 3.0, view, cx)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .child(
+                    div()
+                        .text_size(crate::typography::ui_rems(13.0))
+                        .text_color(theme.text)
+                        .child("Setting up your worktree…"),
+                )
+                .child(
+                    div()
+                        .text_size(crate::typography::ui_rems(12.0))
+                        .text_color(theme.text_muted)
+                        .child(detail.into()),
+                ),
+        )
+        .into_any_element()
 }
 
 /// A 2×3 activity glyph sized for compact status slots. Its color is an

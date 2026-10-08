@@ -66,6 +66,7 @@ struct ProjectActionsStoreInner {
 #[derive(Clone)]
 pub struct ProjectActionsStore {
     inner: Arc<ProjectActionsStoreInner>,
+    pub project_terminals: crate::project_terminals::ProjectTerminals,
 }
 
 impl ProjectActionsStore {
@@ -96,6 +97,9 @@ impl ProjectActionsStore {
             Err(err) => return Err(err.into()),
         };
         Ok(Self {
+            project_terminals: crate::project_terminals::ProjectTerminals::open(
+                profile_store_root,
+            )?,
             inner: Arc::new(ProjectActionsStoreInner {
                 path,
                 state: Mutex::new(state),

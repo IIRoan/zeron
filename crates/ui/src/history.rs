@@ -1301,6 +1301,7 @@ fn decode_history_avatar(encoded: &str) -> Option<Arc<Image>> {
 }
 
 pub struct GitHistory {
+    notifications: Option<Entity<crate::toast::Toasts>>,
     state: Entity<AppState>,
     started: bool,
     target_key: Option<String>,
@@ -1354,9 +1355,9 @@ pub struct GitHistory {
     request_task: Option<Task<()>>,
     copy_task: Option<Task<()>>,
     fetching_all: bool,
+    fetch_epoch: u64,
     fetch_for: Option<String>,
     fetch_error: Option<SharedString>,
-    fetch_task: Option<Task<()>>,
     _observe: Subscription,
 }
 
@@ -1951,6 +1952,7 @@ impl GitHistory {
         });
         Self {
             state,
+            notifications: None,
             started: false,
             target_key: None,
             commits: Vec::new(),
@@ -1999,9 +2001,9 @@ impl GitHistory {
             request_task: None,
             copy_task: None,
             fetching_all: false,
+            fetch_epoch: 0,
             fetch_for: None,
             fetch_error: None,
-            fetch_task: None,
             _observe: observe,
         }
     }
@@ -2019,7 +2021,6 @@ impl GitHistory {
     pub fn ensure_loaded(&mut self, cx: &mut Context<Self>) {
         self.started = true;
         let Some((key, cwd, target)) = self.context(cx) else {
-            self.fetch_task = None;
             self.fetching_all = false;
             self.fetch_for = None;
             self.fetch_error = None;
@@ -2060,7 +2061,6 @@ impl GitHistory {
             return;
         }
         self.request_task = None;
-        self.fetch_task = None;
         self.fetching_all = false;
         self.fetch_for = None;
         self.fetch_error = None;
@@ -2106,6 +2106,10 @@ impl GitHistory {
         self.fetch_page(key, cwd, target, 0, true, cx);
     }
 
+    pub(crate) fn set_notifications(&mut self, notifications: Entity<crate::toast::Toasts>) {
+        self.notifications = Some(notifications);
+    }
+
     pub fn fetch_all(&mut self, cx: &mut Context<Self>) {
         if self.fetching_all {
             return;
@@ -2114,13 +2118,22 @@ impl GitHistory {
             return;
         };
         let Some(engine) = self.state.read(cx).engine().cloned() else {
+            if let Some(toasts) = &self.notifications {
+                toasts.update(cx, |toasts, cx| toasts.error("Source Control".into(), "Repository is unavailable".into(), cx));
+            }
             return;
         };
         self.fetching_all = true;
+        self.fetch_epoch = self.fetch_epoch.wrapping_add(1);
+        let epoch = self.fetch_epoch;
         self.fetch_for = Some(key.clone());
         self.fetch_error = None;
+        let notification = self.notifications.as_ref().map(|toasts| {
+            let name = std::path::Path::new(&cwd).file_name().and_then(|name| name.to_str()).unwrap_or("repository");
+            crate::toast::PendingToast::start(toasts.clone(), format!("Source Control · {name}").into(), "Fetching changes from all remotes…".into(), cx)
+        });
         cx.notify();
-        self.fetch_task = Some(cx.spawn(async move |this, cx| {
+        cx.spawn(async move |this, cx| {
             let mut params = serde_json::Map::new();
             params.insert("repoPath".into(), serde_json::Value::String(cwd.clone()));
             if let Some(target) = target.clone() {
@@ -2130,8 +2143,12 @@ impl GitHistory {
                 .client()
                 .call(methods::FETCH_ALL, serde_json::Value::Object(params))
                 .await;
+            if let Some(notification) = notification {
+                notification.finish(result.as_ref().map(|_| "Fetched changes from all remotes".into())
+                    .map_err(|error| format!("Unable to fetch changes: {error}").into()), cx);
+            }
             this.update(cx, |history, cx| {
-                if history.fetch_for.as_deref() != Some(key.as_str()) {
+                if history.fetch_for.as_deref() != Some(key.as_str()) || history.fetch_epoch != epoch {
                     return;
                 }
                 history.fetching_all = false;
@@ -2151,7 +2168,7 @@ impl GitHistory {
                 cx.notify();
             })
             .ok();
-        }));
+        }).detach();
     }
 
     pub fn commit_count(&self) -> Option<usize> {
@@ -4342,23 +4359,6 @@ impl Render for GitHistory {
             .flex()
             .flex_col()
             .on_drag_move(cx.listener(Self::on_column_resize))
-            .when_some(self.fetch_error.clone(), |element, error| {
-                element.child(
-                    div()
-                        .h(px(28.0))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .px(px(8.0))
-                        .border_b_1()
-                        .border_color(theme.danger.opacity(0.16))
-                        .bg(theme.danger.opacity(0.05))
-                        .truncate()
-                        .text_size(px(11.0))
-                        .text_color(theme.danger_muted)
-                        .child(SharedString::from(format!("Fetch failed: {error}"))),
-                )
-            })
             .when_some(
                 if self.search_active() {
                     self.search_error.clone()

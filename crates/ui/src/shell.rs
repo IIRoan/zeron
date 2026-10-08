@@ -66,6 +66,8 @@ mod chat_dropzone_tests;
 mod chat_rename_tests;
 mod command_palette;
 mod file_close_dialog;
+mod project_terminals_ui;
+mod worktrees_ui;
 use file_close_dialog::FileCloseDialog;
 mod file_mutations;
 mod files_panel;
@@ -321,6 +323,14 @@ fn titlebar_new_session_alpha(is_chat_route: bool, has_selected_chat: bool) -> f
 #[derive(Clone, PartialEq, Action)]
 #[action(namespace = shell, no_json)]
 pub struct JumpSession(pub usize);
+
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = shell, no_json)]
+pub struct OpenProjectSettings(pub String);
+
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = shell, no_json)]
+pub struct OpenRecentChats;
 
 // ---------------------------------------------------------------------------
 // Traffic-light-aware titlebar layout (feature-inventory §1.1)
@@ -1552,7 +1562,6 @@ enum AccountMenuAction {
 #[derive(Debug, Clone)]
 enum DiscardWorkingTreeFlow {
     Confirm(DiscardWorkingTreeRequest),
-    Failed(SharedString),
 }
 
 const RUNTIME_CHANGE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1889,6 +1898,9 @@ pub struct Shell {
     right_plus: popover::Popup<()>,
     /// Host-owned project Actions cached per (device, space).
     project_actions: crate::project_actions::ProjectActionsController,
+    project_terminals: project_terminals_ui::ProjectTerminalUi,
+    worktree_settings: worktrees_ui::WorktreeSettingsUi,
+    toasts: Entity<crate::toast::Toasts>,
     /// Diff surfaces by id — each tab its own [`Changes`] viewer with its own
     /// scope/base pick and diff watch (multiple diff panels, user request).
     diffs: std::collections::HashMap<u64, Entity<Changes>>,
@@ -2398,6 +2410,9 @@ impl Shell {
             right_terminal: None,
             right_plus: popover::Popup::default(),
             project_actions: crate::project_actions::ProjectActionsController::default(),
+            project_terminals: project_terminals_ui::ProjectTerminalUi::default(),
+            worktree_settings: worktrees_ui::WorktreeSettingsUi::default(),
+            toasts: cx.new(|_| crate::toast::Toasts::default()),
             diffs: std::collections::HashMap::new(),
             files: std::collections::HashMap::new(),
             files_subs: std::collections::HashMap::new(),
@@ -3003,7 +3018,8 @@ impl Shell {
                 self.panels.get(&key)
             };
             if let Some(panel) = self.terminal.clone() {
-                panel.update(cx, |panel, cx| panel.set_open(panels.terminal_open, cx));
+                let shell_open = panels.terminal_open && !self.project_terminals.drawer;
+                panel.update(cx, |panel, cx| panel.set_open(shell_open, cx));
             }
             if panels.changes_open
                 && let RightSurface::Diff(id) = self.resolved_right_active(cx)
@@ -3070,12 +3086,17 @@ impl Shell {
     /// new-session canvas, where the titlebar carries no toggle to close it
     /// again (an earlier user request).
     fn right_pane_open(&self, cx: &App) -> bool {
-        !self.active_chat.is_empty() && self.panels.get(&self.panel_key(cx)).changes_open
+        self.session_workspace_visible(cx) && self.panels.get(&self.panel_key(cx)).changes_open
+    }
+
+    fn session_workspace_visible(&self, cx: &App) -> bool {
+        matches!(self.route, Route::Chat) && self.state.read(cx).selected_chat.is_some()
     }
 
     /// The current chat's terminal flag (per-session, in-memory).
     fn terminal_open(&self, cx: &App) -> bool {
-        self.panels.get(&self.panel_key(cx)).terminal_open
+        self.session_workspace_visible(cx)
+            && (self.project_terminals.drawer || self.panels.get(&self.panel_key(cx)).terminal_open)
     }
 
     fn right_target(&self, cx: &App) -> f32 {
@@ -4011,6 +4032,7 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        changes.update(cx, |changes, cx| changes.set_notifications(self.toasts.clone(), cx));
         self.diff_seq += 1;
         let id = self.diff_seq;
         let sub =
@@ -4018,6 +4040,9 @@ impl Shell {
                 &changes,
                 window,
                 |this: &mut Self, _, event, window, cx| match event {
+                    ChangesEvent::Success { title, message } => {
+                        this.toasts.update(cx, |toasts, cx| toasts.success(title.clone(), message.clone(), cx));
+                    }
                     ChangesEvent::OpenChange(selection) => {
                         this.open_change_diff(selection.clone(), window, cx);
                     }
@@ -4115,6 +4140,14 @@ impl Shell {
     /// The picker's Terminal card / the `+` menu's Terminal row: every click
     /// opens a fresh embedded terminal tab.
     fn add_terminal_surface(&mut self, cx: &mut Context<Self>) {
+        if cfg!(target_os = "linux") {
+            // Every entry point opens a shell in the same bottom dock.
+            self.terminal_panel(cx).update(cx, |panel, cx| {
+                panel.open_tab_for_selected(cx);
+            });
+            self.select_terminal_mode(project_terminals_ui::TerminalMode::Shells, cx);
+            return;
+        }
         let panel = self.right_terminal_panel(cx);
         let opened = panel.update(cx, |panel, cx| {
             panel.set_open(true, cx);
@@ -4586,10 +4619,17 @@ impl Shell {
     }
 
     fn terminal_target(&self, cx: &App) -> f32 {
+        if !self.session_workspace_visible(cx) {
+            return 0.0;
+        }
         if self.terminal_open(cx) {
             self.settings.terminal_height
         } else {
-            0.0
+            if cfg!(target_os = "linux") {
+                project_terminals_ui::TERMINAL_TOOLBAR_HEIGHT
+            } else {
+                0.0
+            }
         }
     }
 
@@ -4597,6 +4637,22 @@ impl Shell {
     /// animates 200 ms; closing detaches (PTYs stay alive), opening restores.
     /// The flag is per chat (zeron `sessionPanels`).
     fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.session_workspace_visible(cx) {
+            return;
+        }
+        if cfg!(target_os = "linux") {
+            if self.terminal_open(cx) {
+                self.hide_terminal_panel(window, cx);
+            } else {
+                let mode = if self.terminal_project_context(None, cx).is_some() {
+                    self.project_terminals.mode
+                } else {
+                    project_terminals_ui::TerminalMode::Shells
+                };
+                self.select_terminal_mode(mode, cx);
+            }
+            return;
+        }
         let from = self.terminal_geometry.get().height;
         let key = self.panel_key(cx);
         let open = self.panels.toggle_terminal(&key);
@@ -5770,7 +5826,10 @@ impl Shell {
     /// is not one: navigating leaves it, and its shortcut recorder intercepts
     /// the keys it records before they can dispatch.
     pub(super) fn overlay_owns_keyboard(&self, cx: &App) -> bool {
-        self.command_palette.is_some()
+        self.worktree_settings.editor.is_some()
+            || self.project_terminals.editor.is_some()
+            || self.project_terminals.actions_menu.is_open()
+            || self.command_palette.is_some()
             || self.voice.read(cx).stage_open
             || self.section_dialog.is_some()
             || self.section_menu.is_some()
@@ -5853,9 +5912,8 @@ impl Shell {
             return;
         };
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.discard_working_tree = Some(DiscardWorkingTreeFlow::Failed(
-                "Engine is not connected.".into(),
-            ));
+            self.discard_working_tree = None;
+            self.toasts.update(cx, |toasts, cx| toasts.error("Source Control".into(), "Engine is not connected.".into(), cx));
             cx.notify();
             return;
         };
@@ -5877,6 +5935,7 @@ impl Shell {
         // Dismiss the confirmation immediately. The task remains retained so
         // repeat clicks cannot issue a second destructive request.
         self.discard_working_tree = None;
+        let notification = crate::toast::PendingToast::start(self.toasts.clone(), "Source Control".into(), "Discarding working tree changes…".into(), cx);
         self.discard_working_tree_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
@@ -5885,12 +5944,10 @@ impl Shell {
                     serde_json::Value::Object(params),
                 )
                 .await;
+            notification.finish(result.as_ref().map(|_| "Working tree changes discarded".into())
+                .map_err(|error| format!("Unable to discard changes: {error}").into()), cx);
             this.update(cx, |shell, cx| {
                 shell.discard_working_tree_task = None;
-                shell.discard_working_tree = match result {
-                    Ok(_) => None,
-                    Err(error) => Some(DiscardWorkingTreeFlow::Failed(format!("{error}").into())),
-                };
                 cx.notify();
             })
             .ok();
@@ -6687,6 +6744,7 @@ impl Shell {
         let theme = Theme::of(cx).clone();
         let can_back = self.nav.can_back();
         let can_forward = self.nav.can_forward();
+        let in_session = self.session_workspace_visible(cx);
         // The titlebar is the single owner of the new-session action in both
         // sidebar states. Hide it on the new-session canvas: opening another
         // blank canvas from an already blank canvas has no effect and used to
@@ -6722,7 +6780,11 @@ impl Shell {
             .absolute()
             .top_0()
             .left(px(if cfg!(target_os = "linux") {
-                (self.viewport_width + ACTIVITY_WIDTH - self.sidebar_now().max(160.0)).max(0.0)
+                if in_session {
+                    (self.viewport_width + ACTIVITY_WIDTH - self.sidebar_now().max(160.0)).max(0.0)
+                } else {
+                    (self.viewport_width - self.titlebar_right_pad(0.0) - 100.0).max(0.0)
+                }
             } else {
                 0.0
             }))
@@ -6762,7 +6824,7 @@ impl Shell {
                     .h_full()
                     .w(px(caption_buttons_width(self.linux_left_caption_count())))
             }))
-            .child(window_control_button_with(
+            .when(in_session, |row| row.child(window_control_button_with(
                 "toggle-sidebar",
                 icons::sidebar_glyph(
                     motion::state_t(
@@ -6778,7 +6840,7 @@ impl Shell {
                 ShortcutId::ToggleSidebar.label(),
                 &theme,
                 cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)),
-            ))
+            )))
             .child(
                 div()
                     .ml(px(TITLEBAR_GROUP_GAP))
@@ -9810,7 +9872,26 @@ impl Shell {
 
     /// Resolve shell-owned Escape surfaces in capture phase, before focused
     /// descendants such as an integrated terminal can consume the key.
-    fn capture_escape_surface(&mut self, cx: &mut Context<Self>) -> bool {
+    fn capture_escape_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.dismiss_worktree_removal(window, cx) {
+            return true;
+        }
+        if self.project_terminals.actions_menu.is_open() {
+            self.close_project_terminal_actions(cx);
+            return true;
+        }
+        if self.project_terminals.editor.is_some() {
+            self.project_terminals.editor = None;
+            cx.notify();
+            return true;
+        }
+        if self.worktree_settings.editor.is_some() {
+            if self.dismiss_worktree_select(cx) {
+                return true;
+            }
+            self.close_worktree_settings(cx);
+            return true;
+        }
         // Modals and context menus sit above the rest of the shell. Preserve
         // their existing behavior: only surfaces that already have a Cancel
         // path close here; the others remain explicit blockers.
@@ -9909,7 +9990,7 @@ impl Shell {
         if matches!(self.route, Route::Settings(_)) {
             return;
         }
-        if event.keystroke.key == "escape" && self.capture_escape_surface(cx) {
+        if event.keystroke.key == "escape" && self.capture_escape_surface(window, cx) {
             cx.stop_propagation();
         }
     }
@@ -10249,6 +10330,15 @@ impl Shell {
         if let Some(overlay) = self.render_project_action_overlay(viewport, window, cx) {
             overlays.push(overlay);
         }
+        if let Some(overlay) = self.render_worktree_settings(viewport, cx) {
+            overlays.push(overlay);
+        }
+        if let Some(overlay) = self.render_project_terminal_editor(viewport, cx) {
+            overlays.push(overlay);
+        }
+        if let Some(overlay) = self.render_worktree_removal(viewport, window, cx) {
+            overlays.push(overlay);
+        }
 
         if let Some(chat_id) = self.delete_confirm.clone() {
             let title = transcript::single_line(
@@ -10335,20 +10425,7 @@ impl Shell {
                         )
                         .into_any_element()
                 }
-                DiscardWorkingTreeFlow::Failed(error) => popover::dialog_card(&theme)
-                    .child(popover::dialog_title(&theme, "Couldn’t discard changes"))
-                    .child(div().mt(px(6.0)).child(popover::dialog_body(&theme, error)))
-                    .child(
-                        div().mt(px(16.0)).flex().justify_end().child(
-                            popover::btn_primary(&theme, "Close")
-                                .id("discard-working-tree-error-close")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.discard_working_tree = None;
-                                    cx.notify();
-                                })),
-                        ),
-                    )
-                    .into_any_element(),
+
             };
             overlays.push(popover::modal(
                 "discard-working-tree-dialog",
@@ -10476,7 +10553,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if let Some(editor) = self.render_workbench_file(window, cx) {
-            return editor;
+            return self.render_editor_with_terminals(editor, window, cx);
         }
         if self
             .main_diff
@@ -10489,7 +10566,7 @@ impl Shell {
         if let Some((_, title, view)) = self.main_diff.clone() {
             let theme = Theme::of(cx).clone();
             let controls = view.update(cx, |view, cx| view.render_header_controls(cx));
-            return div()
+            let diff = div()
                 .id("main-file-diff")
                 .track_focus(&self.navigation_focus.main)
                 .capture_any_mouse_down(cx.listener(|this, _, window, cx| {
@@ -10554,6 +10631,7 @@ impl Shell {
                 )
                 .child(div().flex_1().min_h_0().overflow_hidden().child(view))
                 .into_any_element();
+            return self.render_editor_with_terminals(diff, window, cx);
         }
         let theme_owned = Theme::of(cx).clone();
         let theme = &theme_owned;
@@ -10621,19 +10699,19 @@ impl Shell {
         });
         let terminal_geometry =
             std::rc::Rc::new(std::cell::Cell::new(crate::terminal::dock::Geometry::new(
-                self.eval_tween(self.terminal_tween, self.terminal_target(cx)),
+                if has_selection { self.eval_tween(self.terminal_tween, self.terminal_target(cx)) } else { 0.0 },
                 self.settings.terminal_height,
                 (self.viewport_height * TERMINAL_MAX_VH).min(
                     (self.viewport_height - Theme::TITLEBAR_HEIGHT - Theme::STATUS_STRIP_HEIGHT)
                         .max(0.0),
                 ),
             )));
-        let term_h = self.terminal_geometry.get().height;
+        let term_h = if has_selection { self.terminal_geometry.get().height } else { 0.0 };
         let new_thread_background_layer = (!has_selection || dock_frame.active).then(|| {
             if artwork_frame.active {
                 window.request_animation_frame();
             }
-            let width = (self.viewport_width - self.sidebar_now()).max(0.0);
+            let width = (self.viewport_width - if has_selection { self.sidebar_now() } else { 0.0 }).max(0.0);
             let bounds = self.composer.read(cx).surface_bounds();
             let opacity = new_thread_background_opacity(theme.is_frost());
             div()
@@ -11022,6 +11100,38 @@ impl Shell {
         .into_any_element()
     }
 
+    /// File and diff editors share the bottom dock with the conversation.
+    fn render_editor_with_terminals(
+        &mut self,
+        editor: AnyElement,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if !cfg!(target_os = "linux") {
+            return editor;
+        }
+        let limit =
+            (f32::from(window.viewport_size().height) * TERMINAL_MAX_VH).max(TERMINAL_MIN_HEIGHT);
+        let height = self.eval_tween(self.terminal_tween, self.terminal_target(cx));
+        let content_height = height.max(self.terminal_target(cx)).max(
+            self.terminal_tween
+                .map(|tween| tween.from)
+                .unwrap_or(height),
+        );
+        let geometry = std::rc::Rc::new(std::cell::Cell::new(
+            crate::terminal::dock::Geometry::new(height, content_height, limit),
+        ));
+        div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .flex_col()
+            .child(div().flex_1().min_h_0().overflow_hidden().child(editor))
+            .child(self.render_terminal_container(geometry, window, cx))
+            .into_any_element()
+    }
+
     /// Terminal panel dock at the main-column bottom: a 5px height-drag handle
     /// over the panel, the whole container height-animated 200 ms on toggle.
     fn render_terminal_container(
@@ -11030,6 +11140,11 @@ impl Shell {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if !self.session_workspace_visible(cx) {
+            self.terminal_geometry
+                .set(crate::terminal::dock::Geometry::default());
+            return gpui::Empty.into_any_element();
+        }
         let target = self.terminal_target(cx);
         let tween = self.terminal_tween;
         if target <= 0.0 && tween.is_none() {
@@ -11037,14 +11152,26 @@ impl Shell {
                 .set(crate::terminal::dock::Geometry::default());
             return gpui::Empty.into_any_element();
         }
+        let open = self.terminal_open(cx);
+        let content_visible = open || tween.is_some();
+        let content_opacity = self.terminal_content_opacity();
+        let toolbar = self.render_terminal_toolbar(window, cx);
+        let project_content = (self.project_terminals.drawer
+            || (cfg!(target_os = "linux")
+                && !open
+                && tween.is_some()
+                && self.project_terminals.mode == project_terminals_ui::TerminalMode::Services))
+            .then(|| self.render_project_terminal_content(cx));
         // Defensive: an open flag needs its entity (and set_open) even if
         // toggle_terminal never created one.
-        if self.terminal_open(cx) && self.terminal.is_none() {
+        if project_content.is_none() && self.terminal_open(cx) && self.terminal.is_none() {
             let panel = self.terminal_panel(cx);
             panel.update(cx, |panel, cx| panel.set_open(true, cx));
         }
-        let Some(panel) = self.terminal.clone() else {
-            return gpui::Empty.into_any_element();
+        let panel = if project_content.is_some() {
+            self.project_terminals.panel.clone()
+        } else {
+            self.terminal.clone()
         };
         // The dock spans the main column's bottom: when the sidebar is fully
         // closed the column IS the window's left edge (and likewise the right
@@ -11054,7 +11181,9 @@ impl Shell {
         {
             let bl = window_corner && self.sidebar_now() < 0.5;
             let br = window_corner && !self.right_pane_open(cx) && !self.files_panel_open(cx);
-            panel.update(cx, |panel, cx| panel.set_window_corners(bl, br, cx));
+            if let Some(panel) = &panel {
+                panel.update(cx, |panel, cx| panel.set_window_corners(bl, br, cx));
+            }
         }
         let border = Theme::of(cx).border;
         let handle_key = "pane-resize-terminal-resize";
@@ -11139,8 +11268,15 @@ impl Shell {
                 .relative()
                 .flex()
                 .flex_col()
-                .child(div().flex_1().min_h_0().child(panel))
-                .child(handle.absolute().top_0().left_0().right_0());
+                .child(toolbar)
+                .when(content_visible, |inner| {
+                    inner.child(div().flex_1().min_h_0().opacity(content_opacity).children(
+                        project_content.or_else(|| panel.map(|panel| panel.into_any_element())),
+                    ))
+                })
+                .when(open, |inner| {
+                    inner.child(handle.absolute().top_0().left_0().right_0())
+                });
 
             div()
                 .w_full()
@@ -11470,23 +11606,23 @@ impl Shell {
                             |this, _, window, cx| this.add_browser_surface(None, window, cx),
                         )),
                     )
-                    .child(
+                    .when(!cfg!(target_os = "linux"), |el| el.child(
                         row("surface-card-terminal", icons::TERMINAL, "Terminal").on_click(
                             cx.listener(|this, _, _, cx| {
                                 this.add_terminal_surface(cx);
                             }),
                         ),
-                    )
+                    ))
                     // Git surfaces only where there IS git — the pane itself
                     // no longer gates on it (terminals work anywhere).
                     .when(self.space_git_detected(cx), |el| {
-                        el.child(row("surface-card-diffs", icons::LIST, "Diffs").on_click(
+                        el.child(row("surface-card-diffs", icons::SOURCE_CONTROL, "Diffs").on_click(
                             cx.listener(|this, _, window, cx| {
                                 this.add_diff_surface(window, cx);
                             }),
                         ))
                         .child(
-                            row("surface-card-history", icons::GIT_BRANCH, "History").on_click(
+                            row("surface-card-history", icons::HISTORY, "History").on_click(
                                 cx.listener(|this, _, window, cx| {
                                     this.add_history_surface(window, cx);
                                 }),
@@ -11678,9 +11814,9 @@ impl Shell {
                     .get(&id)
                     .map(|changes| {
                         if changes.read(cx).is_history() {
-                            icons::GIT_BRANCH
+                            icons::HISTORY
                         } else {
-                            icons::LIST
+                            icons::SOURCE_CONTROL
                         }
                     })
                     .unwrap_or(icons::LIST),
@@ -12055,7 +12191,7 @@ impl Shell {
                                 )
                                 .child(SharedString::from("Browser")),
                         )
-                        .child(
+                        .when(!cfg!(target_os = "linux"), |menu| menu.child(
                             popover::menu_row(&theme, false, "right-plus-terminal")
                                 .id("right-plus-terminal-row")
                                 .on_click(cx.listener(|this, _, _, cx| {
@@ -12068,7 +12204,7 @@ impl Shell {
                                         .text_color(theme.text_muted),
                                 )
                                 .child(SharedString::from("Terminal")),
-                        )
+                        ))
                         .when(self.space_git_detected(cx), |menu| {
                             menu.child(
                                 popover::menu_row(&theme, false, "right-plus-diff")
@@ -12078,7 +12214,7 @@ impl Shell {
                                         this.close_right_plus(cx);
                                     }))
                                     .child(
-                                        icon(icons::LIST)
+                                        icon(icons::SOURCE_CONTROL)
                                             .size(px(13.0))
                                             .text_color(theme.text_muted),
                                     )
@@ -12092,7 +12228,7 @@ impl Shell {
                                         this.close_right_plus(cx);
                                     }))
                                     .child(
-                                        icon(icons::GIT_BRANCH)
+                                        icon(icons::HISTORY)
                                             .size(px(13.0))
                                             .text_color(theme.text_muted),
                                     )
@@ -12880,6 +13016,8 @@ fn header_icon_button_with(
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.follow_project_terminal_checkout(window, cx);
+        self.ensure_project_terminals(cx);
         self.sync_file_close_dialog(window, cx);
         let active_files_key = self.panel_key(cx);
         let hidden_explorers = self
@@ -13175,12 +13313,11 @@ impl Render for Shell {
             .on_drag_move(cx.listener(Self::on_right_pane_drag))
             .on_drag_move(cx.listener(Self::on_files_panel_drag))
             .on_drag_move(cx.listener(Self::on_terminal_drag))
-            // The panel shortcuts are chat-scoped chrome: in Settings they are
-            // no-ops (zeron __root.tsx gates the hotkey on `!isSettings`, and
-            // the terminal panel is only mounted on session routes). The
-            // sidebar toggle stays live everywhere, as in the original.
+            // Workspace shortcuts only apply to an open session. The new-chat
+            // canvas and Settings leave panel preferences intact for the
+            // return trip.
             .on_action(cx.listener(|this, _: &ToggleTerminal, window, cx| {
-                if matches!(this.route, Route::Chat) {
+                if this.session_workspace_visible(cx) {
                     this.toggle_terminal(window, cx)
                 }
             }))
@@ -13208,7 +13345,7 @@ impl Render for Shell {
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
-                if !matches!(this.route, Route::Settings(_)) {
+                if this.session_workspace_visible(cx) {
                     this.toggle_sidebar(cx)
                 }
             }))
@@ -13228,7 +13365,7 @@ impl Render for Shell {
                 this.cycle_navigation(false, window, cx)
             }))
             .on_action(cx.listener(|this, _: &ToggleChanges, window, cx| {
-                if matches!(this.route, Route::Chat) {
+                if this.session_workspace_visible(cx) {
                     this.toggle_right_pane(cx);
                     if !this.right_pane_open(cx) {
                         // The hidden editor can retain a focus handle after unmounting.
@@ -13240,7 +13377,7 @@ impl Render for Shell {
             // The explorer's own toggle (the titlebar tree button): docks or
             // undocks the explorer portion without touching the surface host.
             .on_action(cx.listener(|this, _: &ToggleFiles, window, cx| {
-                if matches!(this.route, Route::Chat) {
+                if this.session_workspace_visible(cx) {
                     this.toggle_explorer(window, cx);
                 }
             }))
@@ -13275,10 +13412,20 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &ToggleCommandPalette, window, cx| {
                 this.toggle_command_palette(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &OpenRecentChats, window, cx| {
+                if matches!(this.route, Route::Chat) && this.state.read(cx).selected_chat.is_none() {
+                    this.open_recent_chats(window, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &OpenModelPicker, window, cx| {
                 if matches!(this.route, Route::Chat) && !this.overlay_owns_keyboard(cx) {
                     let pickers = this.composer.read(cx).pickers().clone();
                     pickers.update(cx, |pickers, cx| pickers.open_model_menu(window, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, action: &OpenProjectSettings, _, cx| {
+                if matches!(this.route, Route::Chat) {
+                    this.open_worktree_settings(action.0.clone(), cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &AddSpacePalette, _, cx| {
@@ -13340,7 +13487,9 @@ impl Render for Shell {
                 self.viewport_height = f32::from(window.viewport_size().height);
                 // Stamped for `right_target` — the expanded changes panel
                 // sizes itself to the viewport.
-                self.viewport_width = (viewport - ACTIVITY_WIDTH).max(0.0);
+                let on_chat = self.session_workspace_visible(cx);
+                let activity_width = if on_chat { ACTIVITY_WIDTH } else { 0.0 };
+                self.viewport_width = (viewport - activity_width).max(0.0);
                 // Settings replaces the whole workspace, sidebar included. The
                 // chat layout stays unmounted; its entities keep their state
                 // for the return trip.
@@ -13373,7 +13522,6 @@ impl Render for Shell {
                         .child(sidebar_tone)
                         .child(motion::fade_in("phase-app", page));
                 }
-                let on_chat = true;
                 let right_target_width = if on_chat {
                     self.right_visible_width(cx)
                 } else {
@@ -13389,11 +13537,11 @@ impl Render for Shell {
                     self.motion_active.set(true);
                 }
                 let main_target_width = conversation_width(
-                    viewport - ACTIVITY_WIDTH - self.files_reserved_width(cx),
-                    self.sidebar_target(),
+                    viewport - activity_width - if on_chat { self.files_reserved_width(cx) } else { 0.0 },
+                    if on_chat { self.sidebar_target() } else { 0.0 },
                     right_target_width,
                 );
-                let main_transition = self.active_tween_endpoints(self.main_takeover_tween);
+                let main_transition = on_chat.then(|| self.active_tween_endpoints(self.main_takeover_tween)).flatten();
                 let main_content_width =
                     stable_panel_content_width(main_target_width, main_transition);
                 let transcript_width = self.composer_dock.borrow_mut().transcript_width(
@@ -13405,7 +13553,7 @@ impl Render for Shell {
                 // Clearance excludes the terminal dock: the transcript
                 // viewport ends at the dock's top (see the underlay in
                 // `render_main`), so only the chrome above it overlaps.
-                let term_h = self.terminal_geometry.get().height;
+                let term_h = if on_chat { self.terminal_geometry.get().height } else { 0.0 };
                 let stack_h = (self.bottom_stack.get() - term_h).max(0.0);
                 let expected_has_composer = {
                     let state = self.state.read(cx);
@@ -13422,7 +13570,7 @@ impl Render for Shell {
                     }
                 });
 
-                let sidebar = self.render_sidebar(cx);
+                let sidebar = if on_chat { self.render_sidebar(cx) } else { Empty.into_any_element() };
                 let sidebar_handle = self.resize_handle(
                     "sidebar-resize",
                     PaneResizeKind::Sidebar,
@@ -13465,7 +13613,7 @@ impl Render for Shell {
                 } else {
                     Empty.into_any_element()
                 };
-                let files_panel = self.render_files_panel(window, cx);
+                let files_panel = if on_chat { self.render_files_panel(window, cx) } else { Empty.into_any_element() };
                 let overlays = self.render_overlays(window.viewport_size(), window, cx);
                 // Full-window voice stage: above the page chrome, below dialogs.
                 let voice_stage = self.render_voice_stage(window, cx);
@@ -13533,14 +13681,16 @@ impl Render for Shell {
                 // Sidebar tone: a slightly lighter column behind the sidebar.
                 // Its width rides the same tween as the sidebar, so the tone
                 // melts away with the collapse instead of vanishing in a frame.
-                let sidebar_now = self.sidebar_now();
+                let sidebar_now = if on_chat { self.sidebar_now() } else { 0.0 };
                 let sidebar_tone = Self::sidebar_tone(sidebar_now, border_color, window);
                 // The content row spans the FULL window height — the titlebar
                 // overlays it (glass, no fill), so the transcript can scroll
                 // under the header and fade out at its edge. Columns that
                 // must NOT underlap (sidebar content, the changes panel,
                 // settings) pad themselves down by the titlebar height.
-                let columns = if cfg!(target_os = "linux") {
+                let columns = if !on_chat {
+                    div().size_full().flex().child(card)
+                } else if cfg!(target_os = "linux") {
                     div()
                         .size_full()
                         .flex()
@@ -13600,6 +13750,7 @@ impl Render for Shell {
                     // Voice covers the conversation; navigation and dialogs stay live.
                     .children(voice_stage)
                     .child(self.render_titlebar_cluster(cx))
+                    .child(self.toasts.clone())
                     .children(overlays);
                 root.child(sidebar_tone)
                     .child(motion::fade_in("phase-app", page))
@@ -15180,6 +15331,9 @@ mod exit_regressions {
                 assert!(width > 0. && width < 520.);
                 assert_eq!(shell.eval_tween(tween, 0.), width);
                 shell.active_chat = "preview".into();
+                shell.state.update(cx, |state, _| {
+                    state.selected_chat = Some("preview".into());
+                });
                 shell.viewport_width = 1000.;
                 shell.right_tween = tween;
                 shell.toggle_right_pane(cx);
@@ -15749,7 +15903,11 @@ mod exit_regressions {
                     shell.active_chat = "terminal-session".into();
                     let panel = if embedded {
                         shell.add_terminal_surface(cx);
-                        shell.right_terminal.clone().unwrap()
+                        if cfg!(target_os = "linux") {
+                            shell.terminal.clone().unwrap()
+                        } else {
+                            shell.right_terminal.clone().unwrap()
+                        }
                     } else {
                         shell.toggle_terminal(window, cx);
                         shell.terminal.clone().unwrap()
@@ -15758,14 +15916,15 @@ mod exit_regressions {
                     panel
                 })
                 .unwrap();
-            let terminal_window = if !embedded && drawer_window.is_some() {
+            let shared_drawer = !embedded || cfg!(target_os = "linux");
+            let terminal_window = if shared_drawer && drawer_window.is_some() {
                 drawer_window.unwrap()
             } else {
                 let handle = cx.update(|cx| {
                     cx.open_window(gpui::WindowOptions::default(), |_, _| panel.clone())
                         .unwrap()
                 });
-                if !embedded {
+                if shared_drawer {
                     drawer_window = Some(handle);
                 }
                 handle
@@ -16562,6 +16721,9 @@ mod exit_regressions {
         window
             .update(cx, |shell, window, cx| {
                 shell.active_chat = "session".into();
+                shell.state.update(cx, |state, _| {
+                    state.selected_chat = Some("session".into());
+                });
                 shell.toggle_right_pane(cx);
                 assert!(shell.right_pane_open(cx));
 
@@ -16793,8 +16955,24 @@ impl Shell {
         self.add_diff_surface(window, cx);
     }
 
+    pub fn fixture_new_chat(&mut self, cx: &mut Context<Self>) {
+        self.open_new_session(Some("fixture-space".into()), cx);
+        self.on_state_changed(&self.state.clone(), cx);
+    }
+
+    pub fn fixture_send_worktree(&mut self, cx: &mut Context<Self>) {
+        self.composer.update(cx, |composer, cx| composer.fixture_send_worktree(cx));
+    }
+
     pub fn fixture_workbench_state(&self, cx: &App) -> serde_json::Value {
         serde_json::json!({
+            "sessionVisible": self.session_workspace_visible(cx),
+            "selectedChat": self.state.read(cx).selected_chat,
+            "recentChatsOpen": self.command_palette.as_ref().is_some_and(|palette| palette.chats_only),
+            "setupPending": self.state.read(cx).selected_chat.as_deref().is_some_and(|chat| self.state.read(cx).worktree_setup_pending(chat)),
+            "terminalHeight": self.terminal_geometry.get().height,
+            "toast": self.toasts.read(cx).fixture_state(),
+            "worktreeSettings": self.fixture_worktree_settings_state(cx),
             "sourceControl": match self.resolved_right_active(cx) {
                 RightSurface::Diff(id) => self.diffs.get(&id).map_or(serde_json::Value::Null, |view| view.read(cx).fixture_source_control_state(cx)),
                 _ => serde_json::Value::Null,
@@ -16887,6 +17065,9 @@ mod right_tab_mouse_regressions {
                     cx,
                 );
                 shell.active_chat = "parent".into();
+                shell.state.update(cx, |state, _| {
+                    state.selected_chat = Some("parent".into());
+                });
                 for id in ["first", "second"] {
                     shell.add_subagent_surface("parent".into(), id.into(), id.into(), false, cx);
                 }
@@ -17643,6 +17824,88 @@ mod settings_modal_regressions {
             },
             cx,
         )
+    }
+
+    #[gpui::test]
+    fn new_chat_project_settings_button_opens_modal_without_opening_a_session(
+        cx: &mut TestAppContext,
+    ) {
+        assert_new_chat_worktree_settings_shortcut(
+            cx,
+            "canvas-project-picker",
+            "canvas-project-settings",
+            false,
+        );
+    }
+
+    #[gpui::test]
+    fn new_chat_checkout_settings_button_opens_modal_without_opening_a_session(
+        cx: &mut TestAppContext,
+    ) {
+        assert_new_chat_worktree_settings_shortcut(
+            cx,
+            "canvas-checkout-picker",
+            "canvas-checkout-settings",
+            false,
+        );
+    }
+
+    #[gpui::test]
+    fn new_chat_checkout_settings_supports_keyboard_navigation(cx: &mut TestAppContext) {
+        assert_new_chat_worktree_settings_shortcut(
+            cx,
+            "canvas-checkout-picker",
+            "canvas-checkout-settings",
+            true,
+        );
+    }
+
+    fn assert_new_chat_worktree_settings_shortcut(
+        cx: &mut TestAppContext,
+        picker: &'static str,
+        settings: &'static str,
+        keyboard: bool,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        init_settings_test(settings::UiSettings::default(), dir.path(), cx);
+        cx.update(|cx| motion::set_reduced_motion(cx, true));
+        let (shell, cx) = cx.add_window_view(|_, cx| test_shell(dir.path(), cx));
+        shell.update(cx, |shell, cx| {
+            shell.debug_gate = Some(GatePhase::Ready);
+            shell.reduced_motion = true;
+            shell.state.update(cx, |state, cx| {
+                state.local_device_id = Some("local".into());
+                state.spaces = vec![serde_json::from_value(serde_json::json!({
+                    "id":"project", "deviceId":"local", "path":dir.path(),
+                    "name":"Rocal", "gitDetected":true, "createdAt":Utc::now()
+                })).unwrap()];
+                state.selected_space = Some("project".into());
+                state.selected_chat = None;
+                state.auto_selected = true;
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+        let trigger = cx.debug_bounds(picker).unwrap().center();
+        cx.simulate_click(trigger, gpui::Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear());
+        let settings = cx.debug_bounds(settings).unwrap().center();
+        if keyboard {
+            cx.simulate_keystrokes("down down enter");
+        } else {
+            cx.simulate_click(settings, gpui::Modifiers::default());
+        }
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+        shell.read_with(cx, |shell, cx| {
+            assert!(shell.worktree_settings.editor.is_some());
+            assert!(!shell.composer.read(cx).pickers().read(cx).is_open());
+            assert_eq!(shell.state.read(cx).selected_space.as_deref(), Some("project"));
+            assert!(shell.state.read(cx).selected_chat.is_none());
+            assert!(!shell.session_workspace_visible(cx));
+            assert_eq!(shell.terminal_target(cx), 0.0);
+        });
     }
 
     #[test]

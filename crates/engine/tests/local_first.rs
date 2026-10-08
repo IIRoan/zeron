@@ -44,7 +44,22 @@ async fn rejecting_edge() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<
             let seen = seen.clone();
             tokio::spawn(async move {
                 let mut request = [0u8; 4096];
-                let _ = stream.read(&mut request).await;
+                let Ok(read) = stream.read(&mut request).await else {
+                    return;
+                };
+                // Cancelled connection attempts can be accepted and then
+                // close without sending an HTTP request. Do not report EOF
+                // as traffic from an engine that has already shut down.
+                if read == 0 {
+                    return;
+                }
+                // A separately running Dev app discovers this process's
+                // listener because its cwd is inside the Zeron project.
+                // Reject its preview probe; it is not traffic from the
+                // runtime under test and must not count toward shutdown.
+                if request[..read].starts_with(b"HEAD / HTTP/1.1\r\n") {
+                    return;
+                }
                 seen.fetch_add(1, Ordering::SeqCst);
                 let body = r#"{"error":"revoked"}"#;
                 let response = format!(

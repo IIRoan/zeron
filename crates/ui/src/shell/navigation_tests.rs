@@ -353,23 +353,42 @@ fn hiding_reopening_and_expanding_preserve_navigation_boundaries(cx: &mut TestAp
 }
 
 #[gpui::test]
-fn embedded_terminal_and_browser_focus_route_to_right_tabs(cx: &mut TestAppContext) {
+fn terminal_entrypoint_and_browser_respect_navigation_regions(cx: &mut TestAppContext) {
     let (shell, cx) = setup(cx);
     shell.update(cx, |shell, cx| {
         // No engine in this harness: reserve a real emulator tab without
         // starting a PTY, then use the normal surface activation path.
-        shell.right_terminal_panel(cx).update(cx, |panel, cx| {
+        let panel = if cfg!(target_os = "linux") {
+            shell.terminal_panel(cx)
+        } else {
+            shell.right_terminal_panel(cx)
+        };
+        panel.update(cx, |panel, cx| {
             panel.reserve_tab_for_chat("parent".into(), "Test terminal", cx);
         });
         shell.add_terminal_surface(cx);
     });
     cx.update(|window, cx| window.draw(cx).clear());
     cx.update(|window, cx| {
-        let terminal = shell.read(cx).right_terminal.as_ref().unwrap().read(cx);
+        let shell = shell.read(cx);
+        let terminal = if cfg!(target_os = "linux") {
+            assert!(shell.terminal_open(cx));
+            assert!(!shell.right_tabs.values().flatten().any(|surface| matches!(surface, RightSurface::Terminal(_))));
+            shell.terminal.as_ref().unwrap().read(cx)
+        } else {
+            shell.right_terminal.as_ref().unwrap().read(cx)
+        };
         assert!(terminal.focus_handle().is_focused(window));
     });
     press(cx, true);
-    assert_surface(&shell, cx, RightSurface::Subagent(1));
+    if cfg!(target_os = "linux") {
+        shell.read_with(cx, |shell, cx| {
+            assert_eq!(shell.state.read(cx).selected_chat.as_deref(), Some("other"));
+        });
+        shell.update(cx, |shell, cx| shell.open_chat("parent".into(), cx));
+    } else {
+        assert_surface(&shell, cx, RightSurface::Subagent(1));
+    }
     cx.update(|window, cx| {
         shell.update(cx, |shell, cx| {
             shell.add_browser_surface(None, window, cx);

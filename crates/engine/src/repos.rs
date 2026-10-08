@@ -133,6 +133,7 @@ struct ReposInner {
     data_dir: PathBuf,
     device_id: String,
     worktrees_root: PathBuf,
+    worktree_settings: crate::worktree_settings::WorktreeSettingsStore,
     file_searches: std::sync::Mutex<HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     http: reqwest::Client,
     github_avatars: std::sync::Mutex<HashMap<String, String>>,
@@ -180,6 +181,7 @@ impl Repos {
                 data_dir: data_dir.to_path_buf(),
                 device_id: device_id.to_string(),
                 worktrees_root,
+                worktree_settings: crate::worktree_settings::WorktreeSettingsStore::new(data_dir),
                 file_searches: std::sync::Mutex::new(HashMap::new()),
                 http: reqwest::Client::builder()
                     .timeout(GITHUB_AVATAR_TIMEOUT)
@@ -1177,12 +1179,15 @@ impl Repos {
     pub async fn workspace_checkout(&self, repo_path: &Path, candidate: &Path) -> Option<PathBuf> {
         let repo_path = repo_path.to_path_buf();
         let candidate = candidate.to_path_buf();
+        // Branch refs omit detached worktrees. Git's worktree registry is the
+        // authority for every linked checkout, including detached/locked ones.
+        // NUL fields also preserve paths containing spaces or newlines.
         let worktrees: Vec<_> = self
-            .refs(&repo_path)
+            .git(&["worktree", "list", "--porcelain", "-z"], Some(&repo_path))
             .await
             .unwrap_or_default()
-            .into_iter()
-            .filter_map(|row| row.worktree_path.map(PathBuf::from))
+            .split('\0')
+            .filter_map(|field| field.strip_prefix("worktree ").map(PathBuf::from))
             .collect();
         disposable_worker("checkout-auth", move || {
             let candidate = std::fs::canonicalize(candidate).ok()?;
@@ -1253,6 +1258,9 @@ impl Repos {
         repo_path: &Path,
         branch: &str,
     ) -> Result<Worktree, EngineError> {
+        let settings = self.inner.worktree_settings.defaults(repo_path)?;
+        let settings = crate::worktree_settings::normalize(settings)?;
+        let prefix = settings.branch_prefix.clone();
         let repo_name = repo_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -1278,7 +1286,8 @@ impl Repos {
                 ADJECTIVES[(seed % ADJECTIVES.len() as u64) as usize],
                 NOUNS[((seed / 31) % NOUNS.len() as u64) as usize]
             );
-            if !base.join(&candidate).exists() && !existing.contains(&format!("zeron/{candidate}"))
+            if !base.join(&candidate).exists()
+                && !existing.contains(&format!("{prefix}{candidate}"))
             {
                 name = Some(candidate);
                 break;
@@ -1287,19 +1296,50 @@ impl Repos {
         let name =
             name.ok_or_else(|| EngineError::Other("Could not allocate a worktree name".into()))?;
         let path = base.join(&name);
-        let branch_name = format!("zeron/{name}");
-        self.git(
-            &[
-                "worktree",
-                "add",
-                "-b",
-                &branch_name,
-                &path.to_string_lossy(),
-                branch,
-            ],
-            Some(repo_path),
-        )
-        .await?;
+        let branch_name = format!("{prefix}{name}");
+        if settings.create_command.trim().is_empty() {
+            self.git(
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    &branch_name,
+                    &path.to_string_lossy(),
+                    branch,
+                ],
+                Some(repo_path),
+            )
+            .await?;
+        } else {
+            self.inner
+                .worktree_settings
+                .run_lifecycle(
+                    repo_path,
+                    &path,
+                    &settings,
+                    &settings.create_command,
+                    Some((&branch_name, branch)),
+                )
+                .await?;
+            if self.workspace_checkout(repo_path, &path).await.is_none()
+                || path.canonicalize()? != base.canonicalize()?.join(&name)
+                || path.canonicalize()? == repo_path.canonicalize()?
+                || self.current_branch(&path).await?.as_str() != branch_name
+            {
+                return Err(EngineError::Other("The create command must create a linked worktree at $worktreepath on $branchname in this project.".into()));
+            }
+        }
+        self.inner
+            .worktree_settings
+            .remember(repo_path, &path, &branch_name, &prefix)?;
+        if let Err(error) = self
+            .inner
+            .worktree_settings
+            .prepare(repo_path, &path, false)
+            .await
+        {
+            tracing::warn!(%error,worktree=%path.display(),"worktree environment needs attention");
+        }
         let checkout = self.checkout_identity(&path).await?;
         Ok(Worktree {
             repo_path: repo_path.to_string_lossy().to_string(),
@@ -1344,10 +1384,22 @@ impl Repos {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        if current != expected_branch || expected_branch != format!("zeron/{folder}") {
+        let repo = self.workspace_checkout_root(worktree_path).await?;
+        let ownership = self
+            .inner
+            .worktree_settings
+            .owned_branch(&repo, worktree_path)?;
+        let prefix = ownership
+            .as_ref()
+            .map(|(_, prefix)| prefix.as_str())
+            .unwrap_or("zeron/");
+        if current != expected_branch || expected_branch != format!("{prefix}{folder}") {
             return Ok(current);
         }
-        let preferred = worktree_branch_from_title(title);
+        let preferred = format!(
+            "{prefix}{}",
+            worktree_branch_from_title(title).trim_start_matches("zeron/")
+        );
         if preferred == current {
             return Ok(current);
         }
@@ -1369,7 +1421,13 @@ impl Repos {
             Some(worktree_path),
         )
         .await?;
-        self.current_branch(worktree_path).await
+        let branch = self.current_branch(worktree_path).await?;
+        if ownership.is_some() {
+            self.inner
+                .worktree_settings
+                .remember(&repo, worktree_path, &branch, prefix)?;
+        }
+        Ok(branch)
     }
 
     /// Best-effort worktree removal (if it still exists), then prune stale refs.
@@ -1380,33 +1438,195 @@ impl Repos {
         repo_path: &Path,
         worktree_path: &Path,
     ) -> Result<(), EngineError> {
+        self.remove_worktree(repo_path, worktree_path, true, true).await
+    }
+
+    /// Check before stopping services or running a potentially destructive cleanup hook.
+    pub async fn validate_worktree_removal(
+        &self,
+        repo_path: &Path,
+        worktree_path: &Path,
+        force: bool,
+    ) -> Result<(), EngineError> {
+        let root = std::fs::canonicalize(repo_path)?;
+        let target = worktree_path.canonicalize().unwrap_or_else(|_| worktree_path.into());
+        let registry = self.git(&["worktree", "list", "--porcelain", "-z"], Some(&root)).await?;
+        let paths: Vec<_> = registry.split('\0').filter_map(|field| {
+            field.strip_prefix("worktree ").map(|path| {
+                Path::new(path).canonicalize().unwrap_or_else(|_| path.into())
+            })
+        }).collect();
+        if target == root || paths.first() == Some(&target)
+            || (worktree_path.exists() && !paths.contains(&target)) {
+            return Err(EngineError::Other("Only a linked worktree of this project can be removed.".into()));
+        }
+        if !force && worktree_path.exists() {
+            let status = self.git(
+                &["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"],
+                Some(worktree_path),
+            ).await?;
+            if !status.is_empty() {
+                return Err(EngineError::Other("This worktree has uncommitted changes. Commit or stash them, or select ‘Discard uncommitted changes’ before removing it.".into()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Settings removal preserves the branch unless explicitly requested otherwise.
+    pub async fn remove_worktree(
+        &self,
+        repo_path: &Path,
+        worktree_path: &Path,
+        force: bool,
+        delete_branch: bool,
+    ) -> Result<(), EngineError> {
+        self.validate_worktree_removal(repo_path, worktree_path, force).await?;
+        let ownership = self
+            .inner
+            .worktree_settings
+            .owned_branch(repo_path, worktree_path)?;
+        let registered_path = worktree_path
+            .canonicalize()
+            .unwrap_or_else(|_| worktree_path.into());
+        let mut removal_settings = None;
+        if worktree_path.exists() {
+            let root = std::fs::canonicalize(repo_path)?;
+            let cwd = std::fs::canonicalize(worktree_path)?;
+            if root == cwd || self.workspace_checkout(&root, &cwd).await.is_none() {
+                return Err(EngineError::Other(
+                    "Only a linked worktree of this project can be removed.".into(),
+                ));
+            }
+            removal_settings = Some(self.inner.worktree_settings.effective(&root, &cwd)?);
+            self.inner.worktree_settings.cleanup(&root, &cwd).await?;
+        }
         let branch = if worktree_path.exists() {
             self.current_branch(worktree_path).await.unwrap_or_default()
         } else {
             String::new()
         };
         if worktree_path.exists() {
-            let removed = self
-                .git(
-                    &[
-                        "worktree",
-                        "remove",
-                        "--force",
-                        &worktree_path.to_string_lossy(),
-                    ],
-                    Some(repo_path),
-                )
-                .await;
-            if removed.is_err() {
-                // git refused (or the dir is half-gone) — delete the folder directly.
-                let _ = std::fs::remove_dir_all(worktree_path);
+            if let Some(settings) = removal_settings.filter(|s| !s.remove_command.trim().is_empty())
+            {
+                self.inner
+                    .worktree_settings
+                    .run_lifecycle(
+                        repo_path,
+                        worktree_path,
+                        &settings,
+                        &settings.remove_command,
+                        None,
+                    )
+                    .await?;
+                if worktree_path.exists() {
+                    return Err(EngineError::Other("The remove command finished but the worktree still exists. Remove $worktreepath in your command.".into()));
+                }
+            } else {
+                // Git requires --force for initialized submodules even when
+                // clean. Recheck after cleanup before granting that exception;
+                // it must never discard edits created since the preflight.
+                if !force {
+                    self.validate_worktree_removal(repo_path, worktree_path, false).await?;
+                }
+                let initialized_submodules = if force {
+                    false
+                } else {
+                    let submodules = self.git(&["submodule", "status", "--recursive"], Some(worktree_path)).await?;
+                    submodules.lines().any(|line| !line.is_empty() && !line.starts_with('-'))
+                };
+                let path = worktree_path.to_string_lossy();
+                let mut args = vec!["worktree", "remove"];
+                if force || initialized_submodules { args.push("--force"); }
+                args.extend(["--", path.as_ref()]);
+                self.git(&args, Some(repo_path)).await?;
             }
         }
         let _ = self.git(&["worktree", "prune"], Some(repo_path)).await;
-        if branch.starts_with("zeron/") {
+        let registered = self
+            .git(&["worktree", "list", "--porcelain", "-z"], Some(repo_path))
+            .await?;
+        if registered
+            .split('\0')
+            .filter_map(|f| f.strip_prefix("worktree "))
+            .any(|p| Path::new(p) == registered_path)
+        {
+            return Err(EngineError::Other("The worktree is still registered with Git. The remove command must remove its Git worktree entry too.".into()));
+        }
+        let legacy_owned = ownership.is_none()
+            && worktree_path.starts_with(&self.inner.worktrees_root)
+            && branch.starts_with("zeron/");
+        if delete_branch && (ownership
+            .as_ref()
+            .is_some_and(|(owned, _)| owned == &branch)
+            || legacy_owned)
+        {
             let _ = self.git(&["branch", "-D", &branch], Some(repo_path)).await;
         }
+        self.inner
+            .worktree_settings
+            .forget(repo_path, worktree_path)?;
         Ok(())
+    }
+
+    pub fn worktree_settings(&self) -> crate::worktree_settings::WorktreeSettingsStore {
+        self.inner.worktree_settings.clone()
+    }
+
+    async fn workspace_checkout_root(&self, cwd: &Path) -> Result<PathBuf, EngineError> {
+        let output = self
+            .git(&["worktree", "list", "--porcelain", "-z"], Some(cwd))
+            .await?;
+        output
+            .split('\0')
+            .find_map(|field| field.strip_prefix("worktree "))
+            .map(PathBuf::from)
+            .ok_or_else(|| EngineError::Other("Worktree repository is unavailable".into()))
+    }
+
+    pub async fn worktree_settings_snapshot(
+        &self,
+        root: &Path,
+        checkout: Option<&Path>,
+    ) -> Result<zeron_proto::WorktreeSettingsSnapshot, EngineError> {
+        let output = match self
+            .git(&["worktree", "list", "--porcelain", "-z"], Some(root))
+            .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                if self.checkout_identity(root).await.is_ok() {
+                    return Err(error);
+                }
+                // Plain-folder projects still need service and environment settings.
+                if !root.is_dir() {
+                    return Err(error);
+                }
+                String::new()
+            }
+        };
+        let mut rows = Vec::new();
+        let mut path = String::new();
+        let mut branch = String::new();
+        for field in output.split('\0') {
+            if let Some(value) = field.strip_prefix("worktree ") {
+                if !path.is_empty() {
+                    rows.push((path.clone(), branch.clone()));
+                }
+                path = value.into();
+                branch.clear();
+            } else if let Some(value) = field.strip_prefix("branch refs/heads/") {
+                branch = value.into();
+            }
+        }
+        if !path.is_empty() {
+            rows.push((path, branch));
+        }
+        let store = self.worktree_settings();
+        let root = root.to_path_buf();
+        let checkout = checkout.map(Path::to_path_buf);
+        tokio::task::spawn_blocking(move || store.snapshot(&root, checkout.as_deref(), rows))
+            .await
+            .map_err(|e| EngineError::Other(e.to_string()))?
     }
 
     // ── ListFolders ─────────────────────────────────────────────────────────

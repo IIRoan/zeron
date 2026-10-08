@@ -6,6 +6,7 @@ const HISTORY_RESULT_LIMIT: usize = 30;
 const RESULTS_FADE_BAND: f32 = 18.0;
 
 pub(super) struct CommandPalette {
+    pub(super) chats_only: bool,
     search: Entity<ComposerInput>,
     focus: FocusHandle,
     previous_focus: Option<FocusHandle>,
@@ -97,9 +98,30 @@ impl Shell {
             self.close_command_palette(window, cx);
             return;
         }
+        self.open_command_palette(false, window, cx);
+    }
+
+    pub(super) fn open_recent_chats(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_command_palette(true, window, cx);
+    }
+
+    fn open_command_palette(
+        &mut self,
+        chats_only: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.add_space = None;
         let search = cx.new(|cx| {
-            ComposerInput::with_context("Search commands and chats…", "PaletteSearch", cx)
+            ComposerInput::with_context(
+                if chats_only {
+                    "Search previous chats…"
+                } else {
+                    "Search commands and chats…"
+                },
+                "PaletteSearch",
+                cx,
+            )
         });
         let events = cx.subscribe(&search, |this, _, event, cx| {
             if matches!(event, ComposerInputEvent::Edited) {
@@ -112,6 +134,7 @@ impl Shell {
         });
         let previous_focus = window.focused(cx);
         self.command_palette = Some(CommandPalette {
+            chats_only,
             search,
             focus: cx.focus_handle(),
             previous_focus,
@@ -138,7 +161,11 @@ impl Shell {
             return Vec::new();
         };
         let query = palette.search.read(cx).text().trim().to_lowercase();
-        let mut entries = actions_for(&query, Theme::of(cx).appearance.is_dark());
+        let mut entries = if palette.chats_only {
+            Vec::new()
+        } else {
+            actions_for(&query, Theme::of(cx).appearance.is_dark())
+        };
         let state = self.state.read(cx);
         // Global history deliberately ignores the sidebar's project filter and
         // collapsed groups. Archived conversations remain searchable too.
@@ -173,7 +200,12 @@ impl Shell {
                 )
             })
             .collect();
-        chats.sort_by(|a, b| spaces::compare_sidebar_chats(self.settings.sidebar_sort, a, b));
+        let sort = if palette.chats_only {
+            SidebarSort::LastUpdated
+        } else {
+            self.settings.sidebar_sort
+        };
+        chats.sort_by(|a, b| spaces::compare_sidebar_chats(sort, a, b));
         // Limit after filtering and sorting so every chat remains searchable.
         entries.extend(
             chats
@@ -226,6 +258,7 @@ impl Shell {
         }
         palette.active = palette.active.min(entries.len().saturating_sub(1));
         let active = palette.active;
+        let chats_only = palette.chats_only;
         let search = palette.search.clone();
         let query = search.read(cx).text().to_string();
         let focus = palette.focus.clone();
@@ -238,6 +271,7 @@ impl Shell {
             // fade instead of leaving a permanent gutter beside the chrome.
             let mut row = div()
                 .id(("command-result", ix))
+                .debug_selector(move || format!("command-result-{ix}"))
                 .flex_none()
                 .on_mouse_move(cx.listener(move |this, _: &gpui::MouseMoveEvent, _, cx| {
                     this.hover_command(ix, cx)
@@ -358,11 +392,23 @@ impl Shell {
             .gap(px(SIDEBAR_LIST_GAP))
             .children(rows)
             .when(entries.is_empty(), |el| {
-                el.child(palette_empty(
-                    &theme,
-                    "No results",
-                    "Try a command, chat title, project, or device.",
-                ))
+                let (title, hint) = if chats_only && query.trim().is_empty() {
+                    (
+                        "No previous chats yet",
+                        "Start a conversation and it will appear here.",
+                    )
+                } else if chats_only {
+                    (
+                        "No matching chats",
+                        "Try a chat title, project, branch, or device.",
+                    )
+                } else {
+                    (
+                        "No results",
+                        "Try a command, chat title, project, or device.",
+                    )
+                };
+                el.child(palette_empty(&theme, title, hint))
             });
         let body = palette_results_fade(body, &scroll);
         let card = palette_card("command-palette", &focus, viewport, &theme)
@@ -419,6 +465,24 @@ impl Shell {
             .on_mouse_down_out(
                 cx.listener(|this, _, window, cx| this.close_command_palette(window, cx)),
             )
+            .when(chats_only, |card| {
+                card.child(
+                    div()
+                        .px(px(16.0))
+                        .pt(px(14.0))
+                        .pb(px(2.0))
+                        .text_size(crate::typography::ui_rems(12.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .child("Recent chats")
+                        .child(
+                            div()
+                                .mt(px(4.0))
+                                .text_size(crate::typography::ui_rems(11.0))
+                                .text_color(theme.text_muted)
+                                .child("All projects · Includes archived chats"),
+                        ),
+                )
+            })
             .child(palette_header(
                 &theme,
                 search.into_any_element(),
@@ -428,7 +492,11 @@ impl Shell {
             .child(
                 palette_footer()
                     .child(command_key_hint(&theme, "↑ ↓", "Navigate"))
-                    .child(command_key_hint(&theme, "↵", "Select"))
+                    .child(command_key_hint(
+                        &theme,
+                        "↵",
+                        if chats_only { "Open chat" } else { "Select" },
+                    ))
                     .child(command_key_hint(&theme, "Esc", "Close")),
             );
         Some(palette_overlay(viewport, card))
@@ -576,6 +644,14 @@ mod tests {
             gpui_base::init(cx);
             cx.set_global(Theme::default());
             crate::app_menus::init(cx);
+            let prefs = crate::settings::UiSettings::default();
+            crate::history::init(
+                prefs.git_history_columns,
+                prefs.git_history_column_widths,
+                prefs.git_history_column_order,
+                prefs.git_history_author_display,
+                cx,
+            );
         });
         let window = cx.add_window(|_, cx| {
             let state = cx.new(|_| AppState::new());
@@ -691,6 +767,90 @@ mod tests {
                 assert_eq!(search_chats(shell, "", cx), expected);
                 let oldest = format!("session-{HISTORY_RESULT_LIMIT}");
                 assert_eq!(search_chats(shell, &oldest, cx), [oldest]);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn recent_chats_use_activity_order_and_open_archived_sessions(cx: &mut TestAppContext) {
+        let (window, _dir) = palette_window(cx);
+        window
+            .update(cx, |shell, window, cx| {
+                shell.settings.sidebar_sort = SidebarSort::Created;
+                shell.settings.space_filter = Some("another-project".into());
+                let mut archived = chat("archived-session", None, true, 20);
+                archived.space_id = Some("rocal".into());
+                archived.last_message_at = Some(chat("clock", None, false, 0).created_at);
+                archived.cwd = Some("/project/worktrees/feature-login".into());
+                archived.branch = Some("iiroan/feature-login".into());
+                archived.source_context = Some(zeron_proto::ConversationSourceContext {
+                    branch: "iiroan/feature-login".into(),
+                    checkout_id: "worktree-login".into(),
+                    repo_root: "/project".into(),
+                    cwd: "/project/worktrees/feature-login".into(),
+                    head_sha: None,
+                    observed_at: archived.created_at,
+                });
+                shell.state.update(cx, |state, _| {
+                    state.spaces = vec![
+                        serde_json::from_value(serde_json::json!({
+                            "id":"rocal", "deviceId":"local", "path":"/project", "name":"Rocal",
+                            "createdAt":archived.created_at,
+                        }))
+                        .unwrap(),
+                    ];
+                    state.apply_chats(vec![
+                        chat("newer-session", None, false, 5),
+                        chat("worker", Some("archived-session"), false, 0),
+                        archived,
+                    ]);
+                });
+                shell.open_new_session(None, cx);
+                shell.open_recent_chats(window, cx);
+                assert_eq!(
+                    shell.command_entries(cx),
+                    [
+                        Entry::Chat("archived-session".into()),
+                        Entry::Chat("newer-session".into()),
+                    ]
+                );
+                assert_eq!(
+                    search_chats(shell, "rocal feature-login", cx),
+                    ["archived-session"]
+                );
+                shell.activate_command(Entry::Chat("archived-session".into()), window, cx);
+                assert!(shell.command_palette.is_none());
+                assert_eq!(
+                    shell.state.read(cx).selected_chat.as_deref(),
+                    Some("archived-session")
+                );
+                assert!(shell.state.read(cx).selected_chat_row().unwrap().archived);
+                assert!(matches!(shell.route, Route::Chat));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn recent_chat_search_finds_history_outside_the_recent_limit(cx: &mut TestAppContext) {
+        let (window, _dir) = palette_window(cx);
+        window
+            .update(cx, |shell, window, cx| {
+                shell.state.update(cx, |state, _| {
+                    state.apply_chats(
+                        (0..=HISTORY_RESULT_LIMIT)
+                            .map(|ix| chat(&format!("session-{ix}"), None, false, ix as i64))
+                            .collect(),
+                    );
+                });
+                shell.open_new_session(None, cx);
+                shell.open_recent_chats(window, cx);
+                assert_eq!(shell.command_entries(cx).len(), HISTORY_RESULT_LIMIT);
+                let oldest = format!("session-{HISTORY_RESULT_LIMIT}");
+                assert_eq!(search_chats(shell, &oldest, cx), [oldest]);
+                shell.close_command_palette(window, cx);
+                assert!(shell.state.read(cx).selected_chat.is_none());
+                shell.toggle_command_palette(window, cx);
+                assert_eq!(shell.command_entries(cx)[0], Entry::NewChat);
             })
             .unwrap();
     }

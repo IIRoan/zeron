@@ -545,6 +545,9 @@ mod tests {
                     "the new-session canvas has no explorer"
                 );
                 shell.active_chat = "first".into();
+                shell.state.update(cx, |state, _| {
+                    state.selected_chat = Some("first".into());
+                });
                 shell.add_files_surface(window, cx);
                 let explorer = shell.files["first"].entity_id();
                 assert!(shell.files_panel_open(cx));
@@ -563,10 +566,16 @@ mod tests {
                 assert_eq!(shell.file_surfaces.len(), 1);
                 assert!(shell.pending_file_closes.is_empty());
                 shell.active_chat = "second".into();
+                shell.state.update(cx, |state, _| {
+                    state.selected_chat = Some("second".into());
+                });
                 assert!(!shell.files_panel_open(cx));
                 shell.add_files_surface(window, cx);
                 assert_ne!(shell.files["second"].entity_id(), explorer);
                 shell.active_chat = "first".into();
+                shell.state.update(cx, |state, _| {
+                    state.selected_chat = Some("first".into());
+                });
                 assert!(!shell.files_panel_open(cx));
                 shell.add_files_surface(window, cx);
                 assert_eq!(shell.files["first"].entity_id(), explorer);
@@ -606,6 +615,9 @@ mod tests {
         window
             .update(cx, |shell, window, cx| {
                 shell.active_chat = "chat".into();
+                shell.state.update(cx, |state, _| {
+                    state.selected_chat = Some("chat".into());
+                });
                 // Widths settle immediately so the assertions see end states.
                 shell.reduced_motion = true;
                 // A fresh pane toggle lands on the surface host alone.

@@ -8807,6 +8807,8 @@ impl Composer {
         };
         let space_id = space.as_ref().map(|s| s.id.clone());
         let space_path = space.as_ref().map(|s| s.path.clone());
+        let preparing_worktree = is_new && space_id.is_some()
+            && matches!(&plan, crate::pickers::CheckoutPlan::NewWorktree { .. });
         let create_side_chat = self.state.update(cx, |state, _| {
             if state.side_chat_unsaved()
                 && let Some(mut config) = resolved.chat_config()
@@ -9002,6 +9004,9 @@ impl Composer {
                 // without it a remote send flashed Completed (and could ring
                 // the done-chime) in the queue→drain→sync gap.
                 s.begin_pending_send(&chat_id, &message_id, chrono::Utc::now());
+                if preparing_worktree {
+                    s.begin_worktree_setup(&chat_id, &message_id);
+                }
             }
             cx.notify();
         });
@@ -9390,9 +9395,12 @@ impl Composer {
                     let poll_engine = engine.clone();
                     let poll_chat_id = chat_id.clone();
                     let poll_target_device_id = host_device_id.clone();
+                    let poll_message_id = message_id.clone();
                     this.update(cx, |_, cx| {
                         cx.spawn(async move |this, cx| {
-                            for _ in 0..480 {
+                            let deadline = std::time::Instant::now()
+                                + Duration::from_secs(zeron_proto::WORKTREE_OPERATION_TIMEOUT_SECONDS);
+                            while std::time::Instant::now() < deadline {
                                 let mut params = serde_json::json!({
                                     "chatId": poll_chat_id,
                                     "commandId": command_id,
@@ -9424,7 +9432,11 @@ impl Composer {
                                             .get("setupError")
                                             .and_then(|value| value.as_str())
                                             .map(str::to_string);
-                                        this.update(cx, |_, cx| {
+                                        this.update(cx, |composer, cx| {
+                                            composer.state.update(cx, |state, cx| {
+                                                state.finish_worktree_setup(&poll_chat_id, &poll_message_id);
+                                                cx.notify();
+                                            });
                                             cx.emit(ComposerEvent::WorktreeSetup {
                                                 chat_id: poll_chat_id.clone(),
                                                 setup_action,
@@ -9435,13 +9447,22 @@ impl Composer {
                                         .ok();
                                         return;
                                     }
-                                    Err(error) if error.starts_with("unknown method: ") => return,
+                                    Err(error) if error.starts_with("unknown method: ") => break,
                                     Ok(_) | Err(_) => {}
                                 }
+                                if this.update(cx, |_, _| ()).is_err() {
+                                    return;
+                                }
                                 cx.background_executor()
-                                    .timer(Duration::from_millis(250))
+                                    .timer(Duration::from_millis(500))
                                     .await;
                             }
+                            this.update(cx, |composer, cx| {
+                                composer.state.update(cx, |state, cx| {
+                                    state.finish_worktree_setup(&poll_chat_id, &poll_message_id);
+                                    cx.notify();
+                                });
+                            }).ok();
                             tracing::warn!(
                                 chat = %poll_chat_id,
                                 command = %command_id,
@@ -9747,6 +9768,13 @@ impl Composer {
     }
 
     // ---- render pieces ----
+
+    #[cfg(feature = "source-control-fixture")]
+    pub(crate) fn fixture_send_worktree(&mut self, cx: &mut Context<Self>) {
+        self.pickers
+            .update(cx, |pickers, cx| pickers.fixture_new_worktree(cx));
+        self.send("Test worktree preparation".into(), false, cx);
+    }
 
     /// The agent-asked-a-question panel (zeron question-panel.tsx), rendered in
     /// place of the composer: the same floating-pill chrome (`rounded-[26px]

@@ -1858,6 +1858,14 @@ impl Pickers {
         cx.notify();
     }
 
+    fn open_selected_worktree_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let space_id = self.state.read(cx).selected_space_row().map(|space| space.id.clone());
+        if let Some(space_id) = space_id {
+            self.dismiss(cx);
+            window.dispatch_action(Box::new(crate::shell::OpenProjectSettings(space_id)), cx);
+        }
+    }
+
     fn pick_harness(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
         if self.harness_locked(cx) {
             return;
@@ -2466,32 +2474,30 @@ impl Pickers {
     /// the current checkout, else one on the current device, else this
     /// device's, else the first.
     fn pick_project(&mut self, key: String, cx: &mut Context<Self>) {
-        let space_id = {
-            let state = self.state.read(cx);
-            let Some(member) = state
-                .spaces
-                .iter()
-                .find(|s| zeron_proto::view::project_key(s) == key)
-            else {
-                return;
-            };
-            let members = state.project_members(member);
-            let selected = state.selected_space_row().map(|s| s.id.clone());
-            let device = state.effective_device_id();
-            members
-                .iter()
-                .find(|s| selected.as_deref() == Some(s.id.as_str()))
-                .or_else(|| {
-                    members
-                        .iter()
-                        .find(|s| device.as_deref() == Some(s.device_id.as_str()))
-                })
-                .or(members.first())
-                .map(|s| s.id.clone())
-        };
-        if let Some(space_id) = space_id {
+        if let Some(space_id) = self.project_space_id(&key, cx) {
             self.pick_space(space_id, cx);
         }
+    }
+
+    fn project_space_id(&self, key: &str, cx: &App) -> Option<String> {
+        let state = self.state.read(cx);
+        let member = state
+            .spaces
+            .iter()
+            .find(|s| zeron_proto::view::project_key(s) == key)?;
+        let members = state.project_members(member);
+        let selected = state.selected_space_row().map(|s| s.id.as_str());
+        let device = state.effective_device_id();
+        members
+            .iter()
+            .find(|s| selected == Some(s.id.as_str()))
+            .or_else(|| {
+                members
+                    .iter()
+                    .find(|s| device.as_deref() == Some(s.device_id.as_str()))
+            })
+            .or(members.first())
+            .map(|s| s.id.clone())
     }
 
     /// Re-home the canvas onto another project. The state observer does the
@@ -2793,6 +2799,8 @@ impl Pickers {
                         .gap(px(2.0))
                         .max_h(px(self.list_budget(152.0)))
                         .children(rows.into_iter().enumerate().map(|(ix, row)| {
+                            let settings_space = self.project_space_id(&row.key, cx);
+                            let settings_label = format!("Worktree settings for {}", row.name);
                             let label: SharedString = row.name.into();
                             let is_selected = selected.as_deref() == Some(row.key.as_str());
                             let key = row.key;
@@ -2807,6 +2815,38 @@ impl Pickers {
                                 this.pick_project(key.clone(), cx);
                             }))
                             .child(div().flex_1().min_w_0().truncate().child(label))
+                            .when_some(settings_space, |el, space_id| {
+                                el.child(
+                                    div()
+                                        .id(SharedString::from(format!("canvas-project-settings-{space_id}")))
+                                        .debug_selector(|| "canvas-project-settings".into())
+                                        .size(px(24.0))
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(6.0))
+                                        .cursor_pointer()
+                                        .role(gpui::Role::Button)
+                                        .aria_label(settings_label)
+                                        .tooltip(crate::settings::widgets::text_tooltip("Worktree settings"))
+                                        .hover(|el| el.bg(theme.element_hover))
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.dismiss(cx);
+                                            window.dispatch_action(
+                                                Box::new(crate::shell::OpenProjectSettings(space_id.clone())),
+                                                cx,
+                                            );
+                                        }))
+                                        .child(
+                                            crate::icons::icon(crate::icons::SETTINGS_MINIMALISTIC)
+                                                .size(px(14.0))
+                                                .text_color(theme.text_muted),
+                                        )
+                                        .text_color(theme.text_muted),
+                                )
+                            })
                         })),
                 ))
                 .children(scrollbar)
@@ -2901,7 +2941,7 @@ impl Pickers {
         }
     }
 
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &Window, cx: &mut Context<Self>) {
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.cancel_setting_hover();
         // The frame stays mounted (and possibly focused) through the exit
         // animation — keys must not drive a dying popover.
@@ -3000,7 +3040,9 @@ impl Pickers {
                 let delta = if key == MenuKey::Up { -1 } else { 1 };
                 let count = match self.open_kind() {
                     Some(PickerKind::Branch) => self.filtered_ref_rows(cx).len().min(MAX_REF_ROWS),
-                    Some(PickerKind::Checkout) => 2,
+                    Some(PickerKind::Checkout) => {
+                        2 + usize::from(self.state.read(cx).selected_space_row().is_some())
+                    }
                     // Continue from model rows into the pinned settings triggers.
                     Some(PickerKind::HarnessModel) => {
                         self.model_rows_len(cx)
@@ -3033,12 +3075,12 @@ impl Pickers {
                 if self.open_kind() == Some(PickerKind::HarnessModel) {
                     self.activate_model_row(cx);
                 } else if self.open_kind() == Some(PickerKind::Checkout) {
-                    let kind = if self.active == 0 {
-                        CheckoutKind::Local
-                    } else {
-                        CheckoutKind::NewWorktree
-                    };
-                    self.pick_checkout(kind, cx);
+                    match self.active {
+                        0 => self.pick_checkout(CheckoutKind::Local, cx),
+                        1 => self.pick_checkout(CheckoutKind::NewWorktree, cx),
+                        2 => self.open_selected_worktree_settings(window, cx),
+                        _ => {}
+                    }
                 } else {
                     self.on_search_submit(cx);
                 }
@@ -3433,9 +3475,7 @@ impl Pickers {
             )
     }
 
-    /// New-session destination controls: the project, then the device it
-    /// runs on, as a chip-only cluster floating above the composer's trailing
-    /// edge.
+    /// New-session navigation and destination controls above the composer.
     pub fn render_new_thread_target_selectors(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let closing = (self.open.closing_since(), self.menu_geometry().below);
@@ -3486,13 +3526,42 @@ impl Pickers {
             project_label,
             &theme,
             cx,
-        );
+        )
+        .debug_selector(|| "canvas-project-picker".into());
+        let recent_id: SharedString = format!("canvas-recent-chats-{}", cx.entity_id()).into();
+        let recent = div()
+            .id("canvas-recent-chats")
+            .debug_selector(|| "canvas-recent-chats".into())
+            .role(gpui::Role::Button)
+            .aria_label("Open recent chats")
+            .flex_none()
+            .h(px(20.0))
+            .px(px(8.0))
+            .rounded(px(FOOTER_CHIP_RADIUS))
+            .flex().items_center().gap(px(6.0))
+            .text_size(crate::typography::ui_rems(12.0))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(motion::hover_blend(&recent_id, theme.text_muted.opacity(0.7), theme.text.opacity(0.8)))
+            .bg(motion::hover_blend(&recent_id, gpui::transparent_black(), theme.element_hover))
+            .on_hover(motion::hover_listener(recent_id))
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.close(cx);
+                window.dispatch_action(Box::new(crate::shell::OpenRecentChats), cx);
+            }))
+            .child(crate::icons::icon(crate::icons::CLOCK_CIRCLE).size(px(12.0)).flex_none()
+                .text_color(theme.text_muted.opacity(0.7)))
+            .child("Recent chats");
         div()
+            .w_full()
+            .min_w_0()
             .flex_none()
             .flex()
             .flex_row()
             .items_center()
             .gap(px(4.0))
+            .child(recent)
+            .child(div().flex_1())
             .child(attach_overlay_end(
                 project_chip,
                 &mut overlay,
@@ -3549,7 +3618,8 @@ impl Pickers {
             SharedString::from(self.checkout_label()),
             &theme,
             cx,
-        );
+        )
+        .debug_selector(|| "canvas-checkout-picker".into());
         let branch_chip = self.footer_chip(
             PickerKind::Branch,
             "picker-branch",
@@ -4053,8 +4123,7 @@ impl Pickers {
         popover.into_any_element()
     }
 
-    /// The checkout-kind dropdown (t3code BranchToolbarEnvModeSelector): two
-    /// rows — "Current checkout"/"Current worktree" (local) and "New worktree".
+    /// Checkout choices followed by the selected project's worktree settings.
     fn render_checkout_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).for_popup();
         let has_worktree = self.selected_ref_worktree().is_some();
@@ -4112,6 +4181,32 @@ impl Pickers {
                         )
                     }),
             )
+            .when(self.state.read(cx).selected_space_row().is_some(), |el| {
+                el.child(
+                    popover::menu_section().child(
+                        popover::menu_row_nav(
+                            &theme,
+                            false,
+                            active == 2,
+                            "checkout-settings".to_string(),
+                        )
+                        .id("checkout-settings")
+                        .debug_selector(|| "canvas-checkout-settings".into())
+                        .role(gpui::Role::Button)
+                        .aria_label("Worktree settings for the selected project")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.open_selected_worktree_settings(window, cx);
+                        }))
+                        .child(
+                            crate::icons::icon(crate::icons::SETTINGS_MINIMALISTIC)
+                                .size(px(14.0))
+                                .text_color(theme.text_muted),
+                        )
+                        .child("Worktree settings…"),
+                    ),
+                )
+            })
             .into_any_element()
     }
 
@@ -5405,6 +5500,20 @@ impl Pickers {
             .when(!compact, |el| el.pb(px(popover::CARD_INSET)))
             .children(rows)
             .into_any_element()
+    }
+}
+
+#[cfg(feature = "source-control-fixture")]
+impl Pickers {
+    pub(crate) fn fixture_new_worktree(&mut self, cx: &mut Context<Self>) {
+        self.config = DraftConfig {
+            harness: Some(HarnessId::Mock),
+            model: Some("fable-5".into()),
+            branch: Some("main".into()),
+            checkout: CheckoutKind::NewWorktree,
+            ..Default::default()
+        };
+        cx.notify();
     }
 }
 
@@ -7423,6 +7532,12 @@ mod tests {
                     ("notes".into(), "notes".into())
                 ]
             );
+            assert_eq!(
+                pickers.project_space_id("repo:github.com/o/comet", cx).as_deref(),
+                Some("laptop"),
+                "settings use the current device's checkout without selecting it"
+            );
+            assert_eq!(pickers.state.read(cx).selected_space.as_deref(), Some("notes"));
             // Picking it keeps the canvas on this device's checkout.
             pickers.pick_project("repo:github.com/o/comet".into(), cx);
             assert_eq!(

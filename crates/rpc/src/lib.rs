@@ -182,6 +182,14 @@ pub mod methods {
     pub const UPSERT_PROJECT_ACTION: &str = "UpsertProjectAction";
     pub const DELETE_PROJECT_ACTION: &str = "DeleteProjectAction";
     pub const RUN_PROJECT_ACTION: &str = "RunProjectAction";
+    pub const GET_PROJECT_TERMINALS: &str = "GetProjectTerminals";
+    pub const SAVE_PROJECT_TERMINALS: &str = "SaveProjectTerminals";
+    pub const CONTROL_PROJECT_TERMINALS: &str = "ControlProjectTerminals";
+    pub const GET_WORKTREE_SETTINGS: &str = "GetWorktreeSettings";
+    pub const SAVE_WORKTREE_SETTINGS: &str = "SaveWorktreeSettings";
+    pub const PREPARE_WORKTREE: &str = "PrepareWorktree";
+    pub const CANCEL_WORKTREE_SETUP: &str = "CancelWorktreeSetup";
+    pub const GET_WORKTREE_SETUP_LOG: &str = "GetWorktreeSetupLog";
     // Terminals (ControlRpc, relay-forwardable; SubscribeTerminal streams).
     pub const OPEN_TERMINAL: &str = "OpenTerminal";
     pub const SUBSCRIBE_TERMINAL: &str = "SubscribeTerminal";
@@ -197,8 +205,10 @@ pub mod methods {
     pub const GET_CHECKOUT_DIFF: &str = "GetCheckoutDiff";
     pub const GET_CHECKOUT_CHANGES: &str = "GetCheckoutChanges";
     pub const SET_CHECKOUT_STAGED: &str = "SetCheckoutStaged";
+    pub const GET_CHECKOUT_CONFLICT_MARKERS: &str = "GetCheckoutConflictMarkers";
     pub const COMMIT_CHECKOUT_STAGED: &str = "CommitCheckoutStaged";
     pub const GET_CHECKOUT_GIT_DETAILS: &str = "GetCheckoutGitDetails";
+    pub const GET_CHECKOUT_STASHES: &str = "GetCheckoutStashes";
     pub const RUN_CHECKOUT_GIT_ACTION: &str = "RunCheckoutGitAction";
     pub const PREVIEW_CHECKOUT_DISCARD: &str = "PreviewCheckoutDiscard";
     pub const DISCARD_CHECKOUT_CHANGES: &str = "DiscardCheckoutChanges";

@@ -29,7 +29,11 @@ fn sidebar_width(cx: &gpui::App) -> f32 {
 /// The page pane beside the section column, below the titlebar strip.
 pub fn pane_bounds(viewport: gpui::Size<Pixels>, sidebar_width: f32) -> gpui::Bounds<Pixels> {
     let reserved = px(sidebar_width).max(px(0.0)).min(viewport.width);
-    let left = if cfg!(target_os = "linux") { px(0.0) } else { reserved };
+    let left = if cfg!(target_os = "linux") {
+        px(0.0)
+    } else {
+        reserved
+    };
     let top = px(Theme::TITLEBAR_HEIGHT).min(viewport.height);
     gpui::Bounds::new(
         gpui::point(left, top),
@@ -54,11 +58,22 @@ pub fn dropdown(
     closing: Option<std::time::Instant>,
     trigger_height: f32,
 ) -> AnyElement {
+    dropdown_layer(id, content, closing, trigger_height, 1)
+}
+
+fn dropdown_layer(
+    id: impl Into<SharedString>,
+    content: gpui::Div,
+    closing: Option<std::time::Instant>,
+    trigger_height: f32,
+    priority: usize,
+) -> AnyElement {
     SettingsDropdown {
         id: id.into(),
         content,
         closing,
         trigger_height,
+        priority,
     }
     .into_any_element()
 }
@@ -69,17 +84,19 @@ struct SettingsDropdown {
     content: gpui::Div,
     closing: Option<std::time::Instant>,
     trigger_height: f32,
+    priority: usize,
 }
 
 impl RenderOnce for SettingsDropdown {
     fn render(self, window: &mut gpui::Window, cx: &mut gpui::App) -> impl IntoElement {
         let limits = dropdown_limits(window.viewport_size(), sidebar_width(cx));
-        popover::contained_menu(
+        popover::contained_menu_layer(
             self.id,
             self.content,
             self.closing,
             self.trigger_height,
             limits,
+            self.priority,
         )
     }
 }
@@ -1265,6 +1282,7 @@ pub fn select<V: 'static>(
         menu_width: None,
         font: None,
         heading: None,
+        menu_layer: 1,
         reach: Rc::new(reach),
         on_select: None,
     }
@@ -1280,6 +1298,7 @@ pub struct Select<V: 'static> {
     menu_width: Option<f32>,
     font: Option<SharedString>,
     heading: Option<&'static str>,
+    menu_layer: usize,
     reach: SelectReach<V>,
     on_select: Option<SelectHandler<V>>,
 }
@@ -1307,6 +1326,12 @@ fn commit_select<V: 'static>(
 }
 
 impl<V: 'static> Select<V> {
+    /// Use 3 for a select inside a priority-2 modal; ordinary settings use 1.
+    pub fn menu_layer(mut self, priority: usize) -> Self {
+        self.menu_layer = priority;
+        self
+    }
+
     pub fn options(
         mut self,
         options: impl IntoIterator<Item = SelectOption>,
@@ -1360,6 +1385,7 @@ impl<V: 'static> Select<V> {
             menu_width,
             font,
             heading,
+            menu_layer,
             reach,
             on_select,
         } = self;
@@ -1495,11 +1521,12 @@ impl<V: 'static> Select<V> {
                     SELECT_HEIGHT,
                     if heading.is_some() { 32.0 } else { 8.0 },
                 ));
-            trigger = trigger.child(dropdown(
+            trigger = trigger.child(dropdown_layer(
                 format!("{id}-menu"),
                 menu,
                 state.menu.closing_since(),
                 SELECT_HEIGHT,
+                menu_layer,
             ));
         }
         trigger

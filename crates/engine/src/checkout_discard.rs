@@ -175,7 +175,7 @@ pub async fn preview(
         if !include_staged && file.worktree == GitFileState::Unchanged {
             return Err(fail("File has no unstaged changes"));
         }
-        if !include_staged && file.index == GitFileState::Unmerged {
+        if !include_staged && file.is_conflicted() {
             return Err(fail(
                 "Resolve conflicts with Accept Current or Accept Incoming",
             ));

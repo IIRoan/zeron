@@ -15,12 +15,32 @@ pub(crate) fn contained_menu(
     trigger_height: f32,
     limits: Bounds<Pixels>,
 ) -> AnyElement {
+    contained_menu_layer(id, content, closing, trigger_height, limits, 1)
+}
+
+/// Dropdowns inside priority-2 modals need a higher paint/input layer.
+pub(crate) fn contained_menu_layer(
+    id: SharedString,
+    content: gpui::Div,
+    closing: Option<Instant>,
+    trigger_height: f32,
+    limits: Bounds<Pixels>,
+    priority: usize,
+) -> AnyElement {
     // Half the usable height guarantees room on at least one side, even
     // when the trigger sits in the middle of a small dialog.
     let max_height = ((f32::from(limits.size.height) - trigger_height) / 2.0 - 6.0)
         .max(1.0)
         .min(320.0);
-    contained_menu_with_height(id, content, closing, trigger_height, limits, max_height)
+    contained_menu_with_height_layer(
+        id,
+        content,
+        closing,
+        trigger_height,
+        limits,
+        max_height,
+        priority,
+    )
 }
 
 /// A caller with a bounded scroll area can use more of the window than a
@@ -32,6 +52,18 @@ pub(crate) fn contained_menu_with_height(
     trigger_height: f32,
     limits: Bounds<Pixels>,
     max_height: f32,
+) -> AnyElement {
+    contained_menu_with_height_layer(id, content, closing, trigger_height, limits, max_height, 1)
+}
+
+fn contained_menu_with_height_layer(
+    id: SharedString,
+    content: gpui::Div,
+    closing: Option<Instant>,
+    trigger_height: f32,
+    limits: Bounds<Pixels>,
+    max_height: f32,
+    priority: usize,
 ) -> AnyElement {
     let exit = closing.map(super::exit_progress);
     let card = content
@@ -61,7 +93,7 @@ pub(crate) fn contained_menu_with_height(
                 limits,
                 trigger_height,
             })
-            .priority(1),
+            .priority(priority),
         )
         .into_any_element()
 }
@@ -267,5 +299,72 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(background.offset().y, px(0.0));
+    }
+
+    struct ModalSelectFixture {
+        menu: crate::settings::widgets::SelectState,
+        selected: usize,
+    }
+
+    impl gpui::Render for ModalSelectFixture {
+        fn render(
+            &mut self,
+            window: &mut Window,
+            cx: &mut gpui::Context<Self>,
+        ) -> impl IntoElement {
+            use crate::settings::widgets::{self, SelectOption};
+            let theme = crate::theme::Theme::of(cx).clone();
+            let control =
+                widgets::select("modal-select", "Service groups", &theme, |s: &mut Self| {
+                    &mut s.menu
+                })
+                .menu_layer(3)
+                .options(
+                    [
+                        SelectOption::new("Follow conversation"),
+                        SelectOption::new("Parallel groups"),
+                    ],
+                    self.selected,
+                )
+                .width(360.0)
+                .on_select(|this, index, _, cx| {
+                    this.selected = index;
+                    cx.notify();
+                })
+                .render(&self.menu, cx);
+            super::super::modal(
+                "modal-select-dialog",
+                window.viewport_size(),
+                super::super::dialog_card(&theme)
+                    .w(px(540.0))
+                    .child(control)
+                    .into_any_element(),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn dropdown_in_a_modal_receives_option_clicks_above_the_scrim(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(crate::theme::Theme::default());
+        });
+        let (view, cx) = cx.add_window_view(|_, _| ModalSelectFixture {
+            menu: Default::default(),
+            selected: 0,
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        let trigger = cx.debug_bounds("modal-select").unwrap();
+        cx.simulate_click(trigger.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+        view.update(cx, |view, _| assert!(view.menu.is_open()));
+        let option = cx.debug_bounds("modal-select-option-1").unwrap();
+        cx.simulate_click(option.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        view.update(cx, |view, _| {
+            assert_eq!(view.selected, 1);
+            assert!(!view.menu.is_open());
+        });
     }
 }

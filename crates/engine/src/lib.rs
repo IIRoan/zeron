@@ -32,6 +32,7 @@ pub mod local_import;
 mod model_catalogs;
 pub mod profile;
 pub mod project_actions;
+pub mod project_terminals;
 pub mod registry;
 pub mod repos;
 pub mod rpc;
@@ -46,6 +47,7 @@ pub mod uploads;
 pub mod voice;
 pub mod workspace_files;
 pub mod workspace_host;
+pub mod worktree_settings;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
 pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership};
@@ -501,6 +503,7 @@ impl EngineCore {
     /// kill live PTYs, stamp our workspace `lastSeenAt`, and flush every open doc
     /// snapshot.
     pub async fn shutdown(&self) {
+        self.repos.worktree_settings().shutdown();
         self.previews.shutdown().await;
         self.harness_updates.shutdown().await;
         // A run interruption transitions its chat to Idle, and Idle normally
@@ -508,6 +511,7 @@ impl EngineCore {
         // recovered work while the engine is being torn down.
         self.doc_host.pause_all_queues();
         self.sessions.shutdown().await;
+        self.project_actions.project_terminals.shutdown();
         self.terminals.shutdown();
         self.agent_accounts.shutdown();
         self.change_requests.shutdown();

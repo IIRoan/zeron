@@ -296,6 +296,8 @@ impl SourceControl {
         let viewport = window.viewport_size();
         let theme = Theme::of(cx).for_popup();
         let label = match &confirmation.command {
+            Command::StageAndCommit(_) => "Stage & Commit",
+            Command::StageConflicts(_) => "Stage Anyway",
             Command::Discard(_) => "Discard Changes",
             Command::Git(Action::UndoCommit) => "Undo Commit",
             Command::Git(Action::Abort) => "Abort",
@@ -335,7 +337,9 @@ impl SourceControl {
                             })),
                     )
                     .child(
-                        popover::btn_danger(&theme, label)
+                        (if matches!(confirmation.command, Command::StageAndCommit(_)) {
+                            popover::btn_primary(&theme, label)
+                        } else { popover::btn_danger(&theme, label) })
                             .id("git-confirm-accept")
                             .debug_selector(|| "git-confirm-accept".into())
                             .role(gpui::Role::Button)

@@ -777,6 +777,7 @@ pub struct AppState {
     /// Send-in-flight overlay per chat id: a queued doc command the host
     /// hasn't executed yet (see [`Self::begin_pending_send`]).
     pending_sends: HashMap<String, PendingSend>,
+    worktree_setups: HashMap<String, String>,
     /// The in-flight send's attachment upload, when it has one.
     upload_progress: Option<UploadProgress>,
     /// Engine-side queued-attachment transfers by uploadId (`WatchTransfers`
@@ -870,6 +871,7 @@ impl AppState {
             link_roots_revision: 0,
             echoes: HashMap::new(),
             pending_sends: HashMap::new(),
+            worktree_setups: HashMap::new(),
             upload_progress: None,
             transfers: HashMap::new(),
             review_comments: HashMap::new(),
@@ -1640,12 +1642,36 @@ impl AppState {
     /// removes the overlay this message started: a quick resend must not lose
     /// its own overlay to the first send's failure cleanup.
     pub fn end_pending_send(&mut self, chat_id: &str, message_id: &str) {
+        self.finish_worktree_setup(chat_id, message_id);
         if self
             .pending_sends
             .get(chat_id)
             .is_some_and(|p| p.message_id == message_id)
         {
             self.pending_sends.remove(chat_id);
+        }
+    }
+
+    pub fn begin_worktree_setup(&mut self, chat_id: &str, message_id: &str) {
+        self.worktree_setups.insert(chat_id.into(), message_id.into());
+    }
+
+    pub fn worktree_setup_pending(&self, chat_id: &str) -> bool {
+        self.worktree_setups.contains_key(chat_id)
+    }
+
+    pub fn finish_worktree_setup(&mut self, chat_id: &str, message_id: &str) {
+        if self
+            .worktree_setups
+            .get(chat_id)
+            .is_some_and(|id| id == message_id)
+        {
+            self.worktree_setups.remove(chat_id);
+            if let Some(pending) = self.pending_sends.get_mut(chat_id)
+                && pending.message_id == message_id
+            {
+                pending.started = Utc::now();
+            }
         }
     }
 
@@ -1711,6 +1737,7 @@ impl AppState {
         self.pending_sends.get(chat_id).is_some_and(|p| {
             now.signed_duration_since(p.started).num_milliseconds() <= UNDELIVERED_GRACE_MS
                 || self.chat_delivery_degraded(chat_id)
+                || self.worktree_setup_pending(chat_id)
         })
     }
 
@@ -1718,9 +1745,10 @@ impl AppState {
     /// EXPLICIT failed state ("Not delivered — retry") instead of either
     /// faking progress or silently forgetting the send ever happened.
     pub fn send_undelivered(&self, chat_id: &str, now: DateTime<Utc>) -> bool {
-        self.pending_sends.get(chat_id).is_some_and(|p| {
-            now.signed_duration_since(p.started).num_milliseconds() > UNDELIVERED_GRACE_MS
-        })
+        !self.worktree_setup_pending(chat_id)
+            && self.pending_sends.get(chat_id).is_some_and(|p| {
+                now.signed_duration_since(p.started).num_milliseconds() > UNDELIVERED_GRACE_MS
+            })
     }
 
     /// Retry pressed: restart the grace clock so the overlay returns to its
@@ -1742,6 +1770,7 @@ impl AppState {
             .filter(|p| {
                 now.signed_duration_since(p.started).num_milliseconds() <= UNDELIVERED_GRACE_MS
                     || self.chat_delivery_degraded(chat_id)
+                    || self.worktree_setup_pending(chat_id)
             })
             .map(|p| p.started)
     }
@@ -1755,6 +1784,7 @@ impl AppState {
             && self.transcript.iter().any(|e| e.id == pending.message_id)
         {
             self.pending_sends.remove(chat_id);
+            self.worktree_setups.remove(chat_id);
         }
     }
 
@@ -2193,6 +2223,7 @@ impl AppState {
         self.transcript_replayed = false;
         self.echoes.clear();
         self.pending_sends.clear();
+        self.worktree_setups.clear();
         self.upload_progress = None;
         self.transfers.clear();
         self.local_device_id = None;
@@ -4267,6 +4298,30 @@ mod tests {
         // A zero-byte total renders as plain "Sending…", not a percent.
         s.begin_upload_progress(0, Arc::new(AtomicU64::new(0)));
         assert_eq!(s.upload_progress_percent(), None);
+    }
+
+    #[test]
+    fn worktree_setup_keeps_long_installs_pending_and_completion_is_message_scoped() {
+        let now = Utc::now();
+        let mut state = AppState::new();
+        state.begin_pending_send("chat", "first", now - TimeDelta::minutes(10));
+        state.begin_worktree_setup("chat", "first");
+        assert!(state.send_pending("chat", now));
+        assert!(!state.send_undelivered("chat", now));
+        state.finish_worktree_setup("chat", "unrelated");
+        assert!(state.worktree_setup_pending("chat"));
+        state.finish_worktree_setup("chat", "first");
+        assert!(!state.worktree_setup_pending("chat"));
+        assert!(state.send_pending("chat", now));
+        assert!(!state.send_undelivered("chat", now));
+
+        state.begin_pending_send("chat", "second", now);
+        state.begin_worktree_setup("chat", "second");
+        state.end_pending_send("chat", "first");
+        assert!(state.worktree_setup_pending("chat"));
+        state.end_pending_send("chat", "second");
+        assert!(!state.worktree_setup_pending("chat"));
+        assert!(!state.send_pending("chat", now));
     }
 
     #[test]

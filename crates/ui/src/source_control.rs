@@ -19,6 +19,9 @@ use zeron_rpc::methods;
 mod git;
 mod refresh;
 mod selection;
+mod interaction;
+mod conflicts;
+mod stash;
 use git::{Confirmation, ConfirmationDialog, GitForm, GitPanel, UndoDiscard};
 use selection::FileKey;
 
@@ -35,6 +38,7 @@ enum Row {
     Group {
         repository: usize,
         staged: bool,
+        conflicts: bool,
     },
     File {
         repository: usize,
@@ -44,6 +48,7 @@ enum Row {
 }
 
 pub enum SourceControlEvent {
+    Success { title: SharedString, message: SharedString },
     OpenDiff(CheckoutChangeSelection),
     OpenFile(String),
     OpenCommit {
@@ -55,6 +60,7 @@ pub enum SourceControlEvent {
 
 pub struct SourceControl {
     state: Entity<AppState>,
+    notifications: Option<Entity<crate::toast::Toasts>>,
     target: Option<Target>,
     snapshot: Option<CheckoutChanges>,
     rows: Vec<Row>,
@@ -73,10 +79,8 @@ pub struct SourceControl {
     busy: bool,
     mutation_epoch: u64,
     poll: Option<Task<()>>,
-    refresh_task: Option<Task<()>>,
     refreshing: bool,
     refresh_feedback: Option<bool>,
-    mutation: Option<Task<()>>,
     git_details: Option<zeron_proto::RepositoryGitDetails>,
     details_key: Option<(Target, String, Option<zeron_proto::RepositoryGitState>)>,
     details_task: Option<Task<()>>,
@@ -95,17 +99,19 @@ pub struct SourceControl {
     actions_menu_bounds: selection::MenuBounds,
     commit_menu_bounds: selection::MenuBounds,
     commit_followup: Option<zeron_proto::RepositoryGitAction>,
+    commit_primary: Option<zeron_proto::RepositoryGitAction>,
+    list_focus: gpui::FocusHandle,
+    list_scroll: gpui::UniformListScrollHandle,
+    file_menu: popover::Popup<interaction::FileMenu>,
+    file_menu_bounds: selection::MenuBounds,
+    selected_row_bounds: selection::MenuBounds,
+    sort_order: interaction::SortOrder,
+    stash_picker: Option<stash::StashPicker>,
 }
 impl gpui::EventEmitter<SourceControlEvent> for SourceControl {}
 
 fn in_group(file: &GitFileStatus, staged: bool) -> bool {
-    let conflict = [file.index, file.worktree].contains(&GitFileState::Unmerged)
-        || matches!(
-            (file.index, file.worktree),
-            (GitFileState::Added, GitFileState::Added)
-                | (GitFileState::Deleted, GitFileState::Deleted)
-        );
-    if conflict {
+    if file.is_conflicted() {
         return !staged;
     }
     if staged {
@@ -119,7 +125,7 @@ fn in_group(file: &GitFileStatus, staged: bool) -> bool {
 }
 
 fn status_letter(file: &GitFileStatus, staged: bool, submodule: bool) -> &'static str {
-    if [file.index, file.worktree].contains(&GitFileState::Unmerged) {
+    if file.is_conflicted() {
         return "!";
     }
     if submodule {
@@ -139,7 +145,19 @@ fn status_letter(file: &GitFileStatus, staged: bool, submodule: bool) -> &'stati
     }
 }
 
+fn staging_notice(snapshot: &CheckoutChanges, repository: &str, paths: &[String], staged: bool) -> SharedString {
+    let count = if staged {
+        let paths: HashSet<_> = paths.iter().collect();
+        snapshot.repositories.iter().find(|repo| repo.path == repository)
+            .map(|repo| repo.files.iter().filter(|file| paths.contains(&file.path) && in_group(file, true)).count())
+            .unwrap_or(0)
+    } else { paths.len() };
+    if count == 0 { return "No file changes staged".into(); }
+    format!("{} {count} {}", if staged { "Staged" } else { "Unstaged" }, if count == 1 { "file" } else { "files" }).into()
+}
+
 fn status_color(file: &GitFileStatus, staged: bool, theme: &Theme) -> gpui::Hsla {
+    if file.is_conflicted() { return theme.danger; }
     use GitFileState::*;
     match if staged { file.index } else { file.worktree } {
         Added | Untracked => theme.success,
@@ -150,6 +168,60 @@ fn status_color(file: &GitFileStatus, staged: bool, theme: &Theme) -> gpui::Hsla
 }
 
 impl SourceControl {
+    pub(crate) fn set_notifications(&mut self, notifications: Entity<crate::toast::Toasts>) {
+        self.notifications = Some(notifications);
+    }
+
+    fn notification_title(&self, repository: &str) -> SharedString {
+        let name = self.snapshot.as_ref()
+            .and_then(|snapshot| snapshot.repositories.iter().find(|repo| repo.path == repository))
+            .map(|repo| repo.name.as_str())
+            .filter(|name| !name.is_empty());
+        name.map(|name| format!("Source Control · {name}"))
+            .unwrap_or_else(|| "Source Control".into()).into()
+    }
+
+    fn begin_notification(&self, repository: &str, label: &'static str, cx: &mut Context<Self>) -> Option<crate::toast::PendingToast> {
+        self.notifications.as_ref().map(|toasts| {
+            crate::toast::PendingToast::start(toasts.clone(), self.notification_title(repository), label.into(), cx)
+        })
+    }
+
+    fn notify_success(
+        &mut self,
+        repository: &str,
+        message: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        let message = message.into();
+        self.notice = Some(message.clone());
+        cx.emit(SourceControlEvent::Success { title: self.notification_title(repository), message });
+    }
+
+    fn notify_error(&mut self, repository: &str, message: impl Into<SharedString>, cx: &mut Context<Self>) {
+        let message = message.into();
+        self.error = Some(message.clone());
+        if let Some(toasts) = &self.notifications {
+            let title = self.notification_title(repository);
+            toasts.update(cx, |toasts, cx| toasts.error(title, message, cx));
+        }
+        cx.notify();
+    }
+
+    fn notify_load_error(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
+        let message = message.into();
+        if self.load_error.as_ref() == Some(&message) { return; }
+        // Polling failures notify once until the repository recovers.
+        if self.load_error.is_none() {
+            if let Some(toasts) = &self.notifications {
+                let title = self.notification_title(&self.active_repository);
+                toasts.update(cx, |toasts, cx| toasts.error(title, message.clone(), cx));
+            }
+        }
+        self.load_error = Some(message);
+        cx.notify();
+    }
+
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let commit_input = cx.new(|cx| {
             ComposerInput::with_context("Message (Ctrl+Enter to commit)", "GitCommitMessage", cx)
@@ -165,7 +237,13 @@ impl SourceControl {
                 }
                 cx.notify();
             }
-            ComposerInputEvent::Submitted => this.commit_staged(cx),
+            ComposerInputEvent::Submitted => {
+                if this.primary_action() == interaction::PrimaryAction::Continue {
+                    this.run_primary_action(cx);
+                } else {
+                    this.commit_with_followup(this.commit_primary.clone(), cx);
+                }
+            }
             _ => {}
         });
         let form_input = cx.new(|cx| {
@@ -190,6 +268,7 @@ impl SourceControl {
             .collect();
         Self {
             state,
+            notifications: None,
             target: None,
             snapshot: None,
             rows: Vec::new(),
@@ -208,10 +287,8 @@ impl SourceControl {
             busy: false,
             mutation_epoch: 0,
             poll: None,
-            refresh_task: None,
             refreshing: false,
             refresh_feedback: None,
-            mutation: None,
             git_details: None,
             details_key: None,
             details_task: None,
@@ -230,6 +307,14 @@ impl SourceControl {
             actions_menu_bounds: Default::default(),
             commit_menu_bounds: Default::default(),
             commit_followup: None,
+            commit_primary: None,
+            list_focus: cx.focus_handle(),
+            list_scroll: gpui::UniformListScrollHandle::new(),
+            file_menu: Default::default(),
+            file_menu_bounds: Default::default(),
+            selected_row_bounds: Default::default(),
+            sort_order: Default::default(),
+            stash_picker: None,
         }
     }
 
@@ -252,13 +337,12 @@ impl SourceControl {
         }
         self.remember_draft(cx);
         self.poll = None;
-        self.refresh_task = None;
         self.refreshing = false;
         self.refresh_feedback = None;
-        self.mutation = None;
         self.busy = false;
         self.snapshot = None;
         self.rows.clear();
+        self.file_menu = Default::default();
         self.selected = None;
         self.selected_files.clear();
         self.selection_anchor = None;
@@ -270,6 +354,7 @@ impl SourceControl {
         self.details_task = None;
         self.git_panel = None;
         self.git_form = None;
+        self.stash_picker = None;
         self.confirmation = None;
         self.undo_discard = None;
         self.operation_label = None;
@@ -277,6 +362,7 @@ impl SourceControl {
         self.actions_menu = Default::default();
         self.commit_menu = Default::default();
         self.commit_followup = None;
+        self.commit_primary = None;
         self.active_repository.clear();
         self.target = target.clone();
         self.restore_draft(cx);
@@ -306,7 +392,7 @@ impl SourceControl {
                                     cx.notify();
                                 }
                             }
-                            Err(error) => { view.load_error = Some(format!("Unable to load changes: {error}").into()); cx.notify(); }
+                            Err(error) => view.notify_load_error(format!("Unable to load changes: {error}"), cx),
                         }
                     }).is_err() { return; }
                 }
@@ -325,19 +411,29 @@ impl SourceControl {
             if self.collapsed.contains(&repo.path) {
                 continue;
             }
-            for staged in [true, false] {
-                let files: Vec<_> = repo
+            for (staged, conflicts) in [(false, true), (true, false), (false, false)] {
+                let mut files: Vec<_> = repo
                     .files
                     .iter()
                     .enumerate()
-                    .filter(|(_, f)| in_group(f, staged))
+                    .filter(|(_, f)| in_group(f, staged) && f.is_conflicted() == conflicts)
                     .map(|(i, _)| i)
                     .collect();
+                files.sort_by(|a, b| {
+                    let (a, b) = (&repo.files[*a], &repo.files[*b]);
+                    let order = match self.sort_order {
+                        interaction::SortOrder::Path => std::cmp::Ordering::Equal,
+                        interaction::SortOrder::Name => a.path.rsplit('/').next().unwrap_or("").to_lowercase().cmp(&b.path.rsplit('/').next().unwrap_or("").to_lowercase()),
+                        interaction::SortOrder::Status => status_letter(a, staged, false).cmp(status_letter(b, staged, false)),
+                    };
+                    order.then_with(|| a.path.to_lowercase().cmp(&b.path.to_lowercase())).then_with(|| a.path.cmp(&b.path))
+                });
                 if files.is_empty() {
                     continue;
                 }
-                self.rows.push(Row::Group { repository, staged });
-                if self.collapsed.contains(&format!("{}:{staged}", repo.path)) {
+                self.rows.push(Row::Group { repository, staged, conflicts });
+                let key = if conflicts { format!("{}:merge", repo.path) } else { format!("{}:{staged}", repo.path) };
+                if self.collapsed.contains(&key) {
                     continue;
                 }
                 self.rows.extend(files.into_iter().map(|file| Row::File {
@@ -364,6 +460,15 @@ impl SourceControl {
         staged: bool,
         cx: &mut Context<Self>,
     ) {
+        if staged && self.snapshot.as_ref().is_some_and(|snapshot| snapshot.repositories.iter()
+            .any(|repo| repo.path == repository && repo.files.iter().any(|file| file.is_conflicted() && paths.contains(&file.path)))) {
+            self.check_conflicts_before_staging(repository, paths, cx);
+            return;
+        }
+        self.set_staged_checked(repository, paths, staged, false, cx);
+    }
+
+    fn set_staged_checked(&mut self, repository: String, paths: Vec<String>, staged: bool, allow_conflict_markers: bool, cx: &mut Context<Self>) {
         if self.is_busy() {
             return;
         }
@@ -371,21 +476,48 @@ impl SourceControl {
             return;
         };
         let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.notify_error(&repository, "Repository is unavailable", cx);
             return;
         };
+        let git = self.snapshot.as_ref().and_then(|snapshot| snapshot.repositories.iter().find(|repo| repo.path == repository)).and_then(|repo| repo.git.as_ref());
+        let head = git.and_then(|git| git.head.clone());
+        let branch = git.and_then(|git| git.branch.clone());
+        let conflicts: Vec<_> = self.snapshot.as_ref().into_iter().flat_map(|snapshot| &snapshot.repositories)
+            .filter(|repo| repo.path == repository).flat_map(|repo| &repo.files)
+            .filter(|file| staged && file.is_conflicted() && paths.contains(&file.path)).map(|file| file.path.clone()).collect();
         self.busy = true;
         self.error = None;
         self.notice = None;
         self.mutation_epoch += 1;
+        let epoch = self.mutation_epoch;
+        self.details_task = None;
+        self.details_key = None;
         let selected_files = self.selected_files.clone();
         let selection_anchor = self.selection_anchor.clone();
+        let notification = self.begin_notification(&repository, if staged { "Staging changes…" } else { "Unstaging changes…" }, cx);
+        let notified = notification.is_some();
         cx.notify();
-        self.mutation = Some(cx.spawn(async move |this, cx| {
-            let response = engine.client().call(methods::SET_CHECKOUT_STAGED, serde_json::json!({ "cwd": target.cwd, "targetDeviceId": target.device, "repository": repository, "paths": paths, "staged": staged })).await;
+        cx.spawn(async move |this, cx| {
+            let response = engine.client().call_as::<CheckoutChanges>(methods::SET_CHECKOUT_STAGED, serde_json::json!({ "cwd": target.cwd, "targetDeviceId": target.device, "repository": repository, "paths": paths, "staged": staged, "allowConflictMarkers": allow_conflict_markers, "expectedHead": head, "expectedBranch": branch })).await;
+            let outcome = response.as_ref().map(|snapshot| {
+                let notice = staging_notice(snapshot, &repository, &paths, staged);
+                let resolved = snapshot.repositories.iter().find(|repo| repo.path == repository && repo.complete)
+                    .map_or(0, |repo| conflicts.iter().filter(|path| !repo.files.iter().any(|file| &file.path == *path && file.is_conflicted())).count());
+                if resolved == 0 { return notice; }
+                let resolved = format!("Resolved {resolved} merge conflict{}", if resolved == 1 { "" } else { "s" });
+                if notice == "No file changes staged" { resolved.into() } else { format!("{resolved}. {notice}").into() }
+            })
+                .map_err(|error| SharedString::from(format!("Unable to {} changes: {error}", if staged { "stage" } else { "unstage" })));
+            if let Some(notification) = notification { notification.finish(outcome.clone(), cx); }
             this.update(cx, |view, cx| {
-                if view.target.as_ref() != Some(&target) { return; }
+                if view.target.as_ref() != Some(&target) || view.mutation_epoch != epoch { return; }
                 view.busy = false;
-                match response.and_then(|value| serde_json::from_value::<CheckoutChanges>(value).map_err(|e| zeron_rpc::RpcError::Failed(e.to_string()))) {
+                match &outcome {
+                    Ok(message) if notified => view.notice = Some(message.clone()),
+                    Ok(message) => view.notify_success(&repository, message.clone(), cx),
+                    Err(error) => view.error = Some(error.clone()),
+                }
+                match response {
                     Ok(snapshot) => {
                         let unchanged = view.selected_files == selected_files;
                         view.apply_snapshot(snapshot, cx);
@@ -393,11 +525,11 @@ impl SourceControl {
                             view.follow_staging(&repository, &paths, staged, selected_files, selection_anchor);
                         }
                     }
-                    Err(error) => { view.error = Some(format!("Unable to update staging: {error}").into()); }
+                    Err(_) => {},
                 }
                 cx.notify();
             }).ok();
-        }));
+        }).detach();
     }
 
     fn is_busy(&self) -> bool {
@@ -435,6 +567,7 @@ impl SourceControl {
     }
 
     fn select_repository(&mut self, path: String, cx: &mut Context<Self>) {
+        self.stash_picker = None;
         if self.is_busy() || self.confirmation.is_some() || self.active_repository == path {
             return;
         }
@@ -492,6 +625,8 @@ impl SourceControl {
             && self.pending_commit.is_none()
             && self.load_error.is_none()
             && self.confirmation.is_none()
+            && !self.snapshot.as_ref().is_some_and(|snapshot| snapshot.repositories.iter()
+                .any(|repo| repo.path == self.active_repository && repo.files.iter().any(GitFileStatus::is_conflicted)))
             && (self.staged_count() > 0
                 || (self.amend
                     && self
@@ -504,12 +639,26 @@ impl SourceControl {
         if !self.can_commit(cx) {
             return;
         }
+        self.commit_with_paths(Vec::new(), cx);
+    }
+
+    fn can_request_commit(&self, cx: &App) -> bool {
+        if self.can_commit(cx) { return true; }
+        self.git_enabled() && self.confirmation.is_none()
+            && !self.commit_input.read(cx).text().trim().is_empty()
+            && self.snapshot.as_ref().is_some_and(|snapshot| snapshot.repositories.iter()
+                .any(|repo| repo.path == self.active_repository && repo.complete
+                    && !repo.files.is_empty() && !repo.files.iter().any(GitFileStatus::is_conflicted)))
+    }
+
+    fn commit_with_paths(&mut self, stage_paths: Vec<String>, cx: &mut Context<Self>) {
+        if stage_paths.is_empty() && !self.can_commit(cx) { return; }
+        if !stage_paths.is_empty() && !self.can_request_commit(cx) { return; }
         let Some(target) = self.target.clone() else {
             return;
         };
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.error = Some("Repository is unavailable".into());
-            cx.notify();
+            self.notify_error(&self.active_repository.clone(), "Repository is unavailable", cx);
             return;
         };
         let repository = self.active_repository.clone();
@@ -517,11 +666,22 @@ impl SourceControl {
         let amend = self.amend;
         let followup = self.commit_followup.take();
         let head = self.git_state().and_then(|s| s.head.clone());
+        let branch = self.git_state().and_then(|s| s.branch.clone());
         self.remember_draft(cx);
         self.pending_commit = Some((target.clone(), repository.clone()));
         self.mutation_epoch += 1;
+        self.details_task = None;
+        self.details_key = None;
         self.error = None;
         self.notice = None;
+        let label = match &followup {
+            Some(zeron_proto::RepositoryGitAction::Push | zeron_proto::RepositoryGitAction::Publish { .. }) => "Committing and pushing…",
+            Some(zeron_proto::RepositoryGitAction::Sync) => "Committing and syncing…",
+            _ if amend => "Amending last commit…",
+            _ => "Committing staged changes…",
+        };
+        let notification = self.begin_notification(&repository, label, cx);
+        let notified = notification.is_some();
         cx.notify();
         // Closing or switching a view must not cancel a user-submitted commit.
         cx.spawn(async move |this, cx| {
@@ -532,7 +692,8 @@ impl SourceControl {
                     serde_json::json!({
                         "cwd": target.cwd, "targetDeviceId": target.device,
                         "repository": repository, "message": message,
-                        "amend": amend, "expectedHead": head,
+                        "amend": amend, "expectedHead": head, "expectedBranch": branch,
+                        "stagePaths": stage_paths,
                     }),
                 )
                 .await;
@@ -547,6 +708,24 @@ impl SourceControl {
                     None => Some(Err(zeron_rpc::RpcError::Failed("Unable to read the committed branch; refresh before pushing".into()))),
                 }
             } else { None };
+            let outcome = match (&result, &followup_result) {
+                (Err(error), _) => Err(SharedString::from(format!("Unable to commit: {error}"))),
+                (_, Some(Err(error))) => Err(format!("Commit succeeded; remote action failed: {error}").into()),
+                (_, Some(Ok(value))) => Ok(value.get("notice").and_then(|v| v.as_str())
+                    .map(|notice| format!("Commit created. {notice}").into())
+                    .unwrap_or_else(|| "Staged changes committed".into())),
+                _ => Ok(if amend { "Last commit amended" } else { "Staged changes committed" }.into()),
+            };
+            // Keep progress until both Git and its metadata refresh finish.
+            let refreshed = if committed {
+                Some(engine.client().call_as::<CheckoutChanges>(methods::GET_CHECKOUT_CHANGES,
+                    serde_json::json!({ "cwd": target.cwd, "targetDeviceId": target.device })).await)
+            } else { None };
+            let feedback = match (&outcome, &refreshed) {
+                (Ok(message), Some(Err(error))) => Err(SharedString::from(format!("{message}. Unable to refresh changes: {error}"))),
+                _ => outcome.clone(),
+            };
+            if let Some(notification) = notification { notification.finish(feedback, cx); }
             let Ok(epoch) = this.update(cx, |view, cx| {
                 if !committed {
                     view.pending_commit = None;
@@ -567,22 +746,11 @@ impl SourceControl {
                             view.commit_input
                                 .update(cx, |input, cx| input.set_text("", cx));
                         }
-                        view.notice = Some(
-                            if amend {
-                                "Last commit amended"
-                            } else {
-                                "Staged changes committed"
-                            }
-                            .into(),
-                        );
-                        if let Some(followup) = followup_result {
-                            match followup {
-                                Ok(value) => { view.notice = value.get("notice").and_then(|v| v.as_str()).map(|s| format!("Commit created. {s}").into()); }
-                                Err(error) => { view.error = Some(format!("Commit succeeded; remote action failed: {error}").into()); }
-                            }
-                        }
-                    } else if let Err(error) = result {
-                        view.error = Some(format!("Unable to commit: {error}").into());
+                    }
+                    match &outcome {
+                        Ok(message) if notified => view.notice = Some(message.clone()),
+                        Ok(message) => view.notify_success(&repository, message.clone(), cx),
+                        Err(error) => view.error = Some(error.clone()),
                     }
                 }
                 cx.notify();
@@ -591,13 +759,7 @@ impl SourceControl {
                 return;
             };
             if committed {
-                let refreshed = engine
-                    .client()
-                    .call_as::<CheckoutChanges>(
-                        methods::GET_CHECKOUT_CHANGES,
-                        serde_json::json!({ "cwd": target.cwd, "targetDeviceId": target.device }),
-                    )
-                    .await;
+                let refreshed = refreshed.unwrap();
                 this.update(cx, |view, cx| {
                     view.pending_commit = None;
                     cx.notify();
@@ -639,7 +801,7 @@ impl SourceControl {
             return gpui::Empty.into_any_element();
         };
         let theme = Theme::of(cx).clone();
-        let enabled = self.can_commit(cx);
+        let enabled = self.primary_action_enabled(cx);
         let committing = self
             .pending_commit
             .as_ref()
@@ -824,20 +986,20 @@ impl SourceControl {
                     .child(Self::count_badge(repo.files.len(), &theme))
                     .into_any_element()
             }
-            Row::Group { .. } => {
-                let key = format!("{}:{staged}", repo.path);
+            Row::Group { conflicts, .. } => {
+                let key = if conflicts { format!("{}:merge", repo.path) } else { format!("{}:{staged}", repo.path) };
                 let collapsed = self.collapsed.contains(&key);
                 let paths: Vec<_> = repo
                     .files
                     .iter()
-                    .filter(|f| in_group(f, staged))
+                    .filter(|f| in_group(f, staged) && f.is_conflicted() == conflicts)
                     .map(|f| f.path.clone())
                     .collect();
                 let enabled = repo.complete;
                 let discard_paths: Vec<_> = repo
                     .files
                     .iter()
-                    .filter(|f| in_group(f, staged) && !repo.submodules.contains(&f.path))
+                    .filter(|f| in_group(f, staged) && !f.is_conflicted() && !repo.submodules.contains(&f.path))
                     .map(|f| f.path.clone())
                     .collect();
                 let discard_repository = repo_path.clone();
@@ -866,9 +1028,9 @@ impl SourceControl {
                             .text_size(px(12.0))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text_muted)
-                            .child(if staged { "Staged Changes" } else { "Changes" }),
+                            .child(if conflicts { "Merge Changes" } else if staged { "Staged Changes" } else { "Changes" }),
                     )
-                    .when(!staged, |el| {
+                    .when(!staged && !conflicts, |el| {
                         el.child(
                             self.discard_button(
                                 format!("discard-group-{repository}"),
@@ -895,7 +1057,7 @@ impl SourceControl {
                     })
                     .child(
                         self.action(
-                            format!("stage-group-{repository}-{staged}"),
+                            if conflicts { format!("stage-group-{repository}-merge") } else { format!("stage-group-{repository}-{staged}") },
                             staged,
                             enabled,
                             row_group,
@@ -939,6 +1101,8 @@ impl SourceControl {
                 };
                 let key = FileKey::new(&repo.path, &file.path, staged);
                 let selected = self.selected_files.contains(&key);
+                let focused = self.selected.as_ref().is_some_and(|selection| selection.repository == key.repository && selection.path == key.path && selection.staged == key.staged);
+                let marker = self.selected_row_bounds.clone();
                 let clicked_key = key.clone();
                 let debug_key = key.clone();
                 let paths = self.staging_paths(&key);
@@ -956,7 +1120,8 @@ impl SourceControl {
                 } else {
                     format!("{}/{path}", repo.path)
                 };
-                base.pl(px(36.0))
+                base.pl(px(36.0)).relative()
+                    .when(focused, |row| row.child(gpui::canvas(move |bounds, _, _| marker.set(Some(bounds)), |_, _, _, _| {}).absolute().inset_0()))
                     .debug_selector(move || {
                         format!(
                             "sc-file-{}-{}-{}",
@@ -976,11 +1141,19 @@ impl SourceControl {
                         gpui::transparent_black()
                     })
                     .when(!selected, |el| el.hover(|s| s.bg(theme.glass_hover())))
-                    .tooltip(crate::settings::widgets::text_tooltip(format!(
+                    .when(self.file_menu.get().is_none() && self.confirmation.is_none(), |row| row.tooltip(crate::settings::widgets::text_tooltip(format!(
                         "{full_path} ({})",
                         if staged { "Index" } else { "Working Tree" },
-                    )))
-                    .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                    ))))
+                    .on_mouse_down(gpui::MouseButton::Right, cx.listener({
+                        let key = key.clone();
+                        move |this, event: &gpui::MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.open_file_menu(key.clone(), event.position, window, cx);
+                        }
+                    }))
+                    .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                        this.close_file_menu(cx);
                         this.select_repository(selection.repository.clone(), cx);
                         if this.active_repository != selection.repository {
                             return;
@@ -992,6 +1165,7 @@ impl SourceControl {
                             modifiers.control || modifiers.platform,
                         );
                         this.selected = Some(selection.clone());
+                        this.list_focus.focus(window, cx);
                         cx.emit(SourceControlEvent::OpenDiff(selection.clone()));
                         cx.notify();
                     }))
@@ -1030,7 +1204,7 @@ impl SourceControl {
                                     .child(SharedString::from(parent)),
                             ),
                     )
-                    .when(!submodule && file.worktree != GitFileState::Deleted, |el| {
+                    .when(!submodule && interaction::can_open_file(file), |el| {
                         el.child(
                             self.open_file_button(
                                 format!("open-file-{row}"),
@@ -1048,7 +1222,7 @@ impl SourceControl {
                         )
                     })
                     .when(
-                        !staged && !submodule && file.index != GitFileState::Unmerged,
+                        !staged && !submodule && !file.is_conflicted(),
                         |el| {
                             el.child(
                                 self.discard_button(
@@ -1122,8 +1296,9 @@ impl Render for SourceControl {
                 .all(|r| r.complete && r.files.is_empty())
         });
         let commit = self.render_commit(window, cx);
-        let git_toolbar = self.render_git_toolbar(cx);
         let confirmation = self.render_confirmation(window, cx);
+        let file_menu = self.render_file_menu(cx);
+        let stash_picker = self.render_stash_picker(window, cx);
         div()
             .size_full()
             .flex()
@@ -1131,31 +1306,7 @@ impl Render for SourceControl {
             .min_h_0()
             .overflow_hidden()
             .bg(theme.panel_bg())
-            .child(git_toolbar)
             .child(commit)
-            .when_some(
-                self.error.clone().or(self.load_error.clone()),
-                |el, error| {
-                    el.child(
-                        div()
-                            .px(px(12.0))
-                            .py(px(8.0))
-                            .text_size(px(12.0))
-                            .text_color(theme.danger)
-                            .child(error),
-                    )
-                },
-            )
-            .when_some(self.notice.clone(), |el, notice| {
-                el.child(
-                    div()
-                        .px(px(12.0))
-                        .py(px(8.0))
-                        .text_size(px(11.0))
-                        .text_color(theme.success)
-                        .child(notice),
-                )
-            })
             .when(self.snapshot.is_none(), |el| {
                 el.child(
                     div()
@@ -1182,6 +1333,10 @@ impl Render for SourceControl {
                                     .collect::<Vec<AnyElement>>()
                             }),
                         )
+                        .track_scroll(&self.list_scroll)
+                        .track_focus(&self.list_focus)
+                        .tab_index(0)
+                        .on_key_down(cx.listener(Self::on_list_key))
                         .flex_1()
                         .min_h_0()
                         .pt(px(8.0))
@@ -1199,6 +1354,8 @@ impl Render for SourceControl {
                 )
             })
             .child(self.render_git_status(cx))
+            .children(file_menu)
+            .child(stash_picker)
             .child(confirmation)
     }
 }
@@ -1219,6 +1376,9 @@ impl SourceControl {
             "confirmation": self.confirmation.is_some(), "canUndoDiscard": self.undo_discard.is_some(),
             "busy": self.is_busy(), "amend": self.amend,
             "refreshing": self.refreshing, "refreshFeedback": self.refresh_feedback,
+            "primaryAction": format!("{:?}", self.primary_action()), "canRequestCommit": self.can_request_commit(cx),
+            "fileMenu": self.file_menu.is_open(), "sortOrder": format!("{:?}", self.sort_order),
+            "stashPicker": self.stash_picker.as_ref().map(|picker| picker.fixture_state(cx)),
             "selectedFiles": self.selected_files.iter().map(|key| serde_json::json!({ "repository": key.repository, "path": key.path, "staged": key.staged })).collect::<Vec<_>>(),
         })
     }
@@ -1234,6 +1394,8 @@ mod tests {
         fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             self.0.update(cx, |view, cx| {
                 let content = div()
+                    .track_focus(&view.list_focus)
+                    .on_key_down(cx.listener(SourceControl::on_list_key))
                     .flex()
                     .flex_col()
                     .w(px(360.0))
@@ -1249,7 +1411,7 @@ mod tests {
                         (0..view.rows.len())
                             .map(|row| view.render_row(row, cx))
                             .collect::<Vec<_>>(),
-                    );
+                    ).children(view.render_file_menu(cx));
                 view.selection_surface(content, cx)
             })
         }
@@ -1423,7 +1585,45 @@ mod tests {
     }
 
     #[gpui::test]
-    fn selection_never_batches_different_repositories_or_index_sides(cx: &mut TestAppContext) {
+    fn list_keyboard_navigation_extends_and_shrinks_ranges(cx: &mut TestAppContext) {
+        let (view, cx) = selection_setup(cx);
+        let bounds = cx.debug_bounds("sc-file--false-a.rs").unwrap();
+        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        cx.simulate_keystrokes("shift-down shift-down");
+        view.read_with(cx, |view, _| assert_eq!(view.selected_files.len(), 3));
+        cx.simulate_keystrokes("shift-up");
+        view.read_with(cx, |view, _| assert_eq!(view.selected_files.len(), 2));
+        cx.simulate_keystrokes("ctrl-a");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.selected_files.len(), 4);
+            assert_eq!(view.staging_paths(&FileKey::new("", "a.rs", false)).len(), 3);
+            assert_eq!(view.staging_paths(&FileKey::new("", "a.rs", true)).len(), 1);
+        });
+        cx.simulate_keystrokes("escape");
+        view.read_with(cx, |view, _| assert!(view.selected_files.is_empty()));
+    }
+
+    #[gpui::test]
+    fn file_context_menu_keeps_a_selected_range_and_escape_closes_it(cx: &mut TestAppContext) {
+        let (view, cx) = selection_setup(cx);
+        view.update(cx, |view, _| {
+            view.select_files(FileKey::new("", "a.rs", false), false, false);
+            view.select_files(FileKey::new("", "c.rs", false), true, false);
+        });
+        cx.update(|window, cx| view.update(cx, |view, cx| {
+            view.open_file_menu(FileKey::new("", "b.rs", false), gpui::point(px(100.0), px(100.0)), window, cx);
+            assert_eq!(view.selected_files.len(), 3);
+            assert!(view.file_menu.is_open());
+        }));
+        cx.simulate_keystrokes("escape");
+        view.read_with(cx, |view, _| {
+            assert!(!view.file_menu.is_open());
+            assert_eq!(view.selected_files.len(), 3);
+        });
+    }
+
+    #[gpui::test]
+    fn mixed_index_selection_filters_actions_and_keeps_repository_boundaries(cx: &mut TestAppContext) {
         let (view, cx) = selection_setup(cx);
         view.update(cx, |view, _| {
             view.select_files(FileKey::new("", "a.rs", false), false, false);
@@ -1433,6 +1633,7 @@ mod tests {
                 view.staging_paths(&FileKey::new("", "a.rs", true)),
                 ["a.rs"]
             );
+            assert_eq!(view.selected_files.len(), 2);
             view.select_files(FileKey::new("nested", "a.rs", false), true, false);
             assert_eq!(
                 view.staging_paths(&FileKey::new("nested", "a.rs", false)),
@@ -1569,6 +1770,92 @@ mod tests {
         let view = host.read_with(cx, |host, _| host.0.clone());
         cx.update(|window, cx| window.draw(cx).clear());
         (view, cx)
+    }
+
+    #[gpui::test]
+    fn staging_feedback_counts_index_changes_in_the_requested_repository(cx: &mut TestAppContext) {
+        let (view, cx) = commit_setup(cx);
+        view.read_with(cx, |view, _| {
+            let mut snapshot = view.snapshot.clone().unwrap();
+            snapshot.repositories[0].files.push(GitFileStatus {
+                path: "apps/device-apps".into(), old_path: None,
+                index: GitFileState::Unchanged, worktree: GitFileState::Modified,
+            });
+            let files = vec!["file.rs".into(), "apps/device-apps".into()];
+            assert_eq!(staging_notice(&snapshot, "", &files, true), "Staged 1 file");
+            assert_eq!(staging_notice(&snapshot, "", &files[1..], true), "No file changes staged");
+            assert_eq!(staging_notice(&snapshot, "apps/device-apps", &files[..1], true), "Staged 1 file");
+            assert_eq!(staging_notice(&snapshot, "", &files[..1], false), "Unstaged 1 file");
+        });
+    }
+
+    #[gpui::test]
+    fn primary_button_follows_repository_state_and_smart_commit_requires_confirmation(cx: &mut TestAppContext) {
+        let (view, cx) = commit_setup(cx);
+        view.update(cx, |view, cx| {
+            view.snapshot.as_mut().unwrap().repositories[0].git = Some(zeron_proto::RepositoryGitState {
+                head: Some("head".into()), branch: Some("main".into()), upstream: None,
+                ahead: None, behind: None, operation: None, conflicts: 0,
+            });
+            view.snapshot.as_mut().unwrap().repositories[0].files.clear();
+            assert_eq!(view.primary_action(), interaction::PrimaryAction::Publish);
+            assert!(view.primary_action_enabled(cx));
+            let git = view.snapshot.as_mut().unwrap().repositories[0].git.as_mut().unwrap();
+            git.upstream = Some("origin/main".into()); git.ahead = Some(1); git.behind = Some(0);
+            assert_eq!(view.primary_action(), interaction::PrimaryAction::Sync);
+            assert!(view.primary_action_enabled(cx));
+            view.snapshot.as_mut().unwrap().repositories[0].git.as_mut().unwrap().operation = Some("rebase".into());
+            assert_eq!(view.primary_action(), interaction::PrimaryAction::Continue);
+            view.snapshot.as_mut().unwrap().repositories[0].git.as_mut().unwrap().conflicts = 1;
+            assert!(!view.primary_action_enabled(cx));
+            let repo = &mut view.snapshot.as_mut().unwrap().repositories[0];
+            repo.git.as_mut().unwrap().operation = None; repo.git.as_mut().unwrap().conflicts = 0;
+            repo.files.push(GitFileStatus { path: "new.rs".into(), old_path: None, index: GitFileState::Untracked, worktree: GitFileState::Untracked });
+            view.commit_input.update(cx, |input, cx| input.set_text("New file", cx));
+            assert!(!view.can_commit(cx));
+            assert!(view.can_request_commit(cx));
+            view.commit_with_followup(None, cx);
+            let confirmation = view.confirmation.as_ref().unwrap();
+            assert!(matches!(&confirmation.command, git::Command::StageAndCommit(paths) if paths == &["new.rs"]));
+            assert_eq!(view.staged_count(), 0);
+            assert_eq!(view.commit_input.read(cx).text(), "New file");
+        });
+    }
+
+    #[gpui::test]
+    fn an_unavailable_commit_reports_a_toast_and_keeps_the_draft_and_staging(cx: &mut TestAppContext) {
+        let (view, cx) = commit_setup(cx);
+        let toasts = cx.new(|_| crate::toast::Toasts::default());
+        view.update(cx, |view, cx| {
+            view.set_notifications(toasts.clone());
+            view.commit_input.update(cx, |input, cx| input.set_text("Keep this message", cx));
+            view.commit_staged(cx);
+            assert_eq!(view.commit_input.read(cx).text(), "Keep this message");
+            assert_eq!(view.staged_count(), 1);
+        });
+        toasts.read_with(cx, |toasts, _| {
+            let feedback = toasts.fixture_state();
+            assert_eq!(feedback["kind"], "error");
+            assert_eq!(feedback["message"], "Repository is unavailable");
+        });
+    }
+
+    #[gpui::test]
+    fn background_load_errors_notify_once_until_recovery(cx: &mut TestAppContext) {
+        let (view, cx) = commit_setup(cx);
+        let toasts = cx.new(|_| crate::toast::Toasts::default());
+        view.update(cx, |view, cx| {
+            view.set_notifications(toasts.clone());
+            view.notify_load_error("offline", cx);
+            view.notify_load_error("still offline", cx);
+            assert_eq!(view.staged_count(), 1);
+        });
+        toasts.read_with(cx, |toasts, _| assert_eq!(toasts.fixture_state()["message"], "offline"));
+        view.update(cx, |view, cx| {
+            view.load_error = None;
+            view.notify_load_error("new outage", cx);
+        });
+        toasts.read_with(cx, |toasts, _| assert_eq!(toasts.fixture_state()["message"], "new outage"));
     }
 
     #[gpui::test]
@@ -1722,6 +2009,87 @@ mod tests {
         });
     }
 
+    #[gpui::test]
+    fn commit_and_push_chooses_a_remote_before_creating_an_unpublished_commit(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, cx) = commit_setup(cx);
+        view.update(cx, |view, cx| {
+            let state = zeron_proto::RepositoryGitState {
+                branch: Some("feature/new".into()),
+                ..Default::default()
+            };
+            view.snapshot.as_mut().unwrap().repositories[0].git = Some(state.clone());
+            view.git_details = Some(zeron_proto::RepositoryGitDetails {
+                state,
+                remotes: ["personal", "company"]
+                    .into_iter()
+                    .map(|name| zeron_proto::RepositoryGitRemote {
+                        name: name.into(),
+                        url: "/fixture.git".into(),
+                        push_url: None,
+                    })
+                    .collect(),
+                ..Default::default()
+            });
+            view.commit_input
+                .update(cx, |input, cx| input.set_text("New feature", cx));
+            view.commit_with_followup(Some(zeron_proto::RepositoryGitAction::Push), cx);
+            assert_eq!(view.git_panel, Some(git::GitPanel::CommitPublish));
+            assert!(view.pending_commit.is_none());
+            assert!(view.commit_followup.is_none());
+            assert!(
+                view.error.is_none(),
+                "must choose a remote before attempting a commit"
+            );
+            assert_eq!(view.commit_input.read(cx).text(), "New feature");
+            assert_eq!(
+                view.commit_primary,
+                Some(zeron_proto::RepositoryGitAction::Push)
+            );
+            view.commit_with_followup(
+                Some(zeron_proto::RepositoryGitAction::Publish {
+                    remote: "personal".into(),
+                }),
+                cx,
+            );
+            assert_eq!(view.error.as_deref(), Some("Repository is unavailable"));
+            assert_eq!(
+                view.commit_followup,
+                Some(zeron_proto::RepositoryGitAction::Publish {
+                    remote: "personal".into(),
+                })
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn configured_publish_remote_is_used_without_a_picker(cx: &mut TestAppContext) {
+        let (view, cx) = commit_setup(cx);
+        view.update(cx, |view, cx| {
+            let state = zeron_proto::RepositoryGitState {
+                branch: Some("feature/new".into()),
+                ..Default::default()
+            };
+            view.snapshot.as_mut().unwrap().repositories[0].git = Some(state.clone());
+            view.git_details = Some(zeron_proto::RepositoryGitDetails {
+                state,
+                publish_remote: Some("origin".into()),
+                ..Default::default()
+            });
+            view.commit_input
+                .update(cx, |input, cx| input.set_text("New feature", cx));
+            view.commit_with_followup(Some(zeron_proto::RepositoryGitAction::Push), cx);
+            assert_eq!(
+                view.commit_followup,
+                Some(zeron_proto::RepositoryGitAction::Publish {
+                    remote: "origin".into(),
+                })
+            );
+            assert_eq!(view.error.as_deref(), Some("Repository is unavailable"));
+        });
+    }
+
     #[test]
     fn partially_staged_files_appear_on_both_sides() {
         let file = GitFileStatus {
@@ -1754,6 +2122,10 @@ mod tests {
             (GitFileState::Unmerged, GitFileState::Unmerged),
             (GitFileState::Added, GitFileState::Added),
             (GitFileState::Deleted, GitFileState::Deleted),
+            (GitFileState::Unmerged, GitFileState::Deleted),
+            (GitFileState::Deleted, GitFileState::Unmerged),
+            (GitFileState::Unmerged, GitFileState::Added),
+            (GitFileState::Added, GitFileState::Unmerged),
         ] {
             let file = GitFileStatus {
                 path: "conflict".into(),

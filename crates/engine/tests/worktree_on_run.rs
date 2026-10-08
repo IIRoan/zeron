@@ -14,7 +14,9 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 
-use zeron_doc::{MessageRole, MessageStatus, SessionCommandPayload, SessionMessageEntry};
+use zeron_doc::{
+    MessageRole, MessageStatus, SessionCommandPayload, SessionCommandStatus, SessionMessageEntry,
+};
 use zeron_engine::{EngineCore, HarnessRegistry};
 use zeron_harness::{Harness, HarnessError, RunControls};
 use zeron_proto::{
@@ -324,5 +326,66 @@ async fn check_worktree_setup_and_reuse(use_project_symlink: bool) {
     assert!(reused.setup_error.is_none());
     assert!(!first.join("setup-marker").exists());
 
+    // The UI waits for this handoff while it animates worktree preparation.
+    // A failed create command must complete it too, rather than leave the
+    // composer showing a loading state after the durable Run was rejected.
+    core.repos
+        .worktree_settings()
+        .save(
+            &repo_dir,
+            None,
+            Some(zeron_proto::WorktreeSettings {
+                create_command: "echo worktree-create-failed >&2; exit 7".into(),
+                dependencies: zeron_proto::WorktreeDependencyMode::Skip,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+    let failed_chat = "failed-worktree";
+    client
+        .call(
+            zeron_rpc::methods::MUTATE,
+            serde_json::json!({
+                "op": "createChat",
+                "chatId": failed_chat,
+                "deviceId": core.device_id,
+            }),
+        )
+        .await
+        .unwrap();
+    let failed_command = core
+        .doc_host
+        .queue_command(
+            failed_chat,
+            run_payload("failed-message", &repo_path, Some("space-worktree-run")),
+        )
+        .unwrap();
+    wait_for(
+        || {
+            core.doc_host
+                .open(failed_chat)
+                .unwrap()
+                .doc()
+                .read_commands()
+                .unwrap()
+                .iter()
+                .any(|command| {
+                    command.id == failed_command && command.status == SessionCommandStatus::Rejected
+                })
+        },
+        "failed worktree rejection",
+    )
+    .await;
+    let failed = core
+        .project_actions
+        .take_setup_handoff(&failed_command, failed_chat)
+        .expect("failed worktree creation completes the UI handoff");
     core.shutdown().await;
+    assert!(failed.setup_action.is_none());
+    assert!(failed.setup_error.unwrap().contains("status 7"));
+    assert_eq!(
+        cwds.lock().unwrap().len(),
+        2,
+        "a failed worktree must not launch the agent"
+    );
 }

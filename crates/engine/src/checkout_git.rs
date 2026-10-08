@@ -149,6 +149,25 @@ fn redact_url(value: &str) -> String {
     value.into()
 }
 
+/// Load only stash metadata; pickers and stash actions do not need branch or history scans.
+pub async fn stashes(root: &Path) -> Result<Vec<RepositoryGitStash>, EngineError> {
+    let mut stashes = Vec::new();
+    for line in text(root, &["stash", "list", "--format=%H%x00%gd%x00%s"])
+        .await?
+        .lines()
+    {
+        let fields: Vec<_> = line.splitn(3, '\0').collect();
+        if fields.len() == 3 {
+            stashes.push(RepositoryGitStash {
+                sha: fields[0].into(),
+                selector: fields[1].into(),
+                subject: fields[2].into(),
+            });
+        }
+    }
+    Ok(stashes)
+}
+
 pub async fn details(root: &Path) -> Result<RepositoryGitDetails, EngineError> {
     let state = state(root).await?;
     let refs = text(
@@ -186,22 +205,12 @@ pub async fn details(root: &Path) -> Result<RepositoryGitDetails, EngineError> {
         remotes.push(RepositoryGitRemote {
             name: name.into(),
             url: redact_url(&text(root, &["remote", "get-url", name]).await?),
+            push_url: Some(redact_url(
+                &text(root, &["remote", "get-url", "--push", name]).await?,
+            )),
         });
     }
-    let mut stashes = Vec::new();
-    for line in text(root, &["stash", "list", "-100", "--format=%H%x00%gd%x00%s"])
-        .await?
-        .lines()
-    {
-        let fields: Vec<_> = line.splitn(3, '\0').collect();
-        if fields.len() == 3 {
-            stashes.push(RepositoryGitStash {
-                sha: fields[0].into(),
-                selector: fields[1].into(),
-                subject: fields[2].into(),
-            });
-        }
-    }
+    let stashes = stashes(root).await?;
     let (recent, last_message) = if state.head.is_some() {
         (
             commits(root, "HEAD").await?,
@@ -218,10 +227,12 @@ pub async fn details(root: &Path) -> Result<RepositoryGitDetails, EngineError> {
     } else {
         (Vec::new(), Vec::new())
     };
+    let publish_remote = publication_remote(root, &remotes, state.branch.as_deref()).await?;
     Ok(RepositoryGitDetails {
         state,
         branches,
         remotes,
+        publish_remote,
         stashes,
         incoming,
         outgoing,
@@ -335,7 +346,11 @@ async fn push(root: &Path) -> Result<(), EngineError> {
         return Err(fail("Create a commit before pushing"));
     }
     if state.upstream.is_none() {
-        return Err(fail("Publish this branch to set its upstream"));
+        let metadata = details(root).await?;
+        let remote = metadata
+            .publish_remote
+            .ok_or_else(|| fail("Select a remote to publish this branch"))?;
+        return publish(root, &remote, &branch).await;
     }
     let tracking = text(
         root,
@@ -379,6 +394,60 @@ async fn push(root: &Path) -> Result<(), EngineError> {
     Ok(())
 }
 
+/// Honor explicit Git push destinations, then prefer origin, then a single
+/// enabled remote. Ambiguous destinations require a choice in the UI.
+async fn publication_remote(
+    root: &Path,
+    remotes: &[RepositoryGitRemote],
+    branch: Option<&str>,
+) -> Result<Option<String>, EngineError> {
+    let eligible = remotes
+        .iter()
+        .filter(|remote| remote.push_url.as_deref() != Some("DISABLED"))
+        .map(|remote| remote.name.as_str())
+        .collect::<Vec<_>>();
+    let mut keys = Vec::new();
+    if let Some(branch) = branch {
+        keys.push(format!("branch.{branch}.pushRemote"));
+    }
+    keys.push("remote.pushDefault".into());
+    if let Some(branch) = branch {
+        keys.push(format!("branch.{branch}.remote"));
+    }
+    for key in keys {
+        let configured = text(root, &["config", "--default", "", "--get", &key]).await?;
+        if !configured.is_empty() {
+            return Ok(eligible
+                .contains(&configured.as_str())
+                .then_some(configured));
+        }
+    }
+    Ok(if eligible.contains(&"origin") {
+        Some("origin".into())
+    } else if eligible.len() == 1 {
+        Some(eligible[0].into())
+    } else {
+        None
+    })
+}
+
+async fn publish(root: &Path, remote: &str, branch: &str) -> Result<(), EngineError> {
+    known_remote(root, remote).await?;
+    run(
+        root,
+        &[
+            "push",
+            "--set-upstream",
+            "--",
+            remote,
+            &format!("HEAD:refs/heads/{branch}"),
+        ],
+        None,
+    )
+    .await
+    .map(drop)
+}
+
 async fn pull(root: &Path, rebase: Option<bool>) -> Result<(), EngineError> {
     if state(root).await?.upstream.is_none() {
         return Err(fail(
@@ -395,9 +464,8 @@ async fn pull(root: &Path, rebase: Option<bool>) -> Result<(), EngineError> {
 
 async fn stash_entry(root: &Path, sha: &str) -> Result<RepositoryGitStash, EngineError> {
     oid(sha)?;
-    details(root)
+    stashes(root)
         .await?
-        .stashes
         .into_iter()
         .find(|stash| stash.sha == sha)
         .ok_or_else(|| fail("Stash is unavailable; refresh the list"))
@@ -446,18 +514,7 @@ async fn perform_inner(
             if before.head.is_none() {
                 return Err(fail("Create a commit before publishing"));
             }
-            run(
-                root,
-                &[
-                    "push",
-                    "--set-upstream",
-                    "--",
-                    &remote,
-                    &format!("HEAD:refs/heads/{branch}"),
-                ],
-                None,
-            )
-            .await?;
+            publish(root, &remote, &branch).await?;
             "Branch published"
         }
         Action::Sync => {
@@ -537,8 +594,12 @@ async fn perform_inner(
                     "The last commit is not known to be unpublished; fetch before undoing it",
                 ));
             }
-            let parent = text(root, &["rev-parse", "--verify", "HEAD^"]).await?;
-            oid(&parent)?;
+            // Read the actual commit headers: rev-list hides parents at a
+            // shallow boundary, which must never be mistaken for a root commit.
+            let object = text(root, &["cat-file", "-p", "HEAD"]).await?;
+            let parent = object.lines().take_while(|line| !line.is_empty())
+                .find_map(|line| line.strip_prefix("parent "));
+            if let Some(parent) = parent { oid(parent)?; }
             commit_message = Some(text(root, &["log", "-1", "--format=%B"]).await?);
             let head = before
                 .head
@@ -554,8 +615,17 @@ async fn perform_inner(
                 None,
             )
             .await?;
-            run(root, &["reset", "--soft", &parent], None).await?;
-            "Last commit undone; its changes remain staged"
+            if let Some(parent) = parent {
+                run(root, &["reset", "--soft", parent], None).await?;
+                "Last commit undone; its changes remain staged"
+            } else {
+                let branch = before.branch.as_deref().ok_or_else(|| fail("Switch to a branch before undoing an initial commit"))?;
+                // Match VS Code's root-commit undo: keep all files, make the
+                // branch unborn again and empty the index. Preserve a recovery ref.
+                run(root, &["update-ref", "-d", &format!("refs/heads/{branch}"), head], None).await?;
+                run(root, &["read-tree", "--empty"], None).await?;
+                "Initial commit undone; its files remain in the working tree"
+            }
         }
         Action::RevertCommit { sha } => {
             oid(&sha)?;
@@ -588,14 +658,20 @@ async fn perform_inner(
                 "Changes stashed"
             }
         }
-        Action::ApplyStash { sha } => {
+        Action::ApplyStash { sha, reinstate_staged } => {
             stash_entry(root, &sha).await?;
-            run(root, &["stash", "apply", "--index", &sha], None).await?;
+            let mut args = vec!["stash", "apply"];
+            if reinstate_staged { args.push("--index"); }
+            args.push(&sha);
+            run(root, &args, None).await?;
             "Stash applied and kept"
         }
-        Action::PopStash { sha } => {
+        Action::PopStash { sha, reinstate_staged } => {
             stash_entry(root, &sha).await?;
-            run(root, &["stash", "apply", "--index", &sha], None).await?;
+            let mut args = vec!["stash", "apply"];
+            if reinstate_staged { args.push("--index"); }
+            args.push(&sha);
+            run(root, &args, None).await?;
             let entry = stash_entry(root, &sha).await?;
             run(root, &["stash", "drop", &entry.selector], None).await?;
             "Stash applied and removed"
@@ -655,14 +731,19 @@ async fn perform_inner(
             let (files, complete) = checkout_changes::status(root).await?;
             if !complete
                 || !files.iter().any(|f| {
-                    f.path == path
-                        && (f.index == zeron_proto::GitFileState::Unmerged
-                            || f.worktree == zeron_proto::GitFileState::Unmerged)
+                    f.path == path && f.is_conflicted()
                 })
             {
                 return Err(fail("This file is no longer an unresolved conflict"));
             }
+            let stages = text(root, &["--literal-pathspecs", "ls-files", "--unmerged", "-z", "--", &path]).await?;
+            let desired = if incoming { "3" } else { "2" };
+            let has_version = stages.split('\0').any(|line| line.split('\t').next().is_some_and(|header| header.split_whitespace().nth(2) == Some(desired)));
             let payload = format!("{path}\0");
+            if !has_version {
+                run(root, &["--literal-pathspecs", "rm", "--force", "--pathspec-from-file=-", "--pathspec-file-nul"], Some(payload.as_bytes())).await?;
+                return Ok(RepositoryGitActionResult { notice: "Conflict resolved by accepting the deleted version".into(), commit_message: None });
+            }
             run(
                 root,
                 &[
@@ -718,6 +799,168 @@ mod tests {
         let head = state(root).await.unwrap().head;
         perform(root, action, head.as_deref()).await
     }
+
+    #[tokio::test]
+    async fn stash_apply_defaults_to_unstaged_and_failed_pop_keeps_the_stash() {
+        let dir = repo();
+        let root = dir.path();
+        std::fs::write(root.join("file.txt"), "saved\n").unwrap();
+        git(root, &["add", "file.txt"]);
+        act(root, Action::Stash { message: "Saved".into(), include_untracked: false }).await.unwrap();
+        let sha = details(root).await.unwrap().stashes[0].sha.clone();
+        act(root, Action::ApplyStash { sha: sha.clone(), reinstate_staged: false }).await.unwrap();
+        assert_eq!(git(root, &["show", ":file.txt"]), "original");
+        assert_eq!(std::fs::read_to_string(root.join("file.txt")).unwrap(), "saved\n");
+        assert_eq!(details(root).await.unwrap().stashes.len(), 1);
+        git(root, &["restore", "file.txt"]);
+        std::fs::write(root.join("file.txt"), "diverged\n").unwrap();
+        git(root, &["add", "file.txt"]);
+        git(root, &["commit", "-qm", "Diverged"]);
+        assert!(act(root, Action::PopStash { sha: sha.clone(), reinstate_staged: false }).await.is_err());
+        assert_eq!(details(root).await.unwrap().stashes[0].sha, sha);
+        assert_eq!(state(root).await.unwrap().conflicts, 1);
+    }
+
+    #[tokio::test]
+    async fn undo_initial_commit_keeps_files_and_a_recovery_reference() {
+        let dir = repo();
+        let root = dir.path();
+        let head = git(root, &["rev-parse", "HEAD"]);
+        std::fs::write(root.join("file.txt"), "unsaved work\n").unwrap();
+        git(root, &["add", "file.txt"]);
+        let result = act(root, Action::UndoCommit).await.unwrap();
+        assert_eq!(result.commit_message.as_deref().map(str::trim), Some("Initial"));
+        assert_eq!(state(root).await.unwrap().head, None);
+        assert_eq!(state(root).await.unwrap().branch.as_deref(), Some("main"));
+        assert_eq!(git(root, &["ls-files"]), "");
+        assert_eq!(std::fs::read_to_string(root.join("file.txt")).unwrap(), "unsaved work\n");
+        assert!(git(root, &["for-each-ref", "--format=%(objectname)", "refs/zeron/undo"]).contains(&head));
+    }
+
+    #[tokio::test]
+    async fn undo_refuses_a_missing_shallow_parent_without_deleting_the_branch() {
+        let source = repo();
+        std::fs::write(source.path().join("file.txt"), "second\n").unwrap();
+        git(source.path(), &["add", "-A"]);
+        git(source.path(), &["commit", "-qm", "Second"]);
+        let clone = tempfile::tempdir().unwrap();
+        git(clone.path(), &["clone", "-q", "--depth=1", &format!("file://{}", source.path().display()), "."]);
+        git(clone.path(), &["remote", "remove", "origin"]);
+        let head = git(clone.path(), &["rev-parse", "HEAD"]);
+        assert!(act(clone.path(), Action::UndoCommit).await.is_err());
+        assert_eq!(git(clone.path(), &["rev-parse", "HEAD"]), head);
+        assert_eq!(git(clone.path(), &["branch", "--show-current"]), "main");
+        assert_eq!(git(clone.path(), &["show", ":file.txt"]), "second");
+    }
+
+    #[tokio::test]
+    async fn modify_delete_conflicts_can_accept_either_version() {
+        for incoming in [false, true] {
+            let dir = repo();
+            let root = dir.path();
+            git(root, &["switch", "-qc", "other"]);
+            git(root, &["rm", "file.txt"]);
+            git(root, &["commit", "-qm", "Delete"]);
+            git(root, &["switch", "-q", "main"]);
+            std::fs::write(root.join("file.txt"), "modified\n").unwrap();
+            git(root, &["add", "-A"]);
+            git(root, &["commit", "-qm", "Modify"]);
+            assert!(act(root, Action::Merge { branch: "other".into() }).await.is_err());
+            act(root, Action::ResolveConflict { path: "file.txt".into(), incoming }).await.unwrap();
+            if incoming {
+                assert!(!root.join("file.txt").exists());
+            } else {
+                assert_eq!(std::fs::read_to_string(root.join("file.txt")).unwrap(), "modified\n");
+                checkout_changes::set_staged(root, &["file.txt".into()], true).await.unwrap();
+            }
+            assert_eq!(state(root).await.unwrap().conflicts, 0);
+            act(root, Action::Continue).await.unwrap();
+            assert!(state(root).await.unwrap().operation.is_none());
+        }
+    }
+    #[tokio::test]
+    async fn push_publishes_new_branches_and_respects_the_configured_destination() {
+        let project = repo();
+        let root = project.path();
+        let origin = tempfile::tempdir().unwrap();
+        let fork = tempfile::tempdir().unwrap();
+        for remote in [&origin, &fork] {
+            git(remote.path(), &["init", "-q", "--bare"]);
+        }
+        git(
+            root,
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        git(
+            root,
+            &["remote", "add", "fork", fork.path().to_str().unwrap()],
+        );
+        git(
+            root,
+            &["remote", "add", "upstream", origin.path().to_str().unwrap()],
+        );
+        git(
+            root,
+            &["remote", "set-url", "--push", "upstream", "DISABLED"],
+        );
+        git(root, &["checkout", "-qb", "feature/first"]);
+        std::fs::write(root.join("file.txt"), "first feature commit\n").unwrap();
+        git(root, &["add", "file.txt"]);
+        git(root, &["commit", "-qm", "Feature"]);
+        assert_eq!(
+            details(root).await.unwrap().publish_remote.as_deref(),
+            Some("origin")
+        );
+        act(root, Action::Push).await.unwrap();
+        assert_eq!(
+            state(root).await.unwrap().upstream.as_deref(),
+            Some("origin/feature/first")
+        );
+        assert_eq!(
+            git(origin.path(), &["rev-parse", "refs/heads/feature/first"]),
+            git(root, &["rev-parse", "HEAD"])
+        );
+        git(root, &["checkout", "-qb", "feature/second"]);
+        git(
+            root,
+            &["config", "branch.feature/second.pushRemote", "fork"],
+        );
+        assert_eq!(
+            details(root).await.unwrap().publish_remote.as_deref(),
+            Some("fork")
+        );
+        act(root, Action::Push).await.unwrap();
+        assert_eq!(
+            state(root).await.unwrap().upstream.as_deref(),
+            Some("fork/feature/second")
+        );
+        assert_eq!(
+            git(fork.path(), &["rev-parse", "refs/heads/feature/second"]),
+            git(root, &["rev-parse", "HEAD"])
+        );
+        git(root, &["checkout", "-qb", "feature/disabled"]);
+        git(root, &["config", "remote.pushDefault", "upstream"]);
+        assert_eq!(details(root).await.unwrap().publish_remote, None);
+        assert!(act(root, Action::Push).await.is_err());
+        assert!(state(root).await.unwrap().upstream.is_none());
+    }
+
+    #[tokio::test]
+    async fn ambiguous_publication_requires_a_remote_choice_before_pushing() {
+        let project = repo();
+        let root = project.path();
+        let remote = tempfile::tempdir().unwrap();
+        git(remote.path(), &["init", "-q", "--bare"]);
+        for name in ["personal", "company"] {
+            git(
+                root,
+                &["remote", "add", name, remote.path().to_str().unwrap()],
+            );
+        }
+        assert_eq!(details(root).await.unwrap().publish_remote, None);
+        assert!(act(root, Action::Push).await.is_err());
+        assert!(state(root).await.unwrap().upstream.is_none());
+    }
     #[tokio::test]
     async fn branches_stashes_amend_and_undo_preserve_work() {
         let dir = repo();
@@ -754,7 +997,7 @@ mod tests {
             "original\n"
         );
         let saved = details(root).await.unwrap().stashes[0].sha.clone();
-        act(root, Action::PopStash { sha: saved }).await.unwrap();
+        act(root, Action::PopStash { sha: saved, reinstate_staged: true }).await.unwrap();
         assert!(details(root).await.unwrap().stashes.is_empty());
         assert_eq!(git(root, &["show", ":file.txt"]), "staged");
         assert_eq!(

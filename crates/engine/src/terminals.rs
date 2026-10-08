@@ -38,6 +38,9 @@ const EXITED_TTL: Duration = Duration::from_secs(30 * 60);
 const REAPER_INTERVAL: Duration = Duration::from_secs(60);
 
 struct LiveTerminal {
+    service: bool,
+    #[cfg(target_os = "linux")]
+    service_session: Option<i32>,
     // Keep the private action script alive until the shell exits or the tab is closed.
     initial_script: Option<tempfile::NamedTempFile>,
     #[cfg(all(test, windows))]
@@ -55,6 +58,50 @@ struct LiveTerminal {
     seq: u64,
     last_active_at: std::time::Instant,
     exited: bool,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct ServiceKiller(i32);
+
+#[cfg(unix)]
+impl portable_pty::ChildKiller for ServiceKiller {
+    fn kill(&mut self) -> std::io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            // Shell job control and development runners can create child job
+            // groups. All still belong to this PTY's private session. Collect
+            // before killing its leader so teardown covers every group.
+            for pid in service_session_processes(self.0)? {
+                let result = unsafe { libc::kill(pid, libc::SIGKILL) };
+                if result != 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::ESRCH) {
+                        return Err(error);
+                    }
+                }
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // portable-pty starts the shell as its own session/process-group leader.
+            // A service owns that entire group, including npm/bun child processes.
+            let result = unsafe { libc::kill(-self.0, libc::SIGKILL) };
+            if result == 0 {
+                return Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
+    }
+    fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+        Box::new(Self(self.0))
+    }
 }
 
 impl LiveTerminal {
@@ -216,6 +263,22 @@ impl Terminals {
         self.open_session(cwd, cols, rows, None, environment, Some(command))
     }
 
+    /// A managed service exits with its command, rather than returning to an
+    /// interactive prompt. Its Exit event therefore describes the service.
+    pub fn open_service(
+        &self,
+        cwd: &str,
+        environment: &HashMap<String, String>,
+        command: &str,
+    ) -> Result<TerminalSession, EngineError> {
+        #[cfg(not(unix))]
+        return Err(EngineError::Other(
+            "Managed project terminals require Unix".into(),
+        ));
+        #[cfg(unix)]
+        self.open_session_mode(cwd, 100, 28, None, environment, Some(command), true)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn open_session(
         &self,
@@ -225,6 +288,20 @@ impl Terminals {
         shell: Option<&str>,
         environment: &HashMap<String, String>,
         command: Option<&str>,
+    ) -> Result<TerminalSession, EngineError> {
+        self.open_session_mode(cwd, cols, rows, shell, environment, command, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_session_mode(
+        &self,
+        cwd: &str,
+        cols: u16,
+        rows: u16,
+        shell: Option<&str>,
+        environment: &HashMap<String, String>,
+        command: Option<&str>,
+        service: bool,
     ) -> Result<TerminalSession, EngineError> {
         if lock(&self.inner.sessions).len() >= MAX_TERMINALS {
             return Err(EngineError::Other(format!(
@@ -257,7 +334,7 @@ impl Terminals {
                 .tempfile()?;
             script.write_all(command.as_bytes())?;
             script.flush()?;
-            (Some(script), Some(source.to_string()))
+            (Some(script), (!service).then(|| source.to_string()))
         } else {
             (None, None)
         };
@@ -276,6 +353,14 @@ impl Terminals {
             if !cfg!(windows) {
                 cmd.arg("-l"); // login shell — the user's real PATH/profile
             }
+            if service {
+                cmd.arg("-c");
+                cmd.arg(if shell_name == "fish" {
+                    "source \"$ZERON_ACTION_SCRIPT\""
+                } else {
+                    ". \"$ZERON_ACTION_SCRIPT\""
+                });
+            }
             cmd.cwd(cwd);
             cmd.env("TERM", "xterm-256color");
             cmd.env("COLORTERM", "truecolor");
@@ -293,7 +378,14 @@ impl Terminals {
             drop(pair.slave);
             (pair.master, child)
         };
-        let killer = child.clone_killer();
+        let mut killer = child.clone_killer();
+        #[cfg(unix)]
+        if service {
+            let pid = child
+                .process_id()
+                .ok_or_else(|| EngineError::Other("Service process id unavailable".into()))?;
+            killer = Box::new(ServiceKiller(pid as i32));
+        }
         let reader = master
             .try_clone_reader()
             .map_err(|e| EngineError::Other(format!("pty reader: {e}")))?;
@@ -303,6 +395,9 @@ impl Terminals {
 
         let id = new_id();
         let session = Arc::new(Mutex::new(LiveTerminal {
+            service,
+            #[cfg(target_os = "linux")]
+            service_session: service.then(|| child.process_id().expect("service pid") as i32),
             initial_script,
             #[cfg(all(test, windows))]
             process_id: child.process_id().expect("ConPTY child has a process id"),
@@ -469,6 +564,38 @@ impl Terminals {
         }
     }
 
+    /// Managed services must release their ports before another checkout starts.
+    /// Called on the blocking RPC worker, never the UI thread. Keep the session
+    /// registered on timeout so Stop can retry instead of losing a live process.
+    pub(crate) fn close_service_and_wait(&self, terminal_id: &str) -> Result<(), EngineError> {
+        let session = match lock(&self.inner.sessions).get(terminal_id).cloned() {
+            Some(session) => session,
+            None => return Ok(()),
+        };
+        #[cfg(target_os = "linux")]
+        let service_session = lock(&session).service_session;
+        if !dispose(&session, true) {
+            return Err(EngineError::Other("Terminal cleanup did not finish".into()));
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(service_session) = service_session {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !service_session_processes(service_session)?.is_empty() {
+                if std::time::Instant::now() >= deadline {
+                    return Err(EngineError::Other(
+                        "The previous service did not stop; no replacement was started".into(),
+                    ));
+                }
+                // Also cover a child spawned while the initial session scan
+                // raced with teardown, and allow Stop to retry after an error.
+                portable_pty::ChildKiller::kill(&mut ServiceKiller(service_session))?;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        lock(&self.inner.sessions).remove(terminal_id);
+        Ok(())
+    }
+
     /// Any live PTY (the reaper prunes exited ones) — restarts kill shells, so
     /// the auto-updater waits for none.
     pub fn any_open(&self) -> bool {
@@ -482,6 +609,35 @@ impl Terminals {
             dispose(&session, true);
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn service_session_processes(session: i32) -> std::io::Result<Vec<i32>> {
+    let mut processes = Vec::new();
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // comm can contain spaces and parentheses; fields after its final ')'
+        // are state, parent pid, process group, then session. Zombies hold no sockets.
+        let Some((_, fields)) = stat.rsplit_once(") ") else {
+            continue;
+        };
+        let mut fields = fields.split_whitespace();
+        let state = fields.next();
+        let _parent = fields.next();
+        let _group = fields.next();
+        if fields.next().and_then(|s| s.parse::<i32>().ok()) == Some(session)
+            && !matches!(state, Some("Z" | "X"))
+        {
+            processes.push(pid);
+        }
+    }
+    Ok(processes)
 }
 
 fn dispose(session: &Arc<Mutex<LiveTerminal>>, kill: bool) -> bool {
@@ -594,6 +750,7 @@ async fn pump_output(
                 {
                     let (master, writer) = {
                         let mut session = lock(&session);
+                        if session.service { let _ = session.killer.kill(); }
                         (session.master.take(), session.writer.take())
                     };
                     let _ = tokio::task::spawn_blocking(move || {

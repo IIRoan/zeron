@@ -66,6 +66,8 @@ fn screenshot(path: &Path) -> anyhow::Result<()> {
                 "screenshot-window",
                 "--id",
                 &window["id"].to_string(),
+                "--write-to-disk",
+                "true",
                 "--path",
             ])
             .arg(path)
@@ -115,6 +117,7 @@ fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&output)?;
     let temp = tempfile::tempdir()?;
     let repo = temp.path().join("source-control-demo");
+    std::fs::write(output.join("repository-path"), repo.to_string_lossy().as_bytes())?;
     let child = temp.path().join("module-origin");
     std::fs::create_dir_all(repo.join("src"))?;
     std::fs::create_dir_all(&child)?;
@@ -142,11 +145,17 @@ fn main() -> anyhow::Result<()> {
         "fn main() {\n    println!(\"original\");\n}\n",
     )?;
     std::fs::write(repo.join("src/staged.rs"), "pub const VALUE: u32 = 1;\n")?;
-    std::fs::write(repo.join(".gitignore"), "# Dependencies\nnode_modules\n\n# Build output\ntarget\n")?;
+    std::fs::write(
+        repo.join(".gitignore"),
+        "# Dependencies\nnode_modules\n\n# Build output\ntarget\n",
+    )?;
     let typescript = "type Participant = { id: string; active: boolean };\n\nexport function assignMembers(members: Participant[]) {\n    const message = \"original\";\n    const groupRouter = { assign: (member: Participant) => member.id };\n    return members.filter((member) => member.active).map(groupRouter.assign);\n}\n";
     std::fs::write(repo.join("src/example.ts"), typescript)?;
     commit(&repo);
-    for (i, root) in [&repo, &repo.join("apps/device-apps")].into_iter().enumerate() {
+    for (i, root) in [&repo, &repo.join("apps/device-apps")]
+        .into_iter()
+        .enumerate()
+    {
         git(root, &["config", "user.name", "Fixture"]);
         git(root, &["config", "user.email", "fixture@example.com"]);
         git(root, &["config", "commit.gpgsign", "false"]);
@@ -167,7 +176,10 @@ fn main() -> anyhow::Result<()> {
     let origin = temp.path().join("origin.git");
     std::fs::create_dir_all(&origin)?;
     git(&origin, &["init", "-q", "--bare", "-b", "main"]);
-    git(&repo, &["remote", "add", "origin", origin.to_str().unwrap()]);
+    git(
+        &repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
     git(&repo, &["push", "-qu", "origin", "main"]);
     std::fs::write(repo.join("local-history.txt"), "local history\n")?;
     commit(&repo);
@@ -207,6 +219,60 @@ fn main() -> anyhow::Result<()> {
         None,
         true,
     )?;
+    if std::env::var_os("ZERON_FIXTURE_WORKTREES").is_some() {
+        std::fs::write(repo.join(".env.local"),"TEST_VALUE=fixture\n")?;
+        std::fs::create_dir_all(repo.join("node_modules/worktree-example"))?;
+        std::fs::write(repo.join("node_modules/worktree-example/index.js"), "module.exports = 'fixture';\n")?;
+        std::fs::create_dir_all(repo.join("tools/worktrees/src/commands"))?;
+        std::fs::write(repo.join("tools/worktrees/src/commands/codex-sync.ts"),"// Fixture discovery only; never executed\n")?;
+        if std::env::var_os("ZERON_FIXTURE_WORKTREE_LOADING").is_some() {
+            core.repos.worktree_settings().save(&repo, None, Some(zeron_proto::WorktreeSettings {
+                env_files: vec![zeron_proto::WorktreeEnvFile { path: ".env.local".into(), mode: zeron_proto::WorktreeEnvMode::Follow }],
+                dependencies: zeron_proto::WorktreeDependencyMode::Copy,
+                setup_command: "sleep 12".into(),
+                ..Default::default()
+            }))?;
+        }
+    }
+    if std::env::var_os("ZERON_FIXTURE_PROJECT_TERMINALS").is_some() || std::env::var_os("ZERON_FIXTURE_WORKTREES").is_some() {
+        std::fs::create_dir(repo.join("backend"))?;
+        std::fs::create_dir(repo.join("frontend"))?;
+        core.project_actions.project_terminals.save(
+            "fixture-space",
+            &repo,
+            zeron_proto::ProjectTerminalConfig {
+                services: [
+                    ("backend", "Backend", "backend"),
+                    ("frontend", "Frontend", "frontend"),
+                    ("cloudflared", "Cloudflared", "."),
+                ]
+                .into_iter()
+                .map(
+                    |(id, name, directory)| zeron_proto::ProjectTerminalService {
+                        id: id.into(),
+                        name: name.into(),
+                        directory: directory.into(),
+                        restart_on_failure: false,
+                        command: format!("printf '%s\\n' '{name} fixture ready'; exec sleep 600"),
+                    },
+                )
+                .collect(),
+            },
+        )?;
+        git(&repo, &["checkout", "-qb", "feature/fixture"]);
+        // Real linked checkouts exercise the normal foreground agent-selection
+        // path. No fixture command calls the terminal handoff RPC directly.
+        for (suffix, checkout_name) in [("a", "Agent A"), ("b", "Agent B")] {
+            let checkout = temp.path().join(format!("agent-{suffix}"));
+            git(&repo, &["worktree", "add", "-q", "--detach", checkout.to_str().unwrap(), "HEAD"]);
+            std::fs::create_dir(checkout.join("backend"))?;
+            std::fs::create_dir(checkout.join("frontend"))?;
+            let id = format!("fixture-agent-{suffix}");
+            core.workspace.create_chat(&id, Some("fixture-space"), Some(&core.device_id), None, None)?;
+            core.workspace.set_chat_cwd(&id, checkout.to_str().unwrap())?;
+            core.workspace.rename_chat(&id, checkout_name)?;
+        }
+    }
     core.workspace.create_chat(
         "source-control-fixture",
         Some("fixture-space"),
@@ -218,10 +284,9 @@ fn main() -> anyhow::Result<()> {
         .set_chat_cwd("source-control-fixture", repo.to_str().unwrap())?;
     core.workspace
         .rename_chat("source-control-fixture", "Test source control")?;
-    let port = std::net::TcpListener::bind("127.0.0.1:0")?
-        .local_addr()?
-        .port();
-    let _ipc = runtime.block_on(zeron_engine::serve_ipc(port, core.rpc_service()))?;
+    let listener = runtime.block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))?;
+    let port = listener.local_addr()?.port();
+    let _ipc = runtime.spawn(zeron_rpc::serve_ws_listener(listener, core.rpc_service()));
     let data = temp.path().join("ui");
     std::fs::create_dir(&data)?;
     let boot = EngineBootConfig {
@@ -241,10 +306,12 @@ fn main() -> anyhow::Result<()> {
         output.join("repository.txt"),
         repo.to_string_lossy().as_bytes(),
     )?;
+    let engine_runtime = runtime.handle().clone();
     gpui_platform::application().with_assets(icons::Assets).run(move |cx| {
         gpui_tokio::init(cx); gpui_base::init(cx);
         gpui::profiler::set_frame_trace_enabled(true);
         let prefs = settings::UiSettings::default(); settings::init(prefs.clone(), data.clone(), cx);
+        motion::init(prefs.reduce_motion, prefs.pause_animations_in_background, cx);
         let fonts = typography::register_fonts(cx);
         typography::init(prefs.ui_font_family.clone(), prefs.ui_font_size, prefs.terminal_font_family.clone(), prefs.terminal_font_size, prefs.code_font_family.clone(), prefs.code_font_size, fonts, cx);
         theme_library::init(data, cx);
@@ -272,15 +339,33 @@ fn main() -> anyhow::Result<()> {
                 pause(cx, 100).await;
                 let path = output.join("command.json");
                 let Ok(bytes) = std::fs::read(&path) else { continue; };
-                let command: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                let Ok(command) = serde_json::from_slice::<serde_json::Value>(&bytes) else { continue; };
                 std::fs::remove_file(path).unwrap();
                 let action = command["action"].as_str().unwrap();
                 let command_start = std::time::Instant::now();
                 if action == "quit" {
+                    // The fixture owns its engine; drain PTY readers before
+                    // dropping the runtime, including regular shell tabs.
+                    engine_runtime.spawn(async move { core.shutdown().await; }).await.unwrap();
                     gpui::AnyWindowHandle::from(window).update(cx, |_, w, _| w.blur()).unwrap();
                     pause(cx, 100).await;
                     cx.update(|cx| cx.quit());
                     break;
+                }
+                if action == "worktree-settings" {
+                    window.update(cx, |view, _, cx| view.fixture_open_worktree_settings(cx)).unwrap();
+                }
+                if action == "project-terminals" {
+                    window.update(cx, |view, _, cx| view.fixture_open_project_terminals(cx)).unwrap();
+                }
+                if action == "agent" {
+                    window.update(cx, |view, _, cx| view.fixture_select_project_terminal_agent(command["chatId"].as_str().unwrap().into(), cx)).unwrap();
+                }
+                if action == "new-chat" {
+                    window.update(cx, |view, _, cx| view.fixture_new_chat(cx)).unwrap();
+                }
+                if action == "worktree-send" {
+                    window.update(cx, |view, _, cx| view.fixture_send_worktree(cx)).unwrap();
                 }
                 gpui::AnyWindowHandle::from(window).update(cx, |_, w, cx| {
                     if command["forceDraw"].as_bool().unwrap_or(true) {
@@ -295,19 +380,22 @@ fn main() -> anyhow::Result<()> {
                                 _ => w.dispatch_event(gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent { position, ..Default::default() }), cx),
                             };
                         }
-                        "click" => {
+                        "click" | "right-click" => {
                             let position = gpui::point(px(command["x"].as_f64().unwrap() as f32), px(command["y"].as_f64().unwrap() as f32));
                             let modifiers = gpui::Modifiers { shift: command["shift"].as_bool().unwrap_or(false), control: command["control"].as_bool().unwrap_or(false), ..Default::default() };
                             w.dispatch_event(gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent { position, modifiers, ..Default::default() }), cx);
-                            w.dispatch_event(gpui::PlatformInput::MouseDown(gpui::MouseDownEvent { position, modifiers, button: gpui::MouseButton::Left, click_count: 1, ..Default::default() }), cx);
-                            w.dispatch_event(gpui::PlatformInput::MouseUp(gpui::MouseUpEvent { position, modifiers, button: gpui::MouseButton::Left, click_count: 1, ..Default::default() }), cx);
+                            w.dispatch_event(gpui::PlatformInput::MouseDown(gpui::MouseDownEvent { position, modifiers, button: if action == "right-click" { gpui::MouseButton::Right } else { gpui::MouseButton::Left }, click_count: 1, ..Default::default() }), cx);
+                            w.dispatch_event(gpui::PlatformInput::MouseUp(gpui::MouseUpEvent { position, modifiers, button: if action == "right-click" { gpui::MouseButton::Right } else { gpui::MouseButton::Left }, click_count: 1, ..Default::default() }), cx);
                         }
                         "scroll" => {
                             let position = gpui::point(px(command["x"].as_f64().unwrap() as f32), px(command["y"].as_f64().unwrap() as f32));
-                            w.dispatch_event(gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent { position, delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(command["deltaY"].as_f64().unwrap() as f32))), ..Default::default() }), cx);
+                            w.dispatch_event(gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent { position, delta: gpui::ScrollDelta::Pixels(gpui::point(px(command["deltaX"].as_f64().unwrap_or(0.0) as f32), px(command["deltaY"].as_f64().unwrap_or(0.0) as f32))), ..Default::default() }), cx);
                         }
                         "light" => appearance::set_mode(appearance::AppearanceMode::Light, cx),
                         "dark" => appearance::set_mode(appearance::AppearanceMode::Dark, cx),
+                        "reduce-motion" => motion::set_preference(if command["enabled"].as_bool().unwrap() {
+                            motion::ReduceMotion::On
+                        } else { motion::ReduceMotion::Off }, cx),
                         "key" => {
                             for key in command["keys"].as_array().unwrap() {
                                 w.dispatch_keystroke(gpui::Keystroke::parse(key.as_str().unwrap()).unwrap(), cx);
@@ -330,11 +418,14 @@ fn main() -> anyhow::Result<()> {
                         }
                         "resize" => w.resize(size(px(command["width"].as_f64().unwrap() as f32), px(900.0))),
                         "capture" => (),
+                        "worktree-settings" | "project-terminals" | "agent" | "new-chat" | "worktree-send" => (),
                         _ => panic!("Unknown fixture command"),
                     }
                 }).unwrap();
                 pause(cx, command["waitMs"].as_u64().unwrap_or(2400)).await;
                 let name = command["name"].as_str().unwrap_or("latest");
+                let services = window.update(cx, |view, _, cx| view.fixture_project_terminal_state(cx)).unwrap();
+                std::fs::write(output.join(format!("{name}-services.json")), serde_json::to_vec_pretty(&services).unwrap()).unwrap();
                 if command["screenshot"].as_bool().unwrap_or(true) {
                     screenshot(&output.join(format!("{name}.png"))).unwrap();
                 }

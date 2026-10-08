@@ -1639,6 +1639,7 @@ struct CommentDraft {
 /// (the shell calls it when the pane first opens).
 pub struct Changes {
     state: Entity<AppState>,
+    notifications: Option<Entity<crate::toast::Toasts>>,
     source_control: Option<Entity<crate::source_control::SourceControl>>,
     source_control_events: Option<Subscription>,
     file_selection: Option<zeron_proto::CheckoutChangeSelection>,
@@ -1714,6 +1715,7 @@ pub struct DiscardWorkingTreeRequest {
 }
 
 pub enum ChangesEvent {
+    Success { title: SharedString, message: SharedString },
     OpenChange(zeron_proto::CheckoutChangeSelection),
     /// A History row was clicked — open this commit as its own diff tab.
     OpenCommit(GitHistoryCommit),
@@ -1753,6 +1755,7 @@ impl Changes {
         let mode = DiffMode::from_split(settings.diff_split);
         Self {
             state,
+            notifications: None,
             source_control: None,
             source_control_events: None,
             file_selection: None,
@@ -1832,6 +1835,16 @@ impl Changes {
         changes
     }
 
+    pub(crate) fn set_notifications(&mut self, notifications: Entity<crate::toast::Toasts>, cx: &mut Context<Self>) {
+        if let Some(view) = &self.source_control {
+            view.update(cx, |view, _| view.set_notifications(notifications.clone()));
+        }
+        if let Some(history) = &self.history {
+            history.update(cx, |history, _| history.set_notifications(notifications.clone()));
+        }
+        self.notifications = Some(notifications);
+    }
+
     fn source_control(
         &mut self,
         cx: &mut Context<Self>,
@@ -1839,10 +1852,17 @@ impl Changes {
         if let Some(view) = &self.source_control {
             return view.clone();
         }
-        let view = cx.new(|cx| crate::source_control::SourceControl::new(self.state.clone(), cx));
+        let view = cx.new(|cx| {
+            let mut view = crate::source_control::SourceControl::new(self.state.clone(), cx);
+            if let Some(notifications) = &self.notifications {
+                view.set_notifications(notifications.clone());
+            }
+            view
+        });
         self.source_control_events = Some(cx.subscribe(&view, |_, _, event, cx| {
             match event {
                 crate::source_control::SourceControlEvent::OpenDiff(selection) => cx.emit(ChangesEvent::OpenChange(selection.clone())),
+                crate::source_control::SourceControlEvent::Success { title, message } => cx.emit(ChangesEvent::Success { title: title.clone(), message: message.clone() }),
                 crate::source_control::SourceControlEvent::OpenFile(path) => cx.emit(ChangesEvent::OpenFile(path.clone())),
                 crate::source_control::SourceControlEvent::OpenCommit { cwd, repository, commit } => cx.emit(ChangesEvent::OpenRepositoryCommit { cwd: cwd.clone(), repository: repository.clone(), commit: commit.clone() }),
             }
@@ -2322,7 +2342,11 @@ impl Changes {
         if let Some(history) = &self.history {
             return history.clone();
         }
-        let history = cx.new(|cx| GitHistory::new(self.state.clone(), cx));
+        let history = cx.new(|cx| {
+            let mut history = GitHistory::new(self.state.clone(), cx);
+            if let Some(notifications) = &self.notifications { history.set_notifications(notifications.clone()); }
+            history
+        });
         self.history_events =
             Some(
                 cx.subscribe(&history, |this: &mut Self, _, event, cx| match event {

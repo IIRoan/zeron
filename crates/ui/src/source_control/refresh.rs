@@ -11,6 +11,9 @@ impl SourceControl {
             return;
         };
         let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.error = Some("Repository is unavailable".into());
+            self.refresh_feedback = Some(false);
+            cx.notify();
             return;
         };
         let repository = self.active_repository.clone();
@@ -22,7 +25,7 @@ impl SourceControl {
         self.details_task = None;
         self.details_key = None;
         cx.notify();
-        self.refresh_task = Some(cx.spawn(async move |this, cx| {
+        cx.spawn(async move |this, cx| {
             let started = std::time::Instant::now();
             let (snapshot, details) = futures::join!(
                 engine.client().call_as::<CheckoutChanges>(methods::GET_CHECKOUT_CHANGES,
@@ -38,12 +41,12 @@ impl SourceControl {
             if !applied { return; }
             cx.background_executor().timer(Duration::from_millis(1000)).await;
             this.update(cx, |view, cx| {
-                if view.target.as_ref() == Some(&target) {
+                if view.target.as_ref() == Some(&target) && view.mutation_epoch == epoch {
                     view.refresh_feedback = None;
                     cx.notify();
                 }
             }).ok();
-        }));
+        }).detach();
     }
 
     pub(super) fn complete_refresh(

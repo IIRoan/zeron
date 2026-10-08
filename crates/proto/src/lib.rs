@@ -10,16 +10,20 @@ pub mod file_mentions;
 pub mod invocation;
 pub mod motion;
 pub mod preview;
+pub mod project_terminals;
 pub mod sidebar_pins;
 pub mod view;
 pub mod voice;
 pub mod workspace;
+pub mod worktree_settings;
 
 pub use agent::*;
 pub use entities::*;
 pub use preview::*;
+pub use project_terminals::*;
 pub use sidebar_pins::*;
 pub use workspace::*;
+pub use worktree_settings::*;
 
 /// Parse "0.2.12" (tolerating a `-suffix`/`+build` tail on the last part)
 /// into a comparable triple — the fleet feature-gate primitive (device rows

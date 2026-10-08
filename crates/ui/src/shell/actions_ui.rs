@@ -65,6 +65,8 @@ impl Shell {
         self.panels
             .update(&chat_id, |panels| panels.terminal_open = true);
         if selected {
+            self.project_terminals.mode = project_terminals_ui::TerminalMode::Shells;
+            self.project_terminals.drawer = false;
             self.terminal_tween = None;
             self.terminal_tween_task = None;
             panel.update(cx, |panel, cx| panel.set_open(true, cx));
@@ -449,6 +451,8 @@ impl Shell {
         });
         self.panels
             .update(&context.chat_id, |panels| panels.terminal_open = true);
+        self.project_terminals.mode = project_terminals_ui::TerminalMode::Shells;
+        self.project_terminals.drawer = false;
         self.terminal_tween = None;
         self.terminal_tween_task = None;
         panel.update(cx, |panel, cx| {
@@ -842,6 +846,23 @@ impl Shell {
             );
         }
         card.child(popover::menu_separator())
+            .child(
+                popover::menu_row(&theme, false, "project-terminal-settings")
+                    .id("project-terminal-settings")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.close_project_actions_menu(cx);
+                        let project = this.state.read(cx).selected_space_row().map(|space| space.id.clone());
+                        if let Some(project) = project {
+                            this.open_project_terminal_settings(project, cx);
+                        }
+                    }))
+                    .child(
+                        icon(icons::TERMINAL)
+                            .size(px(15.0))
+                            .text_color(theme.text_muted),
+                    )
+                    .child(SharedString::from("Project services…")),
+            )
             .child(
                 popover::menu_row(&theme, false, "project-actions-add-row")
                     .id("project-actions-add-row")

@@ -64,6 +64,9 @@ icon_assets![
     (VSC_ADD, "vscode-add"),
     (VSC_REMOVE, "vscode-remove"),
     (VSC_CHECK, "vscode-check"),
+    // Linux workbench navigation, drawn in the shared linear icon family.
+    (SOURCE_CONTROL, "source-control"),
+    (HISTORY, "history"),
     (PROJECT_DEFAULT, "project-default"),
     (REMOTE_SERVER, "remote-server"),
     // Service-tier bolt, drawn in the toolbar family's linear weight; the
@@ -229,6 +232,8 @@ icon_assets![
     (STAR, "star"),
     (STAR_BOLD, "star-bold"),
     (ZERON_LOGO, "zeron-logo"),
+    // Solace artwork from Rocal's shared layout/Logo component.
+    (SOLACE_LOGO, "solace-logo"),
     // Harness brand marks (icons.tsx).
     (CLAUDE_MARK, "claude-mark"),
     (OPENAI_MARK, "openai-mark"),

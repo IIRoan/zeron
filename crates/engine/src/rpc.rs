@@ -273,6 +273,13 @@ struct DeleteWorktreeParams {
     repo_path: String,
     #[serde(alias = "path")]
     worktree_path: String,
+    /// Older callers force removal and delete Zeron-owned branches.
+    #[serde(default)]
+    force: Option<bool>,
+    #[serde(default)]
+    delete_branch: Option<bool>,
+    #[serde(default)]
+    archive_sessions: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -313,6 +320,32 @@ struct RunProjectActionParams {
     action_id: String,
     cols: u16,
     rows: u16,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectTerminalsParams {
+    space_id: String,
+    #[serde(default)]
+    chat_id: Option<String>,
+    #[serde(default)]
+    config: Option<zeron_proto::ProjectTerminalConfig>,
+    #[serde(default)]
+    checkout_path: Option<String>,
+    #[serde(default)]
+    service_id: Option<String>,
+    #[serde(default)]
+    action: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorktreeSettingsParams {
+    space_id: String,
+    #[serde(default)]
+    checkout_path: Option<String>,
+    #[serde(default)]
+    settings: Option<zeron_proto::WorktreeSettings>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1378,7 +1411,17 @@ fn forward_deadline(method: &str) -> std::time::Duration {
         // Leave headroom beyond the provider's 15-minute mutation timeout for
         // queueing, verification, and the relayed response itself.
         methods::APPLY_HARNESS_UPDATE => Duration::from_secs(20 * 60),
-        methods::CREATE_WORKTREE => Duration::from_secs(120),
+        // Creation/activation can run create, install/setup and activation
+        // workflows, each with a configurable two-hour maximum. Settings
+        // saves serialize behind the same handoff. Allow all stages plus
+        // filesystem/PTY teardown overhead before timing out a remote reply.
+        methods::CREATE_WORKTREE
+        | methods::DELETE_WORKTREE
+        | methods::PREPARE_WORKTREE
+        | methods::CONTROL_PROJECT_TERMINALS
+        | methods::SAVE_PROJECT_TERMINALS
+        | methods::SAVE_WORKTREE_SETTINGS =>
+            Duration::from_secs(zeron_proto::WORKTREE_OPERATION_TIMEOUT_SECONDS),
         // Allow the adapter discovery budget plus relay and shutdown overhead.
         methods::LIST_MODELS | methods::LIST_COMMANDS => Duration::from_secs(100),
         _ => Duration::from_secs(30),
@@ -1453,6 +1496,14 @@ fn forwardable(method: &str) -> bool {
             | methods::UPSERT_PROJECT_ACTION
             | methods::DELETE_PROJECT_ACTION
             | methods::RUN_PROJECT_ACTION
+            | methods::GET_PROJECT_TERMINALS
+            | methods::SAVE_PROJECT_TERMINALS
+            | methods::CONTROL_PROJECT_TERMINALS
+            | methods::GET_WORKTREE_SETTINGS
+            | methods::SAVE_WORKTREE_SETTINGS
+            | methods::PREPARE_WORKTREE
+            | methods::CANCEL_WORKTREE_SETUP
+            | methods::GET_WORKTREE_SETUP_LOG
             // Checkout diffs are produced on the device holding the checkout.
             | methods::WATCH_CHECKOUT_DIFFS
             | methods::WATCH_WORKSPACE_GIT_STATUS
@@ -1460,8 +1511,10 @@ fn forwardable(method: &str) -> bool {
             | methods::GET_CHECKOUT_DIFF
             | methods::GET_CHECKOUT_CHANGES
             | methods::SET_CHECKOUT_STAGED
+            | methods::GET_CHECKOUT_CONFLICT_MARKERS
             | methods::COMMIT_CHECKOUT_STAGED
             | methods::GET_CHECKOUT_GIT_DETAILS
+            | methods::GET_CHECKOUT_STASHES
             | methods::RUN_CHECKOUT_GIT_ACTION
             | methods::PREVIEW_CHECKOUT_DISCARD
             | methods::DISCARD_CHECKOUT_CHANGES
@@ -2546,8 +2599,10 @@ impl RpcService for EngineRpc {
             // is the plain working-tree capture.
             methods::GET_CHECKOUT_CHANGES
             | methods::SET_CHECKOUT_STAGED
+            | methods::GET_CHECKOUT_CONFLICT_MARKERS
             | methods::COMMIT_CHECKOUT_STAGED
             | methods::GET_CHECKOUT_GIT_DETAILS
+            | methods::GET_CHECKOUT_STASHES
             | methods::RUN_CHECKOUT_GIT_ACTION
             | methods::PREVIEW_CHECKOUT_DISCARD
             | methods::DISCARD_CHECKOUT_CHANGES
@@ -2579,6 +2634,9 @@ impl RpcService for EngineRpc {
                         .map_err(|e| RpcError::Failed(e.to_string()))?;
                     if method == methods::GET_CHECKOUT_GIT_DETAILS {
                         return RpcReply::value(&crate::checkout_git::details(&root).await.map_err(|e| RpcError::Failed(e.to_string()))?);
+                    }
+                    if method == methods::GET_CHECKOUT_STASHES {
+                        return RpcReply::value(&crate::checkout_git::stashes(&root).await.map_err(|e| RpcError::Failed(e.to_string()))?);
                     }
                     if method == methods::RUN_CHECKOUT_GIT_ACTION {
                         if !matches!(params.get("action").and_then(|a| a.get("kind")).and_then(|k| k.as_str()), Some("fetch")) && params.get("expectedBranch").is_some() {
@@ -2617,14 +2675,20 @@ impl RpcService for EngineRpc {
                         return RpcReply::value(&serde_json::json!({ "restored": true }));
                     }
                     if method == methods::COMMIT_CHECKOUT_STAGED {
+                        if params.get("expectedBranch").is_some_and(|value| value.is_null())
+                            && crate::checkout_git::state(&root).await.map_err(|e| RpcError::Failed(e.to_string()))?.branch.is_some() {
+                            return Err(RpcError::Failed("The branch changed; review changes before committing".into()));
+                        }
                         #[derive(Deserialize)]
                         struct P {
                             message: String,
                             #[serde(default)] amend: bool,
                             #[serde(rename = "expectedHead")] expected_head: Option<String>,
+                            #[serde(rename = "expectedBranch")] expected_branch: Option<String>,
+                            #[serde(default, rename = "stagePaths")] stage_paths: Vec<String>,
                         }
                         let p: P = parse_params(params)?;
-                        crate::checkout_changes::commit(&root, &p.message, p.amend, p.expected_head.as_deref())
+                        crate::checkout_changes::commit_with_staging(&root, &p.message, p.amend, p.expected_head.as_deref(), p.expected_branch.as_deref(), &p.stage_paths)
                             .await
                             .map_err(|e| RpcError::Failed(e.to_string()))?;
                         self.diff_sync.sync_all();
@@ -2632,14 +2696,27 @@ impl RpcService for EngineRpc {
                         // refreshes, so a failed refresh never invites a duplicate commit.
                         return RpcReply::value(&serde_json::json!({ "committed": true, "git": crate::checkout_git::state(&root).await.ok() }));
                     }
+                    if method == methods::GET_CHECKOUT_CONFLICT_MARKERS {
+                        #[derive(Deserialize)] struct P { paths: Vec<String> }
+                        let p: P = parse_params(params)?;
+                        return RpcReply::value(&crate::checkout_changes::conflict_markers(&root, &p.paths).await.map_err(|e| RpcError::Failed(e.to_string()))?);
+                    }
                     if method == methods::SET_CHECKOUT_STAGED {
+                        if params.get("expectedBranch").is_some() || params.get("expectedHead").is_some() {
+                            let state = crate::checkout_git::state(&root).await.map_err(|e| RpcError::Failed(e.to_string()))?;
+                            if state.head.as_deref() != params.get("expectedHead").and_then(|v| v.as_str())
+                                || state.branch.as_deref() != params.get("expectedBranch").and_then(|v| v.as_str()) {
+                                return Err(RpcError::Failed("The branch changed; refresh before staging changes".into()));
+                            }
+                        }
                         #[derive(Deserialize)]
                         struct P {
                             paths: Vec<String>,
                             staged: bool,
+                            #[serde(default, rename = "allowConflictMarkers")] allow_conflict_markers: bool,
                         }
                         let p: P = parse_params(params)?;
-                        crate::checkout_changes::set_staged(&root, &p.paths, p.staged)
+                        crate::checkout_changes::set_staged_checked(&root, &p.paths, p.staged, p.allow_conflict_markers)
                             .await
                             .map_err(|e| RpcError::Failed(e.to_string()))?;
                         self.diff_sync.sync_all();
@@ -3295,7 +3372,11 @@ impl RpcService for EngineRpc {
                     setup_action: None,
                     setup_error: None,
                 };
-                if let Some((space, project_root)) = setup_space {
+                let status=self.repos.worktree_settings_snapshot(std::path::Path::new(&p.repo_path),Some(std::path::Path::new(&outcome.worktree.path))).await.map_err(|e|RpcError::Failed(e.to_string()))?;
+                outcome.setup_error=status.worktrees.iter().find(|t|t.path==outcome.worktree.path).and_then(|t|t.state.error.clone());
+                if let Some((space, project_root)) = setup_space
+                    && outcome.setup_error.is_none()
+                    && self.repos.worktree_settings().effective(&project_root,std::path::Path::new(&outcome.worktree.path)).map_err(|e|RpcError::Failed(e.to_string()))?.setup_command.trim().is_empty() {
                     match self
                         .project_actions
                         .setup_action(&space.id, std::path::Path::new(&space.path))
@@ -3338,13 +3419,42 @@ impl RpcService for EngineRpc {
             }
             methods::DELETE_WORKTREE => {
                 let p: DeleteWorktreeParams = parse_params(params)?;
+                let force = p.force.unwrap_or(true);
+                self.repos.validate_worktree_removal(
+                    std::path::Path::new(&p.repo_path),
+                    std::path::Path::new(&p.worktree_path), force,
+                ).await.map_err(|e| RpcError::Failed(e.to_string()))?;
+                let target = std::path::Path::new(&p.worktree_path).canonicalize()
+                    .unwrap_or_else(|_| (&p.worktree_path).into());
+                let chats: Vec<_> = self.workspace.read_chats()
+                    .map_err(|e| RpcError::Failed(e.to_string()))?.into_iter()
+                    .filter(|chat| chat.device_id == self.doc_host.device_id())
+                    .filter(|chat| chat.cwd.as_ref().is_some_and(|cwd| {
+                        std::path::Path::new(cwd).canonicalize().unwrap_or_else(|_| cwd.into()).starts_with(&target)
+                    })).collect();
+                if chats.iter().any(|chat| self.sessions.session_status(&chat.id).is_some_and(|s| {
+                    matches!(s.status, zeron_proto::SessionStatus::Working | zeron_proto::SessionStatus::AwaitingInput)
+                })) {
+                    return Err(RpcError::Failed("Stop agents using this worktree before removing it.".into()));
+                }
+                let profiles=self.project_actions.project_terminals.clone();
+                let root=std::path::PathBuf::from(&p.repo_path); let cwd=std::path::PathBuf::from(&p.worktree_path);
+                tokio::task::spawn_blocking(move||profiles.stop_checkout(&root,&cwd)).await.map_err(|e|RpcError::Failed(e.to_string()))?.map_err(|e|RpcError::Failed(e.to_string()))?;
                 self.repos
-                    .delete_worktree(
+                    .remove_worktree(
                         std::path::Path::new(&p.repo_path),
                         std::path::Path::new(&p.worktree_path),
+                        force,
+                        p.delete_branch.unwrap_or(true),
                     )
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
+                if p.archive_sessions {
+                    for chat in chats {
+                        self.workspace.set_chat_archived(&chat.id, true)
+                            .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    }
+                }
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::LIST_PROJECT_ACTIONS => {
@@ -3388,6 +3498,167 @@ impl RpcService for EngineRpc {
                 .await
                 .map_err(|err| RpcError::Failed(err.to_string()))?
                 .map_err(|err| RpcError::Failed(err.to_string()))?;
+                RpcReply::value(&snapshot)
+            }
+            methods::GET_WORKTREE_SETTINGS
+            | methods::SAVE_WORKTREE_SETTINGS
+            | methods::PREPARE_WORKTREE
+            | methods::CANCEL_WORKTREE_SETUP
+            | methods::GET_WORKTREE_SETUP_LOG => {
+                let p: WorktreeSettingsParams = parse_params(params)?;
+                let space = self.local_project_action_space(&p.space_id)?;
+                let root = std::path::PathBuf::from(&space.path);
+                let checkout = if let Some(path) = p.checkout_path {
+                    Some(
+                        self.workspace_files
+                            .resolve_target(&zeron_proto::WorkspaceTarget {
+                                space_id: Some(space.id.clone()),
+                                checkout_path: Some(path),
+                                chat_id: None,
+                            })
+                            .await
+                            .map_err(|e| RpcError::Failed(e.to_string()))?
+                            .root,
+                    )
+                } else {
+                    None
+                };
+                let environments = self.repos.worktree_settings().clone();
+                match method {
+                    methods::SAVE_WORKTREE_SETTINGS => {
+                        self.project_actions
+                            .project_terminals
+                            .save_environment(
+                                &environments,
+                                &space.id,
+                                &root,
+                                checkout.as_deref(),
+                                p.settings,
+                            )
+                            .await
+                            .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    }
+                    methods::PREPARE_WORKTREE => {
+                        let checkout = checkout.as_ref().ok_or_else(|| {
+                            RpcError::Failed("Choose a worktree to prepare".into())
+                        })?;
+                        self.project_actions
+                            .project_terminals
+                            .prepare_checkout(&environments, &space.id, &root, checkout)
+                            .await
+                            .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    }
+                    methods::CANCEL_WORKTREE_SETUP => environments
+                        .cancel(
+                            checkout
+                                .as_ref()
+                                .ok_or_else(|| RpcError::Failed("Choose a worktree".into()))?,
+                        )
+                        .map_err(|e| RpcError::Failed(e.to_string()))?,
+                    methods::GET_WORKTREE_SETUP_LOG => {
+                        let cwd =
+                            checkout.ok_or_else(|| RpcError::Failed("Choose a worktree".into()))?;
+                        let output =
+                            tokio::task::spawn_blocking(move || environments.log(&root, &cwd))
+                                .await
+                                .map_err(|e| RpcError::Failed(e.to_string()))?
+                                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                        return RpcReply::value(&serde_json::json!({"output":output}));
+                    }
+                    _ => {}
+                }
+                RpcReply::value(
+                    &self
+                        .repos
+                        .worktree_settings_snapshot(&root, checkout.as_deref())
+                        .await
+                        .map_err(|e| RpcError::Failed(e.to_string()))?,
+                )
+            }
+            methods::GET_PROJECT_TERMINALS
+            | methods::SAVE_PROJECT_TERMINALS
+            | methods::CONTROL_PROJECT_TERMINALS => {
+                let mut p: ProjectTerminalsParams = parse_params(params)?;
+                let space = self.local_project_action_space(&p.space_id)?;
+                let root = std::path::PathBuf::from(&space.path);
+                if let Some(chat_id) = &p.chat_id {
+                    let chat = self
+                        .workspace
+                        .chat(chat_id)
+                        .map_err(|e| RpcError::Failed(e.to_string()))?
+                        .ok_or_else(|| RpcError::Failed("Project agent not found".into()))?;
+                    if chat.space_id.as_deref() != Some(&space.id)
+                        || chat.device_id != self.doc_host.device_id()
+                    {
+                        return Err(RpcError::Failed(
+                            "Agent belongs to another project or device".into(),
+                        ));
+                    }
+                }
+                let checkout = self
+                    .workspace_files
+                    .resolve_target(&zeron_proto::WorkspaceTarget {
+                        space_id: p.chat_id.is_none().then(|| space.id.clone()),
+                        chat_id: p.chat_id.clone(),
+                        checkout_path: p.checkout_path.clone(),
+                    })
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .root;
+                let profiles = self.project_actions.project_terminals.clone();
+                let environments = self.repos.worktree_settings().clone();
+                if method == methods::SAVE_PROJECT_TERMINALS {
+                    let config = p.config.take().ok_or_else(|| {
+                        RpcError::Failed("Terminal configuration is required".into())
+                    })?;
+                    if p.chat_id.is_none() && p.checkout_path.is_none() {
+                        profiles
+                            .save_defaults(&environments, &space.id, &root, config)
+                            .await
+                            .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    } else {
+                        let mut settings = environments
+                            .effective(&root, &checkout)
+                            .map_err(|e| RpcError::Failed(e.to_string()))?;
+                        settings.services = Some(config);
+                        profiles
+                            .save_environment(
+                                &environments,
+                                &space.id,
+                                &root,
+                                Some(&checkout),
+                                Some(settings),
+                            )
+                            .await
+                            .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    }
+                }
+                let snapshot = if method == methods::CONTROL_PROJECT_TERMINALS {
+                    profiles
+                        .control_checkout(
+                            &self.terminals,
+                            &environments,
+                            &space.id,
+                            &root,
+                            &checkout,
+                            p.service_id.as_deref(),
+                            p.action.as_deref().unwrap_or("start"),
+                        )
+                        .await
+                        .map_err(|e| RpcError::Failed(e.to_string()))?
+                } else {
+                    tokio::task::spawn_blocking(move || {
+                        profiles.checkout_snapshot(
+                            &space.id,
+                            &root,
+                            &checkout,
+                            &environments.effective(&root, &checkout)?,
+                        )
+                    })
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                };
                 RpcReply::value(&snapshot)
             }
             methods::RUN_PROJECT_ACTION => {
@@ -3457,9 +3728,14 @@ impl RpcService for EngineRpc {
                 });
                 let cwd = resolve_open_terminal_cwd(p.cwd, chat_cwd, space_cwd)
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let mut environment=std::collections::HashMap::new();
+                if let Some(root)=crate::workspace_host::linked_worktree_root(std::path::Path::new(&cwd)) {
+                    let settings=self.repos.worktree_settings().effective(std::path::Path::new(&root),std::path::Path::new(&cwd)).map_err(|e|RpcError::Failed(e.to_string()))?;
+                    environment.extend(settings.variables);
+                }
                 let session = self
                     .terminals
-                    .open(&cwd, p.cols, p.rows)
+                    .open_with_environment(&cwd, p.cols, p.rows, &environment)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&session)
             }
@@ -4135,8 +4411,10 @@ mod tests {
         for method in [
             methods::GET_CHECKOUT_CHANGES,
             methods::SET_CHECKOUT_STAGED,
+            methods::GET_CHECKOUT_CONFLICT_MARKERS,
             methods::COMMIT_CHECKOUT_STAGED,
             methods::GET_CHECKOUT_GIT_DETAILS,
+            methods::GET_CHECKOUT_STASHES,
             methods::RUN_CHECKOUT_GIT_ACTION,
             methods::PREVIEW_CHECKOUT_DISCARD,
             methods::DISCARD_CHECKOUT_CHANGES,
@@ -4179,10 +4457,13 @@ mod tests {
             );
         }
         use std::time::Duration;
-        assert_eq!(
-            forward_deadline(methods::CREATE_WORKTREE),
-            Duration::from_secs(120)
-        );
+        for method in [
+            methods::CREATE_WORKTREE, methods::DELETE_WORKTREE,
+            methods::PREPARE_WORKTREE, methods::CONTROL_PROJECT_TERMINALS,
+            methods::SAVE_PROJECT_TERMINALS, methods::SAVE_WORKTREE_SETTINGS,
+        ] {
+            assert_eq!(forward_deadline(method), Duration::from_secs(zeron_proto::WORKTREE_OPERATION_TIMEOUT_SECONDS));
+        }
         assert_eq!(
             forward_deadline(methods::CLONE_REPO),
             Duration::from_secs(15 * 60)

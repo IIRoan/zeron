@@ -4237,12 +4237,34 @@ impl Shell {
                                 this.activate_spaces_menu_row(activate.clone(), cx);
                             }))
                             .when_some(menu_space, |el, space_id| {
+                                let context_id = space_id.clone();
                                 el.on_mouse_down(
                                     MouseButton::Right,
                                     cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                        this.space_menu.open((space_id.clone(), event.position));
+                                        this.space_menu.open((context_id.clone(), event.position));
                                         cx.notify();
                                     }),
+                                )
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("project-settings-{space_id}")))
+                                        .size(px(24.0))
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(6.0))
+                                        .cursor_pointer()
+                                        .role(gpui::Role::Button)
+                                        .aria_label("Project settings")
+                                        .tooltip(crate::settings::widgets::text_tooltip("Project settings"))
+                                        .hover(|el| el.bg(theme.element_hover))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.close_spaces_menu(cx);
+                                            this.open_worktree_settings(space_id.clone(), cx);
+                                        }))
+                                        .child(icon(icons::SETTINGS_MINIMALISTIC).size(px(14.0)).text_color(theme.text_muted)),
                                 )
                             })
                             .child(div().flex_1().min_w_0().truncate().child(label))
@@ -6819,6 +6841,7 @@ impl Shell {
             let closing = self.space_menu.closing_since();
             let rename_id = space_id.clone();
             let delete_id = space_id.clone();
+            let terminals_id = space_id.clone();
             let menu = popover::popover_card(&theme)
                 .w(px(170.0))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
@@ -6826,6 +6849,20 @@ impl Shell {
                 }))
                 .flex()
                 .flex_col()
+                .child(
+                    popover::menu_row(&theme, false, "space-project-terminals")
+                        .id("space-project-terminals")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_space_menu(cx);
+                            this.open_project_terminal_settings(terminals_id.clone(), cx);
+                        }))
+                        .child(
+                            icon(icons::TERMINAL)
+                                .size(px(16.0))
+                                .text_color(theme.text_muted),
+                        )
+                        .child(SharedString::from("Project services…")),
+                )
                 .child(
                     popover::menu_row(&theme, false, format!("space-menu-rename-{space_id}"))
                         .id("space-menu-rename")

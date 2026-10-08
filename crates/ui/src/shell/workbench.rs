@@ -8,7 +8,6 @@ enum Tool {
     Explorer,
     Changes,
     Browser,
-    Terminal,
     History,
     Views,
 }
@@ -33,8 +32,7 @@ impl Shell {
             .into_iter()
             .find_map(|(surface, _, _, _)| {
                 let matches = match (tool, surface) {
-                    (Tool::Browser, RightSurface::Browser(_))
-                    | (Tool::Terminal, RightSurface::Terminal(_)) => true,
+                    (Tool::Browser, RightSurface::Browser(_)) => true,
                     (Tool::Changes, RightSurface::Diff(id)) => self
                         .diffs
                         .get(&id)
@@ -54,7 +52,6 @@ impl Shell {
                 Tool::Changes => self.add_diff_surface(window, cx),
                 Tool::History => self.add_history_surface(window, cx),
                 Tool::Browser => self.add_browser_surface(None, window, cx),
-                Tool::Terminal => self.add_terminal_surface(cx),
                 _ => {}
             }
         }
@@ -109,19 +106,13 @@ impl Shell {
             (
                 Tool::Changes,
                 "workbench-changes",
-                icons::GIT_BRANCH,
+                icons::SOURCE_CONTROL,
                 "Source Control",
-            ),
-            (
-                Tool::Terminal,
-                "workbench-terminal",
-                icons::TERMINAL,
-                "Terminal",
             ),
             (
                 Tool::History,
                 "workbench-history",
-                icons::GIT_BRANCH,
+                icons::HISTORY,
                 "History",
             ),
             (Tool::Views, "workbench-views", icons::LIST, "All views"),
@@ -134,7 +125,6 @@ impl Shell {
             } else {
                 open && match (tool, active) {
                     (Tool::Browser, RightSurface::Browser(_))
-                    | (Tool::Terminal, RightSurface::Terminal(_))
                     | (Tool::Views, RightSurface::Picker) => true,
                     (Tool::Changes, RightSurface::Diff(id)) => self
                         .diffs
@@ -197,10 +187,11 @@ impl Shell {
 
     pub(super) fn render_workbench_titlebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
-        let files_width = self.files_visible_width(cx);
-        let tools_width = self.right_visible_width(cx);
-        let left = ACTIVITY_WIDTH + files_width + tools_width;
-        let sidebar = self.sidebar_now();
+        let in_session = self.session_workspace_visible(cx);
+        let files_width = if in_session { self.files_visible_width(cx) } else { 0.0 };
+        let tools_width = if in_session { self.right_visible_width(cx) } else { 0.0 };
+        let left = if in_session { ACTIVITY_WIDTH + files_width + tools_width } else { ACTIVITY_WIDTH };
+        let sidebar = if in_session { self.sidebar_now() } else { 0.0 };
         let title: SharedString = self
             .state
             .read(cx)
@@ -213,6 +204,29 @@ impl Shell {
             })
             .unwrap_or_else(|| "Zeron".into());
         let tabs = self.render_right_tab_strip(cx);
+        let brand = div()
+            .id("workbench-brand")
+            .debug_selector(|| "workbench-brand".into())
+            .absolute()
+            .left_0()
+            .top_0()
+            .w(px(ACTIVITY_WIDTH))
+            .h(px(Theme::TITLEBAR_HEIGHT))
+            .flex()
+            .items_center()
+            .justify_center()
+            .border_b_1()
+            .border_r_1()
+            .border_color(theme.border)
+            .bg(theme.panel_bg())
+            .role(gpui::Role::Image)
+            .aria_label("Solace")
+            .tooltip(settings::widgets::text_tooltip("Solace"))
+            .child(
+                icon(icons::SOLACE_LOGO)
+                    .size(px(26.0))
+                    .text_color(theme.text),
+            );
         let tools = div()
             .absolute()
             .left(px(ACTIVITY_WIDTH + files_width))
@@ -277,6 +291,7 @@ impl Shell {
         .when(files_width > 0.0, |el| el.child(explorer))
         .when(tools_width > 0.0, |el| el.child(tools))
         .child(main)
+        .child(brand)
         .into_any_element()
     }
 
