@@ -15,6 +15,7 @@
 mod account_usage;
 pub mod app_menus;
 pub mod app_update;
+pub mod release_notes;
 pub mod appearance;
 pub mod appshots;
 pub mod attachments;
@@ -202,6 +203,7 @@ pub fn run_app(config: UiConfig) {
         terminal::panel::init(cx);
         app_menus::init(cx);
         app_update::AppUpdate::init(config.boot().edge_url, data_dir.clone(), cx);
+        release_notes::ReleaseNotes::init(data_dir.clone(), cx);
         cx.register_url_scheme("zeron").detach();
 
         let state = cx.new(|cx| {

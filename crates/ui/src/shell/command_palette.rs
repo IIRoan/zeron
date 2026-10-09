@@ -42,6 +42,7 @@ enum Entry {
     NewChat,
     NewProject,
     Settings,
+    ReleaseNotes,
     Theme(AppearanceMode),
     Chat(String),
 }
@@ -52,6 +53,7 @@ impl Entry {
             Self::NewChat => Some(("New chat", icons::PEN_NEW_SQUARE)),
             Self::NewProject => Some(("New project", icons::FOLDER)),
             Self::Settings => Some(("Open settings", icons::SETTINGS)),
+            Self::ReleaseNotes => Some(("View release notes", icons::DOCUMENT)),
             Self::Theme(mode) => Some((
                 match mode {
                     AppearanceMode::System => "Switch to system theme",
@@ -75,6 +77,7 @@ fn actions_for(query: &str, is_dark: bool) -> Vec<Entry> {
         Entry::NewChat,
         Entry::NewProject,
         Entry::Settings,
+        Entry::ReleaseNotes,
         Entry::Theme(if is_dark {
             AppearanceMode::Light
         } else {
@@ -82,7 +85,8 @@ fn actions_for(query: &str, is_dark: bool) -> Vec<Entry> {
         }),
     ]
     .into_iter()
-    .filter(|entry| matches_query(query, entry.action().unwrap().0))
+    .filter(|entry| matches_query(query, entry.action().unwrap().0)
+        || (*entry == Entry::ReleaseNotes && matches_query(query, "changelog what’s new")))
     .collect()
 }
 
@@ -240,6 +244,7 @@ impl Shell {
             Entry::NewChat => self.open_new_session(None, cx),
             Entry::NewProject => self.open_add_space(cx),
             Entry::Settings => self.open_last_settings(cx),
+            Entry::ReleaseNotes => crate::release_notes::show(cx),
             Entry::Theme(_) => unreachable!(),
             Entry::Chat(id) => self.open_chat(id, cx),
         }
@@ -886,14 +891,16 @@ mod tests {
                 Entry::NewChat,
                 Entry::NewProject,
                 Entry::Settings,
+                Entry::ReleaseNotes,
                 Entry::Theme(AppearanceMode::Light)
             ]
         );
         assert_eq!(
             actions_for("new", true),
-            vec![Entry::NewChat, Entry::NewProject]
+            vec![Entry::NewChat, Entry::NewProject, Entry::ReleaseNotes]
         );
         assert_eq!(actions_for("settings", true), vec![Entry::Settings]);
+        assert_eq!(actions_for("changelog", true), vec![Entry::ReleaseNotes]);
         assert_eq!(
             actions_for("theme", true),
             vec![Entry::Theme(AppearanceMode::Light)]

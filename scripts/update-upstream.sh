@@ -53,9 +53,27 @@ if git merge-base --is-ancestor "$target" HEAD; then
 fi
 
 backup="backup/pre-upstream-$backup_label-$(date -u +%Y%m%dT%H%M%S)-$$"
+fork_head="$(git rev-parse HEAD)"
 git branch "$backup"
 echo "Rollback point: $backup"
+merge_ok=true
 if ! git merge --no-ff --no-commit "$target"; then
+  merge_ok=false
+fi
+# Bundle notes even when the merge needs manual repair. GitHub outages use
+# local upstream history; notes never depend on the official binary updater.
+# Checked Action bundles already contain their reviewed changelog.
+if ! $from_run; then
+  if ! python3 scripts/snapshot-release-notes.py --tag "$release" --fork-head "$fork_head"; then
+    echo "Resolve the merge, then prepare its release notes before running checks:" >&2
+    echo "  python3 scripts/snapshot-release-notes.py --tag $release --fork-head $fork_head" >&2
+    echo "  git add docs/releases/changelog.json" >&2
+    echo "The merge remains uncommitted. To cancel: git merge --abort" >&2
+    exit 1
+  fi
+  git add -- docs/releases/changelog.json
+fi
+if ! $merge_ok; then
   cat >&2 <<EOF
 The merge needs attention. Your original version is saved in $backup.
 Resolve the files shown by git status, then run:

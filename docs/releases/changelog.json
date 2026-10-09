@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "upstream_repository": "zeronsh/zeron",
+  "fork_repository": "IIRoan/zeron",
+  "releases": [
+    {
+      "version": "0.2.107",
+      "upstream_commit": "565b49c527fb738704f217b897f9ba3aee575285",
+      "upstream_url": "https://github.com/zeronsh/zeron/releases/tag/v0.2.107",
+      "published_at": "2026-10-08T17:29:28Z",
+      "notes_source": "github_release",
+      "upstream_notes": "## What's Changed\n* Cut startup memory from ~700 MB to ~200 MB on large local profiles by @neo773 in https://github.com/zeronsh/zeron/pull/818\n* Windows browser, image previews in tool calls, selectable tool output by @Master0fFate in https://github.com/zeronsh/zeron/pull/813\n* Engine: keep turn snapshots out of the checkout's object database by @katulevskiy in https://github.com/zeronsh/zeron/pull/820\n* Harden Claude/Codex adapters: no early \"done\", Stop kills, sends never do by @wingleeio in https://github.com/zeronsh/zeron/pull/748\n\n## New Contributors\n* @Master0fFate made their first contribution in https://github.com/zeronsh/zeron/pull/813\n\n**Full Changelog**: https://github.com/zeronsh/zeron/compare/v0.2.106...v0.2.107",
+      "fork_changes": [
+        "Managed terminals and project services use your interactive shell PATH, including Go and Cloudflared.",
+        "Review this update and the previous upstream release in the new update summary."
+      ],
+      "fork_through_commit": "85016cff1a9eb690a49c96c2c10ab39f590082ee"
+    },
+    {
+      "version": "0.2.106",
+      "upstream_commit": "916cb1ccb1342c2061963a5f6ecf5c977ba46f2c",
+      "upstream_url": "https://github.com/zeronsh/zeron/releases/tag/v0.2.106",
+      "published_at": "2026-10-07T19:49:28Z",
+      "notes_source": "github_release",
+      "upstream_notes": "## What's Changed\n* Fold dated Claude snapshot IDs into curated model rows by @wingleeio in https://github.com/zeronsh/zeron/pull/835\n* Fix native voice startup compatibility with Codex 0.161 by @jsgrrchg in https://github.com/zeronsh/zeron/pull/834\n\n\n**Full Changelog**: https://github.com/zeronsh/zeron/compare/v0.2.105...v0.2.106",
+      "fork_changes": [],
+      "fork_through_commit": "85016cff1a9eb690a49c96c2c10ab39f590082ee"
+    }
+  ]
+}

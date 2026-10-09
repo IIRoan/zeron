@@ -1,5 +1,6 @@
 """Exercise the updater in disposable local repositories, without network access."""
 import os
+import json
 from pathlib import Path
 import shutil
 import subprocess
@@ -18,6 +19,7 @@ class UpdateUpstreamTests(unittest.TestCase):
         self.upstream = self.root / "upstream"
         self.fork = self.root / "fork"
         self.env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull,
+                        ZERON_RELEASE_NOTES_OFFLINE="1",
                         GIT_CONFIG_NOSYSTEM="1", GIT_AUTHOR_NAME="Updater Test",
                         GIT_AUTHOR_EMAIL="test@example.invalid",
                         GIT_COMMITTER_NAME="Updater Test",
@@ -25,12 +27,15 @@ class UpdateUpstreamTests(unittest.TestCase):
         self.upstream.mkdir()
         self.git(self.upstream, "init", "-q", "-b", "main")
         (self.upstream / "shared.txt").write_text("base\n")
+        (self.upstream / "Cargo.toml").write_text('[workspace.package]\nversion = "9.9.8"\n')
         self.commit(self.upstream, "base")
+        self.git(self.upstream, "tag", "v9.9.8")
         self.git(self.root, "clone", "-q", str(self.upstream), str(self.fork))
         self.git(self.fork, "remote", "add", "upstream", str(self.upstream))
         scripts = self.fork / "scripts"
         scripts.mkdir()
         shutil.copy2(UPDATER, scripts / "update-upstream.sh")
+        shutil.copy2(UPDATER.parent / "snapshot-release-notes.py", scripts / "snapshot-release-notes.py")
         self.checker = scripts / "check-linux-fork.sh"
         self.checker.write_text("#!/bin/sh\nexit 0\n")
         self.checker.chmod(0o755)
@@ -50,6 +55,7 @@ class UpdateUpstreamTests(unittest.TestCase):
         self.git(cwd, "commit", "-qm", message)
 
     def release(self, path="upstream.txt"):
+        (self.upstream / "Cargo.toml").write_text('[workspace.package]\nversion = "9.9.9"\n')
         (self.upstream / path).write_text("upstream update\n")
         self.commit(self.upstream, "release")
         self.git(self.upstream, "tag", "v9.9.9")
@@ -81,6 +87,9 @@ class UpdateUpstreamTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertEqual((self.fork / "custom.txt").read_text(), "Linux customization\n")
         self.assertEqual((self.fork / "upstream.txt").read_text(), "upstream update\n")
+        catalog = json.loads((self.fork / "docs/releases/changelog.json").read_text())
+        self.assertEqual([e["version"] for e in catalog["releases"]], ["9.9.9", "9.9.8"])
+        self.assertIn("custom fork", catalog["releases"][0]["fork_changes"])
         self.assertEqual(self.git(self.fork, "status", "--porcelain"), "")
         head = self.git(self.fork, "rev-parse", "HEAD")
         self.assertEqual(self.update().returncode, 0)
@@ -108,6 +117,18 @@ class UpdateUpstreamTests(unittest.TestCase):
         self.assertEqual(self.git(self.fork, "rev-parse", "HEAD"), head)
         self.git(self.fork, "merge", "--abort")
         self.assertEqual((self.fork / "shared.txt").read_text(), "fork edit\n")
+        self.assertEqual(self.git(self.fork, "status", "--porcelain"), "")
+
+    def test_version_conflict_leaves_clear_recovery_instructions(self):
+        (self.fork / "Cargo.toml").write_text('[workspace.package]\nversion="9.9.7"\n')
+        self.commit(self.fork, "fork version edit")
+        self.release()
+        result = self.update()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("snapshot-release-notes.py --tag v9.9.9 --fork-head", result.stdout)
+        self.assertIn("git merge --abort", result.stdout)
+        self.git(self.fork, "merge", "--abort")
+        self.assertEqual(self.git(self.fork, "status", "--porcelain"), "")
 
     def test_failed_checks_leave_merge_uncommitted(self):
         self.checker.write_text("#!/bin/sh\nexit 1\n")

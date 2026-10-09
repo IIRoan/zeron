@@ -20,6 +20,11 @@ commits the result. It never pushes automatically or replaces your dirty work.
 You can also choose a release explicitly: `scripts/update-upstream.sh v0.2.105`.
 Re-running it after a successful update is harmless.
 
+The command also bundles the current and previous upstream release notes.
+The desktop presents them in **What’s new**, with fork changes shown separately.
+See [update summaries](reference/release-notes.md) for offline handling,
+preferences and maintaining notes for fork-only updates.
+
 If upstream and the fork changed the same code, Git leaves the merge open. Run
 `git status`, resolve those files while keeping the fork behavior, stage the
 resolved files, and finish with:

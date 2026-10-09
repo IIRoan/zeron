@@ -66,6 +66,7 @@ mod chat_dropzone_tests;
 mod chat_rename_tests;
 mod command_palette;
 mod file_close_dialog;
+mod release_notes_ui;
 mod project_terminals_ui;
 mod worktrees_ui;
 use file_close_dialog::FileCloseDialog;
@@ -1976,6 +1977,8 @@ pub struct Shell {
     file_surface_seq: u64,
     pending_file_closes: std::collections::HashSet<RightSurface>,
     file_close_dialog: Option<FileCloseDialog>,
+    release_notes_dialog: Option<release_notes_ui::ReleaseNotesDialog>,
+    _release_notes_observation: Option<Subscription>,
     pending_exit: Option<PendingExit>,
     /// Event hookups for [`Self::diffs`] (History rows opening commit tabs).
     diff_subs: std::collections::HashMap<u64, Subscription>,
@@ -2442,6 +2445,9 @@ impl Shell {
             files_subs: std::collections::HashMap::new(),
             file_surfaces: std::collections::HashMap::new(),
             file_close_dialog: None,
+            release_notes_dialog: None,
+            _release_notes_observation: crate::release_notes::ReleaseNotes::global(cx)
+                .map(|notes| cx.observe(&notes, |_, _, cx| cx.notify())),
             file_surface_paths: std::collections::HashMap::new(),
             file_surface_keys: std::collections::HashMap::new(),
             file_surface_subs: std::collections::HashMap::new(),
@@ -9418,6 +9424,16 @@ impl Shell {
                             .child(SharedString::from("Check for updates")),
                     )
                 })
+                .child(
+                    popover::menu_row(theme, false, "user-menu-release-notes")
+                        .id("user-menu-release-notes")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.close_user_menu(cx);
+                            crate::release_notes::show(cx);
+                        }))
+                        .child(icon(icons::DOCUMENT).size(px(16.0)).text_color(theme.text_muted))
+                        .child(SharedString::from("What’s new")),
+                )
                 .into_any_element();
             // Opens upward, left-aligned with the pill: the card is as wide as
             // the footer row, so it covers the row instead of the pane beside it.
@@ -9987,6 +10003,10 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.release_notes_dialog.is_some() {
+            cx.stop_propagation();
+            return;
+        }
         if self.file_close_dialog.is_some()
             || self
                 .active_changes(cx)
@@ -10463,6 +10483,9 @@ impl Shell {
         }
         if let Some(update) = self.render_update_prompt(viewport, cx) {
             overlays.push(update);
+        }
+        if let Some(notes) = self.render_release_notes_dialog(viewport, window, cx) {
+            overlays.push(notes);
         }
         if let Some(dialog) = self.render_file_close_dialog(viewport, cx) {
             overlays.push(dialog);
@@ -13151,6 +13174,9 @@ impl Render for Shell {
             .debug_gate
             .clone()
             .unwrap_or_else(|| self.state.read(cx).gate());
+        if matches!(gate, GatePhase::Ready) && !restart_required {
+            self.sync_release_notes_dialog(window, cx);
+        }
 
         let browser_profile = {
             let state = self.state.read(cx);
@@ -17169,6 +17195,9 @@ mod right_tab_mouse_regressions {
     impl Render for TabHost {
         fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             self.shell.update(cx, |shell, cx| {
+                shell.sync_release_notes_dialog(window, cx);
+                let release_notes = shell.render_release_notes_dialog(window.viewport_size(), window, cx);
+                let block_background = self.with_file_close_dialog || release_notes.is_some();
                 let dialog = if self.with_file_close_dialog {
                     shell.sync_file_close_dialog(window, cx);
                     shell.render_file_close_dialog(window.viewport_size(), cx)
@@ -17181,7 +17210,7 @@ mod right_tab_mouse_regressions {
                     div().w(px(400.)).h(px(40.)).child(tabs),
                     cx,
                 )
-                .when(self.with_file_close_dialog, |el| {
+                .when(block_background, |el| {
                     el.size_full()
                         .track_focus(&shell.shortcut_focus)
                         .capture_key_down(cx.listener(Shell::on_key_down_capture))
@@ -17191,6 +17220,7 @@ mod right_tab_mouse_regressions {
                         .child(div().track_focus(&shell.unfocused))
                 })
                 .children(dialog)
+                .children(release_notes)
             })
         }
     }
@@ -17290,6 +17320,68 @@ mod right_tab_mouse_regressions {
                 assert_eq!(shell.resolved_right_active(cx), RightSurface::Explorer);
             });
         });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    fn release_notes_modal_tabs_focus_and_background_are_isolated(cx: &mut TestAppContext) {
+        let (shell, cx) = setup(cx);
+        let root = tempfile::tempdir().unwrap();
+        cx.update(|window, cx| {
+            crate::release_notes::ReleaseNotes::init(root.path().into(), cx);
+            let focus = shell.read(cx).unfocused.clone();
+            window.focus(&focus, cx);
+            cx.bind_keys([gpui::KeyBinding::new("ctrl-s", SaveFile, None)]);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+        let card = cx.debug_bounds("release-notes-card").unwrap();
+        let close = cx.debug_bounds("release-notes-close").unwrap();
+        let scroll = cx.debug_bounds("release-notes-scroll").unwrap();
+        assert!(scroll.size.height > px(100.0));
+        assert!(close.bottom() <= card.bottom());
+        cx.simulate_keystrokes("ctrl-s");
+        assert!(shell.read_with(cx, |shell, _| shell.release_notes_dialog.is_some()));
+        let background = cx.debug_bounds("right-surface-tab-0").unwrap().center();
+        cx.simulate_click(background, gpui::Modifiers::default());
+        shell.read_with(cx, |shell, cx| {
+            assert_eq!(shell.resolved_right_active(cx), RightSurface::Subagent(2));
+        });
+        let previous = cx.debug_bounds("release-notes-tab-1").unwrap().center();
+        cx.simulate_click(previous, gpui::Modifiers::default());
+        assert_eq!(shell.read_with(cx, |shell, _| shell.release_notes_dialog.as_ref().unwrap().selected), 1);
+        // Restore the primary button then exercise the focus loop and opt out.
+        cx.update(|window, cx| {
+            let focus = shell.read(cx).release_notes_dialog.as_ref().unwrap().buttons[4].clone();
+            window.focus(&focus, cx);
+        });
+        for (keys, selected) in [("tab", 0), ("tab", 1), ("tab", 2), ("shift-tab", 1)] {
+            cx.simulate_keystrokes(keys);
+            cx.update(|window, cx| {
+                assert!(shell.read(cx).release_notes_dialog.as_ref().unwrap().buttons[selected].is_focused(window));
+            });
+        }
+        cx.simulate_keystrokes("tab space");
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert!(!crate::release_notes::ReleaseNotes::global(cx).unwrap().read(cx).state.show_after_updates);
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        let saved: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.path().join("release-notes-state.json")).unwrap(),
+        ).unwrap();
+        assert_eq!(saved["seen_version"], zeron_update::current_version());
+        assert_eq!(saved["show_after_updates"], false);
+        cx.update(|window, cx| {
+            assert!(shell.read(cx).release_notes_dialog.is_none());
+            assert!(shell.read(cx).unfocused.is_focused(window));
+            // Manual menu action is available even with automatic display off.
+            cx.dispatch_action(&crate::app_menus::OpenReleaseNotes);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(shell.read_with(cx, |shell, _| shell.release_notes_dialog.is_some()));
     }
 
     #[cfg(target_os = "linux")]

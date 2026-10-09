@@ -10,6 +10,7 @@ on:
       - 'apps/zeron/**'
       - 'assets/**'
       - 'scripts/**'
+      - 'docs/releases/**'
       - '.github/**'
   push:
     branches: [main]
@@ -21,6 +22,7 @@ on:
       - 'apps/zeron/**'
       - 'assets/**'
       - 'scripts/**'
+      - 'docs/releases/**'
       - '.github/**'
   workflow_dispatch:
 
@@ -49,6 +51,13 @@ jobs:
           save-rust-cache: 'true'
       - name: Harness, engine, sync, update, doc and preview tests
         run: scripts/ci/test-core.sh
+      - name: Fork update and release note regressions
+        run: |
+          python3 scripts/tests/test_update_upstream.py
+          python3 scripts/tests/test_snapshot_release_notes.py
+          python3 scripts/snapshot-release-notes.py --check
+          python3 scripts/tests/test_fork_workflows.py
+          python3 scripts/check-fork-workflows.py
 
   ui-tests:
     if: github.repository == 'IIRoan/zeron'
