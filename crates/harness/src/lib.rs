@@ -209,6 +209,12 @@ pub fn compose_login_shell_path(cmd: &mut tokio::process::Command) {
     compose_path(cmd.as_std_mut(), std::iter::empty());
 }
 
+/// PATH for child launchers that do not use `std::process::Command`, including
+/// PTYs. Keep inherited directories first and add the interactive login PATH.
+pub fn composed_login_shell_path() -> Option<std::ffi::OsString> {
+    composed_path(std::iter::empty())
+}
+
 /// Compose the child's PATH: the resolved executable's directory first, then
 /// our own PATH, then the login-shell PATH snapshot — deduped. npm-shim CLIs
 /// are `#!/usr/bin/env node` scripts whose `node` lives beside them in the
@@ -225,6 +231,14 @@ fn compose_path<'a>(
     cmd: &mut std::process::Command,
     executable_dir: impl IntoIterator<Item = &'a std::path::Path>,
 ) {
+    if let Some(joined) = composed_path(executable_dir) {
+        cmd.env("PATH", joined);
+    }
+}
+
+fn composed_path<'a>(
+    executable_dir: impl IntoIterator<Item = &'a std::path::Path>,
+) -> Option<std::ffi::OsString> {
     let mut paths: Vec<std::path::PathBuf> = Vec::new();
     for dir in executable_dir {
         paths.push(dir.to_path_buf());
@@ -237,9 +251,7 @@ fn compose_path<'a>(
     }
     let mut seen = std::collections::HashSet::new();
     paths.retain(|p| !p.as_os_str().is_empty() && seen.insert(p.clone()));
-    if let Ok(joined) = std::env::join_paths(paths) {
-        cmd.env("PATH", joined);
-    }
+    std::env::join_paths(paths).ok()
 }
 
 /// Rolling tail of a child's stderr, shared between the reader task and the

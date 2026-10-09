@@ -365,6 +365,15 @@ impl Terminals {
             cmd.env("TERM", "xterm-256color");
             cmd.env("COLORTERM", "truecolor");
             cmd.env("TERM_PROGRAM", "Zeron");
+            // Managed services are non-interactive: rc files may only add
+            // Homebrew/version-manager tools in interactive shells. Reuse the
+            // bounded, cached login PATH used by harnesses before loading the
+            // service's profile. Explicit checkout PATH settings still win.
+            if !environment.contains_key("PATH")
+                && let Some(path) = zeron_harness::composed_login_shell_path()
+            {
+                cmd.env("PATH", path);
+            }
             for (name, value) in environment {
                 cmd.env(name, value);
             }
