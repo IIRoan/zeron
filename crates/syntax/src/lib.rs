@@ -390,31 +390,36 @@ pub fn highlight_with_limits(
         language,
         LanguageId::JavaScript | LanguageId::Jsx | LanguageId::TypeScript | LanguageId::Tsx
     ) {
-        color_brackets(&mut document, request.source);
-        if document.lines.iter().map(Vec::len).sum::<usize>() > limits.max_spans {
-            return Err(HighlightError::TooManySpans);
-        }
+        color_brackets(&mut document, request.source, limits.max_spans);
     }
     Ok(document)
 }
 
 /// Only parser-classified punctuation participates: brackets in comments,
 /// strings and regular expressions never change the nesting colors.
-fn color_brackets(document: &mut HighlightedDocument, source: &str) {
+/// Bracket coloring is cosmetic, so a document that would exceed `max_spans`
+/// once brackets are split out keeps its plain punctuation instead.
+fn color_brackets(document: &mut HighlightedDocument, source: &str, max_spans: usize) {
+    let mut total = document.lines.iter().map(Vec::len).sum::<usize>();
     let mut stack = Vec::new();
-    for (spans, line) in document.lines.iter_mut().zip(source.lines()) {
-        let mut colored = Vec::new();
-        for span in std::mem::take(spans) {
-            if span.kind != HighlightKind::Punctuation {
-                colored.push(span);
-                continue;
-            }
-            for (offset, character) in line[span.range.clone()].char_indices() {
+    let mut colored_lines = Vec::with_capacity(document.lines.len());
+    for (spans, line) in document.lines.iter().zip(source.lines()) {
+        let mut colored = Vec::with_capacity(spans.len());
+        for span in spans {
+            let text = match line.get(span.range.clone()) {
+                Some(text) if span.kind == HighlightKind::Punctuation => text,
+                _ => {
+                    colored.push(span.clone());
+                    continue;
+                }
+            };
+            let mut pieces = 0;
+            let mut run_start = span.range.start;
+            for (offset, character) in text.char_indices() {
                 let depth = match character {
                     '(' | '[' | '{' => {
-                        let depth = stack.len();
                         stack.push(character);
-                        Some(depth)
+                        stack.len() - 1
                     }
                     ')' | ']' | '}' => {
                         let opening = match character {
@@ -425,24 +430,46 @@ fn color_brackets(document: &mut HighlightedDocument, source: &str) {
                         if stack.last() == Some(&opening) {
                             stack.pop();
                         }
-                        Some(stack.len())
+                        stack.len()
                     }
-                    _ => None,
+                    _ => continue,
                 };
+                let start = span.range.start + offset;
+                if run_start < start {
+                    colored.push(HighlightSpan {
+                        range: run_start..start,
+                        kind: HighlightKind::Punctuation,
+                    });
+                    pieces += 1;
+                }
+                run_start = start + character.len_utf8();
                 colored.push(HighlightSpan {
-                    range: span.range.start + offset
-                        ..span.range.start + offset + character.len_utf8(),
-                    kind: match depth.map(|d| d % 3) {
-                        Some(0) => HighlightKind::Bracket1,
-                        Some(1) => HighlightKind::Bracket2,
-                        Some(_) => HighlightKind::Bracket3,
-                        None => HighlightKind::Punctuation,
+                    range: start..run_start,
+                    kind: match depth % 3 {
+                        0 => HighlightKind::Bracket1,
+                        1 => HighlightKind::Bracket2,
+                        _ => HighlightKind::Bracket3,
                     },
                 });
+                pieces += 1;
+            }
+            if run_start < span.range.end {
+                colored.push(HighlightSpan {
+                    range: run_start..span.range.end,
+                    kind: HighlightKind::Punctuation,
+                });
+                pieces += 1;
+            }
+            total = total + pieces - 1;
+            if total > max_spans {
+                return;
             }
         }
-        *spans = colored;
+        colored_lines.push(colored);
     }
+    let colored_count = colored_lines.len();
+    colored_lines.extend(document.lines.drain(colored_count..));
+    document.lines = colored_lines;
 }
 
 fn injected_languages(parent: LanguageId) -> Vec<LanguageId> {
@@ -586,10 +613,10 @@ fn javascript_family_highlights(language: LanguageId) -> String {
         ][..],
         _ => unreachable!("JavaScript query composition requires a JavaScript-family language"),
     };
-    // Storage declarations are blue, control keywords purple, and punctuation
-    // brackets retain their parser role for the nesting-color pass.
+    // Storage declarations are blue and control keywords purple; the bundled
+    // queries already tag brackets for the nesting-color pass.
     let mut highlights = format!(
-        "{}\n[\"const\" \"let\" \"var\" \"function\" \"class\" \"new\"] @keyword.storage\n[\"(\" \")\" \"[\" \"]\" \"{{\" \"}}\"] @punctuation.bracket",
+        "{}\n[\"const\" \"let\" \"var\" \"function\" \"class\" \"new\"] @keyword.storage",
         queries.join("\n")
     );
     if matches!(language, TypeScript | Tsx) {
@@ -1369,6 +1396,81 @@ fn build(value: usize) -> Widget {
         }
         assert!(stack.is_empty());
         assert_eq!(colors.len(), 3);
+    }
+
+    #[test]
+    fn bracket_coloring_keeps_other_punctuation_runs_merged() {
+        let source = "for (;;) { a.b(); }\n";
+        let mut document = HighlightedDocument {
+            language: LanguageId::JavaScript,
+            lines: vec![vec![
+                HighlightSpan {
+                    range: 4..8,
+                    kind: HighlightKind::Punctuation,
+                },
+                HighlightSpan {
+                    range: 9..10,
+                    kind: HighlightKind::Punctuation,
+                },
+                HighlightSpan {
+                    range: 12..13,
+                    kind: HighlightKind::Punctuation,
+                },
+                HighlightSpan {
+                    range: 14..19,
+                    kind: HighlightKind::Punctuation,
+                },
+            ]],
+        };
+        color_brackets(&mut document, source, DEFAULT_MAX_SPANS);
+        let line = source.lines().next().unwrap();
+        let pieces = document.lines[0]
+            .iter()
+            .map(|span| (&line[span.range.clone()], span.kind))
+            .collect::<Vec<_>>();
+        use HighlightKind::*;
+        assert_eq!(
+            pieces,
+            [
+                ("(", Bracket1),
+                (";;", Punctuation),
+                (")", Bracket1),
+                ("{", Bracket1),
+                (".", Punctuation),
+                ("(", Bracket2),
+                (")", Bracket2),
+                ("; ", Punctuation),
+                ("}", Bracket1),
+            ]
+        );
+    }
+
+    #[test]
+    fn bracket_coloring_is_skipped_instead_of_exceeding_the_span_limit() {
+        let source = "f(a);\n";
+        let plain = vec![HighlightSpan {
+            range: 1..5,
+            kind: HighlightKind::Punctuation,
+        }];
+        let mut document = HighlightedDocument {
+            language: LanguageId::TypeScript,
+            lines: vec![plain.clone()],
+        };
+        color_brackets(&mut document, source, 2);
+        assert_eq!(document.lines, [plain]);
+
+        let minified = format!("f({});\n", "[a?.b,...c],".repeat(15_000));
+        let document = highlight(HighlightRequest {
+            source: &minified,
+            path: Some("bundle.min.js"),
+            fence_tag: None,
+        })
+        .expect("bracket coloring never turns a highlightable document into an error");
+        assert!(
+            document.lines[0]
+                .iter()
+                .any(|span| span.kind == HighlightKind::Bracket1)
+        );
     }
 
     #[test]

@@ -1652,6 +1652,10 @@ pub struct Changes {
     /// chat hosted elsewhere tears the watch down and re-subscribes.
     watch_target: Option<String>,
     watch_task: Option<Task<()>>,
+    /// Set by every render and consumed by the single-file poll's visibility
+    /// probe; the poll stops while the pane is hidden and render restarts it.
+    rendered: bool,
+    file_watch_paused: bool,
     parsed: Option<ParsedDiff>,
     parse_task: Option<Task<()>>,
     intraline: intraline::Changes,
@@ -1766,6 +1770,8 @@ impl Changes {
             error: None,
             watch_target: None,
             watch_task: None,
+            rendered: false,
+            file_watch_paused: false,
             parsed: None,
             parse_task: None,
             intraline: Default::default(),
@@ -1899,46 +1905,64 @@ impl Changes {
             return;
         };
         let target = self.desired_target(cx);
+        self.file_watch_paused = false;
         self.watch_task = Some(cx.spawn(async move |this, cx| {
+            let mut interval = crate::source_control::POLL_INTERVAL_MIN;
+            let mut first = true;
             loop {
+                if !first {
+                    cx.background_executor().timer(interval).await;
+                }
+                first = false;
+                match crate::source_control::is_displayed(&this, cx, |view: &mut Self| {
+                    &mut view.rendered
+                })
+                .await
+                {
+                    None => return,
+                    Some(false) => {
+                        this.update(cx, |view, _| view.file_watch_paused = true)
+                            .ok();
+                        return;
+                    }
+                    Some(true) => {}
+                }
                 let mut params = serde_json::to_value(&selection).unwrap();
                 params["targetDeviceId"] = serde_json::json!(target);
                 let result = engine
                     .client()
                     .call(methods::GET_CHECKOUT_CHANGE_DIFF, params)
                     .await;
-                if this
-                    .update(cx, |view, cx| {
-                        match result.and_then(|v| {
-                            serde_json::from_value::<CheckoutDiff>(v)
-                                .map_err(|e| zeron_rpc::RpcError::Failed(e.to_string()))
-                        }) {
-                            Ok(diff) => {
-                                let recovered = view.error.take().is_some();
-                                let changed = view
-                                    .scoped
-                                    .as_ref()
-                                    .is_none_or(|old| old.checksum != diff.checksum);
-                                if changed {
-                                    view.scoped = Some(diff);
-                                    view.sync(cx);
-                                    cx.notify();
-                                } else if recovered {
-                                    cx.notify();
-                                }
-                            }
-                            Err(error) => {
-                                view.error =
-                                    Some(format!("Unable to load file diff: {error}").into());
+                let Ok(changed) = this.update(cx, |view, cx| {
+                    match result.and_then(|v| {
+                        serde_json::from_value::<CheckoutDiff>(v)
+                            .map_err(|e| zeron_rpc::RpcError::Failed(e.to_string()))
+                    }) {
+                        Ok(diff) => {
+                            let recovered = view.error.take().is_some();
+                            let changed = view
+                                .scoped
+                                .as_ref()
+                                .is_none_or(|old| old.checksum != diff.checksum);
+                            if changed {
+                                view.scoped = Some(diff);
+                                view.sync(cx);
+                                cx.notify();
+                            } else if recovered {
                                 cx.notify();
                             }
+                            changed || recovered
                         }
-                    })
-                    .is_err()
-                {
+                        Err(error) => {
+                            view.error = Some(format!("Unable to load file diff: {error}").into());
+                            cx.notify();
+                            false
+                        }
+                    }
+                }) else {
                     return;
-                }
-                cx.background_executor().timer(Duration::from_secs(2)).await;
+                };
+                interval = crate::source_control::next_poll_interval(interval, changed);
             }
         }));
     }
@@ -5200,6 +5224,11 @@ fn render_file_body_upto(
 
 impl Render for Changes {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.rendered = true;
+        if self.file_watch_paused {
+            self.watch_task = None;
+            self.ensure_file_watch(cx);
+        }
         if self.scope == DiffScope::WorkingTree && self.file_selection.is_none() {
             return div()
                 .size_full()
@@ -5417,7 +5446,7 @@ mod tests {
                     changes.cancel_draft(cx);
                     assert_eq!(
                         changes.state.read(cx).review_comments(""),
-                        &[original.clone()]
+                        std::slice::from_ref(&original)
                     );
 
                     changes.edit_comment(&original.id, window, cx);

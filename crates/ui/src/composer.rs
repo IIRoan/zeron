@@ -7377,9 +7377,8 @@ impl Composer {
                 "targetDeviceId": space.device_id,
                 "cwd": space.path,
             });
-            if let crate::pickers::CheckoutPlan::ReuseWorktree { path, .. } =
-                self.pickers.read(cx).checkout_plan()
-            {
+            if let crate::pickers::CheckoutPlan::ReuseWorktree { path, .. }
+                | crate::pickers::CheckoutPlan::ReuseCheckout { path, .. } = self.pickers.read(cx).checkout_plan() {
                 params["path"] = path.into();
             }
             Some(params)
@@ -9197,7 +9196,7 @@ impl Composer {
                 // it from the first frame (it read "Select ref" until the
                 // host's diff reconciler got around to stamping the branch).
                 let mut chat_branch: Option<String> = None;
-                if is_new && space_path.is_some() {
+                if is_new {
                     match &plan {
                         crate::pickers::CheckoutPlan::CurrentCheckout { branch } => {
                             chat_branch = branch.clone();
@@ -9206,6 +9205,11 @@ impl Composer {
                             cwd = path.clone();
                             worktree_cwd = Some(path.clone());
                             chat_branch = Some(branch.clone());
+                        }
+                        crate::pickers::CheckoutPlan::ReuseCheckout { path, branch } => {
+                            cwd = path.clone();
+                            worktree_cwd = Some(path.clone());
+                            chat_branch = branch.clone();
                         }
                         crate::pickers::CheckoutPlan::NewWorktree { base } => {
                             // Footer shows the base until the host stamps the
@@ -13106,6 +13110,122 @@ mod tests {
                     assert_eq!(zeron_proto::invocation::invocation_links(text).len(), 2);
                     assert!(text.ends_with(" @README.md"));
                 }
+            });
+        }
+    }
+
+    /// Reusing an environment creates a separate provider session and never
+    /// requests a worktree, including for detached and project-less folders.
+    #[gpui::test]
+    fn fresh_chat_in_same_checkout_creates_an_independent_provider_session(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let directory = tempfile::tempdir().unwrap();
+        crate::settings::composer::ComposerDefaults {
+            harness: Some(HarnessId::Codex),
+            ..Default::default()
+        }
+        .save(directory.path())
+        .unwrap();
+        cx.update(|cx| crate::settings::init(Default::default(), directory.path(), cx));
+        for in_project in [true, false] {
+            let (out, mut requests) = tokio::sync::mpsc::channel::<String>(256);
+            let (replies, inbound) = tokio::sync::mpsc::channel::<String>(256);
+            let state = cx.new(|_| AppState::new());
+            state.update(cx, |state, _| {
+            state.data_dir = Some(directory.path().into());
+            state.local_device_id = Some("local".into());
+            state.selected_device = Some("remote".into());
+            state.no_project = !in_project;
+            if in_project {
+                state.spaces = vec![serde_json::from_value(serde_json::json!({
+                    "id": "project", "deviceId": "remote", "path": "/repo", "createdAt": chrono::Utc::now()
+                })).unwrap()];
+                state.selected_space = Some("project".into());
+            }
+            state.chats = vec![serde_json::from_value(serde_json::json!({
+                "id": "claude", "deviceId": "remote", "cwd": "/worktrees/shared",
+                "archived": false, "createdAt": chrono::Utc::now(), "harnessSessionId": "old-provider-session",
+                "config": { "harness": "claude-code", "sandbox": "workspace-write" }
+            })).unwrap()];
+            state.set_test_engine(crate::state::EngineHandle::from_test_client(zeron_rpc::RpcClient::new(out, inbound)));
+        });
+            let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+            composer.update(cx, |composer, cx| {
+                composer.pickers.update(cx, |pickers, cx| {
+                    pickers.reuse_checkout("/worktrees/shared".into(), None, cx)
+                });
+            });
+            cx.run_until_parked();
+            composer.update(cx, |composer, cx| {
+                composer.send("Try with Codex".into(), false, cx)
+            });
+            cx.run_until_parked();
+            let mut sent = Vec::new();
+            while let Ok(frame) = requests.try_recv() {
+                sent.push(serde_json::from_str::<zeron_rpc::ClientFrame>(&frame).unwrap());
+            }
+            let create = sent
+                .iter()
+                .find(|frame| frame.params["op"] == "createChat")
+                .expect("fresh chat is created");
+            assert_eq!(create.params["cwd"], "/worktrees/shared");
+            assert_eq!(create.params["config"]["harness"], "codex");
+            assert!(create.params.get("parentChatId").is_none());
+            assert!(create.params.get("sourceChatId").is_none());
+            assert!(create.params.get("harnessSessionId").is_none());
+            if in_project {
+                assert_eq!(create.params["spaceId"], "project");
+            } else {
+                assert_eq!(create.params["deviceId"], "remote");
+            }
+            assert_ne!(create.params["chatId"], "claude");
+            replies
+                .try_send(
+                    serde_json::to_string(&zeron_rpc::ServerFrame {
+                        id: create.id.clone(),
+                        ok: Some(serde_json::json!({})),
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+            runtime.block_on(async { tokio::task::yield_now().await });
+            cx.run_until_parked();
+            let mut after = Vec::new();
+            while let Ok(frame) = requests.try_recv() {
+                after.push(serde_json::from_str::<zeron_rpc::ClientFrame>(&frame).unwrap());
+            }
+            let run = after
+                .iter()
+                .find(|frame| frame.method.as_deref() == Some(methods::QUEUE_COMMAND))
+                .expect("fresh run is queued");
+            let request = &run.params["command"]["request"];
+            assert_eq!(run.params["chatId"], create.params["chatId"]);
+            assert_eq!(request["cwd"], "/worktrees/shared");
+            assert_eq!(request["harness"], "codex");
+            assert_eq!(request["resume"], serde_json::Value::Null);
+            assert_eq!(request["worktree"], serde_json::Value::Null);
+            assert!(
+                sent.iter()
+                    .chain(&after)
+                    .all(|frame| frame.method.as_deref() != Some(methods::CREATE_WORKTREE))
+            );
+            state.read_with(cx, |state, _| {
+                assert_eq!(state.chats.len(), 1);
+                assert_eq!(
+                    state.chats[0].harness_session_id.as_deref(),
+                    Some("old-provider-session")
+                );
+                assert_eq!(
+                    state.chats[0].config.as_ref().unwrap().harness,
+                    HarnessId::ClaudeCode
+                );
             });
         }
     }

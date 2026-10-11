@@ -68,6 +68,7 @@ mod command_palette;
 mod file_close_dialog;
 mod release_notes_ui;
 mod project_terminals_ui;
+use project_terminals_ui::UnsavedForm;
 mod worktrees_ui;
 use file_close_dialog::FileCloseDialog;
 mod file_mutations;
@@ -274,6 +275,13 @@ fn right_panel_content_width(
 
 fn conversation_width(viewport: f32, sidebar: f32, right: f32) -> f32 {
     (viewport - sidebar - right).max(0.0)
+}
+
+/// Linux hides the session workspace (sidebar, explorer, tools and terminal
+/// dock) on the new-chat canvas and in Settings. Other platforms keep the
+/// upstream layout, where that chrome is never hidden this way.
+fn session_workspace_visible_on(linux: bool, chat_route: bool, chat_selected: bool) -> bool {
+    !linux || (chat_route && chat_selected)
 }
 
 /// The chat's working directory as the host device spells it — the folder the
@@ -1617,11 +1625,6 @@ enum AccountMenuAction {
     SignOut,
 }
 
-#[derive(Debug, Clone)]
-enum DiscardWorkingTreeFlow {
-    Confirm(DiscardWorkingTreeRequest),
-}
-
 const RUNTIME_CHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 const RUNTIME_CHANGE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -2035,9 +2038,9 @@ pub struct Shell {
     chat_rename: Option<ChatRename>,
     /// Chat id awaiting delete confirmation.
     delete_confirm: Option<String>,
-    /// Global confirmation/error dialog for the Changes-pane trash action. The
-    /// RPC task is retained separately so rerenders do not cancel it.
-    discard_working_tree: Option<DiscardWorkingTreeFlow>,
+    /// Global confirmation dialog for the Changes-pane trash action. The RPC
+    /// task is retained separately so rerenders do not cancel it.
+    discard_working_tree: Option<DiscardWorkingTreeRequest>,
     discard_working_tree_task: Option<Task<()>>,
     /// Space-row context menu (dropdown rows): (space id, window position).
     space_menu: popover::Popup<(String, Point<Pixels>)>,
@@ -3116,11 +3119,20 @@ impl Shell {
     /// new-session canvas, where the titlebar carries no toggle to close it
     /// again (an earlier user request).
     fn right_pane_open(&self, cx: &App) -> bool {
-        self.session_workspace_visible(cx) && self.panels.get(&self.panel_key(cx)).changes_open
+        let visible = if cfg!(target_os = "linux") {
+            self.session_workspace_visible(cx)
+        } else {
+            !self.active_chat.is_empty()
+        };
+        visible && self.panels.get(&self.panel_key(cx)).changes_open
     }
 
     fn session_workspace_visible(&self, cx: &App) -> bool {
-        matches!(self.route, Route::Chat) && self.state.read(cx).selected_chat.is_some()
+        session_workspace_visible_on(
+            cfg!(target_os = "linux"),
+            matches!(self.route, Route::Chat),
+            self.state.read(cx).selected_chat.is_some(),
+        )
     }
 
     /// The current chat's terminal flag (per-session, in-memory).
@@ -4092,8 +4104,7 @@ impl Shell {
                     }
                     ChangesEvent::DiscardWorkingTree(request) => {
                         if this.discard_working_tree_task.is_none() {
-                            this.discard_working_tree =
-                                Some(DiscardWorkingTreeFlow::Confirm(request.clone()));
+                            this.discard_working_tree = Some(request.clone());
                             cx.notify();
                         }
                     }
@@ -4681,6 +4692,16 @@ impl Shell {
                 };
                 self.select_terminal_mode(mode, cx);
             }
+            return;
+        }
+        self.toggle_shell_terminal(window, cx);
+    }
+
+    fn toggle_shell_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The services drawer counts as an open terminal, so flipping only
+        // the shell flag would leave it on screen.
+        if self.project_terminals.drawer {
+            self.hide_terminal_panel(window, cx);
             return;
         }
         let from = self.terminal_geometry.get().height;
@@ -5937,8 +5958,7 @@ impl Shell {
         if self.discard_working_tree_task.is_some() {
             return;
         }
-        let Some(DiscardWorkingTreeFlow::Confirm(request)) = self.discard_working_tree.clone()
-        else {
+        let Some(request) = self.discard_working_tree.clone() else {
             return;
         };
         let Some(engine) = self.state.read(cx).engine().cloned() else {
@@ -7597,6 +7617,31 @@ impl Shell {
         };
         let compact = search_query.is_none() && self.settings.sidebar_compact;
         let show_label = search_query.is_some() || self.settings.sidebar_show_project_label;
+        // Pinned and custom-section rows keep their manual placement. In All
+        // projects their project is named explicitly instead of relying on a monogram.
+        let project_label = (compact
+            && self.settings.space_filter.is_none()
+            && (self.active_sidebar_pins(cx).iter().any(|pin| pin == &id)
+                || self
+                    .active_sidebar_sections(cx)
+                    .iter()
+                    .any(|section| section.session_ids.contains(&id))))
+        .then(|| {
+            let state = self.state.read(cx);
+            state.chats.iter().find(|chat| chat.id == id).map(|chat| {
+                state.space_for_chat(chat).map_or_else(
+                    || {
+                        if chat.space_id.is_some() {
+                            "Unavailable project".into()
+                        } else {
+                            "No project".into()
+                        }
+                    },
+                    |space| state.representative_space(space).display_name().to_string(),
+                )
+            })
+        })
+        .flatten();
         let remote = self
             .state
             .read(cx)
@@ -8112,6 +8157,17 @@ impl Shell {
                         )
                         .into_any_element(),
                     })
+                    .when_some(project_label, |el, label: String| {
+                        el.child(
+                            div()
+                                .max_w(px(88.0))
+                                .min_w_0()
+                                .truncate()
+                                .text_size(crate::typography::ui_rems(10.0))
+                                .text_color(subline)
+                                .child(SharedString::from(label)),
+                        )
+                    })
                     .when(!compact && !show_label && remote, |el| {
                         el.child(
                             icon(icons::REMOTE_SERVER)
@@ -8488,7 +8544,7 @@ impl Shell {
         let regular_start = pinned_count + custom_count;
         let keyed = session_rows.rows;
         let regular_count = session_rows.regular_count;
-        let ungrouped = self.settings.sidebar_organization == SidebarOrganization::InOneList;
+        let ungrouped = self.sidebar_organization() == SidebarOrganization::InOneList;
         let regular_body_height = spaces::SIDEBAR_DISCLOSURE_BODY_INSET
             + keyed
                 .iter()
@@ -9913,6 +9969,11 @@ impl Shell {
     /// Resolve shell-owned Escape surfaces in capture phase, before focused
     /// descendants such as an integrated terminal can consume the key.
     fn capture_escape_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.keep_editing(UnsavedForm::Services, window, cx)
+            || self.keep_editing(UnsavedForm::WorktreeSettings, window, cx)
+        {
+            return true;
+        }
         if self.dismiss_worktree_removal(window, cx) {
             return true;
         }
@@ -9921,15 +9982,14 @@ impl Shell {
             return true;
         }
         if self.project_terminals.editor.is_some() {
-            self.project_terminals.editor = None;
-            cx.notify();
+            self.request_close_form(UnsavedForm::Services, window, cx);
             return true;
         }
         if self.worktree_settings.editor.is_some() {
             if self.dismiss_worktree_select(cx) {
                 return true;
             }
-            self.close_worktree_settings(cx);
+            self.request_close_form(UnsavedForm::WorktreeSettings, window, cx);
             return true;
         }
         // Modals and context menus sit above the rest of the shell. Preserve
@@ -10004,6 +10064,10 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         if self.release_notes_dialog.is_some() {
+            cx.stop_propagation();
+            return;
+        }
+        if self.project_terminals.discard.is_some() || self.worktree_settings.discard.is_some() {
             cx.stop_propagation();
             return;
         }
@@ -10124,11 +10188,13 @@ impl Shell {
                     .any(|chat| chat.id == chat_id && chat.parent_chat_id.is_some());
             let is_pinned = self.active_sidebar_pins(cx).contains(&chat_id);
             let rename_id = chat_id.clone();
+            let new_chat_id = chat_id.clone();
+            let can_reuse_checkout = self.can_reuse_chat_checkout(&chat_id, cx);
             let pin_id = chat_id.clone();
             let archive_id = chat_id.clone();
             let delete_id = chat_id.clone();
             let menu = popover::popover_card(&theme)
-                .w(px(216.0))
+                .w(px(if can_reuse_checkout { 256.0 } else { 216.0 }))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                     this.close_chat_menu(cx);
                 }))
@@ -10152,6 +10218,34 @@ impl Shell {
                             .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
                             .child(SharedString::from("Rename")),
                     )
+                    .when(can_reuse_checkout, |menu| {
+                        menu.child(
+                            popover::menu_row(
+                                &theme,
+                                false,
+                                format!("chat-menu-new-chat-{chat_id}"),
+                            )
+                                .id("chat-menu-new-chat")
+                                .debug_selector(|| "chat-menu-new-chat".into())
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.close_chat_menu(cx);
+                                    if this.new_chat_in_checkout_of(&new_chat_id, cx) {
+                                        this.composer.update(cx, |composer, cx| {
+                                            composer.open_model_menu(window, cx)
+                                        });
+                                    }
+                                }))
+                                .tooltip(crate::settings::widgets::text_tooltip(
+                                    "Choose another agent. Files, env and services stay in the same checkout.",
+                                ))
+                                .child(
+                                    icon(icons::PEN_NEW_SQUARE)
+                                        .size(px(16.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(SharedString::from("New chat in this checkout…")),
+                        )
+                    })
                     .when(!is_side_chat, |menu| {
                         menu.child(
                             popover::menu_row(&theme, false, format!("chat-menu-pin-{chat_id}"))
@@ -10377,7 +10471,17 @@ impl Shell {
         if let Some(overlay) = self.render_worktree_settings(viewport, cx) {
             overlays.push(overlay);
         }
+        if let Some(overlay) =
+            self.render_discard_prompt(UnsavedForm::WorktreeSettings, viewport, window, cx)
+        {
+            overlays.push(overlay);
+        }
         if let Some(overlay) = self.render_project_terminal_editor(viewport, cx) {
+            overlays.push(overlay);
+        }
+        if let Some(overlay) =
+            self.render_discard_prompt(UnsavedForm::Services, viewport, window, cx)
+        {
             overlays.push(overlay);
         }
         if let Some(overlay) = self.render_worktree_removal(viewport, window, cx) {
@@ -10428,49 +10532,40 @@ impl Shell {
             overlays.push(popover::modal("delete-chat-dialog", viewport, card));
         }
 
-        if let Some(flow) = self.discard_working_tree.clone() {
-            let card = match flow {
-                DiscardWorkingTreeFlow::Confirm(_) => {
-                    popover::dialog_card(&theme)
-                        .child(popover::dialog_title(
-                            &theme,
-                            "Discard working tree changes?",
-                        ))
-                        .child(div().mt(px(6.0)).child(popover::dialog_body(
-                            &theme,
-                            "Discard all uncommitted changes in this working tree? This can’t be undone.",
-                        )))
+        if self.discard_working_tree.is_some() {
+            let card = popover::dialog_card(&theme)
+                .child(popover::dialog_title(
+                    &theme,
+                    "Discard working tree changes?",
+                ))
+                .child(div().mt(px(6.0)).child(popover::dialog_body(
+                    &theme,
+                    "Discard all uncommitted changes in this working tree? This can’t be undone.",
+                )))
+                .child(
+                    div()
+                        .mt(px(16.0))
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .gap(px(8.0))
                         .child(
-                            div()
-                                .mt(px(16.0))
-                                .flex()
-                                .flex_row()
-                                .justify_end()
-                                .gap(px(8.0))
-                                .child(
-                                    popover::btn_ghost(
-                                        &theme,
-                                        "Cancel",
-                                        "discard-working-tree-cancel",
-                                    )
-                                    .id("discard-working-tree-cancel")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.discard_working_tree = None;
-                                        cx.notify();
-                                    })),
-                                )
-                                .child(
-                                    popover::btn_danger(&theme, "Discard changes")
-                                        .id("discard-working-tree-confirm")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.confirm_discard_working_tree(cx)
-                                        })),
-                                ),
+                            popover::btn_ghost(&theme, "Cancel", "discard-working-tree-cancel")
+                                .id("discard-working-tree-cancel")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.discard_working_tree = None;
+                                    cx.notify();
+                                })),
                         )
-                        .into_any_element()
-                }
-
-            };
+                        .child(
+                            popover::btn_danger(&theme, "Discard changes")
+                                .id("discard-working-tree-confirm")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.confirm_discard_working_tree(cx)
+                                })),
+                        ),
+                )
+                .into_any_element();
             overlays.push(popover::modal(
                 "discard-working-tree-dialog",
                 viewport,
@@ -13369,11 +13464,11 @@ impl Render for Shell {
             .on_drag_move(cx.listener(Self::on_right_pane_drag))
             .on_drag_move(cx.listener(Self::on_files_panel_drag))
             .on_drag_move(cx.listener(Self::on_terminal_drag))
-            // Workspace shortcuts only apply to an open session. The new-chat
-            // canvas and Settings leave panel preferences intact for the
-            // return trip.
+            // Workspace shortcuts only apply to the chat route (on Linux, only
+            // to an open session). The new-chat canvas and Settings leave
+            // panel preferences intact for the return trip.
             .on_action(cx.listener(|this, _: &ToggleTerminal, window, cx| {
-                if this.session_workspace_visible(cx) {
+                if matches!(this.route, Route::Chat) && this.session_workspace_visible(cx) {
                     this.toggle_terminal(window, cx)
                 }
             }))
@@ -13401,7 +13496,7 @@ impl Render for Shell {
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
-                if this.session_workspace_visible(cx) {
+                if !matches!(this.route, Route::Settings(_)) && this.session_workspace_visible(cx) {
                     this.toggle_sidebar(cx)
                 }
             }))
@@ -13421,7 +13516,7 @@ impl Render for Shell {
                 this.cycle_navigation(false, window, cx)
             }))
             .on_action(cx.listener(|this, _: &ToggleChanges, window, cx| {
-                if this.session_workspace_visible(cx) {
+                if matches!(this.route, Route::Chat) && this.session_workspace_visible(cx) {
                     this.toggle_right_pane(cx);
                     if !this.right_pane_open(cx) {
                         // The hidden editor can retain a focus handle after unmounting.
@@ -13433,7 +13528,7 @@ impl Render for Shell {
             // The explorer's own toggle (the titlebar tree button): docks or
             // undocks the explorer portion without touching the surface host.
             .on_action(cx.listener(|this, _: &ToggleFiles, window, cx| {
-                if this.session_workspace_visible(cx) {
+                if matches!(this.route, Route::Chat) && this.session_workspace_visible(cx) {
                     this.toggle_explorer(window, cx);
                 }
             }))
@@ -17324,6 +17419,50 @@ mod right_tab_mouse_regressions {
 
     #[cfg(target_os = "linux")]
     #[gpui::test]
+    fn release_notes_scroll_reaches_the_last_line(cx: &mut TestAppContext) {
+        let (shell, cx) = setup(cx);
+        let root = tempfile::tempdir().unwrap();
+        cx.update(|_, cx| crate::release_notes::ReleaseNotes::init(root.path().into(), cx));
+        cx.run_until_parked();
+        for size in [
+            gpui::size(px(1000.), px(900.)),
+            gpui::size(px(700.), px(420.)),
+            gpui::size(px(400.), px(420.)),
+        ] {
+            cx.simulate_resize(size);
+            for selected in [0, 1] {
+                cx.update(|window, cx| {
+                    shell.update(cx, |shell, cx| shell.select_release_notes(selected, cx));
+                    window.draw(cx).clear();
+                });
+                let scroll = shell.read_with(cx, |shell, _| {
+                    shell.release_notes_dialog.as_ref().unwrap().scroll.clone()
+                });
+                if selected == 0 {
+                    assert!(scroll.max_offset().y > px(0.));
+                }
+                cx.update(|window, cx| {
+                    scroll.set_offset(gpui::point(px(0.), -scroll.max_offset().y));
+                    window.draw(cx).clear();
+                });
+                let content = cx.debug_bounds("release-notes-upstream-content").unwrap();
+                let viewport = cx.debug_bounds("release-notes-scroll").unwrap();
+                assert!(
+                    content.bottom() <= viewport.bottom() + px(1.),
+                    "release {selected}: last line at {:?} is clipped below {:?}",
+                    content.bottom(),
+                    viewport.bottom()
+                );
+                let close = cx.debug_bounds("release-notes-close").unwrap();
+                let card = cx.debug_bounds("release-notes-card").unwrap();
+                assert!(close.bottom() <= card.bottom());
+                assert!(viewport.bottom() < close.top());
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
     fn release_notes_modal_tabs_focus_and_background_are_isolated(cx: &mut TestAppContext) {
         let (shell, cx) = setup(cx);
         let root = tempfile::tempdir().unwrap();
@@ -18080,6 +18219,119 @@ mod settings_modal_regressions {
             },
             cx,
         )
+    }
+
+    #[gpui::test]
+    fn chat_menu_starts_fresh_chat_in_clicked_checkout_and_opens_agent_picker(cx: &mut TestAppContext) {
+        // Render the real sidebar and menu directly, without booting an engine
+        // or relying on the full shell's sidebar animation/cache during setup.
+        struct ChatMenuHost {
+            shell: Entity<Shell>,
+            _observation: Subscription,
+        }
+        impl Render for ChatMenuHost {
+            fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                self.shell.update(cx, |shell, cx| {
+                    let theme = Theme::of(cx).clone();
+                    div()
+                        .size_full()
+                        .relative()
+                        .child(
+                            div()
+                                .w(px(300.0))
+                                .h_full()
+                                .child(shell.render_chat_sidebar(&theme, cx)),
+                        )
+                        .children(shell.render_overlays(window.viewport_size(), window, cx))
+                })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        init_settings_test(settings::UiSettings::default(), dir.path(), cx);
+        cx.update(|cx| motion::set_reduced_motion(cx, true));
+        let (host, cx) = cx.add_window_view(|_, cx| {
+            let shell = cx.new(|cx| test_shell(dir.path(), cx));
+            let observation = cx.observe(&shell, |_, _, cx| cx.notify());
+            ChatMenuHost {
+                shell,
+                _observation: observation,
+            }
+        });
+        let shell = host.read_with(cx, |host, _| host.shell.clone());
+        shell.update(cx, |shell, cx| {
+            shell.debug_gate = Some(GatePhase::Ready);
+            shell.reduced_motion = true;
+            shell.state.update(cx, |state, cx| {
+                state.local_device_id = Some("local".into());
+                state.spaces = ["project", "other"].into_iter().map(|id| {
+                    serde_json::from_value(serde_json::json!({
+                        "id":id, "deviceId":"remote", "path":format!("/{id}"),
+                        "name":id, "gitDetected":true, "createdAt":Utc::now()
+                    })).unwrap()
+                }).collect();
+                state.chats = ["source", "other"].into_iter().map(|id| {
+                    serde_json::from_value(serde_json::json!({
+                        "id":id, "deviceId":"remote", "spaceId":if id == "source" { "project" } else { "other" },
+                        "title":id, "cwd":format!("/worktrees/{id}"), "branch":id,
+                        "archived":false, "createdAt":Utc::now(), "harnessSessionId":"existing-session",
+                        "config":{"harness":"claude-code", "sandbox":"workspace-write"}
+                    })).unwrap()
+                }).collect();
+                state.auto_selected = true;
+                state.select_chat(Some("other".into()), cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+        let source = cx.debug_bounds("chat-source").unwrap().center();
+        cx.simulate_mouse_down(source, MouseButton::Right, gpui::Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear());
+        shell.read_with(cx, |shell, cx| {
+            assert_eq!(shell.state.read(cx).selected_chat.as_deref(), Some("other"));
+            assert_eq!(shell.chat_menu.get().unwrap().chat_id, "source");
+        });
+        let action = cx.debug_bounds("chat-menu-new-chat").unwrap().center();
+        cx.simulate_click(action, gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+        shell.read_with(cx, |shell, cx| {
+            let state = shell.state.read(cx);
+            assert!(shell.chat_menu.as_open().is_none());
+            assert!(state.selected_chat.is_none());
+            assert!(state.transcript.is_empty());
+            assert_eq!(state.selected_space.as_deref(), Some("project"));
+            assert_eq!(state.effective_device_id().as_deref(), Some("remote"));
+            assert_eq!(state.chats.len(), 2);
+            assert!(
+                state
+                    .chats
+                    .iter()
+                    .all(|chat| chat.harness_session_id.as_deref() == Some("existing-session"))
+            );
+            let pickers = shell.composer.read(cx).pickers().read(cx);
+            assert!(
+                pickers.is_open(),
+                "the new canvas should offer the unlocked agent picker immediately"
+            );
+            assert_eq!(
+                pickers.checkout_plan(),
+                crate::pickers::CheckoutPlan::ReuseCheckout {
+                    path: "/worktrees/source".into(),
+                    branch: Some("source".into())
+                }
+            );
+            assert!(!shell.session_workspace_visible(cx));
+            assert_eq!(shell.terminal_target(cx), 0.0);
+        });
+        shell.update(cx, |shell, cx| {
+            assert!(!shell.can_reuse_chat_checkout("deleted", cx));
+            assert!(!shell.new_chat_in_checkout_of("deleted", cx));
+            shell
+                .state
+                .update(cx, |state, _| state.begin_worktree_setup("source", "setup"));
+            assert!(!shell.can_reuse_chat_checkout("source", cx));
+            assert!(!shell.new_chat_in_checkout_of("source", cx));
+        });
     }
 
     #[gpui::test]

@@ -1,6 +1,6 @@
 //! Confirm removal without discarding work or leaving a live session in a deleted checkout.
 use super::*;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub(super) struct Removal {
     path: String,
@@ -13,31 +13,83 @@ pub(super) struct Removal {
     previous_focus: Option<FocusHandle>,
 }
 
+/// Resolves symlinks (such as `/home` -> `/var/home`) and `..` through the
+/// longest existing ancestor, so a path that does not exist yet still compares
+/// by its real location.
+fn canonical_path(path: &Path) -> PathBuf {
+    let mut existing = path;
+    let mut missing = Vec::new();
+    loop {
+        if let Ok(real) = existing.canonicalize() {
+            return missing
+                .iter()
+                .rev()
+                .fold(real, |path, part| path.join(part));
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name);
+                existing = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// Whether `path` lies inside `root`. Paths on another device cannot be
+/// resolved here and are compared as written.
+fn path_within(path: &Path, root: &Path, local: bool) -> bool {
+    if local {
+        canonical_path(path).starts_with(root)
+    } else {
+        path.starts_with(root)
+    }
+}
+
 impl Shell {
     fn worktree_removal_blocker(&self, path: &str, cx: &App) -> Option<String> {
         let state = self.state.read(cx);
         let device = &self.worktree_settings.editor.as_ref()?.project.device;
-        let chats: Vec<_> = state
-            .chats
-            .iter()
-            .filter(|chat| {
-                &chat.device_id == device
-                    && chat
-                        .cwd
-                        .as_deref()
-                        .is_some_and(|cwd| Path::new(cwd).starts_with(path))
-            })
-            .collect();
-        if chats.iter().any(|chat| {
-            matches!(
-                state.display_status_for(chat, Utc::now()),
-                zeron_proto::ChatIndicator::Working | zeron_proto::ChatIndicator::AwaitingInput
-            )
+        let local = state.local_device_id.as_ref() == Some(device);
+        let root = if local {
+            canonical_path(Path::new(path))
+        } else {
+            PathBuf::from(path)
+        };
+        let side_states = self
+            .side_chats
+            .values()
+            .map(|side| side.state.read(cx))
+            .collect::<Vec<_>>();
+        let chat_cwd = |id: &str| {
+            std::iter::once(state)
+                .chain(side_states.iter().copied())
+                .flat_map(|state| &state.chats)
+                .find(|chat| chat.id == id && &chat.device_id == device)
+                .and_then(|chat| chat.cwd.as_deref())
+        };
+        let in_worktree = |cwd: &str| path_within(Path::new(cwd), &root, local);
+        if state.chats.iter().any(|chat| {
+            &chat.device_id == device
+                && chat.cwd.as_deref().is_some_and(in_worktree)
+                && matches!(
+                    state.display_status_for(chat, Utc::now()),
+                    zeron_proto::ChatIndicator::Working | zeron_proto::ChatIndicator::AwaitingInput
+                )
         }) {
             return Some("Stop agents using this worktree before removing it.".into());
         }
+        // Check where each unsaved editor's file really lives: its owning
+        // chat may sit outside the worktree while the file path leads in.
         if self.file_surface_keys.iter().any(|((_, chat, _), id)| {
-            chats.iter().any(|c| &c.id == chat)
+            let Some(cwd) = chat_cwd(chat) else {
+                return false;
+            };
+            let file = self
+                .file_surface_paths
+                .get(id)
+                .map(|file| Path::new(cwd).join(file));
+            (in_worktree(cwd) || file.is_some_and(|file| path_within(&file, &root, local)))
                 && self
                     .file_surfaces
                     .get(id)
@@ -67,7 +119,9 @@ impl Shell {
             return;
         }
         if let Some(error) = self.worktree_removal_blocker(&path, cx) {
-            self.worktree_settings.editor.as_mut().unwrap().error = Some(error);
+            if let Some(editor) = self.worktree_settings.editor.as_mut() {
+                editor.error = Some(error);
+            }
             cx.notify();
             return;
         }
@@ -112,20 +166,24 @@ impl Shell {
             return;
         };
         let path = removal.path.clone();
-        if let Some(error) = self.worktree_removal_blocker(&path, cx) {
-            self.worktree_settings.removal.as_mut().unwrap().error = Some(error);
-            cx.notify();
+        let blocker = self.worktree_removal_blocker(&path, cx).or_else(|| {
+            self.state.read(cx).engine().is_none().then(|| {
+                "Connect to the project's device before removing this worktree.".to_string()
+            })
+        });
+        let engine = self.state.read(cx).engine().cloned();
+        let (Some(removal), Some(editor)) = (
+            self.worktree_settings.removal.as_mut(),
+            self.worktree_settings.editor.as_mut(),
+        ) else {
             return;
-        }
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.worktree_settings.removal.as_mut().unwrap().error =
-                Some("Connect to the project's device before removing this worktree.".into());
+        };
+        let Some(engine) = engine.filter(|_| blocker.is_none()) else {
+            removal.error = blocker;
             cx.notify();
             return;
         };
-        let removal = self.worktree_settings.removal.as_mut().unwrap();
         let name = removal.name.clone();
-        let editor = self.worktree_settings.editor.as_mut().unwrap();
         let project = editor.project.clone();
         let params = project.params(serde_json::json!({
             "repoPath":project.cwd,"worktreePath":path,"force":removal.discard,
@@ -153,18 +211,20 @@ impl Shell {
                     cx,
                 );
                 if result.is_ok() {
-                    let selected_removed =
-                        shell
-                            .state
-                            .read(cx)
-                            .selected_chat_row()
-                            .is_some_and(|chat| {
-                                chat.device_id == project.device
-                                    && chat
-                                        .cwd
-                                        .as_deref()
-                                        .is_some_and(|cwd| Path::new(cwd).starts_with(&path))
-                            });
+                    let state = shell.state.read(cx);
+                    let local = state.local_device_id.as_ref() == Some(&project.device);
+                    let root = if local {
+                        canonical_path(Path::new(&path))
+                    } else {
+                        PathBuf::from(&path)
+                    };
+                    let selected_removed = state.selected_chat_row().is_some_and(|chat| {
+                        chat.device_id == project.device
+                            && chat
+                                .cwd
+                                .as_deref()
+                                .is_some_and(|cwd| path_within(Path::new(cwd), &root, local))
+                    });
                     if selected_removed {
                         shell.open_new_session(Some(project.space.clone()), cx);
                     }
@@ -231,8 +291,9 @@ impl Shell {
             }
             "enter" | "space" => match active {
                 0 if !removal.busy => {
-                    let removal = self.worktree_settings.removal.as_mut().unwrap();
-                    removal.discard = !removal.discard;
+                    if let Some(removal) = self.worktree_settings.removal.as_mut() {
+                        removal.discard = !removal.discard;
+                    }
                     cx.notify();
                 }
                 1 => {

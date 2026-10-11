@@ -1311,22 +1311,31 @@ impl Repos {
             )
             .await?;
         } else {
-            self.inner
-                .worktree_settings
-                .run_lifecycle(
-                    repo_path,
-                    &path,
-                    &settings,
-                    &settings.create_command,
-                    Some((&branch_name, branch)),
-                )
-                .await?;
-            if self.workspace_checkout(repo_path, &path).await.is_none()
-                || path.canonicalize()? != base.canonicalize()?.join(&name)
-                || path.canonicalize()? == repo_path.canonicalize()?
-                || self.current_branch(&path).await?.as_str() != branch_name
-            {
-                return Err(EngineError::Other("The create command must create a linked worktree at $worktreepath on $branchname in this project.".into()));
+            let created = async {
+                self.inner
+                    .worktree_settings
+                    .run_lifecycle(
+                        repo_path,
+                        &path,
+                        &settings,
+                        &settings.create_command,
+                        Some((&branch_name, branch)),
+                    )
+                    .await?;
+                if self.workspace_checkout(repo_path, &path).await.is_none()
+                    || path.canonicalize()? != base.canonicalize()?.join(&name)
+                    || path.canonicalize()? == repo_path.canonicalize()?
+                    || self.current_branch(&path).await?.as_str() != branch_name
+                {
+                    return Err(EngineError::Other("The create command must create a linked worktree at $worktreepath on $branchname in this project.".into()));
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(error) = created {
+                self.rollback_created_worktree(repo_path, &path, &branch_name)
+                    .await;
+                return Err(error);
             }
         }
         self.inner
@@ -1348,6 +1357,40 @@ impl Repos {
             name,
             checkout_id: Some(checkout.id),
         })
+    }
+
+    /// Undo a custom create command that failed or produced the wrong result.
+    /// The folder and branch names were unused before the command ran, so
+    /// anything Git registered there belongs to this attempt. Files the
+    /// command left in a non-empty, unregistered folder are kept.
+    async fn rollback_created_worktree(&self, repo_path: &Path, path: &Path, branch_name: &str) {
+        let target = path.to_string_lossy();
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let _ = std::fs::remove_file(path);
+            }
+            Ok(metadata) if metadata.is_dir() => {
+                if self.workspace_checkout(repo_path, path).await.is_some()
+                    && path.canonicalize().ok() != repo_path.canonicalize().ok()
+                {
+                    let _ = self
+                        .git(
+                            &["worktree", "remove", "--force", "--", &target],
+                            Some(repo_path),
+                        )
+                        .await;
+                }
+                let _ = std::fs::remove_dir(path);
+            }
+            _ => {}
+        }
+        let _ = self.git(&["worktree", "prune"], Some(repo_path)).await;
+        if self.branch_exists(repo_path, branch_name).await {
+            let _ = self
+                .git(&["branch", "-D", branch_name], Some(repo_path))
+                .await;
+        }
+        let _ = self.inner.worktree_settings.forget(repo_path, path);
     }
 
     async fn branch_exists(&self, path: &Path, branch: &str) -> bool {
@@ -1480,6 +1523,20 @@ impl Repos {
         force: bool,
         delete_branch: bool,
     ) -> Result<(), EngineError> {
+        struct Removal(crate::worktree_settings::WorktreeSettingsStore, PathBuf);
+        impl Drop for Removal {
+            fn drop(&mut self) {
+                self.0.finish_removal(&self.1);
+            }
+        }
+        // Resolve before the folder disappears so the removal mark is cleared
+        // under the same canonical path it was set with.
+        let _removal = Removal(
+            self.inner.worktree_settings.clone(),
+            worktree_path
+                .canonicalize()
+                .unwrap_or_else(|_| worktree_path.into()),
+        );
         self.validate_worktree_removal(repo_path, worktree_path, force).await?;
         let ownership = self
             .inner

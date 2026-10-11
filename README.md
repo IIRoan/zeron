@@ -97,15 +97,16 @@ its changes separately. Discarding staged edits as well is an explicit **…**
 action. **Undo Discard** restores the selection while the files, branch, and
 staging still match its post-discard state. Recovery copies stay in the selected
 repository's Git directory under `zeron-discard`; each recovery directory is
-private to your user. During merge/rebase conflicts, select a file to open it or
+private to your user. Zeron keeps the 16 most recent copies for up to 7 days
+(1 GiB in total) and removes a copy once it has been undone. During merge/rebase conflicts, select a file to open it or
 accept the current/incoming version, stage the resolution, then continue or abort.
 
 Run `scripts/dev-linux.sh` to build and launch a development instance. It uses
 `target/linux-dev-data` and IPC port `27700`, independently of an installed Zeron,
 and disables automatic binary replacement. Click **Source Control** in the left
 activity bar to show changes; `Ctrl+R` also toggles the tool panel.
-On this Homebrew-equipped Linux host
-the launcher configures the native library paths automatically. See
+When Homebrew is installed at `/home/linuxbrew/.linuxbrew`, the launcher
+configures its native library paths automatically. See
 [CONTRIBUTORS.md](CONTRIBUTORS.md#setup) for system dependencies on other hosts.
 
 To incorporate a new upstream release, run `scripts/update-upstream.sh` from a

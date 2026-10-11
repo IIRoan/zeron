@@ -2120,6 +2120,9 @@ impl GitHistory {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             if let Some(toasts) = &self.notifications {
                 toasts.update(cx, |toasts, cx| toasts.error("Source Control".into(), "Repository is unavailable".into(), cx));
+            } else {
+                self.fetch_error = Some("Repository is unavailable".into());
+                cx.notify();
             }
             return;
         };
@@ -4359,6 +4362,29 @@ impl Render for GitHistory {
             .flex()
             .flex_col()
             .on_drag_move(cx.listener(Self::on_column_resize))
+            // With a notifier the failure is reported as a toast instead.
+            .when_some(
+                self.fetch_error
+                    .clone()
+                    .filter(|_| self.notifications.is_none()),
+                |element, error| {
+                    element.child(
+                        div()
+                            .h(px(28.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .px(px(8.0))
+                            .border_b_1()
+                            .border_color(theme.danger.opacity(0.16))
+                            .bg(theme.danger.opacity(0.05))
+                            .truncate()
+                            .text_size(px(11.0))
+                            .text_color(theme.danger_muted)
+                            .child(SharedString::from(format!("Fetch failed: {error}"))),
+                    )
+                },
+            )
             .when_some(
                 if self.search_active() {
                     self.search_error.clone()

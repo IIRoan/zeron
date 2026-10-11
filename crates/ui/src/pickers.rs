@@ -127,6 +127,8 @@ pub enum CheckoutPlan {
     CurrentCheckout { branch: Option<String> },
     /// Reuse the picked ref's existing worktree (a cwd override; no git).
     ReuseWorktree { path: String, branch: String },
+    /// An explicitly retained session folder, including a detached checkout.
+    ReuseCheckout { path: String, branch: Option<String> },
     /// `CreateWorktree` off `base` on send (zeron mints a `zeron/<name>`
     /// branch). `base: None` = refs never loaded — send falls back to the
     /// space folder rather than failing.
@@ -585,9 +587,19 @@ struct SettingGroup {
     choices: Vec<SettingChoice>,
 }
 
+struct ReusedCheckout {
+    space: Option<String>,
+    device: Option<String>,
+    path: String,
+    branch: Option<String>,
+}
+
 pub struct Pickers {
     state: Entity<AppState>,
     config: DraftConfig,
+    /// Fresh-chat destination pinned by "New chat in this checkout". Ref
+    /// loading must never substitute the project's main folder for this path.
+    reused_checkout: Option<ReusedCheckout>,
     /// Thread-naming binding (Settings → General): the model picker reads and
     /// emits the local device's title settings instead of a composer draft.
     /// `config.harness` then only tracks the tab being browsed.
@@ -789,6 +801,12 @@ impl Pickers {
         // the draft picks — they belonged to the previous chat/new-chat canvas.
         let state_observe = cx.observe(&state, |this: &mut Self, state, cx| {
             let selected = state.read(cx).selected_chat.clone();
+            if selected.is_none() && this.reused_checkout.as_ref().is_some_and(|checkout| {
+                checkout.space != state.read(cx).selected_space
+                    || checkout.device != state.read(cx).effective_device_id()
+            }) {
+                this.reused_checkout = None;
+            }
             if selected != this.draft_owner {
                 this.draft_owner = selected;
                 this.config.harness = None;
@@ -875,6 +893,7 @@ impl Pickers {
         let device_owner = state.read(cx).effective_device_id();
         Self {
             state,
+            reused_checkout: None,
             space_owner,
             device_owner,
             target_generation: 0,
@@ -970,6 +989,31 @@ impl Pickers {
 
     pub fn draft(&self) -> &DraftConfig {
         &self.config
+    }
+
+    pub(crate) fn reuse_checkout(
+        &mut self,
+        path: String,
+        branch: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let state = self.state.read(cx);
+        self.reused_checkout = Some(ReusedCheckout {
+            space: state.selected_space.clone(),
+            device: state.effective_device_id(),
+            path,
+            branch,
+        });
+        self.config.checkout = CheckoutKind::Local;
+        cx.notify();
+    }
+
+    pub(crate) fn clear_reused_checkout(&mut self, cx: &mut Context<Self>) {
+        if self.reused_checkout.take().is_some() {
+            self.config.branch = None;
+            self.config.checkout = CheckoutKind::Local;
+            cx.notify();
+        }
     }
 
     /// Harness is locked once the chat exists (feature-inventory §1.7).
@@ -1769,6 +1813,7 @@ impl Pickers {
         if self.state.read(cx).selected_chat_row().is_some() {
             return;
         }
+        self.reused_checkout = None;
         if row.worktree_path.is_some() {
             // Reuse the ref's existing worktree ("Current worktree") — the
             // t3code `reuseExistingWorktree` path.
@@ -1843,6 +1888,11 @@ impl Pickers {
     }
 
     fn pick_checkout(&mut self, kind: CheckoutKind, cx: &mut Context<Self>) {
+        if kind == CheckoutKind::NewWorktree
+            && let Some(checkout) = self.reused_checkout.take()
+        {
+            self.config.branch = checkout.branch;
+        }
         if kind == CheckoutKind::Local
             && self.config.checkout == CheckoutKind::NewWorktree
             && self.selected_ref_worktree().is_none()
@@ -2318,6 +2368,13 @@ impl Pickers {
 
     // ---- checkout resolution (the t3code env-mode semantics) ----
 
+    fn picked_branch(&self) -> Option<String> {
+        match &self.reused_checkout {
+            Some(checkout) => checkout.branch.clone(),
+            None => self.config.branch.clone(),
+        }
+    }
+
     /// Index of the highlighted-by-default row in the (filtered) ref list:
     /// the session's branch on an existing chat, the draft pick on a new one,
     /// else the current branch. Capped to the displayed window.
@@ -2328,7 +2385,7 @@ impl Pickers {
             .read(cx)
             .selected_chat_row()
             .and_then(|c| c.branch.clone())
-            .or_else(|| self.config.branch.clone());
+            .or_else(|| self.picked_branch());
         let index = match selected {
             Some(name) => rows.iter().position(|r| r.name == name).unwrap_or(0),
             None => rows.iter().position(|r| r.current).unwrap_or(0),
@@ -2374,6 +2431,12 @@ impl Pickers {
 
     /// The resolved on-send checkout action for a new session.
     pub fn checkout_plan(&self) -> CheckoutPlan {
+        if let Some(checkout) = &self.reused_checkout {
+            return CheckoutPlan::ReuseCheckout {
+                path: checkout.path.clone(),
+                branch: checkout.branch.clone(),
+            };
+        }
         match self.config.checkout {
             CheckoutKind::NewWorktree => CheckoutPlan::NewWorktree {
                 base: self.effective_ref_name(),
@@ -2393,6 +2456,9 @@ impl Pickers {
     /// Label of the checkout-kind trigger (t3code `resolveEnvModeLabel` /
     /// `resolveCurrentWorkspaceLabel`).
     fn checkout_label(&self) -> &'static str {
+        if self.reused_checkout.is_some() {
+            return "Same checkout";
+        }
         match self.config.checkout {
             CheckoutKind::NewWorktree => "New worktree",
             CheckoutKind::Local => {
@@ -2408,6 +2474,9 @@ impl Pickers {
     /// Label of the ref trigger: `From <ref>` only when a NEW worktree will be
     /// created off it (t3code `getBranchTriggerLabel`); the bare name otherwise.
     fn ref_label(&self) -> SharedString {
+        if let Some(checkout) = &self.reused_checkout {
+            return checkout.branch.clone().unwrap_or_else(|| "Detached checkout".into()).into();
+        }
         let name = self
             .config
             .branch
@@ -2480,24 +2549,40 @@ impl Pickers {
     }
 
     fn project_space_id(&self, key: &str, cx: &App) -> Option<String> {
+        self.project_space_ids(cx).remove(key)
+    }
+
+    /// The space each project key opens, computed for every project in one
+    /// pass so the project list does not rescan all spaces for each row.
+    fn project_space_ids(&self, cx: &App) -> HashMap<String, String> {
         let state = self.state.read(cx);
-        let member = state
-            .spaces
-            .iter()
-            .find(|s| zeron_proto::view::project_key(s) == key)?;
-        let members = state.project_members(member);
         let selected = state.selected_space_row().map(|s| s.id.as_str());
         let device = state.effective_device_id();
-        members
-            .iter()
-            .find(|s| selected == Some(s.id.as_str()))
-            .or_else(|| {
-                members
+        let mut groups = HashMap::<String, Vec<&zeron_proto::Space>>::new();
+        for space in &state.spaces {
+            groups
+                .entry(zeron_proto::view::project_key(space))
+                .or_default()
+                .push(space);
+        }
+        groups
+            .into_iter()
+            .filter_map(|(key, mut members)| {
+                if members.len() > 1 {
+                    members = state.project_members(members[0]);
+                }
+                let space = members
                     .iter()
-                    .find(|s| device.as_deref() == Some(s.device_id.as_str()))
+                    .find(|s| selected == Some(s.id.as_str()))
+                    .or_else(|| {
+                        members
+                            .iter()
+                            .find(|s| device.as_deref() == Some(s.device_id.as_str()))
+                    })
+                    .or(members.first())?;
+                Some((key, space.id.clone()))
             })
-            .or(members.first())
-            .map(|s| s.id.clone())
+            .collect()
     }
 
     /// Re-home the canvas onto another project. The state observer does the
@@ -2767,6 +2852,7 @@ impl Pickers {
     fn render_space_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).for_popup();
         let rows = self.filtered_project_rows(cx);
+        let mut settings_spaces = self.project_space_ids(cx);
         let selected = self
             .state
             .read(cx)
@@ -2799,7 +2885,7 @@ impl Pickers {
                         .gap(px(2.0))
                         .max_h(px(self.list_budget(152.0)))
                         .children(rows.into_iter().enumerate().map(|(ix, row)| {
-                            let settings_space = self.project_space_id(&row.key, cx);
+                            let settings_space = settings_spaces.remove(&row.key);
                             let settings_label = format!("Worktree settings for {}", row.name);
                             let label: SharedString = row.name.into();
                             let is_selected = selected.as_deref() == Some(row.key.as_str());
@@ -3591,7 +3677,15 @@ impl Pickers {
             .selected_space_row()
             .is_some_and(|space| space.git_detected);
         if !git {
-            return None;
+            return self.reused_checkout.as_ref().map(|checkout| {
+                workspace_footer_row()
+                    .child(Self::footer_label(crate::icons::FOLDER, "Same checkout".into(), Theme::of(cx))
+                        .id("canvas-same-checkout-folder")
+                        .tooltip(crate::settings::widgets::text_tooltip(format!(
+                            "{}\nFresh chat with the same files and environment. Choose an agent in the model picker.", checkout.path
+                        ))))
+                    .into_any_element()
+            });
         }
         self.ensure_refs(false, cx);
         let theme = Theme::of(cx).clone();
@@ -3619,7 +3713,12 @@ impl Pickers {
             &theme,
             cx,
         )
-        .debug_selector(|| "canvas-checkout-picker".into());
+        .debug_selector(|| "canvas-checkout-picker".into())
+        .when_some(self.reused_checkout.as_ref(), |chip, checkout| {
+            chip.tooltip(crate::settings::widgets::text_tooltip(format!(
+                "{}\nFresh chat with the same files, env and services. Choose an agent in the model picker.", checkout.path
+            )))
+        });
         let branch_chip = self.footer_chip(
             PickerKind::Branch,
             "picker-branch",
@@ -4021,7 +4120,7 @@ impl Pickers {
                 .into_any_element(),
             Loadable::Ready(_) => {
                 let active = self.active;
-                let selected = session_branch.or_else(|| self.config.branch.clone());
+                let selected = session_branch.or_else(|| self.picked_branch());
                 popover::menu_scroll_host("branch-list-host")
                     .on_hover(cx.listener(Self::on_menu_list_hover))
                     .child(popover::faded_menu_list(
@@ -4127,7 +4226,9 @@ impl Pickers {
     fn render_checkout_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).for_popup();
         let has_worktree = self.selected_ref_worktree().is_some();
-        let local_label: &'static str = if has_worktree {
+        let local_label: &'static str = if self.reused_checkout.is_some() {
+            "Same checkout"
+        } else if has_worktree {
             "Current worktree"
         } else {
             "Current checkout"
@@ -7313,6 +7414,80 @@ mod tests {
             current,
             worktree_path: worktree.map(str::to_string),
         }
+    }
+
+    #[gpui::test]
+    fn reused_checkout_survives_ref_loading_and_provider_changes(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.local_device_id = Some("local".into());
+            state.apply_spaces(vec![git_space("a", "remote"), git_space("b", "remote")]);
+            state.selected_space = Some("a".into());
+            state
+        });
+        let pickers = cx.new(|cx| Pickers::new(state.clone(), cx));
+        let expected = CheckoutPlan::ReuseCheckout {
+            path: "/worktrees/feature".into(),
+            branch: Some("feature".into()),
+        };
+        pickers.update(cx, |pickers, cx| {
+            pickers.reuse_checkout("/worktrees/feature".into(), Some("feature".into()), cx);
+            assert_eq!(pickers.checkout_plan(), expected);
+            // Delayed refs report the MAIN folder. The explicit path wins.
+            pickers.refs = Loadable::Ready(vec![repo_ref("main", true, None)]);
+            pickers.pick_harness(HarnessId::Codex, cx);
+            assert_eq!(pickers.resolved(cx).harness, Some(HarnessId::Codex));
+            assert_eq!(pickers.checkout_plan(), expected);
+            assert_eq!(pickers.checkout_label(), "Same checkout");
+            assert_eq!(pickers.ref_label(), SharedString::from("feature"));
+            assert!(!pickers.harness_locked(cx));
+            pickers.refs = Loadable::Ready(vec![
+                repo_ref("main", true, None),
+                repo_ref("feature", false, Some("/worktrees/feature")),
+            ]);
+            assert_eq!(pickers.selected_ref_index(cx), 1);
+            assert_eq!(pickers.picked_branch().as_deref(), Some("feature"));
+        });
+        // Visiting another conversation and returning must restore this draft's
+        // explicit checkout, just as AppState restores its project/device.
+        state.update(cx, |state, cx| {
+            state.chats = vec![
+                serde_json::from_value(serde_json::json!({
+                    "id": "existing", "deviceId": "remote", "spaceId": "b", "cwd": "/b",
+                    "archived": false, "createdAt": chrono::Utc::now()
+                }))
+                .unwrap(),
+            ];
+            state.select_chat(Some("existing".into()), cx);
+        });
+        cx.run_until_parked();
+        state.update(cx, |state, cx| state.select_chat(None, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            pickers.read_with(cx, |pickers, _| pickers.checkout_plan()),
+            expected
+        );
+        state.update(cx, |state, cx| state.select_space(Some("b".into()), cx));
+        cx.run_until_parked();
+        pickers.update(cx, |pickers, cx| {
+            assert_eq!(
+                pickers.checkout_plan(),
+                CheckoutPlan::CurrentCheckout { branch: None }
+            );
+            pickers.reuse_checkout("/worktrees/detached".into(), None, cx);
+            assert_eq!(pickers.ref_label(), SharedString::from("Detached checkout"));
+            pickers.pick_checkout(CheckoutKind::NewWorktree, cx);
+            assert!(matches!(
+                pickers.checkout_plan(),
+                CheckoutPlan::NewWorktree { .. }
+            ));
+            pickers.reuse_checkout("/worktrees/feature".into(), Some("feature".into()), cx);
+            pickers.clear_reused_checkout(cx);
+            assert_eq!(
+                pickers.checkout_plan(),
+                CheckoutPlan::CurrentCheckout { branch: None }
+            );
+        });
     }
 
     #[gpui::test]

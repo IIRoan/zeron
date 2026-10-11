@@ -43,13 +43,46 @@ impl ProjectContext {
     }
 }
 
-struct ServiceFields {
-    id: String,
-    name: Entity<ComposerInput>,
-    command: Entity<ComposerInput>,
-    directory: Entity<ComposerInput>,
-    restart: bool,
+pub(super) struct ServiceFields {
+    pub(super) id: String,
+    pub(super) name: Entity<ComposerInput>,
+    pub(super) command: Entity<ComposerInput>,
+    pub(super) directory: Entity<ComposerInput>,
+    pub(super) restart: bool,
+    pub(super) prerequisite: bool,
+    pub(super) readiness: Entity<ComposerInput>,
+    pub(super) readiness_timeout: Entity<ComposerInput>,
+    /// A suggested service the project has not saved yet. It is only saved
+    /// once the user changes it from `original`.
+    seeded: bool,
+    original: ProjectTerminalService,
     _events: Vec<Subscription>,
+}
+
+impl ServiceFields {
+    pub(super) fn service(&self, cx: &App) -> ProjectTerminalService {
+        ProjectTerminalService {
+            id: self.id.clone(),
+            name: self.name.read(cx).text().to_string(),
+            command: self.command.read(cx).text().to_string(),
+            directory: self.directory.read(cx).text().to_string(),
+            restart_on_failure: self.restart,
+            setup_prerequisite: self
+                .prerequisite
+                .then(|| zeron_proto::ProjectServiceReadiness {
+                    command: self.readiness.read(cx).text().to_string(),
+                    timeout_seconds: self.readiness_timeout.read(cx).text().trim().parse().unwrap_or(0),
+                }),
+        }
+    }
+
+    fn untouched_seed(&self, cx: &App) -> bool {
+        self.seeded && self.service(cx) == self.original
+    }
+
+    fn missing_command(&self, cx: &App) -> bool {
+        !self.untouched_seed(cx) && self.command.read(cx).text().trim().is_empty()
+    }
 }
 
 pub(super) struct Editor {
@@ -58,6 +91,51 @@ pub(super) struct Editor {
     selected: Option<String>,
     initialized: bool,
     scroll: gpui::ScrollHandle,
+    /// The services as loaded, to detect unsaved edits.
+    saved: Vec<ProjectTerminalService>,
+    /// Set by a rejected save, so empty commands are flagged only after the
+    /// user tried to save them.
+    show_missing: bool,
+}
+
+impl Editor {
+    fn new(project: ProjectContext) -> Self {
+        Self {
+            project,
+            services: Vec::new(),
+            selected: None,
+            initialized: false,
+            scroll: gpui::ScrollHandle::new(),
+            saved: Vec::new(),
+            show_missing: false,
+        }
+    }
+
+    fn config(&self, cx: &App) -> Vec<ProjectTerminalService> {
+        self.services
+            .iter()
+            .filter(|fields| !fields.untouched_seed(cx))
+            .map(|fields| fields.service(cx))
+            .collect()
+    }
+
+    fn is_dirty(&self, cx: &App) -> bool {
+        self.initialized && self.config(cx) != self.saved
+    }
+}
+
+/// Asks before an editor with unsaved edits is closed.
+pub(super) struct DiscardPrompt {
+    buttons: [FocusHandle; 2],
+    previous_focus: Option<FocusHandle>,
+    focus_pending: bool,
+    _key_interceptor: Subscription,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum UnsavedForm {
+    Services,
+    WorktreeSettings,
 }
 
 #[derive(Default)]
@@ -65,6 +143,7 @@ pub(super) struct ProjectTerminalUi {
     pub drawer: bool,
     pub mode: TerminalMode,
     pub editor: Option<Editor>,
+    pub(super) discard: Option<DiscardPrompt>,
     pub panel: Option<Entity<TerminalPanel>>,
     context: Option<ProjectContext>,
     snapshot: Option<ProjectTerminalsSnapshot>,
@@ -82,9 +161,9 @@ pub(super) struct ProjectTerminalUi {
     epoch: u64,
     error: Option<String>,
     handoff: Option<Task<()>>,
-    last_activation: Option<ProjectContext>,
+    /// Scope of the checkout services were last activated for.
+    last_activation: Option<String>,
     handoff_error: Option<String>,
-    was_active: bool,
 }
 
 impl Shell {
@@ -123,19 +202,15 @@ impl Shell {
         })
     }
 
-    /// Only foreground selection/focus changes can move services. Background
-    /// status polls and the project settings editor never claim a checkout.
+    /// Only a foreground change of the selected checkout can move services.
+    /// Refocusing the window, background status polls and the project
+    /// settings editor never claim a checkout again.
     pub(super) fn follow_project_terminal_checkout(
         &mut self,
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        let active = window.is_window_active();
-        if active && !self.project_terminals.was_active {
-            self.project_terminals.last_activation = None;
-        }
-        self.project_terminals.was_active = active;
-        if !active
+        if !window.is_window_active()
             || !matches!(self.route, Route::Chat)
             || self.project_terminals.handoff.is_some()
             || self.project_terminals.busy
@@ -145,13 +220,14 @@ impl Shell {
         let Some(context) = self.terminal_project_context(None, cx) else {
             return;
         };
-        if self.project_terminals.last_activation.as_ref() == Some(&context) {
+        let scope = context.scope();
+        if self.project_terminals.last_activation.as_ref() == Some(&scope) {
             return;
         }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        self.project_terminals.last_activation = Some(context.clone());
+        self.project_terminals.last_activation = Some(scope);
         self.project_terminals.handoff_error = None;
         self.project_terminals.poll = None;
         self.project_terminals.handoff = Some(cx.spawn(async move |this, cx| {
@@ -288,14 +364,13 @@ impl Shell {
         self.open_service_settings_context(context,cx);
     }
 
-    pub(super) fn open_service_settings_context(&mut self, context: ProjectContext, cx: &mut Context<Self>) {
-        self.project_terminals.editor = Some(Editor {
-            project: context,
-            services: Vec::new(),
-            selected: None,
-            initialized: false,
-            scroll: gpui::ScrollHandle::new(),
-        });
+    pub(super) fn open_service_settings_context(
+        &mut self,
+        context: ProjectContext,
+        cx: &mut Context<Self>,
+    ) {
+        self.project_terminals.editor = Some(Editor::new(context));
+        self.project_terminals.discard = None;
         self.project_terminals.poll = None;
         self.ensure_project_terminals(cx);
         cx.notify();
@@ -364,11 +439,14 @@ impl Shell {
                         if shell.project_terminals.epoch == epoch {
                             match result {
                                 Ok(snapshot) => {
-                                    shell.accept_project_terminal_snapshot(snapshot, cx)
+                                    shell.accept_project_terminal_snapshot(snapshot, cx);
                                 }
                                 Err(error) => {
-                                    shell.project_terminals.error = Some(error.to_string());
-                                    cx.notify();
+                                    let error = Some(error.to_string());
+                                    if shell.project_terminals.error != error {
+                                        shell.project_terminals.error = error;
+                                        cx.notify();
+                                    }
                                 }
                             }
                         }
@@ -383,18 +461,39 @@ impl Shell {
         }));
     }
 
-    fn service_fields(
+    pub(super) fn service_fields(
         &self,
         service: ProjectTerminalService,
+        seeded: bool,
         cx: &mut Context<Self>,
     ) -> ServiceFields {
+        let original = service.clone();
         let name = cx.new(|cx| ComposerInput::new("Service name", cx));
         let command = cx.new(|cx| ComposerInput::new("Command to run", cx));
         let directory = cx.new(|cx| ComposerInput::new("Directory relative to agent checkout", cx));
+        let readiness =
+            cx.new(|cx| ComposerInput::new("Command that exits 0 when the service is ready", cx));
+        let prerequisite = service.setup_prerequisite.is_some();
+        let timeout_seconds = service
+            .setup_prerequisite
+            .as_ref()
+            .map_or(120, |r| r.timeout_seconds);
+        let readiness_timeout = cx.new(|cx| ComposerInput::new("Seconds to wait for readiness", cx));
+        readiness_timeout.update(cx, |input, cx| input.set_text(timeout_seconds.to_string(), cx));
+        readiness.update(cx, |input, cx| {
+            input.set_text(
+                service
+                    .setup_prerequisite
+                    .as_ref()
+                    .map(|r| r.command.clone())
+                    .unwrap_or_default(),
+                cx,
+            )
+        });
         name.update(cx, |input, cx| input.set_text(service.name, cx));
         command.update(cx, |input, cx| input.set_text(service.command, cx));
         directory.update(cx, |input, cx| input.set_text(service.directory, cx));
-        let events = [&name, &command, &directory]
+        let events = [&name, &command, &directory, &readiness, &readiness_timeout]
             .into_iter()
             .map(|input| {
                 cx.subscribe(
@@ -409,23 +508,34 @@ impl Shell {
             command,
             directory,
             restart: service.restart_on_failure,
+            prerequisite,
+            readiness,
+            readiness_timeout,
+            seeded,
+            original,
             _events: events,
         }
     }
 
+    /// Returns whether the snapshot changed anything on screen.
     fn accept_project_terminal_snapshot(
         &mut self,
         snapshot: ProjectTerminalsSnapshot,
         cx: &mut Context<Self>,
-    ) {
-        self.project_terminals.error = None;
+    ) -> bool {
+        // Status polls repeat every second; an unchanged result must not
+        // re-render the whole shell.
+        let mut changed = self.project_terminals.error.take().is_some()
+            || self.project_terminals.snapshot.as_ref() != Some(&snapshot);
         if self
             .project_terminals
             .editor
             .as_ref()
             .is_some_and(|editor| !editor.initialized)
         {
-            let services = if snapshot.config.services.is_empty() {
+            changed = true;
+            let seeded = snapshot.config.services.is_empty();
+            let services = if seeded {
                 ["Backend", "Frontend", "Cloudflared"]
                     .into_iter()
                     .map(|name| ProjectTerminalService {
@@ -434,6 +544,7 @@ impl Shell {
                         command: String::new(),
                         directory: ".".into(),
                         restart_on_failure: false,
+                        setup_prerequisite: None,
                     })
                     .collect()
             } else {
@@ -441,16 +552,20 @@ impl Shell {
             };
             let fields = services
                 .into_iter()
-                .map(|service| self.service_fields(service, cx))
+                .map(|service| self.service_fields(service, seeded, cx))
                 .collect();
             if let Some(editor) = &mut self.project_terminals.editor {
                 editor.services = fields;
                 editor.selected = editor.services.first().map(|service| service.id.clone());
                 editor.initialized = true;
+                editor.saved = editor.config(cx);
             }
         }
         let Some(context) = self.project_terminals.context.clone() else {
-            return;
+            if changed {
+                cx.notify();
+            }
+            return changed;
         };
         let scope = context.scope();
         if let Some(panel) = self.project_terminals.panel.clone() {
@@ -466,6 +581,7 @@ impl Shell {
             for key in removed {
                 if let Some((tab, _)) = self.project_terminals.tabs.remove(&key) {
                     panel.update(cx, |panel, cx| panel.remove_service_view(&scope, tab, cx));
+                    changed = true;
                 }
             }
             for service in &snapshot.config.services {
@@ -475,6 +591,7 @@ impl Shell {
                     .tabs
                     .entry(map_key)
                     .or_insert_with(|| {
+                        changed = true;
                         let key = panel.update(cx, |panel, cx| {
                             panel.reserve_tab_for_chat(scope.clone(), service.name.clone(), cx)
                         });
@@ -516,6 +633,7 @@ impl Shell {
                         )
                     }) {
                         entry.1 = Some(id);
+                        changed = true;
                     }
                 }
             }
@@ -524,6 +642,7 @@ impl Shell {
                 .selected
                 .entry(scope.clone())
                 .or_insert_with(|| {
+                    changed = true;
                     snapshot
                         .config
                         .services
@@ -532,19 +651,24 @@ impl Shell {
                         .unwrap_or_default()
                 });
             if !snapshot.config.services.iter().any(|s| &s.id == selected) {
-                *selected = snapshot
+                let first = snapshot
                     .config
                     .services
                     .first()
                     .map(|s| s.id.clone())
                     .unwrap_or_default();
+                changed |= *selected != first;
+                *selected = first;
             }
             if let Some((tab, _)) = self.project_terminals.tabs.get(&(scope, selected.clone())) {
                 panel.update(cx, |panel, cx| panel.select_tab_by_key(*tab, cx));
             }
         }
         self.project_terminals.snapshot = Some(snapshot);
-        cx.notify();
+        if changed {
+            cx.notify();
+        }
+        changed
     }
 
     fn control_project_terminal(
@@ -612,6 +736,7 @@ impl Shell {
                                 shell.update_worktree_service_fields(context, snapshot.config.clone());
                             }
                             shell.project_terminals.editor = None;
+                            shell.project_terminals.discard = None;
                         }
                         shell.accept_project_terminal_snapshot(snapshot, cx);
                     }
@@ -629,30 +754,27 @@ impl Shell {
     }
 
     fn save_project_terminal_settings(&mut self, cx: &mut Context<Self>) {
-        let Some(editor) = &self.project_terminals.editor else {
+        let Some(editor) = &mut self.project_terminals.editor else {
             return;
         };
+        if let Some(missing) = editor
+            .services
+            .iter()
+            .find(|fields| fields.missing_command(cx))
+            .map(|fields| fields.id.clone())
+        {
+            editor.selected = Some(missing);
+            editor.show_missing = true;
+            cx.notify();
+            return;
+        }
         let config = ProjectTerminalConfig {
-            services: editor
-                .services
-                .iter()
-                .filter(|fields| !fields.command.read(cx).text().trim().is_empty())
-                .map(|fields| ProjectTerminalService {
-                    id: fields.id.clone(),
-                    name: fields.name.read(cx).text().to_string(),
-                    command: fields.command.read(cx).text().to_string(),
-                    directory: fields.directory.read(cx).text().to_string(),
-                    restart_on_failure: fields.restart,
-                })
-                .collect(),
+            services: editor.config(cx),
         };
-        self.request_project_terminals(
-            methods::SAVE_PROJECT_TERMINALS,
-            editor
-                .project
-                .params(serde_json::json!({ "config": config })),
-            cx,
-        );
+        let params = editor
+            .project
+            .params(serde_json::json!({ "config": config }));
+        self.request_project_terminals(methods::SAVE_PROJECT_TERMINALS, params, cx);
     }
 
     pub(super) fn render_terminal_toolbar(
@@ -774,17 +896,6 @@ impl Shell {
         );
         if open && mode == TerminalMode::Services {
             header = header.child(self.render_service_toolbar_actions(window, cx));
-            header = header.child(
-                service_icon_button(
-                    &theme,
-                    "services-settings".into(),
-                    icons::SETTINGS_MINIMALISTIC,
-                    "Worktree environment and services",
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.open_active_worktree_settings(cx);
-                })),
-            );
         }
         header
             .child(
@@ -829,57 +940,91 @@ impl Shell {
                 .iter()
                 .any(|service| service_is_active(service_status(s, &service.id)))
         });
-        let mut actions = div().flex_none().flex().items_center().gap(px(2.0));
         let selected = self
             .project_terminals
             .context
             .as_ref()
             .and_then(|context| self.project_terminals.selected.get(&context.scope()));
-        if let Some(service) = snapshot.and_then(|s| {
-            s.config
-                .services
-                .iter()
-                .find(|service| Some(&service.id) == selected)
-        }) {
-            let status = service_status(snapshot.unwrap(), &service.id);
-            for (action, glyph, label) in [
-                if service_is_active(status) {
-                    ("stop", icons::STOP, "Stop")
-                } else {
-                    ("start", icons::ACTION_PLAY, "Start")
-                },
-                ("restart", icons::RESTART, "Restart"),
-            ] {
-                let id = service.id.clone();
-                actions = actions.child(
-                    service_icon_button(
-                        &theme,
-                        format!("service-{action}"),
-                        glyph,
-                        format!("{label} {}", service.name),
-                    )
-                    .when(busy, |el| el.opacity(0.4).cursor_default())
-                    .when(!busy, |el| {
-                        el.on_click(cx.listener(move |this, _, _, cx| {
-                            this.control_project_terminal(Some(id.clone()), action, cx);
-                        }))
-                    }),
+        let selected_service = snapshot
+            .and_then(|snapshot| {
+                snapshot
+                    .config
+                    .services
+                    .iter()
+                    .find(|service| Some(&service.id) == selected)
+            })
+            .cloned();
+        // One split control, like the project-action pill: a direct primary
+        // action and an attached menu for restart, bulk actions and settings.
+        let mut actions = div()
+            .id("service-controls")
+            .flex_none()
+            .flex()
+            .items_center()
+            .h(px(24.0))
+            .rounded(px(7.0))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.wash(0.035));
+        if let (Some(snapshot), Some(service)) = (snapshot, selected_service.as_ref()) {
+            let status = service_status(snapshot, &service.id);
+            let (action, glyph, label) = if service_is_active(status) {
+                ("stop", icons::STOP, "Stop")
+            } else {
+                ("start", icons::ACTION_PLAY, "Start")
+            };
+            let id = service.id.clone();
+            let hint = format!("{label} {}", service.name);
+            actions = actions
+                .child(
+                    popover::btn_ghost(&theme, "", format!("service-{action}"))
+                        .id(SharedString::from(format!("service-{action}")))
+                        .h(px(22.0))
+                        .px(px(7.0))
+                        .py_0()
+                        .rounded(px(0.0))
+                        .rounded_l(px(6.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap(px(5.0))
+                        .text_size(px(11.5))
+                        .role(gpui::Role::Button)
+                        .aria_label(hint.clone())
+                        .tooltip(crate::settings::widgets::text_tooltip(hint))
+                        .child(icon(glyph).size(px(13.0)).text_color(theme.text_muted))
+                        .child(label)
+                        .when(busy, |el| el.opacity(0.4).cursor_default())
+                        .when(!busy, |el| {
+                            el.on_click(cx.listener(move |this, _, _, cx| {
+                                this.control_project_terminal(Some(id.clone()), action, cx);
+                            }))
+                        }),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(1.0))
+                        .h(px(14.0))
+                        .bg(theme.text.opacity(0.14)),
                 );
-            }
         }
         let mut more = popover::btn_ghost(&theme, "", "project-services-more")
             .id("services-more")
-            .size(px(24.0))
+            .size(px(22.0))
             .p_0()
+            .rounded(px(0.0))
+            .rounded_r(px(6.0))
+            .when(selected_service.is_none(), |el| el.rounded_l(px(6.0)))
             .flex_none()
             .relative()
             .flex()
             .items_center()
             .justify_center()
             .role(gpui::Role::Button)
-            .aria_label("All service actions")
+            .aria_label("Service actions")
             .tooltip(crate::settings::widgets::text_tooltip(
-                "All service actions",
+                "Service actions and settings",
             ))
             .on_mouse_down(
                 MouseButton::Left,
@@ -925,6 +1070,37 @@ impl Shell {
                 )
                 .on_click(|_, _, cx| cx.stop_propagation());
             let closing = self.project_terminals.actions_menu.is_closing();
+            if let Some(service) = &selected_service {
+                let id = service.id.clone();
+                let label = format!("Restart {}", service.name);
+                menu = menu
+                    .child(
+                        popover::menu_row(&popup_theme, false, "services-menu-restart-selected")
+                            .id("service-restart")
+                            .role(gpui::Role::Button)
+                            .aria_label(label.clone())
+                            .child(
+                                icon(icons::RESTART)
+                                    .size(px(14.0))
+                                    .text_color(popup_theme.text_muted),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(SharedString::from(label)),
+                            )
+                            .when(busy || closing, |el| el.opacity(0.4).cursor_default())
+                            .when(!busy && !closing, |el| {
+                                el.on_click(cx.listener(move |this, _, _, cx| {
+                                    this.close_project_terminal_actions(cx);
+                                    this.control_project_terminal(Some(id.clone()), "restart", cx);
+                                }))
+                            }),
+                    )
+                    .child(popover::menu_separator());
+            }
             for (label, action, glyph, enabled) in [
                 (
                     "Start all services",
@@ -962,6 +1138,62 @@ impl Shell {
                         }),
                 );
             }
+            if snapshot.is_some_and(|s| s.config.services.iter().any(|s| s.setup_prerequisite.is_some())) {
+                let worktree_running = snapshot.is_some_and(|s| s.config.services.iter()
+                    .any(|service| service.setup_prerequisite.is_none() && service_is_active(service_status(s, &service.id))));
+                menu = menu.child(popover::menu_row(&popup_theme, false, "services-menu-stop-worktree")
+                    .id("services-stop-worktree").role(gpui::Role::Button)
+                    .aria_label("Stop worktree services")
+                    .child(icon(icons::STOP).size(px(14.0)).text_color(popup_theme.text_muted))
+                    .child("Stop worktree services")
+                    .when(busy || closing || !worktree_running, |el| el.opacity(0.4).cursor_default())
+                    .when(!busy && !closing && worktree_running, |el| el.on_click(cx.listener(|this, _, _, cx| {
+                        this.close_project_terminal_actions(cx);
+                        this.control_project_terminal(None, "stop-worktree", cx);
+                    }))));
+            }
+            menu = menu
+                .child(popover::menu_separator())
+                .child(
+                    popover::menu_row(&popup_theme, false, "services-menu-edit")
+                        .id("services-edit")
+                        .role(gpui::Role::Button)
+                        .aria_label("Edit services")
+                        .child(
+                            icon(icons::SETTINGS_MINIMALISTIC)
+                                .size(px(14.0))
+                                .text_color(popup_theme.text_muted),
+                        )
+                        .child("Edit services…")
+                        .when(closing, |el| el.opacity(0.4).cursor_default())
+                        .when(!closing, |el| {
+                            el.on_click(cx.listener(|this, _, _, cx| {
+                                this.close_project_terminal_actions(cx);
+                                if let Some(context) = this.terminal_project_context(None, cx) {
+                                    this.open_project_terminal_settings(context.space, cx);
+                                }
+                            }))
+                        }),
+                )
+                .child(
+                    popover::menu_row(&popup_theme, false, "services-menu-worktree-settings")
+                        .id("services-worktree-settings")
+                        .role(gpui::Role::Button)
+                        .aria_label("Worktree settings")
+                        .child(
+                            icon(icons::FOLDER)
+                                .size(px(14.0))
+                                .text_color(popup_theme.text_muted),
+                        )
+                        .child("Worktree settings…")
+                        .when(closing, |el| el.opacity(0.4).cursor_default())
+                        .when(!closing, |el| {
+                            el.on_click(cx.listener(|this, _, _, cx| {
+                                this.close_project_terminal_actions(cx);
+                                this.open_active_worktree_settings(cx);
+                            }))
+                        }),
+                );
             let viewport = window.viewport_size();
             more = more.child(popover::contained_menu(
                 "project-service-actions-popup".into(),
@@ -1292,6 +1524,7 @@ impl Shell {
         for service in &editor.services {
             let id = service.id.clone();
             let active = selected.is_some_and(|selected| selected.id == id);
+            let missing = editor.show_missing && service.missing_command(cx);
             let name = service.name.read(cx).text().trim().to_string();
             let key = format!("{}-service-settings-tab-{id}", cx.entity_id());
             let progress = motion::state_t(&key, active, motion::TAB_SLIDE, self.reduced_motion);
@@ -1306,7 +1539,13 @@ impl Shell {
                     .py(px(8.0))
                     .rounded(px(7.0))
                     .text_size(px(12.0))
-                    .text_color(if active { theme.text } else { theme.text_muted })
+                    .text_color(if missing {
+                        theme.danger
+                    } else if active {
+                        theme.text
+                    } else {
+                        theme.text_muted
+                    })
                     .bg(motion::hover_blend(
                         &key,
                         theme.wash(0.08).opacity(progress),
@@ -1364,7 +1603,9 @@ impl Shell {
                             command: String::new(),
                             directory: ".".into(),
                             restart_on_failure: false,
+                            setup_prerequisite: None,
                         },
+                        false,
                         cx,
                     );
                     if let Some(editor) = &mut this.project_terminals.editor {
@@ -1396,9 +1637,25 @@ impl Shell {
             .track_scroll(&editor.scroll)
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation());
         if let Some(service) = selected {
+            if service.prerequisite {
+                let space = editor.project.space.clone();
+                let can_open = !editor.is_dirty(cx) && !busy;
+                fields = fields.child(popover::dialog_title(&theme, "Databases"))
+                    .child(popover::dialog_body(&theme, "Database startup and readiness are configured together with the worktree setup workflow."))
+                    .child(popover::btn_ghost(&theme, "Open Worktree settings", "database-worktree-settings")
+                        .id("database-worktree-settings")
+                        .when(!can_open, |button| button.opacity(0.4).cursor_default()
+                            .tooltip(crate::settings::widgets::text_tooltip("Save or cancel your service edits first.")))
+                        .when(can_open, |button| button.on_click(cx.listener(move |this, _, _, cx| {
+                            this.project_terminals.editor = None;
+                            this.show_project_database_settings(space.clone(), cx);
+                        }))));
+            } else {
             let id = service.id.clone();
             let restart_id = id.clone();
             let restart = service.restart;
+            let prerequisite = service.prerequisite;
+            let missing = editor.show_missing && service.missing_command(cx);
             fields = fields
                 .child(
                     div()
@@ -1448,8 +1705,18 @@ impl Shell {
                             .child(service.command.clone())
                             .into_any_element(),
                     )
-                    .font_family(theme.font_mono.clone()),
+                    .font_family(theme.font_mono.clone())
+                    .when(missing, |field| field.border_color(theme.danger)),
                 )
+                .when(missing, |fields| {
+                    fields.child(
+                        div()
+                            .mt(px(5.0))
+                            .text_size(px(11.0))
+                            .text_color(theme.danger)
+                            .child("Command required"),
+                    )
+                })
                 .child(field_label(&theme, "Run in folder"))
                 .child(
                     terminal_setting_field(&theme, service.directory.clone().into_any_element())
@@ -1460,7 +1727,7 @@ impl Shell {
                         .mt(px(5.0))
                         .text_size(px(11.0))
                         .text_color(theme.text_faint)
-                        .child("Relative to the active checkout. Use . for the checkout root."),
+                        .child(if prerequisite { "Relative to the main project folder; shared across worktrees." } else { "Relative to the active checkout. Use . for the checkout root." }),
                 )
                 .child(
                     div()
@@ -1514,6 +1781,7 @@ impl Shell {
                             )),
                         ),
                 );
+            }
         } else {
             fields = fields.child(popover::dialog_body(
                 &theme,
@@ -1561,9 +1829,8 @@ impl Shell {
                     icons::CLOSE,
                     "Close service settings",
                 )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.project_terminals.editor = None;
-                    cx.notify();
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.request_close_form(UnsavedForm::Services, window, cx);
                 })),
             );
         let mut footer = div()
@@ -1603,9 +1870,8 @@ impl Shell {
                     .child(
                         popover::btn_ghost(&theme, "Cancel", "cancel-project-services")
                             .id("cancel-project-services")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.project_terminals.editor = None;
-                                cx.notify();
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.request_close_form(UnsavedForm::Services, window, cx);
                             })),
                     )
                     .child(
@@ -1647,6 +1913,213 @@ impl Shell {
             viewport,
             card.into_any_element(),
         ))
+    }
+
+    fn discard_prompt(&self, form: UnsavedForm) -> Option<&DiscardPrompt> {
+        match form {
+            UnsavedForm::Services => self.project_terminals.discard.as_ref(),
+            UnsavedForm::WorktreeSettings => self.worktree_settings.discard.as_ref(),
+        }
+    }
+
+    fn discard_prompt_slot(&mut self, form: UnsavedForm) -> &mut Option<DiscardPrompt> {
+        match form {
+            UnsavedForm::Services => &mut self.project_terminals.discard,
+            UnsavedForm::WorktreeSettings => &mut self.worktree_settings.discard,
+        }
+    }
+
+    fn unsaved_form_dirty(&self, form: UnsavedForm, cx: &App) -> bool {
+        match form {
+            UnsavedForm::Services => self
+                .project_terminals
+                .editor
+                .as_ref()
+                .is_some_and(|editor| editor.is_dirty(cx)),
+            UnsavedForm::WorktreeSettings => self.worktree_settings_dirty(cx),
+        }
+    }
+
+    /// Close an editor, or ask first when it holds unsaved edits.
+    pub(super) fn request_close_form(
+        &mut self,
+        form: UnsavedForm,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.unsaved_form_dirty(form, cx) {
+            self.discard_form(form, window, cx);
+            return;
+        }
+        if self.discard_prompt_slot(form).is_none() {
+            let shell = cx.weak_entity();
+            let owner = window.window_handle();
+            let interceptor = cx.intercept_keystrokes(move |event, window, cx| {
+                if window.window_handle() != owner {
+                    return;
+                }
+                let _ = shell.update(cx, |shell, cx| {
+                    if shell.capture_discard_prompt_key(form, &event.keystroke, window, cx) {
+                        cx.stop_propagation();
+                    }
+                });
+            });
+            let buttons = std::array::from_fn(|_| cx.focus_handle().tab_stop(true));
+            let previous_focus = window.focused(cx);
+            window.focus(&buttons[0], cx);
+            *self.discard_prompt_slot(form) = Some(DiscardPrompt {
+                buttons,
+                previous_focus,
+                focus_pending: true,
+                _key_interceptor: interceptor,
+            });
+        }
+        cx.notify();
+    }
+
+    pub(super) fn discard_form(
+        &mut self,
+        form: UnsavedForm,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.discard_prompt_slot(form).take().is_some() {
+            window.focus(&self.shortcut_focus, cx);
+        }
+        match form {
+            UnsavedForm::Services => self.project_terminals.editor = None,
+            UnsavedForm::WorktreeSettings => self.close_worktree_settings(cx),
+        }
+        cx.notify();
+    }
+
+    /// Dismiss the discard prompt and return to the editor. Returns whether
+    /// a prompt was open.
+    pub(super) fn keep_editing(
+        &mut self,
+        form: UnsavedForm,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(prompt) = self.discard_prompt_slot(form).take() else {
+            return false;
+        };
+        if let Some(focus) = prompt.previous_focus {
+            window.focus(&focus, cx);
+        }
+        cx.notify();
+        true
+    }
+
+    fn capture_discard_prompt_key(
+        &mut self,
+        form: UnsavedForm,
+        key: &gpui::Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(prompt) = self.discard_prompt(form) else {
+            return false;
+        };
+        let active = prompt
+            .buttons
+            .iter()
+            .position(|button| button.is_focused(window))
+            .unwrap_or(0);
+        let plain = !key.modifiers.control && !key.modifiers.alt && !key.modifiers.platform;
+        let discard = match key.key.as_str() {
+            "tab" if plain => {
+                window.focus(&prompt.buttons[(active + 1) % 2], cx);
+                None
+            }
+            "escape" => Some(false),
+            "enter" | "space" if plain => Some(active == 1),
+            _ => None,
+        };
+        if let Some(discard) = discard {
+            let identity = prompt.buttons[0].clone();
+            let shell = cx.weak_entity();
+            // Keep the capture guard mounted until this dispatch finishes.
+            window.defer(cx, move |window, cx| {
+                let _ = shell.update(cx, |shell, cx| {
+                    if shell
+                        .discard_prompt(form)
+                        .is_some_and(|prompt| prompt.buttons[0] == identity)
+                    {
+                        if discard {
+                            shell.discard_form(form, window, cx);
+                        } else {
+                            shell.keep_editing(form, window, cx);
+                        }
+                    }
+                });
+            });
+        }
+        true
+    }
+
+    pub(super) fn render_discard_prompt(
+        &mut self,
+        form: UnsavedForm,
+        viewport: gpui::Size<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let prompt = self.discard_prompt_slot(form).as_mut()?;
+        if std::mem::take(&mut prompt.focus_pending) {
+            window.focus(&prompt.buttons[0], cx);
+        }
+        let prompt = self.discard_prompt(form)?;
+        let theme = Theme::of(cx).for_popup();
+        let (id, body) = match form {
+            UnsavedForm::Services => (
+                "discard-project-services",
+                "Your edits to these services have not been saved.",
+            ),
+            UnsavedForm::WorktreeSettings => (
+                "discard-worktree-settings",
+                "Your edits to these project settings have not been saved.",
+            ),
+        };
+        let card = popover::dialog_card(&theme)
+            .id(SharedString::from(format!("{id}-card")))
+            .role(gpui::Role::Dialog)
+            .aria_label("Discard unsaved changes?")
+            .w(px(400.0).min(viewport.width - px(32.0)))
+            .child(popover::dialog_title(&theme, "Discard unsaved changes?"))
+            .child(div().mt(px(6.0)).child(popover::dialog_body(&theme, body)))
+            .child(
+                div()
+                    .mt(px(20.0))
+                    .flex()
+                    .justify_end()
+                    .gap(px(8.0))
+                    .child(
+                        popover::btn_ghost(&theme, "Keep editing", format!("{id}-keep"))
+                            .id(SharedString::from(format!("{id}-keep")))
+                            .role(gpui::Role::Button)
+                            .track_focus(&prompt.buttons[0])
+                            .border_1()
+                            .border_color(gpui::transparent_black())
+                            .focus_visible(|style| style.border_color(theme.text_muted))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.keep_editing(form, window, cx);
+                            })),
+                    )
+                    .child(
+                        popover::btn_danger(&theme, "Discard changes")
+                            .id(SharedString::from(format!("{id}-confirm")))
+                            .role(gpui::Role::Button)
+                            .track_focus(&prompt.buttons[1])
+                            .border_1()
+                            .border_color(gpui::transparent_black())
+                            .focus_visible(|style| style.border_color(theme.text_muted))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.discard_form(form, window, cx)
+                            })),
+                    ),
+            );
+        Some(popover::modal(id, viewport, card.into_any_element()))
     }
 }
 
@@ -1693,7 +2166,11 @@ fn service_tooltip(
     service: &ProjectTerminalService,
 ) -> String {
     let status = service_status(snapshot, &service.id);
-    let checkout = snapshot.checkout.as_deref().unwrap_or(&context.cwd);
+    let checkout = if service.setup_prerequisite.is_some() {
+        &context.cwd
+    } else {
+        snapshot.checkout.as_deref().unwrap_or(&context.cwd)
+    };
     format!(
         "{} · {}\n{}\nCommand: {}\nFolder: {}\nCheckout: {}",
         service.name,
@@ -1742,7 +2219,7 @@ fn status_label(status: Status) -> &'static str {
 
 fn action_label(action: &str) -> &'static str {
     match action {
-        "stop" => "Stopping",
+        "stop" | "stop-worktree" => "Stopping",
         "restart" => "Restarting",
         _ => "Starting",
     }
@@ -1849,6 +2326,7 @@ mod tests {
             command: "sleep 600".into(),
             directory: ".".into(),
             restart_on_failure: false,
+            setup_prerequisite: None,
         };
         let run = |id: &str, status| zeron_proto::ProjectTerminalRun {
             service_id: id.into(),
@@ -1952,6 +2430,39 @@ mod tests {
     }
 
     #[gpui::test]
+    fn service_editor_preserves_and_edits_startup_readiness(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let shell = test_shell(cx, dir.path());
+        shell
+            .update(cx, |shell, _, cx| {
+                let service = ProjectTerminalService {
+                    id: "databases".into(),
+                    name: "Databases".into(),
+                    command: "bun run start-db".into(),
+                    directory: ".".into(),
+                    restart_on_failure: false,
+                    setup_prerequisite: Some(zeron_proto::ProjectServiceReadiness {
+                        command: "check-database".into(),
+                        timeout_seconds: 75,
+                    }),
+                };
+                let mut fields = shell.service_fields(service.clone(), false, cx);
+                assert_eq!(fields.service(cx), service);
+                fields.readiness.update(cx, |input, cx| {
+                    input.set_text("check-database-and-redis", cx)
+                });
+                let changed = fields.service(cx).setup_prerequisite.unwrap();
+                assert_eq!(changed.command, "check-database-and-redis");
+                assert_eq!(changed.timeout_seconds, 75);
+                fields.readiness_timeout.update(cx, |input, cx| input.set_text("240", cx));
+                assert_eq!(fields.service(cx).setup_prerequisite.unwrap().timeout_seconds, 240);
+                fields.prerequisite = false;
+                assert!(fields.service(cx).setup_prerequisite.is_none());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn status_polling_cannot_replace_unsaved_service_settings(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let shell = test_shell(cx, dir.path());
@@ -1967,13 +2478,7 @@ mod tests {
                     checkout_override: None,
                 };
                 shell.project_terminals.context = Some(project.clone());
-                shell.project_terminals.editor = Some(Editor {
-                    project,
-                    services: Vec::new(),
-                    selected: None,
-                    initialized: false,
-                    scroll: gpui::ScrollHandle::new(),
-                });
+                shell.project_terminals.editor = Some(Editor::new(project));
                 let snapshot = ProjectTerminalsSnapshot {
                     checkout: None,
                     config: ProjectTerminalConfig {
@@ -1983,6 +2488,7 @@ mod tests {
                             command: "bun dev".into(),
                             directory: ".".into(),
                             restart_on_failure: false,
+                            setup_prerequisite: None,
                         }],
                     },
                     runs: Vec::new(),
@@ -2000,6 +2506,61 @@ mod tests {
             })
             .unwrap();
     }
+    #[gpui::test]
+    fn fresh_chat_keeps_checkout_and_shared_service_scope(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+        });
+        let shell = test_shell(cx, dir.path());
+        shell.update(cx, |shell, _, cx| {
+        shell.state.update(cx, |state, cx| {
+            state.local_device_id = Some("local".into());
+            state.spaces = ["project", "other"].into_iter().map(|id| {
+                serde_json::from_value(serde_json::json!({
+                    "id": id, "deviceId": "remote", "path": format!("/{id}"),
+                    "gitDetected": true, "createdAt": Utc::now()
+                })).unwrap()
+            }).collect();
+            state.chats = ["claude", "codex"].into_iter().map(|id| {
+                serde_json::from_value(serde_json::json!({
+                    "id": id, "deviceId": "remote", "spaceId": "project", "cwd": "/worktrees/shared",
+                    "branch": "feature", "archived": false, "createdAt": Utc::now(),
+                    "harnessSessionId": "old-provider-session",
+                    "config": { "harness": "claude-code", "sandbox": "workspace-write" }
+                })).unwrap()
+            }).collect();
+            state.select_chat(Some("claude".into()), cx);
+        });
+        let before = shell.terminal_project_context(None, cx).unwrap();
+        shell.settings.space_filter = Some("other".into());
+        shell.new_chat_in_current_checkout(cx);
+        let state = shell.state.read(cx);
+        assert!(state.selected_chat.is_none());
+        assert!(state.transcript.is_empty());
+        assert_eq!(state.selected_space.as_deref(), Some("project"));
+        assert_eq!(state.effective_device_id().as_deref(), Some("remote"));
+        assert_eq!(state.chats.len(), 2);
+        assert!(!shell.session_workspace_visible(cx));
+        assert!(shell.terminal_project_context(None, cx).is_none());
+        assert_eq!(shell.composer.read(cx).pickers().read(cx).checkout_plan(), crate::pickers::CheckoutPlan::ReuseCheckout {
+            path: "/worktrees/shared".into(), branch: Some("feature".into())
+        });
+        shell.state.update(cx, |state, cx| state.select_chat(Some("codex".into()), cx));
+        let after = shell.terminal_project_context(None, cx).unwrap();
+        assert_eq!(before.scope(), after.scope(), "changing agents in one checkout must reuse its services");
+        assert_ne!(before.chat, after.chat);
+    }).unwrap();
+        cx.run_until_parked();
+    }
+
     #[gpui::test]
     fn new_canvas_hides_session_chrome_and_does_not_activate_project_services(
         cx: &mut TestAppContext,
@@ -2160,6 +2721,233 @@ mod tests {
             assert_eq!(shell_panel.read(cx).tab_summaries(cx), shell_tabs);
             assert!(shell.right_terminal.is_none());
         }).unwrap();
+    }
+
+    fn test_project(dir: &std::path::Path) -> ProjectContext {
+        ProjectContext {
+            space: "project".into(),
+            device: "local".into(),
+            name: "Project".into(),
+            target: None,
+            chat: None,
+            cwd: dir.to_string_lossy().into_owned(),
+            checkout_override: None,
+        }
+    }
+
+    fn empty_snapshot() -> ProjectTerminalsSnapshot {
+        ProjectTerminalsSnapshot {
+            checkout: None,
+            config: ProjectTerminalConfig {
+                services: Vec::new(),
+            },
+            runs: Vec::new(),
+        }
+    }
+
+    struct PromptHost {
+        shell: Entity<Shell>,
+        _observer: Subscription,
+    }
+
+    impl Render for PromptHost {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.shell.update(cx, |shell, cx| {
+                let modal = shell.render_discard_prompt(
+                    UnsavedForm::Services,
+                    window.viewport_size(),
+                    window,
+                    cx,
+                );
+                div()
+                    .size_full()
+                    .track_focus(&shell.shortcut_focus)
+                    .capture_key_down(cx.listener(Shell::on_key_down_capture))
+                    .on_action(|_: &SaveFile, _, _| {
+                        panic!("background save bypassed unsaved-settings prompt")
+                    })
+                    .children(modal)
+            })
+        }
+    }
+
+    #[gpui::test]
+    fn unsaved_settings_prompt_traps_shortcuts_and_keyboard_focus(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let shell_window = test_shell(cx, dir.path());
+        let shell = shell_window.update(cx, |_, _, cx| cx.entity()).unwrap();
+        cx.update(|cx| cx.bind_keys([gpui::KeyBinding::new("ctrl-s", SaveFile, None)]));
+        let (host, cx) = cx.add_window_view(|window, cx| {
+            shell.update(cx, |shell, cx| {
+                let project = test_project(dir.path());
+                shell.project_terminals.context = Some(project.clone());
+                shell.project_terminals.editor = Some(Editor::new(project));
+                shell.accept_project_terminal_snapshot(empty_snapshot(), cx);
+                shell.project_terminals.editor.as_ref().unwrap().services[0]
+                    .command
+                    .update(cx, |input, cx| input.set_text("run dev", cx));
+                shell.request_close_form(UnsavedForm::Services, window, cx);
+            });
+            PromptHost {
+                _observer: cx.observe(&shell, |_, _, cx| cx.notify()),
+                shell,
+            }
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        cx.simulate_keystrokes("ctrl-s");
+        for (keys, button) in [("tab", 1), ("tab", 0), ("shift-tab", 1)] {
+            cx.simulate_keystrokes(keys);
+            cx.update(|window, cx| {
+                assert!(
+                    host.read(cx)
+                        .shell
+                        .read(cx)
+                        .project_terminals
+                        .discard
+                        .as_ref()
+                        .unwrap()
+                        .buttons[button]
+                        .is_focused(window)
+                );
+            });
+        }
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        host.read_with(cx, |host, cx| {
+            let shell = host.shell.read(cx);
+            assert!(shell.project_terminals.discard.is_none());
+            assert!(shell.project_terminals.editor.is_some());
+        });
+    }
+
+    #[test]
+    fn session_workspace_gating_applies_only_on_linux() {
+        for (chat_route, chat_selected) in [(false, false), (true, false), (false, true)] {
+            assert!(session_workspace_visible_on(
+                false,
+                chat_route,
+                chat_selected
+            ));
+            assert!(!session_workspace_visible_on(
+                true,
+                chat_route,
+                chat_selected
+            ));
+        }
+        assert!(session_workspace_visible_on(true, true, true));
+    }
+
+    #[gpui::test]
+    fn shell_terminal_toggle_closes_an_open_services_drawer(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let shell = test_shell(cx, dir.path());
+        shell
+            .update(cx, |shell, window, cx| {
+                shell.state.update(cx, |state, _| {
+                    state.local_device_id = Some("local".into());
+                    state.spaces = vec![
+                        serde_json::from_value(serde_json::json!({
+                            "id": "project", "deviceId": "local", "path": dir.path(),
+                            "createdAt": Utc::now()
+                        }))
+                        .unwrap(),
+                    ];
+                    state.selected_space = Some("project".into());
+                    state.selected_chat = Some("session".into());
+                    state.chats = vec![
+                        serde_json::from_value(serde_json::json!({
+                            "id": "session", "deviceId": "local", "spaceId": "project",
+                            "cwd": dir.path(), "createdAt": Utc::now(), "archived": false
+                        }))
+                        .unwrap(),
+                    ];
+                });
+                shell.select_terminal_mode(TerminalMode::Services, cx);
+                assert!(shell.project_terminals.drawer);
+                assert!(shell.terminal_open(cx));
+                shell.toggle_shell_terminal(window, cx);
+                assert!(!shell.project_terminals.drawer);
+                assert!(!shell.terminal_open(cx));
+                assert!(!shell.panels.get(&shell.panel_key(cx)).terminal_open);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn services_editor_skips_untouched_suggestions_and_requires_commands(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let shell = test_shell(cx, dir.path());
+        shell
+            .update(cx, |shell, window, cx| {
+                let project = test_project(dir.path());
+                shell.project_terminals.context = Some(project.clone());
+                shell.project_terminals.editor = Some(Editor::new(project.clone()));
+                shell.accept_project_terminal_snapshot(empty_snapshot(), cx);
+                let editor = shell.project_terminals.editor.as_ref().unwrap();
+                assert_eq!(editor.services.len(), 3, "a new project suggests services");
+                assert!(
+                    editor.config(cx).is_empty(),
+                    "untouched suggestions are not saved"
+                );
+                assert!(!editor.is_dirty(cx));
+                shell.request_close_form(UnsavedForm::Services, window, cx);
+                assert!(shell.project_terminals.editor.is_none());
+                assert!(shell.project_terminals.discard.is_none());
+
+                shell.project_terminals.editor = Some(Editor::new(project));
+                shell.accept_project_terminal_snapshot(empty_snapshot(), cx);
+                let editor = shell.project_terminals.editor.as_ref().unwrap();
+                let frontend = editor.services[1].id.clone();
+                editor.services[1]
+                    .name
+                    .update(cx, |input, cx| input.set_text("Web", cx));
+                assert!(editor.is_dirty(cx));
+                shell.save_project_terminal_settings(cx);
+                let editor = shell.project_terminals.editor.as_ref().unwrap();
+                assert!(
+                    editor.show_missing,
+                    "an edited service without a command is flagged"
+                );
+                assert_eq!(editor.selected.as_deref(), Some(frontend.as_str()));
+                assert!(
+                    !shell.project_terminals.busy,
+                    "the save request is not sent"
+                );
+
+                shell.request_close_form(UnsavedForm::Services, window, cx);
+                assert!(shell.project_terminals.discard.is_some());
+                assert!(shell.project_terminals.editor.is_some());
+                assert!(shell.capture_escape_surface(window, cx));
+                assert!(shell.project_terminals.discard.is_none());
+                assert!(
+                    shell.project_terminals.editor.is_some(),
+                    "Escape keeps editing"
+                );
+                shell.request_close_form(UnsavedForm::Services, window, cx);
+                shell.discard_form(UnsavedForm::Services, window, cx);
+                assert!(shell.project_terminals.discard.is_none());
+                assert!(shell.project_terminals.editor.is_none());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn unchanged_status_polls_do_not_rerender(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let shell = test_shell(cx, dir.path());
+        shell
+            .update(cx, |shell, _, cx| {
+                shell.project_terminals.context = Some(test_project(dir.path()));
+                assert!(shell.accept_project_terminal_snapshot(empty_snapshot(), cx));
+                assert!(!shell.accept_project_terminal_snapshot(empty_snapshot(), cx));
+                shell.project_terminals.error = Some("Temporary status error".into());
+                assert!(
+                    shell.accept_project_terminal_snapshot(empty_snapshot(), cx),
+                    "clearing a poll error is a visible change"
+                );
+                assert!(shell.project_terminals.error.is_none());
+            })
+            .unwrap();
     }
 
     #[gpui::test]

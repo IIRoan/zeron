@@ -39,12 +39,33 @@ async fn pause(cx: &mut AsyncApp, ms: u64) {
         .await;
 }
 
+/// Screenshots are evidence, not part of the fixture's behavior: a missing
+/// capture backend is reported and the command loop continues.
+fn capture(path: &Path) {
+    if let Err(error) = screenshot(path) {
+        eprintln!("Skipping screenshot {}: {error}", path.display());
+    }
+}
+
+/// `ZERON_FIXTURE_SCREENSHOTS` selects `niri`, `x11` or `off`. By default
+/// niri is used when its socket is present, otherwise the X11 display.
 #[cfg(target_os = "linux")]
 fn screenshot(path: &Path) -> anyhow::Result<()> {
-    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+    let backend = std::env::var("ZERON_FIXTURE_SCREENSHOTS").unwrap_or_default();
+    if backend == "off" {
+        return Ok(());
+    }
+    let niri = match backend.as_str() {
+        "niri" => true,
+        "x11" => false,
+        "" => std::env::var_os("NIRI_SOCKET").is_some(),
+        other => anyhow::bail!("Unknown ZERON_FIXTURE_SCREENSHOTS backend {other:?}"),
+    };
+    if niri {
         let output = std::process::Command::new("niri")
             .args(["msg", "-j", "windows"])
             .output()?;
+        anyhow::ensure!(output.status.success(), "niri could not list windows");
         let windows: serde_json::Value = serde_json::from_slice(&output.stdout)?;
         let window = windows
             .as_array()
@@ -75,6 +96,10 @@ fn screenshot(path: &Path) -> anyhow::Result<()> {
         anyhow::ensure!(status.success(), "Window screenshot failed");
         return Ok(());
     }
+    anyhow::ensure!(
+        std::env::var_os("DISPLAY").is_some(),
+        "No niri session or X11 display is available"
+    );
     use x11rb::{
         connection::Connection,
         protocol::xproto::{ConnectionExt, ImageFormat},
@@ -97,7 +122,7 @@ fn screenshot(path: &Path) -> anyhow::Result<()> {
         pixels.len() == screen.width_in_pixels as usize * screen.height_in_pixels as usize * 4,
         "Expected 32-bit X11 pixels"
     );
-    for pixel in pixels.chunks_exact_mut(4) {
+    for pixel in pixels.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
         pixel[3] = 255;
     }
@@ -112,6 +137,22 @@ fn screenshot(path: &Path) -> anyhow::Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Every Git process here, including the engine's, must ignore the
+    // developer's global and system config (hooks, signing, aliases, default
+    // branch) so the fixture behaves the same on every machine.
+    // SAFETY: no other threads have started yet.
+    unsafe {
+        std::env::set_var("GIT_CONFIG_GLOBAL", "/dev/null");
+        std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
+        for (name, value) in [
+            ("GIT_AUTHOR_NAME", "Fixture"),
+            ("GIT_AUTHOR_EMAIL", "fixture@example.com"),
+            ("GIT_COMMITTER_NAME", "Fixture"),
+            ("GIT_COMMITTER_EMAIL", "fixture@example.com"),
+        ] {
+            std::env::set_var(name, value);
+        }
+    }
     tracing_subscriber::fmt().with_env_filter("warn").init();
     let output = PathBuf::from(std::env::args().nth(1).expect("output directory"));
     std::fs::create_dir_all(&output)?;
@@ -253,6 +294,7 @@ fn main() -> anyhow::Result<()> {
                         name: name.into(),
                         directory: directory.into(),
                         restart_on_failure: false,
+                        setup_prerequisite: None,
                         command: format!("printf '%s\\n' '{name} fixture ready'; exec sleep 600"),
                     },
                 )
@@ -332,7 +374,7 @@ fn main() -> anyhow::Result<()> {
             pause(cx, 1500).await;
             window.update(cx, |view, window, cx| view.fixture_open_source_control(window, cx)).unwrap();
             pause(cx, 2500).await;
-            screenshot(&output.join("initial.png")).unwrap();
+            capture(&output.join("initial.png"));
             std::fs::write(output.join("ready"), "ready").unwrap();
             let mut frame_timings = gpui::profiler::FrameTimingCollector::new();
             loop {
@@ -385,7 +427,7 @@ fn main() -> anyhow::Result<()> {
                             let modifiers = gpui::Modifiers { shift: command["shift"].as_bool().unwrap_or(false), control: command["control"].as_bool().unwrap_or(false), ..Default::default() };
                             w.dispatch_event(gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent { position, modifiers, ..Default::default() }), cx);
                             w.dispatch_event(gpui::PlatformInput::MouseDown(gpui::MouseDownEvent { position, modifiers, button: if action == "right-click" { gpui::MouseButton::Right } else { gpui::MouseButton::Left }, click_count: 1, ..Default::default() }), cx);
-                            w.dispatch_event(gpui::PlatformInput::MouseUp(gpui::MouseUpEvent { position, modifiers, button: if action == "right-click" { gpui::MouseButton::Right } else { gpui::MouseButton::Left }, click_count: 1, ..Default::default() }), cx);
+                            w.dispatch_event(gpui::PlatformInput::MouseUp(gpui::MouseUpEvent { position, modifiers, button: if action == "right-click" { gpui::MouseButton::Right } else { gpui::MouseButton::Left }, click_count: 1 }), cx);
                         }
                         "scroll" => {
                             let position = gpui::point(px(command["x"].as_f64().unwrap() as f32), px(command["y"].as_f64().unwrap() as f32));
@@ -427,7 +469,7 @@ fn main() -> anyhow::Result<()> {
                 let services = window.update(cx, |view, _, cx| view.fixture_project_terminal_state(cx)).unwrap();
                 std::fs::write(output.join(format!("{name}-services.json")), serde_json::to_vec_pretty(&services).unwrap()).unwrap();
                 if command["screenshot"].as_bool().unwrap_or(true) {
-                    screenshot(&output.join(format!("{name}.png"))).unwrap();
+                    capture(&output.join(format!("{name}.png")));
                 }
                 let workbench = window.update(cx, |s, _, cx| s.fixture_workbench_state(cx)).unwrap();
                 let frame_ms: Vec<_> = frame_timings.collect_unseen().iter().map(|frame| frame.draw_duration().as_secs_f64() * 1000.0).collect();

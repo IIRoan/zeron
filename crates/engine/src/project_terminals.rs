@@ -17,6 +17,7 @@ use crate::{EngineError, Terminals};
 
 const MAX_SERVICES: usize = 12;
 const MAX_RESTARTS: u32 = 3;
+const RESTART_BUDGET_RESET: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -70,12 +71,31 @@ impl ProjectTerminals {
     pub fn open(directory: &Path) -> Result<Self, EngineError> {
         let path = directory.join("project-terminals.json");
         let mut projects: BTreeMap<String, Project> = match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
-                EngineError::Other(format!("Invalid project terminal profiles: {e}"))
-            })?,
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(projects) => projects,
+                Err(error) => {
+                    // A damaged file must not keep the engine from starting.
+                    // Set it aside for recovery rather than overwriting it.
+                    let aside = path.with_file_name(format!(
+                        "project-terminals.json.invalid-{}",
+                        chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ")
+                    ));
+                    std::fs::rename(&path, &aside)?;
+                    tracing::warn!(%error, preserved = %aside.display(), "project terminal profiles were unreadable; starting with none");
+                    BTreeMap::new()
+                }
+            },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
             Err(e) => return Err(e.into()),
         };
+        // Worktree service groups outlive folders deleted outside Zeron.
+        projects.retain(|_, project| {
+            project.parent.is_none()
+                || project
+                    .checkout
+                    .as_deref()
+                    .is_some_and(|checkout| Path::new(checkout).is_dir())
+        });
         for project in projects.values_mut() {
             for run in &mut project.runs {
                 if matches!(run.status, Status::Running | Status::Restarting) {
@@ -345,6 +365,8 @@ impl ProjectTerminals {
         directory: PathBuf,
     ) -> Result<(), EngineError> {
         let key = (space.to_string(), service.id.clone());
+        // The first lookup can wait for the user's shell; never under `live`.
+        warm_login_path();
         let mut live = self.inner.live.lock().unwrap_or_else(|e| e.into_inner());
         if live.contains_key(&key) {
             return Ok(());
@@ -432,13 +454,30 @@ impl ProjectTerminals {
     }
 
     fn stop(&self, space: &str, service: &str) -> Result<(), EngineError> {
-        let mut live = self.inner.live.lock().unwrap_or_else(|e| e.into_inner());
-        let key = (space.into(), service.into());
-        if let Some(run) = live.get(&key) {
-            run.token.cancel();
-            run.terminals.close_service_and_wait(&run.terminal_id)?;
+        let key: (String, String) = (space.into(), service.into());
+        // Cancelling under the lock keeps the supervisor from restarting the
+        // process. The wait happens without it, so other services can still
+        // start, exit and stop during the grace period.
+        let run = {
+            let mut live = self.inner.live.lock().unwrap_or_else(|e| e.into_inner());
+            let run = live.remove(&key);
+            if let Some(run) = &run {
+                run.token.cancel();
+            }
+            run
+        };
+        if let Some(run) = run
+            && let Err(error) = run.terminals.close_service_and_wait(&run.terminal_id)
+        {
+            // Keep the process registered so Stop can retry.
+            self.inner
+                .live
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(key)
+                .or_insert(run);
+            return Err(error);
         }
-        live.remove(&key);
         let mut projects = self
             .inner
             .projects
@@ -497,11 +536,17 @@ impl ProjectTerminals {
             .keys()
             .cloned()
             .collect::<Vec<_>>();
-        for (space, service) in keys {
-            if let Err(error) = self.stop(&space, &service) {
-                tracing::warn!(%error, "could not stop project service during shutdown");
+        // Each stop can take the full SIGTERM grace period; overlap them so
+        // shutdown waits for the slowest service, not the sum of all of them.
+        std::thread::scope(|scope| {
+            for (space, service) in &keys {
+                scope.spawn(move || {
+                    if let Err(error) = self.stop(space, service) {
+                        tracing::warn!(%error, "could not stop project service during shutdown");
+                    }
+                });
             }
-        }
+        });
     }
 
     fn group_key(space: &str, checkout: &Path) -> Result<String, EngineError> {
@@ -522,10 +567,36 @@ impl ProjectTerminals {
         settings: &zeron_proto::WorktreeSettings,
     ) -> Result<ProjectTerminalsSnapshot, EngineError> {
         let mut snapshot = self.snapshot(&Self::group_key(space, checkout)?, root)?;
+        let defaults = self.snapshot(space, root)?;
         snapshot.config = settings
             .services
             .clone()
-            .unwrap_or(self.snapshot(space, root)?.config);
+            .unwrap_or(defaults.config.clone());
+        snapshot.config.services
+            .retain(|service| service.setup_prerequisite.is_none());
+        snapshot.runs.retain(|run| {
+            snapshot
+                .config
+                .services
+                .iter()
+                .any(|service| service.id == run.service_id)
+        });
+        for service in defaults
+            .config
+            .services
+            .into_iter()
+            .filter(|service| service.setup_prerequisite.is_some())
+            .rev()
+        {
+            snapshot.config.services.insert(0, service.clone());
+            if let Some(run) = defaults
+                .runs
+                .iter()
+                .find(|run| run.service_id == service.id)
+            {
+                snapshot.runs.push(run.clone());
+            }
+        }
         snapshot.checkout = Some(canonical_root(checkout)?);
         Ok(snapshot)
     }
@@ -535,9 +606,12 @@ impl ProjectTerminals {
         space: &str,
         root: &Path,
         checkout: &Path,
-        config: ProjectTerminalConfig,
+        mut config: ProjectTerminalConfig,
     ) -> Result<(), EngineError> {
         let key = Self::group_key(space, checkout)?;
+        config
+            .services
+            .retain(|service| service.setup_prerequisite.is_none());
         self.save(&key, root, config)?;
         let mut projects = self
             .inner
@@ -580,7 +654,15 @@ impl ProjectTerminals {
                 self.save(
                     &id,
                     root,
-                    settings.services.unwrap_or_else(|| config.clone()),
+                    ProjectTerminalConfig {
+                        services: settings
+                            .services
+                            .unwrap_or_else(|| config.clone())
+                            .services
+                            .into_iter()
+                            .filter(|service| service.setup_prerequisite.is_none())
+                            .collect(),
+                    },
                 )?;
             }
         }
@@ -642,6 +724,24 @@ impl ProjectTerminals {
         let root = root.to_path_buf();
         let checkout = checkout.map(Path::to_path_buf);
         tokio::task::spawn_blocking(move || {
+            if checkout.is_some()
+                && let Some(services) = settings.as_ref().and_then(|s| s.services.as_ref())
+            {
+                let defaults = this.snapshot(&space, &root)?.config;
+                let shared = |config: &ProjectTerminalConfig| {
+                    config
+                        .services
+                        .iter()
+                        .filter(|s| s.setup_prerequisite.is_some())
+                        .cloned()
+                        .collect::<Vec<_>>()
+                };
+                if shared(services) != shared(&defaults) {
+                    return Err(EngineError::Other(
+                        "Shared startup services must be edited in Project defaults.".into(),
+                    ));
+                }
+            }
             environments.save(&root, checkout.as_deref(), settings)?;
             let config = this.snapshot(&space, &root)?.config;
             if let Some(cwd) = checkout {
@@ -661,8 +761,168 @@ impl ProjectTerminals {
         .map_err(|e| EngineError::Other(e.to_string()))?
     }
 
+    pub(crate) fn has_setup_services(&self, root: &Path) -> Result<bool, EngineError> {
+        let root = canonical_root(root)?;
+        Ok(self
+            .inner
+            .projects
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(|p| {
+                p.root == root
+                    && p.parent.is_none()
+                    && p.config
+                        .services
+                        .iter()
+                        .any(|s| s.setup_prerequisite.is_some())
+            }))
+    }
+
+    /// Infrastructure belongs to the project's main folder, outside checkout
+    /// handoffs. Status polling never calls this method.
+    pub(crate) async fn ensure_setup_services(
+        &self,
+        terminals: &Terminals,
+        root: &Path,
+        settings: &zeron_proto::WorktreeSettings,
+        log: &Path,
+        token: &CancellationToken,
+    ) -> Result<(), EngineError> {
+        let source = canonical_root(root)?;
+        let services = {
+            let projects = self
+                .inner
+                .projects
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            projects
+                .iter()
+                .filter(|(_, p)| p.root == source && p.parent.is_none())
+                .flat_map(|(space, p)| {
+                    p.config
+                        .services
+                        .iter()
+                        .filter(|s| s.setup_prerequisite.is_some())
+                        .cloned()
+                        .map(|s| (space.clone(), s))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        for (space, service) in services {
+            if token.is_cancelled() {
+                return Err(EngineError::Other("Worktree setup was cancelled.".into()));
+            }
+            {
+                let mut projects = self
+                    .inner
+                    .projects
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some(project) = projects.get_mut(&space) {
+                    project.environment = settings.variables.clone().into_iter().collect();
+                }
+            }
+            let this = self.clone();
+            let terminals = terminals.clone();
+            let root_path = root.to_path_buf();
+            let id = service.id.clone();
+            let owner = space.clone();
+            tokio::task::spawn_blocking(move || {
+                this.control_in_checkout(
+                    &terminals,
+                    &owner,
+                    &root_path,
+                    Some(&root_path),
+                    Some(&id),
+                    "start",
+                )
+            })
+            .await
+            .map_err(|e| EngineError::Other(e.to_string()))??;
+            let readiness = service.setup_prerequisite.as_ref().unwrap();
+            let deadline =
+                tokio::time::Instant::now() + Duration::from_secs(readiness.timeout_seconds);
+            loop {
+                if token.is_cancelled() {
+                    return Err(EngineError::Other("Worktree setup was cancelled.".into()));
+                }
+                let snapshot = self.snapshot(&space, root)?;
+                if !snapshot
+                    .config
+                    .services
+                    .iter()
+                    .any(|saved| saved == &service)
+                {
+                    return Err(EngineError::Other(
+                        "Project services changed during startup.".into(),
+                    ));
+                }
+                let run = snapshot
+                    .runs
+                    .iter()
+                    .find(|run| run.service_id == service.id)
+                    .ok_or_else(|| {
+                        EngineError::Other(format!(
+                            "{} was removed while waiting for readiness.",
+                            service.name
+                        ))
+                    })?;
+                if !matches!(
+                    run.status,
+                    Status::Running | Status::Restarting | Status::Exited
+                ) || (run.status == Status::Exited && run.exit_code != Some(0))
+                {
+                    return Err(EngineError::Other(format!(
+                        "{} stopped before it was ready. Open its service output for details.",
+                        service.name
+                    )));
+                }
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(EngineError::Other(format!(
+                        "{} was not ready after {} seconds. Open its service and setup output for details.",
+                        service.name, readiness.timeout_seconds
+                    )));
+                }
+                let mut check_settings = settings.clone();
+                check_settings.command_timeout_seconds = remaining.as_secs().clamp(1, 5);
+                if crate::worktree_settings::commands::run(
+                    root,
+                    root,
+                    &check_settings,
+                    &readiness.command,
+                    log,
+                    token,
+                    true,
+                )
+                .await
+                .is_ok()
+                {
+                    // A successful check must not hide an exited or stopped
+                    // infrastructure process (for example a stale ready file).
+                    let after = self.snapshot(&space, root)?;
+                    if after.runs.iter().any(|r| {
+                        r.service_id == service.id
+                            && (r.status == Status::Running
+                                || (r.status == Status::Exited && r.exit_code == Some(0)))
+                    }) {
+                        break;
+                    }
+                }
+                tokio::select! {
+                    _ = token.cancelled() => return Err(EngineError::Other("Worktree setup was cancelled.".into())),
+                    _ = tokio::time::sleep_until((tokio::time::Instant::now() + Duration::from_millis(250)).min(deadline)) => {},
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// All windows serialize a project's handoff. Parallel groups are keyed by
     /// the physical checkout: two conversations in one worktree reuse its PTYs.
+    #[allow(clippy::too_many_arguments)]
     pub async fn control_checkout(
         &self,
         terminals: &Terminals,
@@ -673,6 +933,11 @@ impl ProjectTerminals {
         service_id: Option<&str>,
         action: &str,
     ) -> Result<ProjectTerminalsSnapshot, EngineError> {
+        let worktree_only = action == "stop-worktree";
+        if worktree_only && service_id.is_some() {
+            return Err(EngineError::Other("Stop worktree services does not take a service id.".into()));
+        }
+        let action = if worktree_only { "stop" } else { action };
         if !matches!(action, "start" | "stop" | "restart" | "activate") {
             return Err(EngineError::Other("Unknown terminal action".into()));
         }
@@ -686,10 +951,58 @@ impl ProjectTerminals {
             .clone();
         let _guard = operation.lock().await;
         let settings = environments.effective(root, checkout)?;
-        let config = settings
+        let config = self
+            .checkout_snapshot(space, root, checkout, &settings)?
+            .config;
+        let shared: HashSet<_> = config
             .services
-            .clone()
-            .unwrap_or(self.snapshot(space, root)?.config);
+            .iter()
+            .filter(|s| s.setup_prerequisite.is_some())
+            .map(|s| s.id.clone())
+            .collect();
+        if action != "activate" && service_id.is_some_and(|id| shared.contains(id)) {
+            let this = self.clone();
+            let startup_terminals = terminals.clone();
+            let owner = space.to_string();
+            let source = root.to_path_buf();
+            let id = service_id.map(str::to_string);
+            let operation = action.to_string();
+            tokio::task::spawn_blocking(move || {
+                this.control_in_checkout(
+                    &startup_terminals,
+                    &owner,
+                    &source,
+                    Some(&source),
+                    id.as_deref(),
+                    &operation,
+                )
+            })
+            .await
+            .map_err(|e| EngineError::Other(e.to_string()))??;
+            if action != "stop" {
+                let log = self.readiness_log(root)?;
+                self.ensure_setup_services(
+                    terminals,
+                    root,
+                    &environments.defaults(root)?,
+                    &log,
+                    &CancellationToken::new(),
+                )
+                .await?;
+            }
+            return self.checkout_snapshot(space, root, checkout, &settings);
+        }
+        if !worktree_only && !shared.is_empty() && action == "stop" && service_id.is_none() {
+            let this = self.clone();
+            let terminals = terminals.clone();
+            let owner = space.to_string();
+            let source = root.to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                this.control_in_checkout(&terminals, &owner, &source, None, None, "stop")
+            })
+            .await
+            .map_err(|e| EngineError::Other(e.to_string()))??;
+        }
         let key = Self::group_key(space, checkout)?;
         let mut restart = HashSet::new();
         let needs_prepare = !environments.is_prepared(root, checkout)?;
@@ -717,6 +1030,7 @@ impl ProjectTerminals {
                         p.runs
                             .iter()
                             .filter(|r| matches!(r.status, Status::Running | Status::Restarting))
+                            .filter(|r| !shared.contains(&r.service_id))
                             .map(|r| r.service_id.clone())
                             .collect::<Vec<_>>(),
                     )
@@ -730,7 +1044,17 @@ impl ProjectTerminals {
                 let root = root.to_path_buf();
                 let terminals = terminals.clone();
                 tokio::task::spawn_blocking(move || {
-                    this.control_in_checkout(&terminals, &group, &root, None, None, "stop")
+                    for id in services {
+                        this.control_in_checkout(
+                            &terminals,
+                            &group,
+                            &root,
+                            None,
+                            Some(&id),
+                            "stop",
+                        )?;
+                    }
+                    Ok::<_, EngineError>(())
                 })
                 .await
                 .map_err(|e| EngineError::Other(e.to_string()))??;
@@ -749,13 +1073,27 @@ impl ProjectTerminals {
             self.write(&projects)?;
         }
         if action != "stop" {
+            if !shared.is_empty()
+                && root.canonicalize()? == checkout.canonicalize()?
+            {
+                let log = self.readiness_log(root)?;
+                self.ensure_setup_services(
+                    terminals,
+                    root,
+                    &environments.defaults(root)?,
+                    &log,
+                    &CancellationToken::new(),
+                )
+                .await?;
+            }
             environments.activate(root, checkout).await?;
         }
         if action != "stop" {
             // Validate the entire handoff before starting any replacement process.
             for service in config.services.iter().filter(|s| {
-                restart.contains(&s.id)
-                    || (action != "activate" && service_id.is_none_or(|id| id == s.id))
+                s.setup_prerequisite.is_none()
+                    && (restart.contains(&s.id)
+                        || (action != "activate" && service_id.is_none_or(|id| id == s.id)))
             }) {
                 service_directory(checkout, &service.directory)?;
             }
@@ -784,8 +1122,8 @@ impl ProjectTerminals {
         }
         let this = self.clone();
         let terminals = terminals.clone();
-        let root = root.to_path_buf();
-        let checkout = checkout.to_path_buf();
+        let source = root.to_path_buf();
+        let destination = checkout.to_path_buf();
         let key = key.clone();
         let service = service_id.map(str::to_string);
         let action = action.to_string();
@@ -794,18 +1132,39 @@ impl ProjectTerminals {
                 "No saved terminal services selected".into(),
             ));
         }
+        if !config
+            .services
+            .iter()
+            .any(|s| s.setup_prerequisite.is_none())
+            && service_id.is_none()
+        {
+            return self.checkout_snapshot(space, root, checkout, &settings);
+        }
         tokio::task::spawn_blocking(move || {
             this.control_in_checkout(
                 &terminals,
                 &key,
-                &root,
-                Some(&checkout),
+                &source,
+                Some(&destination),
                 service.as_deref(),
                 &action,
             )
         })
         .await
-        .map_err(|e| EngineError::Other(e.to_string()))?
+        .map_err(|e| EngineError::Other(e.to_string()))??;
+        self.checkout_snapshot(space, root, checkout, &settings)
+    }
+
+    fn readiness_log(&self, root: &Path) -> Result<PathBuf, EngineError> {
+        use sha2::{Digest, Sha256};
+        let hash = format!("{:x}", Sha256::digest(canonical_root(root)?.as_bytes()));
+        Ok(self
+            .inner
+            .path
+            .parent()
+            .unwrap()
+            .join("service-readiness")
+            .join(format!("{hash}.log")))
     }
 
     pub async fn prepare_checkout(
@@ -858,6 +1217,7 @@ impl ProjectTerminals {
                         id.clone(),
                         p.runs
                             .iter()
+                            .filter(|run| !p.config.services.iter().any(|s| s.id == run.service_id && s.setup_prerequisite.is_some()))
                             .map(|r| r.service_id.clone())
                             .collect::<Vec<_>>(),
                     )
@@ -890,6 +1250,7 @@ async fn supervise(
 ) {
     let mut restarts = 0;
     loop {
+        let started = std::time::Instant::now();
         let mut stream = match terminals.subscribe(&session.id, None) {
             Ok(stream) => stream,
             Err(_) => return,
@@ -904,6 +1265,11 @@ async fn supervise(
                 }
             }
         };
+        // The limit stops crash loops. A service that stayed up for a while
+        // before failing gets its full budget again.
+        if started.elapsed() >= RESTART_BUDGET_RESET {
+            restarts = 0;
+        }
         let Some(inner) = weak.upgrade() else { return };
         let store = ProjectTerminals { inner };
         // Serialize exit/restart with Stop and Start. A cancelled old watcher
@@ -951,47 +1317,72 @@ async fn supervise(
         }
         let Some(inner) = weak.upgrade() else { return };
         let store = ProjectTerminals { inner };
-        let mut live = store.inner.live.lock().unwrap_or_else(|e| e.into_inner());
-        if token.is_cancelled() {
-            return;
-        }
-        let _ = terminals.close(&session.id);
         restarts += 1;
-        match terminals.open_service(&directory.to_string_lossy(), &environment, &service.command) {
-            Ok(next) => {
-                session = next;
-                if let Some(run) = live.get_mut(&key) {
-                    run.terminal_id = session.id.clone();
+        let failed = session.clone();
+        let respawn = {
+            let terminals = terminals.clone();
+            let key = key.clone();
+            let directory = directory.clone();
+            let environment = environment.clone();
+            let command = service.command.clone();
+            let token = token.clone();
+            // Spawning a shell blocks; keep it off the async workers.
+            tokio::task::spawn_blocking(move || {
+                warm_login_path();
+                let mut live = store.inner.live.lock().unwrap_or_else(|e| e.into_inner());
+                if token.is_cancelled() {
+                    return None;
                 }
-                store.update(
-                    &key.0,
-                    ProjectTerminalRun {
-                        service_id: key.1.clone(),
-                        status: Status::Running,
-                        exit_code: None,
-                        restarts,
-                        message: None,
-                        terminal: Some(session.clone()),
-                    },
-                );
-            }
-            Err(error) => {
-                live.remove(&key);
-                store.update(
-                    &key.0,
-                    ProjectTerminalRun {
-                        service_id: key.1.clone(),
-                        status: Status::Failed,
-                        exit_code: None,
-                        restarts,
-                        message: Some(error.to_string()),
-                        terminal: None,
-                    },
-                );
-                return;
-            }
+                match terminals.open_service(&directory.to_string_lossy(), &environment, &command) {
+                    Ok(next) => {
+                        let _ = terminals.close(&failed.id);
+                        if let Some(run) = live.get_mut(&key) {
+                            run.terminal_id = next.id.clone();
+                        }
+                        store.update(
+                            &key.0,
+                            ProjectTerminalRun {
+                                service_id: key.1.clone(),
+                                status: Status::Running,
+                                exit_code: None,
+                                restarts,
+                                message: None,
+                                terminal: Some(next.clone()),
+                            },
+                        );
+                        Some(next)
+                    }
+                    Err(error) => {
+                        live.remove(&key);
+                        // Keep the failed run's terminal so its output explains
+                        // the failure.
+                        store.update(
+                            &key.0,
+                            ProjectTerminalRun {
+                                service_id: key.1.clone(),
+                                status: Status::Failed,
+                                exit_code: Some(code),
+                                restarts,
+                                message: Some(error.to_string()),
+                                terminal: Some(failed),
+                            },
+                        );
+                        None
+                    }
+                }
+            })
+        };
+        match respawn.await {
+            Ok(Some(next)) => session = next,
+            _ => return,
         }
     }
+}
+
+/// Resolve the cached login-shell PATH before taking `live`, so the first
+/// service start never waits for the user's shell while holding the registry.
+fn warm_login_path() {
+    let _ = zeron_harness::composed_login_shell_path();
 }
 
 fn canonical_root(root: &Path) -> Result<String, EngineError> {
@@ -1025,6 +1416,17 @@ pub fn normalize_config(
     let mut ids = HashSet::new();
     let mut names = HashSet::new();
     for service in &mut config.services {
+        if let Some(readiness) = &mut service.setup_prerequisite {
+            readiness.command = readiness.command.trim().to_string();
+            if readiness.command.is_empty()
+                || readiness.command.len() > 16 * 1024
+                || readiness.command.contains('\0')
+                || !(1..=zeron_proto::MAX_WORKTREE_COMMAND_TIMEOUT_SECONDS)
+                    .contains(&readiness.timeout_seconds)
+            {
+                return Err(EngineError::Other("Startup services need a readiness command and a timeout between 1 and 7200 seconds.".into()));
+            }
+        }
         service.name = service.name.trim().to_string();
         service.command = service.command.trim().to_string();
         service.directory = service.directory.trim().to_string();

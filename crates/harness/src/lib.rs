@@ -315,10 +315,31 @@ pub fn compose_login_shell_path(cmd: &mut tokio::process::Command) {
     compose_path(cmd.as_std_mut(), std::iter::empty());
 }
 
-/// PATH for child launchers that do not use `std::process::Command`, including
-/// PTYs. Keep inherited directories first and add the interactive login PATH.
+/// PATH for PTYs and project services. The interactive login PATH comes first,
+/// so a version manager's `node`/`python` wins over a system copy exactly as
+/// in the user's own terminal; directories only the app inherited follow.
 pub fn composed_login_shell_path() -> Option<std::ffi::OsString> {
-    composed_path(std::iter::empty())
+    login_shell_first_path(
+        std::env::var_os("PATH").as_deref(),
+        shell_env::login_shell_path(),
+    )
+}
+
+fn login_shell_first_path(
+    inherited: Option<&std::ffi::OsStr>,
+    login_shell: Option<&std::ffi::OsStr>,
+) -> Option<std::ffi::OsString> {
+    let mut seen = std::collections::HashSet::new();
+    let paths: Vec<std::path::PathBuf> = login_shell
+        .into_iter()
+        .chain(inherited)
+        .flat_map(std::env::split_paths)
+        .filter(|p| !p.as_os_str().is_empty() && seen.insert(p.clone()))
+        .collect();
+    if paths.is_empty() {
+        return None;
+    }
+    std::env::join_paths(paths).ok()
 }
 
 /// Compose the child's PATH: the resolved executable's directory first, then
@@ -625,6 +646,26 @@ pub fn supports_titles(id: HarnessId) -> bool {
         id,
         HarnessId::Codex | HarnessId::ClaudeCode | HarnessId::Mock
     )
+}
+
+#[cfg(all(test, unix))]
+mod compose_tests {
+    use std::ffi::OsStr;
+
+    #[test]
+    fn composed_terminal_path_puts_login_shell_entries_first_and_keeps_app_only_dirs() {
+        let joined = super::login_shell_first_path(
+            Some(OsStr::new("/usr/bin:/app/only:/bin")),
+            Some(OsStr::new("/home/u/.nvm/bin:/usr/bin::/bin")),
+        )
+        .unwrap();
+        assert_eq!(joined, "/home/u/.nvm/bin:/usr/bin:/bin:/app/only");
+        assert_eq!(
+            super::login_shell_first_path(Some(OsStr::new("/usr/bin")), None).unwrap(),
+            "/usr/bin"
+        );
+        assert!(super::login_shell_first_path(None, None).is_none());
+    }
 }
 
 #[cfg(test)]

@@ -7,10 +7,26 @@ pub struct ProjectTerminalService {
     pub id: String,
     pub name: String,
     pub command: String,
-    /// Relative to the active session's checkout, including the main checkout.
+    /// Relative to the active checkout, or the main folder for startup services.
     pub directory: String,
     #[serde(default)]
     pub restart_on_failure: bool,
+    /// Shared project infrastructure started before checkout preparation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_prerequisite: Option<ProjectServiceReadiness>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectServiceReadiness {
+    /// Retried in the main project folder until it exits successfully.
+    pub command: String,
+    #[serde(default = "default_readiness_timeout")]
+    pub timeout_seconds: u64,
+}
+
+fn default_readiness_timeout() -> u64 {
+    120
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,7 +57,7 @@ pub struct ProjectTerminalRun {
     pub terminal: Option<crate::TerminalSession>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectTerminalsSnapshot {
     pub config: ProjectTerminalConfig,

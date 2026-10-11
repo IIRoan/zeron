@@ -40,6 +40,7 @@ impl EnterPress {
 #[derive(Clone, Debug, PartialEq)]
 enum Entry {
     NewChat,
+    NewChatSameCheckout,
     NewProject,
     Settings,
     ReleaseNotes,
@@ -51,6 +52,7 @@ impl Entry {
     fn action(&self) -> Option<(&'static str, &'static str)> {
         match self {
             Self::NewChat => Some(("New chat", icons::PEN_NEW_SQUARE)),
+            Self::NewChatSameCheckout => Some(("New chat in this checkout", icons::PEN_NEW_SQUARE)),
             Self::NewProject => Some(("New project", icons::FOLDER)),
             Self::Settings => Some(("Open settings", icons::SETTINGS)),
             Self::ReleaseNotes => Some(("View release notes", icons::DOCUMENT)),
@@ -171,6 +173,14 @@ impl Shell {
             actions_for(&query, Theme::of(cx).appearance.is_dark())
         };
         let state = self.state.read(cx);
+        if !palette.chats_only
+            && let Some(chat) = state.selected_chat_row()
+            && !state.worktree_setup_pending(&chat.id)
+            && (chat.cwd.is_some() || state.space_for_chat(chat).is_some())
+            && matches_query(&query, "New chat in this checkout")
+        {
+            entries.insert(usize::from(entries.first() == Some(&Entry::NewChat)), Entry::NewChatSameCheckout);
+        }
         // Global history deliberately ignores the sidebar's project filter and
         // collapsed groups. Archived conversations remain searchable too.
         // Like the sidebar, only list top-level sessions, not side chats or MCP workers.
@@ -242,6 +252,7 @@ impl Shell {
         self.close_command_palette(window, cx);
         match entry {
             Entry::NewChat => self.open_new_session(None, cx),
+            Entry::NewChatSameCheckout => self.new_chat_in_current_checkout(cx),
             Entry::NewProject => self.open_add_space(cx),
             Entry::Settings => self.open_last_settings(cx),
             Entry::ReleaseNotes => crate::release_notes::show(cx),

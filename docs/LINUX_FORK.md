@@ -56,9 +56,12 @@ Open **Actions → Update Linux fork from upstream → Run workflow**, select
 push trigger. It runs the same updater command on a temporary branch and provides
 a Git bundle artifact only after the Linux checks and build pass. Apply its
 checked result locally with the one command printed in the run summary:
-`scripts/update-upstream.sh --from-run RUN_ID`. It never pushes or merges directly
-to `main` on GitHub. If already up to date, it exits without creating an artifact.
-Conflicts and failed checks produce diagnostic artifacts for manual repair.
+`scripts/update-upstream.sh --from-run RUN_ID`. Without local commits since the
+run started, this fast-forwards to the checked merge; otherwise it merges the
+checked result with your newer work. Both paths rerun the Linux checks locally.
+The Action never pushes or merges directly to `main` on GitHub. If already up to
+date, it exits without creating an artifact. Conflicts and failed checks produce
+diagnostic artifacts for manual repair.
 
 Review the local result, push with `git push origin main`, and restart with
 `scripts/dev-linux.sh`. The Action needs no additional secret or write deploy
@@ -72,9 +75,10 @@ scheduled SDK updates in your fork.
 
 **Linux fork tests** runs on relevant pushes to `main` and pull requests, and
 can also be started manually. It runs the native Linux core and UI suites
-directly, and builds the desktop. It uses
-read-only repository permissions and has no publishing step. New commits cancel
-older runs for the same branch. Documentation-only changes skip the builds.
+directly, including the fork's worktree, service and terminal integration tests
+and the syntax highlighting and theme tests, and builds the desktop. It uses read-only repository permissions and has no
+publishing step. New commits cancel older runs for the same branch.
+Documentation-only changes skip the builds.
 
 Both the manual Action and the Linux check command validate workflow isolation.
 If a future merge introduces an unguarded upstream job, the checks fail before

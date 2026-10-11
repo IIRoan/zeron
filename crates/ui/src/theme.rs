@@ -463,10 +463,14 @@ impl SyntaxPalette {
                 .map(model_color)
                 .unwrap_or(fallback)
         };
+        // Storage keywords and rainbow brackets are opt-in refinements: a theme
+        // that doesn't name them keeps its own keyword and punctuation colors.
+        let keyword = color("keyword", fallback.keyword);
+        let punctuation = color("punctuation", fallback.punctuation);
         Self {
             comment: color("comment", fallback.comment),
-            keyword: color("keyword", fallback.keyword),
-            keyword_storage: color("keywordStorage", fallback.keyword_storage),
+            keyword,
+            keyword_storage: color("keywordStorage", keyword),
             string: color("string", fallback.string),
             string_special: color("stringSpecial", fallback.string_special),
             escape: color("escape", fallback.escape),
@@ -484,10 +488,10 @@ impl SyntaxPalette {
             variable_special: color("variableSpecial", fallback.variable_special),
             parameter: color("parameter", fallback.parameter),
             operator: color("operator", fallback.operator),
-            punctuation: color("punctuation", fallback.punctuation),
-            bracket1: color("bracket1", fallback.bracket1),
-            bracket2: color("bracket2", fallback.bracket2),
-            bracket3: color("bracket3", fallback.bracket3),
+            punctuation,
+            bracket1: color("bracket1", punctuation),
+            bracket2: color("bracket2", punctuation),
+            bracket3: color("bracket3", punctuation),
             tag: color("tag", fallback.tag),
             attribute: color("attribute", fallback.attribute),
             label: color("label", fallback.label),
@@ -511,7 +515,7 @@ impl SyntaxPalette {
         Self {
             comment,
             keyword: indigo,
-            keyword_storage: model_color(ModelColor::rgb(86, 156, 214)),
+            keyword_storage: indigo,
             string: emerald,
             string_special: pink,
             escape: pink,
@@ -530,9 +534,9 @@ impl SyntaxPalette {
             parameter: text,
             operator: text,
             punctuation: text,
-            bracket1: model_color(ModelColor::rgb(255, 215, 0)),
-            bracket2: model_color(ModelColor::rgb(218, 112, 214)),
-            bracket3: model_color(ModelColor::rgb(23, 159, 255)),
+            bracket1: text,
+            bracket2: text,
+            bracket3: text,
             tag: pink,
             attribute: amber,
             label: amber,
@@ -556,7 +560,7 @@ impl SyntaxPalette {
         Self {
             comment,
             keyword: indigo,
-            keyword_storage: model_color(ModelColor::rgb(0, 0, 255)),
+            keyword_storage: indigo,
             string: emerald,
             string_special: pink,
             escape: pink,
@@ -575,9 +579,9 @@ impl SyntaxPalette {
             parameter: text,
             operator: text,
             punctuation: text,
-            bracket1: model_color(ModelColor::rgb(139, 101, 0)),
-            bracket2: model_color(ModelColor::rgb(145, 0, 145)),
-            bracket3: model_color(ModelColor::rgb(0, 91, 190)),
+            bracket1: text,
+            bracket2: text,
+            bracket3: text,
             tag: pink,
             attribute: amber,
             label: amber,
@@ -596,6 +600,58 @@ impl SyntaxPalette {
             Appearance::Dark => Self::dark(text, comment, danger),
             Appearance::Light => Self::light(text, comment, danger),
         }
+    }
+}
+
+/// Translucent fills for diff rows (`*_line`) and for the changed characters
+/// inside a modified line (`*_text`). Themes may set them explicitly through
+/// the `diffInsertedLine`, `diffRemovedLine`, `diffInsertedText` and
+/// `diffRemovedText` keys of their syntax map; otherwise they are faint tints
+/// of the theme's own diff colors.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DiffWashes {
+    pub add_line: Hsla,
+    pub del_line: Hsla,
+    pub add_text: Hsla,
+    pub del_text: Hsla,
+}
+
+impl DiffWashes {
+    pub const LINE_ALPHA: f32 = 0.055;
+
+    fn tinted(appearance: Appearance, add: Hsla, del: Hsla) -> Self {
+        let text = if appearance.is_dark() { 0.24 } else { 0.18 };
+        Self {
+            add_line: add.opacity(Self::LINE_ALPHA),
+            del_line: del.opacity(Self::LINE_ALPHA),
+            add_text: add.opacity(text),
+            del_text: del.opacity(text),
+        }
+    }
+
+    fn from_variant(variant: &ThemeVariant, fallback: Self) -> Self {
+        let color = |key: &str, fallback: Hsla| {
+            variant
+                .syntax
+                .get(key)
+                .copied()
+                .map(model_color)
+                .unwrap_or(fallback)
+        };
+        Self {
+            add_line: color("diffInsertedLine", fallback.add_line),
+            del_line: color("diffRemovedLine", fallback.del_line),
+            add_text: color("diffInsertedText", fallback.add_text),
+            del_text: color("diffRemovedText", fallback.del_text),
+        }
+    }
+
+    pub fn line(&self, added: bool) -> Hsla {
+        if added { self.add_line } else { self.del_line }
+    }
+
+    pub fn text(&self, added: bool) -> Hsla {
+        if added { self.add_text } else { self.del_text }
     }
 }
 
@@ -751,6 +807,8 @@ pub struct Theme {
     pub diff_del: Hsla,
     /// Diff: hunk-header wash (bluish grey).
     pub diff_hunk_bg: Hsla,
+    /// Diff: washes behind changed rows and the changed characters in them.
+    pub diff_wash: DiffWashes,
 
     /// Theme-owned terminal background, selection, and ANSI16 palette.
     pub terminal: TerminalColors,
@@ -1221,6 +1279,11 @@ impl Theme {
             diff_add: oklch(0.765, 0.177, 163.223), // emerald-400
             diff_del: oklch(0.704, 0.191, 22.216),  // red-400
             diff_hunk_bg: hsla(0.6, 0.35, 0.6, 0.05),
+            diff_wash: DiffWashes::tinted(
+                Appearance::Dark,
+                oklch(0.765, 0.177, 163.223),
+                oklch(0.704, 0.191, 22.216),
+            ),
             terminal: TerminalColors::zeron(Appearance::Dark),
             font_sans: "Geist".into(),
             font_sans_fixed: "Geist".into(),
@@ -1321,6 +1384,11 @@ impl Theme {
             diff_add: oklch(0.596, 0.145, 163.225), // emerald-600
             diff_del: oklch(0.577, 0.245, 27.325),  // red-600
             diff_hunk_bg: hsla(0.6, 0.35, 0.35, 0.07),
+            diff_wash: DiffWashes::tinted(
+                Appearance::Light,
+                oklch(0.596, 0.145, 163.225),
+                oklch(0.577, 0.245, 27.325),
+            ),
             terminal: TerminalColors::zeron(Appearance::Light),
             font_sans: "Geist".into(),
             font_sans_fixed: "Geist".into(),
@@ -1514,6 +1582,10 @@ impl Theme {
         theme.diff_add = model_color(colors.diff_add);
         theme.diff_del = model_color(colors.diff_delete);
         theme.diff_hunk_bg = model_color(colors.diff_hunk);
+        theme.diff_wash = DiffWashes::from_variant(
+            variant,
+            DiffWashes::tinted(appearance, theme.diff_add, theme.diff_del),
+        );
         theme.terminal = TerminalColors::from_variant(variant);
         if !is_curated_builtin {
             theme.terminal.foreground = model_color(harden_model_foreground(
@@ -2611,6 +2683,89 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn storage_keywords_and_brackets_fall_back_to_the_theme_own_colors() {
+        let registry = ThemeRegistry::builtin();
+        for id in ["zeron-dark", "zeron-light", "catppuccin-mocha"] {
+            let variant = registry.variant(id).unwrap();
+            assert!(!variant.syntax.contains_key("keywordStorage"), "{id}");
+            let theme = Theme::from_variant(
+                variant,
+                AccentSelection::ThemeDefault,
+                SurfacePreference::Opaque,
+            );
+            let syntax = &theme.syntax;
+            assert_eq!(syntax.keyword_storage, syntax.keyword, "{id}");
+            for bracket in [syntax.bracket1, syntax.bracket2, syntax.bracket3] {
+                assert_eq!(bracket, syntax.punctuation, "{id}");
+            }
+        }
+        for theme in [Theme::dark(), Theme::light()] {
+            assert_eq!(theme.syntax.keyword_storage, theme.syntax.keyword);
+            assert_eq!(theme.syntax.bracket1, theme.syntax.punctuation);
+        }
+
+        let dark_plus = Theme::from_variant(
+            registry.variant("vscode-dark-plus").unwrap(),
+            AccentSelection::ThemeDefault,
+            SurfacePreference::Opaque,
+        );
+        let rgb = |r, g, b| model_color(ModelColor::rgb(r, g, b));
+        assert_eq!(dark_plus.syntax.keyword_storage, rgb(0x56, 0x9c, 0xd6));
+        assert_eq!(dark_plus.syntax.bracket1, rgb(0xff, 0xd7, 0x00));
+        assert_eq!(dark_plus.syntax.bracket2, rgb(0xda, 0x70, 0xd6));
+        assert_eq!(dark_plus.syntax.bracket3, rgb(0x17, 0x9f, 0xff));
+        let light_plus = Theme::from_variant(
+            registry.variant("vscode-light-plus").unwrap(),
+            AccentSelection::ThemeDefault,
+            SurfacePreference::Opaque,
+        );
+        assert_eq!(light_plus.syntax.keyword_storage, rgb(0x00, 0x00, 0xff));
+        assert_eq!(light_plus.syntax.bracket1, rgb(0x8b, 0x65, 0x00));
+        assert_eq!(light_plus.syntax.bracket2, rgb(0x91, 0x00, 0x91));
+        assert_eq!(light_plus.syntax.bracket3, rgb(0x00, 0x5b, 0xbe));
+    }
+
+    #[test]
+    fn diff_washes_follow_each_theme_and_stay_faint_by_default() {
+        let registry = ThemeRegistry::builtin();
+        for variant in registry.families.iter().flat_map(|family| &family.variants) {
+            if variant.family_id == "vscode-default" {
+                continue;
+            }
+            let theme = Theme::from_variant(
+                variant,
+                AccentSelection::ThemeDefault,
+                SurfacePreference::Opaque,
+            );
+            let wash = theme.diff_wash;
+            assert_eq!(
+                wash.add_line,
+                theme.diff_add.opacity(DiffWashes::LINE_ALPHA)
+            );
+            assert_eq!(
+                wash.del_line,
+                theme.diff_del.opacity(DiffWashes::LINE_ALPHA)
+            );
+            assert!(wash.add_text.a > wash.add_line.a, "{}", variant.id);
+            assert_eq!(wash.add_text.h, theme.diff_add.h, "{}", variant.id);
+        }
+
+        let dark_plus = Theme::from_variant(
+            registry.variant("vscode-dark-plus").unwrap(),
+            AccentSelection::ThemeDefault,
+            SurfacePreference::Opaque,
+        );
+        let rgba = |r, g, b, a| model_color(ModelColor::rgba(r, g, b, a));
+        let wash = dark_plus.diff_wash;
+        assert_eq!(wash.add_line, rgba(0x9b, 0xb9, 0x55, 0x26));
+        assert_eq!(wash.del_line, rgba(0xf1, 0x4c, 0x4c, 0x26));
+        assert_eq!(wash.add_text, rgba(0x9b, 0xb9, 0x55, 0x57));
+        assert_eq!(wash.del_text, rgba(0xf1, 0x4c, 0x4c, 0x57));
+        assert!((wash.add_line.a - 0.15).abs() < 0.005);
+        assert!((wash.add_text.a - 0.34).abs() < 0.005);
     }
 
     /// The caret is a 2px bar, so the 3:1 non-text floor applies — but it is the

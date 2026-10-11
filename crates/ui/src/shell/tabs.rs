@@ -44,9 +44,9 @@ struct PanelTitlebarWidths {
     files_controls: f32,
 }
 
-/// The session header's "+" and fork buttons (28px each, 2px gap) plus the
+/// The session header's three chat buttons (28px each, 2px gaps) plus the
 /// row gap they cost the project-actions control.
-const SESSION_CONTROLS_WIDTH: f32 = 28.0 * 2.0 + 2.0 + 8.0;
+const SESSION_CONTROLS_WIDTH: f32 = 28.0 * 3.0 + 4.0 + 8.0;
 
 /// The two fixed right-edge anchors: the explorer toggle and the pane toggle
 /// (28px each) with the same 4px gap the surface strip keeps between its
@@ -226,6 +226,8 @@ impl Shell {
     /// `project` (the per-project `+` on a sidebar group header) homes the
     /// canvas on that project and wins over the sidebar filter.
     pub(super) fn open_new_session(&mut self, project: Option<String>, cx: &mut Context<Self>) {
+        let pickers = self.composer.read(cx).pickers().clone();
+        pickers.update(cx, |pickers, cx| pickers.clear_reused_checkout(cx));
         self.command_palette = None;
         self.set_voice_stage_open(false, cx);
         self.route = Route::Chat;
@@ -282,6 +284,82 @@ impl Shell {
             panel.update(cx, |panel, cx| panel.set_open(false, cx));
         }
         cx.notify();
+    }
+
+    /// A separate agent conversation in the exact same environment. The first
+    /// send creates an ordinary top-level chat using the chosen provider;
+    /// neither history nor provider session IDs are inherited.
+    pub(super) fn new_chat_in_current_checkout(&mut self, cx: &mut Context<Self>) {
+        let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
+            return;
+        };
+        self.new_chat_in_checkout_of(&chat_id, cx);
+    }
+
+    pub(super) fn can_reuse_chat_checkout(&self, chat_id: &str, cx: &App) -> bool {
+        let state = self.state.read(cx);
+        state
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .is_some_and(|chat| {
+                !state.worktree_setup_pending(chat_id)
+                    && (chat.cwd.is_some()
+                        || state
+                            .space_for_chat(chat)
+                            .is_some_and(|space| space.device_id == chat.device_id))
+            })
+    }
+
+    /// Context-menu actions target their own row, not the currently open chat.
+    pub(super) fn new_chat_in_checkout_of(&mut self, chat_id: &str, cx: &mut Context<Self>) -> bool {
+        let Some(chat) = self
+            .state
+            .read(cx)
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .cloned()
+        else {
+            return false;
+        };
+        if self.state.read(cx).worktree_setup_pending(&chat.id) {
+            return false;
+        }
+        let project = self
+            .state
+            .read(cx)
+            .space_for_chat(&chat)
+            .filter(|space| space.device_id == chat.device_id)
+            .cloned();
+        let Some(path) = chat
+            .cwd
+            .clone()
+            .or_else(|| project.as_ref().map(|space| space.path.clone()))
+        else {
+            return false;
+        };
+        if self
+            .settings
+            .space_filter
+            .as_ref()
+            .is_some_and(|filter| project.as_ref().is_none_or(|space| &space.id != filter))
+        {
+            self.settings.space_filter = None;
+            self.schedule_save(cx);
+        }
+        self.open_new_session(project.as_ref().map(|space| space.id.clone()), cx);
+        self.state.update(cx, |state, cx| {
+            // A sidebar filter must not redirect an explicit checkout reuse.
+            state.select_space(project.map(|space| space.id), cx);
+            state.select_device(chat.device_id.clone(), cx);
+        });
+        let pickers = self.composer.read(cx).pickers().clone();
+        pickers.update(cx, |pickers, cx| {
+            pickers.reuse_checkout(path, chat.branch, cx)
+        });
+        cx.notify();
+        true
     }
 
     /// The unified titlebar in chat mode:
@@ -528,10 +606,8 @@ impl Shell {
             )
         };
 
-        // The session's own side-chat controls: "+" mints a fresh side chat
-        // under this session, fork copies its history into one. Same pair
-        // the side-chat header carries, so a family reads the same from
-        // either end.
+        // A fresh main chat can choose another agent in this checkout. The
+        // side-chat "+" and fork retain their separate companion-chat flows.
         let session_controls = (!takeover && !on_canvas).then(|| {
             let busy = self.side_chat_creating;
             div()
@@ -540,6 +616,18 @@ impl Shell {
                 .flex_row()
                 .items_center()
                 .gap(px(2.0))
+                .child(
+                    header_icon_button(
+                        "session-new-chat-same-checkout",
+                        icons::PEN_NEW_SQUARE,
+                        "New chat in this checkout · choose another agent",
+                        &theme,
+                        cx.listener(|this, _, _, cx| this.new_chat_in_current_checkout(cx)),
+                    )
+                    .debug_selector(|| "session-new-chat-same-checkout".into())
+                    .role(gpui::Role::Button)
+                    .aria_label("New chat in this checkout"),
+                )
                 .child(
                     header_icon_button(
                         "session-new-side-chat",

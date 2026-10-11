@@ -27,7 +27,7 @@ async fn append_output(output: &mut tokio::fs::File, bytes: &[u8]) -> std::io::R
     output.write_all(bytes).await
 }
 
-pub(super) async fn run(
+pub(crate) async fn run(
     root: &Path,
     checkout: &Path,
     settings: &WorktreeSettings,
@@ -44,6 +44,7 @@ pub(super) async fn run(
 
 /// References are passed as environment variables, never interpolated into shell code.
 /// Creation needs the intended branch and base before the destination exists.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_with_refs(
     root: &Path,
     checkout: &Path,
@@ -108,7 +109,15 @@ pub(super) async fn run_with_refs(
     ]);
     let terminals = Terminals::new();
     let cwd = if in_project { root } else { checkout };
-    let session = terminals.open_service(&cwd.to_string_lossy(), &environment, command)?;
+    let session = {
+        let terminals = terminals.clone();
+        let cwd = cwd.to_string_lossy().into_owned();
+        let command = command.to_string();
+        // The first spawn may wait for the user's login shell to report PATH.
+        tokio::task::spawn_blocking(move || terminals.open_service(&cwd, &environment, &command))
+            .await
+            .map_err(|e| EngineError::Other(e.to_string()))??
+    };
     let mut guard = CommandGuard {
         terminals: terminals.clone(),
         id: Some(session.id.clone()),

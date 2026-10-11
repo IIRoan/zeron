@@ -7,6 +7,185 @@ pub(crate) struct ConfirmationDialog {
     _key_interceptor: Subscription,
 }
 
+impl SourceControl {
+    pub(crate) fn has_confirmation(&self) -> bool {
+        self.confirmation.is_some()
+    }
+
+    fn sync_confirmation_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.confirmation.is_none() {
+            self.restore_confirmation_focus(window, cx);
+            return;
+        }
+        if self.confirmation_dialog.is_some() {
+            return;
+        }
+        // Bound actions run before Div key listeners. Intercept this window's
+        // keys while the modal is open so editor and Git shortcuts cannot
+        // bypass the question and affect the background.
+        let view = cx.weak_entity();
+        let owner_window = window.window_handle();
+        let interceptor = cx.intercept_keystrokes(move |event, window, cx| {
+            if window.window_handle() != owner_window {
+                return;
+            }
+            let _ = view.update(cx, |view, cx| {
+                if view.capture_confirmation_key(&event.keystroke, window, cx) {
+                    cx.stop_propagation();
+                }
+            });
+        });
+        let dialog = ConfirmationDialog {
+            buttons: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
+            previous_focus: window.focused(cx),
+            _key_interceptor: interceptor,
+        };
+        // Destructive actions start with Cancel focused.
+        window.focus(&dialog.buttons[0], cx);
+        self.confirmation_dialog = Some(dialog);
+    }
+
+    fn restore_confirmation_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(dialog) = self.confirmation_dialog.take()
+            && dialog.buttons.iter().any(|focus| focus.is_focused(window))
+        {
+            if let Some(focus) = dialog.previous_focus {
+                window.focus(&focus, cx);
+            } else {
+                window.blur();
+            }
+        }
+    }
+
+    fn finish_confirmation(&mut self, accept: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.restore_confirmation_focus(window, cx);
+        if accept {
+            self.accept_confirmation(cx);
+        } else {
+            self.confirmation = None;
+        }
+        cx.notify();
+    }
+
+    fn capture_confirmation_key(
+        &mut self,
+        key: &gpui::Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(dialog) = self
+            .confirmation_dialog
+            .as_ref()
+            .filter(|_| self.has_confirmation())
+        else {
+            return false;
+        };
+        let plain = !key.modifiers.control && !key.modifiers.alt && !key.modifiers.platform;
+        let accept = match key.key.as_str() {
+            "escape" => Some(false),
+            "tab" if plain => {
+                let next = usize::from(dialog.buttons[0].is_focused(window));
+                window.focus(&dialog.buttons[next], cx);
+                None
+            }
+            "enter" | "space" if plain => Some(dialog.buttons[1].is_focused(window)),
+            _ => None,
+        };
+        if let Some(accept) = accept {
+            let identity = dialog.buttons[0].clone();
+            let view = cx.weak_entity();
+            // GPUI still calls capture listeners after interception. Leave
+            // the blocker mounted until this key dispatch has finished.
+            window.defer(cx, move |window, cx| {
+                let _ = view.update(cx, |view, cx| {
+                    if view
+                        .confirmation_dialog
+                        .as_ref()
+                        .is_some_and(|dialog| dialog.buttons[0] == identity)
+                    {
+                        view.finish_confirmation(accept, window, cx);
+                    }
+                });
+            });
+        }
+        true
+    }
+
+    pub(crate) fn render_confirmation(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.sync_confirmation_dialog(window, cx);
+        let Some(confirmation) = &self.confirmation else {
+            return gpui::Empty.into_any_element();
+        };
+        let dialog = self.confirmation_dialog.as_ref().unwrap();
+        let viewport = window.viewport_size();
+        let theme = Theme::of(cx).for_popup();
+        let label = match &confirmation.command {
+            Command::StageAndCommit(_) => "Stage & Commit",
+            Command::StageConflicts(_) => "Stage Anyway",
+            Command::Discard(_) => "Discard Changes",
+            Command::Git(Action::UndoCommit) => "Undo Commit",
+            Command::Git(Action::Abort) => "Abort",
+            Command::Git(Action::DropStash { .. }) => "Delete Stash",
+            Command::Git(Action::RevertCommit { .. }) => "Revert Commit",
+            Command::Git(Action::ResolveConflict { .. }) => "Replace File Contents",
+            _ => "Confirm",
+        };
+        let card = popover::dialog_card(&theme)
+            .id("git-confirm-dialog-card")
+            .debug_selector(|| "git-confirm-dialog-card".into())
+            .role(gpui::Role::Dialog)
+            .aria_label(confirmation.title.clone())
+            .w(px(440.0).min(viewport.width - px(32.0)))
+            .child(popover::dialog_title(&theme, &confirmation.title))
+            .child(
+                div()
+                    .mt(px(6.0))
+                    .child(popover::dialog_body(&theme, &confirmation.body)),
+            )
+            .child(
+                div()
+                    .mt(px(20.0))
+                    .flex()
+                    .justify_end()
+                    .gap(px(8.0))
+                    .child(
+                        popover::btn_ghost(&theme, "Cancel", "git-confirm-cancel")
+                            .id("git-confirm-cancel")
+                            .debug_selector(|| "git-confirm-cancel".into())
+                            .role(gpui::Role::Button)
+                            .track_focus(&dialog.buttons[0])
+                            .border_1()
+                            .border_color(gpui::transparent_black())
+                            .focus_visible(|style| style.border_color(theme.text_muted))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.finish_confirmation(false, window, cx)
+                            })),
+                    )
+                    .child(
+                        (if matches!(confirmation.command, Command::StageAndCommit(_)) {
+                            popover::btn_primary(&theme, label)
+                        } else { popover::btn_danger(&theme, label) })
+                            .id("git-confirm-accept")
+                            .debug_selector(|| "git-confirm-accept".into())
+                            .role(gpui::Role::Button)
+                            .track_focus(&dialog.buttons[1])
+                            .border_1()
+                            .border_color(gpui::transparent_black())
+                            .focus_visible(|style| style.border_color(theme.text_muted))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.finish_confirmation(true, window, cx)
+                            })),
+                    ),
+            )
+            .into_any_element();
+        popover::modal("git-confirm-dialog", viewport, card)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,183 +355,5 @@ mod tests {
         host.read_with(cx, |host, cx| {
             assert!(!host.view.read(cx).has_confirmation())
         });
-    }
-}
-
-impl SourceControl {
-    pub(crate) fn has_confirmation(&self) -> bool {
-        self.confirmation.is_some()
-    }
-
-    fn sync_confirmation_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.confirmation.is_none() {
-            self.restore_confirmation_focus(window, cx);
-            return;
-        }
-        if self.confirmation_dialog.is_some() {
-            return;
-        }
-        // Bound actions run before Div key listeners. Intercept this window's
-        // keys while the modal is open so editor and Git shortcuts cannot
-        // bypass the question and affect the background.
-        let view = cx.weak_entity();
-        let owner_window = window.window_handle();
-        let interceptor = cx.intercept_keystrokes(move |event, window, cx| {
-            if window.window_handle() != owner_window {
-                return;
-            }
-            let _ = view.update(cx, |view, cx| {
-                if view.capture_confirmation_key(&event.keystroke, window, cx) {
-                    cx.stop_propagation();
-                }
-            });
-        });
-        let dialog = ConfirmationDialog {
-            buttons: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
-            previous_focus: window.focused(cx),
-            _key_interceptor: interceptor,
-        };
-        // Destructive actions start with Cancel focused.
-        window.focus(&dialog.buttons[0], cx);
-        self.confirmation_dialog = Some(dialog);
-    }
-
-    fn restore_confirmation_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(dialog) = self.confirmation_dialog.take()
-            && dialog.buttons.iter().any(|focus| focus.is_focused(window))
-        {
-            if let Some(focus) = dialog.previous_focus {
-                window.focus(&focus, cx);
-            } else {
-                window.blur();
-            }
-        }
-    }
-
-    fn finish_confirmation(&mut self, accept: bool, window: &mut Window, cx: &mut Context<Self>) {
-        self.restore_confirmation_focus(window, cx);
-        if accept {
-            self.accept_confirmation(cx);
-        } else {
-            self.confirmation = None;
-        }
-        cx.notify();
-    }
-
-    fn capture_confirmation_key(
-        &mut self,
-        key: &gpui::Keystroke,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let Some(dialog) = self
-            .confirmation_dialog
-            .as_ref()
-            .filter(|_| self.has_confirmation())
-        else {
-            return false;
-        };
-        let plain = !key.modifiers.control && !key.modifiers.alt && !key.modifiers.platform;
-        let accept = match key.key.as_str() {
-            "escape" => Some(false),
-            "tab" if plain => {
-                let next = usize::from(dialog.buttons[0].is_focused(window));
-                window.focus(&dialog.buttons[next], cx);
-                None
-            }
-            "enter" | "space" if plain => Some(dialog.buttons[1].is_focused(window)),
-            _ => None,
-        };
-        if let Some(accept) = accept {
-            let identity = dialog.buttons[0].clone();
-            let view = cx.weak_entity();
-            // GPUI still calls capture listeners after interception. Leave
-            // the blocker mounted until this key dispatch has finished.
-            window.defer(cx, move |window, cx| {
-                let _ = view.update(cx, |view, cx| {
-                    if view
-                        .confirmation_dialog
-                        .as_ref()
-                        .is_some_and(|dialog| dialog.buttons[0] == identity)
-                    {
-                        view.finish_confirmation(accept, window, cx);
-                    }
-                });
-            });
-        }
-        true
-    }
-
-    pub(crate) fn render_confirmation(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        self.sync_confirmation_dialog(window, cx);
-        let Some(confirmation) = &self.confirmation else {
-            return gpui::Empty.into_any_element();
-        };
-        let dialog = self.confirmation_dialog.as_ref().unwrap();
-        let viewport = window.viewport_size();
-        let theme = Theme::of(cx).for_popup();
-        let label = match &confirmation.command {
-            Command::StageAndCommit(_) => "Stage & Commit",
-            Command::StageConflicts(_) => "Stage Anyway",
-            Command::Discard(_) => "Discard Changes",
-            Command::Git(Action::UndoCommit) => "Undo Commit",
-            Command::Git(Action::Abort) => "Abort",
-            Command::Git(Action::DropStash { .. }) => "Delete Stash",
-            Command::Git(Action::RevertCommit { .. }) => "Revert Commit",
-            _ => "Confirm",
-        };
-        let card = popover::dialog_card(&theme)
-            .id("git-confirm-dialog-card")
-            .debug_selector(|| "git-confirm-dialog-card".into())
-            .role(gpui::Role::Dialog)
-            .aria_label(confirmation.title.clone())
-            .w(px(440.0).min(viewport.width - px(32.0)))
-            .child(popover::dialog_title(&theme, &confirmation.title))
-            .child(
-                div()
-                    .mt(px(6.0))
-                    .child(popover::dialog_body(&theme, &confirmation.body)),
-            )
-            .child(
-                div()
-                    .mt(px(20.0))
-                    .flex()
-                    .justify_end()
-                    .gap(px(8.0))
-                    .child(
-                        popover::btn_ghost(&theme, "Cancel", "git-confirm-cancel")
-                            .id("git-confirm-cancel")
-                            .debug_selector(|| "git-confirm-cancel".into())
-                            .role(gpui::Role::Button)
-                            .track_focus(&dialog.buttons[0])
-                            .border_1()
-                            .border_color(gpui::transparent_black())
-                            .focus_visible(|style| style.border_color(theme.text_muted))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.finish_confirmation(false, window, cx)
-                            })),
-                    )
-                    .child(
-                        (if matches!(confirmation.command, Command::StageAndCommit(_)) {
-                            popover::btn_primary(&theme, label)
-                        } else { popover::btn_danger(&theme, label) })
-                            .id("git-confirm-accept")
-                            .debug_selector(|| "git-confirm-accept".into())
-                            .role(gpui::Role::Button)
-                            .track_focus(&dialog.buttons[1])
-                            .border_1()
-                            .border_color(gpui::transparent_black())
-                            .focus_visible(|style| style.border_color(theme.text_muted))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.finish_confirmation(true, window, cx)
-                            })),
-                    ),
-            )
-            .into_any_element();
-        popover::modal("git-confirm-dialog", viewport, card)
     }
 }

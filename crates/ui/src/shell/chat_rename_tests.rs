@@ -245,6 +245,15 @@ fn rename_opens_a_collapsed_pinned_section_with_its_motion(cx: &mut TestAppConte
 fn rename_opens_collapsed_sessions_groups_and_the_sidebar(cx: &mut TestAppContext) {
     let (shell, cx) = setup(cx);
     shell.update(cx, |shell, cx| {
+        shell.settings.space_filter = Some("project".into());
+        shell.state.update(cx, |state, _| {
+            state.spaces = vec![serde_json::from_value(serde_json::json!({
+                "id": "project", "deviceId": "local", "path": "/project", "createdAt": Utc::now()
+            })).unwrap()];
+            for chat in &mut state.chats {
+                chat.space_id = Some("project".into());
+            }
+        });
         shell.sessions_open = false;
         shell.settings.sidebar_collapsed = true;
         cx.notify();
@@ -261,9 +270,11 @@ fn rename_opens_collapsed_sessions_groups_and_the_sidebar(cx: &mut TestAppContex
     shell.update(cx, |shell, cx| {
         shell.finish_rename_chat(false, cx);
         shell.settings.sidebar_organization = SidebarOrganization::ByProject;
+        shell.settings.space_filter = None;
+        let group = zeron_proto::view::project_key(&shell.state.read(cx).spaces[0]);
         shell
             .sidebar_collapsed_groups
-            .insert("project:home:local".into());
+            .insert(format!("project:{group}"));
         cx.notify();
     });
     redraw(cx);

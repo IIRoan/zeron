@@ -63,6 +63,288 @@ impl Fixture {
     }
 }
 
+fn startup_service(
+    f: &Fixture,
+    command: &str,
+    readiness: &str,
+    timeout: u64,
+) -> (ProjectTerminals, Terminals) {
+    let services = ProjectTerminals::open(&f.temp.path().join("profile")).unwrap();
+    let terminals = Terminals::new();
+    services
+        .save(
+            "project",
+            &f.root,
+            ProjectTerminalConfig {
+                services: vec![ProjectTerminalService {
+                    id: "databases".into(),
+                    name: "Databases".into(),
+                    command: command.into(),
+                    directory: ".".into(),
+                    restart_on_failure: false,
+                    setup_prerequisite: Some(ProjectServiceReadiness {
+                        command: readiness.into(),
+                        timeout_seconds: timeout,
+                    }),
+                }],
+            },
+        )
+        .unwrap();
+    f.store
+        .bind_project_services(services.clone(), terminals.clone());
+    let mut settings = f.settings(WorktreeEnvMode::Copy);
+    settings.setup_command = "printf setup >> prepared".into();
+    f.store.save(&f.root, None, Some(settings)).unwrap();
+    (services, terminals)
+}
+
+#[tokio::test]
+async fn startup_services_gate_setup_and_stay_shared_across_worktrees() {
+    let f = Fixture::new();
+    let (services, terminals) = startup_service(
+        &f,
+        "echo $$ > database.pid; printf '%s' \"$DATABASE_MARKER\" > database.environment; sleep 0.3; touch database.ready; exec sleep 60",
+        "test -f database.ready && test \"$DATABASE_MARKER\" = shared",
+        10,
+    );
+    let mut defaults = f.store.defaults(&f.root).unwrap();
+    defaults
+        .variables
+        .insert("DATABASE_MARKER".into(), "shared".into());
+    f.store.save(&f.root, None, Some(defaults.clone())).unwrap();
+    defaults
+        .variables
+        .insert("DATABASE_MARKER".into(), "checkout".into());
+    f.store.save(&f.root, Some(&f.a), Some(defaults)).unwrap();
+    let store = f.store.clone();
+    let root = f.root.clone();
+    let cwd = f.a.clone();
+    let prepare = tokio::spawn(async move { store.prepare(&root, &cwd, false).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !f.root.join("database.pid").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        !f.a.join(".env.local").exists(),
+        "env copying must wait for the database too"
+    );
+    assert!(!f.a.join("prepared").exists());
+    prepare.await.unwrap().unwrap();
+    let first = services.snapshot("project", &f.root).unwrap().runs[0]
+        .terminal
+        .clone()
+        .unwrap()
+        .id;
+    f.store.prepare(&f.root, &f.b, false).await.unwrap();
+    let mut config = services.snapshot("project", &f.root).unwrap().config;
+    config.services.push(ProjectTerminalService {
+        id: "backend".into(),
+        name: "Backend".into(),
+        command: "test -f \"$ZERON_PROJECT_ROOT/database.ready\" && exec sleep 60".into(),
+        directory: ".".into(),
+        restart_on_failure: false,
+        setup_prerequisite: None,
+    });
+    services
+        .save_defaults(&f.store, "project", &f.root, config)
+        .await
+        .unwrap();
+    services
+        .control_checkout(
+            &terminals, &f.store, "project", &f.root, &f.a, None, "start",
+        )
+        .await
+        .unwrap();
+    let second = services
+        .control_checkout(
+            &terminals, &f.store, "project", &f.root, &f.b, None, "activate",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        second
+            .runs
+            .iter()
+            .find(|r| r.service_id == "databases")
+            .unwrap()
+            .terminal
+            .as_ref()
+            .unwrap()
+            .id,
+        first
+    );
+    assert!(
+        second
+            .runs
+            .iter()
+            .any(|r| r.service_id == "backend" && r.status == ProjectTerminalStatus::Running)
+    );
+    assert!(!f.b.join("database.pid").exists());
+    assert_eq!(
+        std::fs::read_to_string(f.root.join("database.environment")).unwrap(),
+        "shared"
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.a.join("prepared")).unwrap(),
+        "setup"
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.b.join("prepared")).unwrap(),
+        "setup"
+    );
+    let worktree_stopped = services
+        .control_checkout(&terminals, &f.store, "project", &f.root, &f.b, None, "stop-worktree")
+        .await.unwrap();
+    let database = worktree_stopped.runs.iter().find(|r| r.service_id == "databases").unwrap();
+    assert_eq!(database.status, ProjectTerminalStatus::Running);
+    assert_eq!(database.terminal.as_ref().unwrap().id, first);
+    assert_eq!(worktree_stopped.runs.iter().find(|r| r.service_id == "backend").unwrap().status,
+        ProjectTerminalStatus::Stopped);
+    let restarted = services.control_checkout(
+        &terminals, &f.store, "project", &f.root, &f.b, None, "start",
+    ).await.unwrap();
+    assert_eq!(restarted.runs.iter().find(|r| r.service_id == "databases").unwrap()
+        .terminal.as_ref().unwrap().id, first);
+    assert_eq!(restarted.runs.iter().find(|r| r.service_id == "backend").unwrap().status,
+        ProjectTerminalStatus::Running);
+    let stopped = services
+        .control_checkout(&terminals, &f.store, "project", &f.root, &f.b, None, "stop")
+        .await
+        .unwrap();
+    assert!(
+        stopped
+            .runs
+            .iter()
+            .all(|r| r.status == ProjectTerminalStatus::Stopped)
+    );
+    let main = services
+        .control_checkout(
+            &terminals, &f.store, "project", &f.root, &f.root, None, "activate",
+        )
+        .await
+        .unwrap();
+    assert!(
+        main.runs
+            .iter()
+            .any(|r| r.service_id == "databases" && r.status == ProjectTerminalStatus::Running)
+    );
+    services.shutdown();
+}
+
+#[tokio::test]
+async fn startup_service_failure_and_timeout_block_worktree_setup() {
+    for (command, timeout) in [("exit 23", 5), ("exec sleep 60", 1)] {
+        let f = Fixture::new();
+        let (services, _) = startup_service(&f, command, "false", timeout);
+        let error = f
+            .store
+            .prepare(&f.root, &f.a, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Databases"), "{error}");
+        assert_eq!(f.phase(&f.a), WorktreeSetupPhase::Failed);
+        assert!(!f.a.join("prepared").exists());
+        assert!(!f.a.join(".env.local").exists());
+        services.shutdown();
+    }
+}
+
+#[tokio::test]
+async fn cancelling_startup_readiness_stops_its_check_and_blocks_setup() {
+    let f = Fixture::new();
+    let (services, _) = startup_service(
+        &f,
+        "exec sleep 60",
+        "echo $$ > readiness.pid; exec sleep 60",
+        120,
+    );
+    let store = f.store.clone();
+    let root = f.root.clone();
+    let cwd = f.a.clone();
+    let prepare = tokio::spawn(async move { store.prepare(&root, &cwd, false).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !f.root.join("readiness.pid").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    f.store.cancel(&f.a).unwrap();
+    assert!(
+        prepare
+            .await
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("cancelled")
+    );
+    assert!(!f.a.join("prepared").exists());
+    let pid = std::fs::read_to_string(f.root.join("readiness.pid")).unwrap();
+    #[cfg(target_os = "linux")]
+    assert!(
+        !Path::new(&format!("/proc/{}", pid.trim())).exists(),
+        "readiness processes must stop on cancellation"
+    );
+    services.shutdown();
+}
+
+#[tokio::test]
+async fn prepared_worktree_restarts_stopped_infrastructure_without_rerunning_setup() {
+    let f = Fixture::new();
+    let (services, terminals) = startup_service(
+        &f,
+        "touch database.ready; exec sleep 60",
+        "test -f database.ready",
+        10,
+    );
+    f.store.prepare(&f.root, &f.a, false).await.unwrap();
+    let before = services.snapshot("project", &f.root).unwrap().runs[0]
+        .terminal
+        .clone()
+        .unwrap()
+        .id;
+    services
+        .control_checkout(
+            &terminals,
+            &f.store,
+            "project",
+            &f.root,
+            &f.a,
+            Some("databases"),
+            "stop",
+        )
+        .await
+        .unwrap();
+    std::fs::remove_file(f.root.join("database.ready")).unwrap();
+    f.store.prepare(&f.root, &f.a, false).await.unwrap();
+    let after = services.snapshot("project", &f.root).unwrap().runs[0]
+        .terminal
+        .clone()
+        .unwrap()
+        .id;
+    assert_ne!(before, after);
+    let mut config = services.snapshot("project", &f.root).unwrap().config;
+    config.services[0].setup_prerequisite = Some(ProjectServiceReadiness {
+        command: "false".into(),
+        timeout_seconds: 1,
+    });
+    services.save("project", &f.root, config).unwrap();
+    assert!(f.store.prepare(&f.root, &f.a, false).await.is_err());
+    assert_eq!(f.phase(&f.a), WorktreeSetupPhase::Failed);
+    services.save("project", &f.root, ProjectTerminalConfig::default()).unwrap();
+    f.store.prepare(&f.root, &f.a, false).await.unwrap();
+    assert_eq!(f.phase(&f.a), WorktreeSetupPhase::Ready);
+    assert_eq!(
+        std::fs::read_to_string(f.a.join("prepared")).unwrap(),
+        "setup"
+    );
+    services.shutdown();
+}
+
 #[tokio::test]
 async fn independent_env_copies_preserve_edits_and_settings_survive_restart() {
     let f = Fixture::new();
@@ -410,7 +692,7 @@ async fn custom_prefix_survives_title_rename_and_delete_preserves_a_user_branch(
 }
 
 fn svc() -> ProjectTerminalConfig {
-    ProjectTerminalConfig{services:vec![ProjectTerminalService{id:"backend".into(),name:"Backend".into(),command:"/bin/sh -c 'echo $$ > service.pid; echo \"$TEST_PORT\" > port.marker; exec sleep 60'".into(),directory:".".into(),restart_on_failure:false}]}
+    ProjectTerminalConfig{services:vec![ProjectTerminalService{id:"backend".into(),name:"Backend".into(),command:"/bin/sh -c 'echo $$ > service.pid; echo \"$TEST_PORT\" > port.marker; exec sleep 60'".into(),directory:".".into(),restart_on_failure:false,setup_prerequisite:None}]}
 }
 
 #[tokio::test]
@@ -1168,4 +1450,378 @@ async fn shutdown_cancels_cleanup_without_removing_the_worktree() {
     assert_dead(pid).await;
     assert!(f.a.is_dir());
     assert_eq!(f.phase(&f.a), WorktreeSetupPhase::Interrupted);
+}
+
+fn completed_turns(core: &zeron_engine::EngineCore, chat: &str) -> usize {
+    core.doc_host
+        .open(chat)
+        .ok()
+        .and_then(|h| h.doc().read_entries().ok())
+        .unwrap_or_default()
+        .iter()
+        .filter(|e| {
+            e.role == zeron_doc::MessageRole::Assistant
+                && e.status == Some(zeron_doc::MessageStatus::Complete)
+        })
+        .count()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_dispatch_prepares_only_worktrees_zeron_created() {
+    let (f, _) = workflow_repository();
+    let manual = f.temp.path().join("manual-worktree");
+    let managed = f.temp.path().join("managed-worktree");
+    git(
+        &f.root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "manual",
+            manual.to_str().unwrap(),
+            "main",
+        ],
+    );
+    git(
+        &f.root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "iiroan/managed",
+            managed.to_str().unwrap(),
+            "main",
+        ],
+    );
+    let registry = zeron_engine::HarnessRegistry::new();
+    registry.register(std::sync::Arc::new(zeron_harness::mock::MockHarness {
+        script: vec![
+            AgentEvent::SessionStarted {
+                harness: HarnessId::Mock,
+                model: "mock-1".into(),
+                tools: vec![],
+                cwd: String::new(),
+                session_id: "session".into(),
+                assistant_message_id: "assistant".into(),
+            },
+            AgentEvent::TextDelta {
+                text: "done".into(),
+            },
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: Some("session".into()),
+            },
+        ],
+    }));
+    let core = zeron_engine::EngineCore::assemble(
+        &f.temp.path().join("engine"),
+        std::sync::Arc::new(registry),
+        HarnessId::Mock,
+        None,
+    )
+    .unwrap();
+    core.workspace
+        .create_space(
+            "project",
+            &core.device_id,
+            f.root.to_str().unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
+    let mut settings = f.settings(WorktreeEnvMode::Copy);
+    settings.setup_command = "printf done > setup.marker".into();
+    let store = core.repos.worktree_settings();
+    store.save(&f.root, None, Some(settings)).unwrap();
+    store
+        .remember(&f.root, &managed, "iiroan/managed", "iiroan/")
+        .unwrap();
+    for (chat, cwd) in [("manual-chat", &manual), ("managed-chat", &managed)] {
+        core.workspace
+            .create_chat(chat, Some("project"), Some(&core.device_id), None, None)
+            .unwrap();
+        core.workspace
+            .set_chat_cwd(chat, cwd.to_str().unwrap())
+            .unwrap();
+        core.workspace.rename_chat(chat, "Pre-titled").unwrap();
+        core.doc_host
+            .queue_command(
+                chat,
+                zeron_doc::SessionCommandPayload::Run {
+                    request: RunRequest {
+                        mcp: None,
+                        prompt: "hello".into(),
+                        harness: None,
+                        model: None,
+                        reasoning: None,
+                        model_options: Default::default(),
+                        cwd: cwd.to_string_lossy().into_owned(),
+                        sandbox: SandboxLevel::WorkspaceWrite,
+                        auto_approve: true,
+                        attachments: Vec::new(),
+                        resume: None,
+                        worktree: None,
+                    },
+                    message_id: format!("{chat}-message"),
+                },
+            )
+            .unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while completed_turns(&core, "manual-chat") == 0
+            || completed_turns(&core, "managed-chat") == 0
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("both turns complete");
+    assert!(managed.join("setup.marker").is_file());
+    assert!(managed.join(".env.local").is_file());
+    assert!(
+        !manual.join("setup.marker").exists() && !manual.join(".env.local").exists(),
+        "a worktree made outside Zeron keeps its files until the user prepares it"
+    );
+    assert!(!store.is_prepared(&f.root, &manual).unwrap());
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn project_edits_follow_into_the_first_worktree_and_missing_files_do_not_block() {
+    let f = Fixture::new();
+    f.store
+        .save(&f.root, None, Some(f.settings(WorktreeEnvMode::Follow)))
+        .unwrap();
+    // Preparing seeds the followed copy before any checkout is active.
+    f.store.prepare(&f.root, &f.a, false).await.unwrap();
+    std::fs::write(f.root.join(".env.local"), b"TEST_VALUE=edited_in_project\n").unwrap();
+    f.store.activate(&f.root, &f.b).await.unwrap();
+    assert_eq!(
+        std::fs::read(f.b.join(".env.local")).unwrap(),
+        b"TEST_VALUE=edited_in_project\n",
+        "the project folder is the active checkout until another one is activated"
+    );
+    std::fs::remove_file(f.b.join(".env.local")).unwrap();
+    f.store.activate(&f.root, &f.a).await.unwrap();
+    assert_eq!(
+        std::fs::read(f.a.join(".env.local")).unwrap(),
+        b"TEST_VALUE=edited_in_project\n"
+    );
+    std::fs::write(f.a.join(".env.local"), b"TEST_VALUE=latest_a\n").unwrap();
+    f.store.cleanup(&f.root, &f.a).await.unwrap();
+    assert_eq!(
+        std::fs::read(f.root.join(".env.local")).unwrap(),
+        b"TEST_VALUE=latest_a\n",
+        "removing the active worktree hands its followed files back to the project"
+    );
+    f.store.activate(&f.root, &f.b).await.unwrap();
+    assert_eq!(
+        std::fs::read(f.b.join(".env.local")).unwrap(),
+        b"TEST_VALUE=latest_a\n"
+    );
+    std::fs::remove_file(f.b.join(".env.local")).unwrap();
+    f.store.cleanup(&f.root, &f.b).await.unwrap();
+    assert_eq!(
+        std::fs::read(f.root.join(".env.local")).unwrap(),
+        b"TEST_VALUE=latest_a\n"
+    );
+}
+
+#[tokio::test]
+async fn setup_queued_behind_a_removal_does_not_recreate_files() {
+    let f = Fixture::new();
+    let mut settings = f.settings(WorktreeEnvMode::Copy);
+    settings.cleanup_command = "touch cleanup.started; sleep 1".into();
+    f.store.save(&f.root, None, Some(settings)).unwrap();
+    let store = f.store.clone();
+    let root = f.root.clone();
+    let checkout = f.a.clone();
+    let cleanup = tokio::spawn(async move { store.cleanup(&root, &checkout).await });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !f.a.join("cleanup.started").exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let error = f.store.prepare(&f.root, &f.a, false).await.unwrap_err();
+    assert!(error.to_string().contains("being removed"));
+    cleanup.await.unwrap().unwrap();
+    assert!(!f.a.join(".env.local").exists());
+    f.store.finish_removal(&f.a);
+    f.store.prepare(&f.root, &f.a, false).await.unwrap();
+    assert!(f.a.join(".env.local").exists());
+}
+
+#[tokio::test]
+async fn changing_only_the_command_timeout_keeps_a_worktree_prepared() {
+    let f = Fixture::new();
+    let mut settings = f.settings(WorktreeEnvMode::Copy);
+    f.store.save(&f.root, None, Some(settings.clone())).unwrap();
+    f.store.prepare(&f.root, &f.a, false).await.unwrap();
+    settings.command_timeout_seconds = 60;
+    f.store.save(&f.root, None, Some(settings.clone())).unwrap();
+    assert!(f.store.is_prepared(&f.root, &f.a).unwrap());
+    settings.setup_command = "true".into();
+    f.store.save(&f.root, None, Some(settings)).unwrap();
+    assert!(!f.store.is_prepared(&f.root, &f.a).unwrap());
+}
+
+#[test]
+fn npm_without_a_lockfile_does_not_create_one() {
+    let f = Fixture::new();
+    assert_eq!(
+        zeron_engine::worktree_settings::detect_install(&f.root),
+        "npm install --no-package-lock"
+    );
+}
+
+#[tokio::test]
+async fn deleted_worktree_folders_leave_the_environment_list() {
+    let f = Fixture::new();
+    f.store
+        .save(&f.root, None, Some(f.settings(WorktreeEnvMode::Copy)))
+        .unwrap();
+    f.store.prepare(&f.root, &f.a, false).await.unwrap();
+    f.store.prepare(&f.root, &f.b, false).await.unwrap();
+    let a = f.a.canonicalize().unwrap().to_string_lossy().into_owned();
+    std::fs::remove_dir_all(&f.a).unwrap();
+    let listed = |store: &WorktreeSettingsStore| {
+        store
+            .snapshot(&f.root, None, vec![])
+            .unwrap()
+            .worktrees
+            .into_iter()
+            .map(|t| t.path)
+            .collect::<Vec<_>>()
+    };
+    let paths = listed(&f.store);
+    assert!(!paths.contains(&a));
+    assert_eq!(paths.len(), 1);
+    let reopened = WorktreeSettingsStore::new(&f.temp.path().join("state"));
+    assert!(!listed(&reopened).contains(&a));
+}
+
+#[tokio::test]
+async fn failed_custom_creation_removes_what_the_command_registered() {
+    let (f, repos) = workflow_repository();
+    repos
+        .worktree_settings()
+        .save(
+            &f.root,
+            None,
+            Some(WorktreeSettings {
+                dependencies: WorktreeDependencyMode::Skip,
+                create_command:
+                    r#"git worktree add -b "$branchname" "$worktreepath" "$basebranch" && exit 5"#
+                        .into(),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+    let error = repos.create_worktree(&f.root, "main").await.unwrap_err();
+    assert!(error.to_string().contains("status 5"));
+    let registered = git(&f.root, &["worktree", "list", "--porcelain"]);
+    assert_eq!(
+        registered
+            .lines()
+            .filter(|l| l.starts_with("worktree "))
+            .count(),
+        1,
+        "only the project checkout remains: {registered}"
+    );
+    assert_eq!(git(&f.root, &["branch", "--list"]), "* main");
+    let base = f.temp.path().join("worktrees with spaces/project");
+    assert_eq!(std::fs::read_dir(base).map(|d| d.count()).unwrap_or(0), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn terminals_opened_in_a_worktree_subfolder_get_its_variables() {
+    let (f, _) = workflow_repository();
+    let path = f.temp.path().join("linked-worktree");
+    git(
+        &f.root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "linked",
+            path.to_str().unwrap(),
+            "main",
+        ],
+    );
+    let subfolder = path.join("nested/deeper");
+    std::fs::create_dir_all(&subfolder).unwrap();
+    let core = zeron_engine::EngineCore::assemble(
+        &f.temp.path().join("engine"),
+        std::sync::Arc::new(zeron_engine::HarnessRegistry::new()),
+        HarnessId::Mock,
+        None,
+    )
+    .unwrap();
+    core.workspace
+        .create_space(
+            "project",
+            &core.device_id,
+            f.root.to_str().unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
+    core.workspace
+        .create_chat(
+            "session",
+            Some("project"),
+            Some(&core.device_id),
+            None,
+            None,
+        )
+        .unwrap();
+    let mut settings = WorktreeSettings {
+        dependencies: WorktreeDependencyMode::Skip,
+        ..Default::default()
+    };
+    settings
+        .variables
+        .insert("TEST_WORKTREE_VALUE".into(), "from-settings".into());
+    core.repos
+        .worktree_settings()
+        .save(&f.root, Some(&path), Some(settings))
+        .unwrap();
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let session = client
+        .call(
+            zeron_rpc::methods::OPEN_TERMINAL,
+            serde_json::json!({"chatId":"session","cols":80,"rows":24,"cwd":subfolder}),
+        )
+        .await
+        .unwrap();
+    let output = f.temp.path().join("terminal-variable");
+    let input = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(format!(
+            "printf '%s' \"$TEST_WORKTREE_VALUE\" > '{}'\r",
+            output.display()
+        ))
+    };
+    client
+        .call(
+            zeron_rpc::methods::WRITE_TERMINAL,
+            serde_json::json!({
+                "terminalId": session["id"],
+                "data": input,
+            }),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while std::fs::read_to_string(&output).ok().as_deref() != Some("from-settings") {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the terminal receives the containing worktree's variables");
+    core.shutdown().await;
 }

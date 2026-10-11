@@ -7,7 +7,6 @@ pub(super) const ACTIVITY_WIDTH: f32 = if cfg!(target_os = "linux") { 44.0 } els
 enum Tool {
     Explorer,
     Changes,
-    Browser,
     History,
     Views,
 }
@@ -32,7 +31,6 @@ impl Shell {
             .into_iter()
             .find_map(|(surface, _, _, _)| {
                 let matches = match (tool, surface) {
-                    (Tool::Browser, RightSurface::Browser(_)) => true,
                     (Tool::Changes, RightSurface::Diff(id)) => self
                         .diffs
                         .get(&id)
@@ -51,7 +49,6 @@ impl Shell {
             match tool {
                 Tool::Changes => self.add_diff_surface(window, cx),
                 Tool::History => self.add_history_surface(window, cx),
-                Tool::Browser => self.add_browser_surface(None, window, cx),
                 _ => {}
             }
         }
@@ -124,8 +121,7 @@ impl Shell {
                 explorer
             } else {
                 open && match (tool, active) {
-                    (Tool::Browser, RightSurface::Browser(_))
-                    | (Tool::Views, RightSurface::Picker) => true,
+                    (Tool::Views, RightSurface::Picker) => true,
                     (Tool::Changes, RightSurface::Diff(id)) => self
                         .diffs
                         .get(&id)
