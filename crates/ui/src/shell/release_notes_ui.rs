@@ -5,7 +5,7 @@ pub(super) struct ReleaseNotesDialog {
     pub(super) selected: usize,
     pub(super) buttons: [FocusHandle; 5],
     previous_focus: Option<FocusHandle>,
-    scroll: gpui::ScrollHandle,
+    pub(super) scroll: gpui::ScrollHandle,
     cache: std::rc::Rc<std::cell::RefCell<crate::markdown::render::RenderCache>>,
     _key_interceptor: Subscription,
 }
@@ -87,7 +87,7 @@ impl Shell {
         cx.notify();
     }
 
-    fn select_release_notes(&mut self, selected: usize, cx: &mut Context<Self>) {
+    pub(super) fn select_release_notes(&mut self, selected: usize, cx: &mut Context<Self>) {
         if let Some(dialog) = self.release_notes_dialog.as_mut() {
             dialog.selected = selected;
             dialog.cache = Default::default();
@@ -198,7 +198,7 @@ impl Shell {
             catalog.and_then(|catalog| catalog.current_index(zeron_update::current_version()));
         let previous = current.and_then(|index| catalog?.releases.get(index + 1));
         let entry = current.and_then(|index| catalog?.releases.get(index + dialog.selected));
-        let mut tabs = div().flex().gap(px(8.0)).flex_wrap().mt(px(16.0));
+        let mut tabs = div().flex_none().flex().gap(px(8.0)).flex_wrap().mt(px(16.0));
         for (index, label) in [
             (
                 0,
@@ -230,26 +230,21 @@ impl Shell {
                     ),
             );
         }
-        let mut body = div()
-            .id("release-notes-scroll")
-            .debug_selector(|| "release-notes-scroll".into())
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .track_scroll(&dialog.scroll)
-            .mt(px(16.0))
-            .pr(px(8.0));
+        // GPUI measures scrolling from the first child's bounds, excluding
+        // that child's top margin. One content wrapper includes all heading
+        // margins in the scroll extent, so the final Markdown line is reachable.
+        let mut content = div().w_full().flex_none().flex().flex_col().pb(px(4.0));
         if let Some(entry) = entry {
             let release = &entry.release;
             if dialog.selected == 0 || !release.fork_changes.is_empty() {
-                body = body.child(section_heading(&theme, "In this Linux fork"));
+                content = content.child(section_heading(&theme, "In this Linux fork"));
                 if release.fork_changes.is_empty() {
-                    body = body.child(popover::dialog_body(
+                    content = content.child(popover::dialog_body(
                         &theme,
                         "No additional fork changes are recorded for this release.",
                     ));
                 } else {
-                    body = body.child(div().flex().flex_col().gap(px(8.0)).children(
+                    content = content.child(div().flex_none().flex().flex_col().gap(px(8.0)).children(
                         release.fork_changes.iter().map(|change| {
                             div()
                                 .flex()
@@ -267,12 +262,12 @@ impl Shell {
                     ));
                 }
             }
-            body = body.child(section_heading(
+            content = content.child(section_heading(
                 &theme,
                 &format!("Upstream Zeron · v{}", release.version),
             ));
             if release.notes_source == "git_history" {
-                body = body.child(div().mb(px(10.0)).child(popover::dialog_body(&theme,
+                content = content.child(div().flex_none().mb(px(10.0)).child(popover::dialog_body(&theme,
                     "Release notes were unavailable when this build was prepared. These changes come from upstream’s Git history.")));
             }
             let opts = crate::markdown::render::RenderOptions {
@@ -287,18 +282,31 @@ impl Shell {
                 workspace_root: None,
                 code: None,
             };
-            body = body.child(crate::markdown::render::render_tree(
+            content = content.child(div().flex_none().id("release-notes-upstream-content")
+                .debug_selector(|| "release-notes-upstream-content".into())
+                .child(crate::markdown::render::render_tree(
                 &entry.upstream,
                 &opts,
                 &theme,
                 window,
                 &|_| None,
-            ));
+            )));
         } else {
-            body = body.child(popover::dialog_body(&theme,
+            content = content.child(popover::dialog_body(&theme,
                 "Release notes weren’t bundled for this build. Your app and project data are unchanged."));
         }
+        let body = div()
+            .id("release-notes-scroll")
+            .debug_selector(|| "release-notes-scroll".into())
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&dialog.scroll)
+            .mt(px(16.0))
+            .pr(px(8.0))
+            .child(content);
         let footer = div()
+            .flex_none()
             .mt(px(16.0))
             .pt(px(12.0))
             .border_t_1()
@@ -382,8 +390,8 @@ impl Shell {
             .aria_label("What’s new")
             .w(px(760.0).min((viewport.width - px(32.0)).max(px(0.0))))
             .h(px(680.0).min((viewport.height - px(32.0)).max(px(0.0))))
-            .child(popover::dialog_title(&theme, "What’s new"))
-            .child(div().mt(px(6.0)).child(popover::dialog_body(
+            .child(popover::dialog_title(&theme, "What’s new").flex_none())
+            .child(div().flex_none().mt(px(6.0)).child(popover::dialog_body(
                 &theme,
                 "Your Linux fork, with notes from the upstream releases it includes.",
             )))
@@ -397,6 +405,7 @@ impl Shell {
 
 fn section_heading(theme: &Theme, title: &str) -> gpui::Div {
     div()
+        .flex_none()
         .mt(px(12.0))
         .mb(px(10.0))
         .text_size(crate::typography::ui_rems(13.0))

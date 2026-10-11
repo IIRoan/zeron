@@ -538,7 +538,9 @@ impl TerminalPanel {
             && tab.terminal_id.as_deref() != Some(session.id.as_str())
         {
             tab._run = None;
-            if tab.fixed_title {
+            // Keystrokes typed into a fresh reserved tab belong to the session
+            // being attached. Input queued for a previous session does not.
+            if tab.fixed_title || tab.terminal_id.is_some() {
                 tab.flush_task = None;
                 tab.resize_task = None;
                 tab.coalescer.take();
@@ -1996,6 +1998,45 @@ mod tests {
             panel.remove_service_view(scope, first, cx);
             assert_eq!(panel.active_tab(cx).unwrap().key, second);
             assert_eq!(panel.chats[scope].tabs.len(), 1);
+        });
+    }
+
+    #[gpui::test]
+    fn attaching_a_new_session_drops_input_queued_for_the_previous_one(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::AppContext;
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+        });
+        let (panel, cx) = cx.add_window_view(|_, cx| {
+            let state = cx.new(|_| {
+                let mut state = AppState::new();
+                state.selected_chat = Some("chat".into());
+                state
+            });
+            TerminalPanel::new(state, cx)
+        });
+        panel.update(cx, |panel, cx| {
+            let session = |id: &str| TerminalSession {
+                id: id.into(),
+                cwd: "/project".into(),
+                shell: "bash".into(),
+            };
+            let key = panel.reserve_tab_for_chat("chat".into(), "Terminal 1", cx);
+            panel.queue_input(b"typed before attach", cx);
+            panel.attach_reserved_session("chat", key, session("first"), None, cx);
+            let tab = panel.tab_mut("chat", key).unwrap();
+            assert!(
+                !tab.coalescer.is_empty(),
+                "a fresh tab keeps input for its first session"
+            );
+            tab.terminal_id = Some("first".into());
+            panel.attach_reserved_session("chat", key, session("second"), None, cx);
+            let tab = panel.tab_mut("chat", key).unwrap();
+            assert!(tab.coalescer.is_empty());
+            assert!(tab.flush_task.is_none());
         });
     }
 

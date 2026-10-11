@@ -10,6 +10,7 @@ fn service(id: &str, command: &str, restart: bool) -> ProjectTerminalService {
         command: command.into(),
         directory: ".".into(),
         restart_on_failure: restart,
+        setup_prerequisite: None,
     }
 }
 
@@ -588,8 +589,8 @@ async fn agents_share_one_service_set_and_handoff_releases_ports_before_restarti
         )
         .await
         .unwrap();
-    assert_eq!(
-        polled.runs.iter().all(|r|r.status==Status::Stopped), true,
+    assert!(
+        polled.runs.iter().all(|r| r.status == Status::Stopped),
         "background polling reads the old checkout without activating its services"
     );
     assert_eq!(
@@ -756,4 +757,136 @@ async fn failed_handoff_stops_old_services_instead_of_serving_the_wrong_worktree
     assert!(snapshot.runs.iter().all(|r| r.status == Status::Stopped));
     assert_eq!(snapshot.checkout.as_deref(), f.b.to_str());
     assert!(!f.core.terminals.any_open());
+}
+
+#[tokio::test]
+async fn stop_lets_a_service_handle_sigterm_before_it_is_killed() {
+    let root = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let store = ProjectTerminals::open(state.path()).unwrap();
+    let terminals = Terminals::new();
+    store
+        .save(
+            "project",
+            root.path(),
+            ProjectTerminalConfig {
+                services: vec![service(
+                    "graceful",
+                    "/bin/sh -c 'trap \"echo flushed > graceful.marker; exit 0\" TERM; echo $$ > graceful.pid; while :; do sleep 0.1; done'",
+                    false,
+                )],
+            },
+        )
+        .unwrap();
+    store
+        .control(&terminals, "project", root.path(), None, "start")
+        .unwrap();
+    new_pid(root.path(), "graceful", None).await;
+    store
+        .control(&terminals, "project", root.path(), None, "stop")
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("graceful.marker"))
+            .unwrap()
+            .trim(),
+        "flushed",
+        "Stop must send SIGTERM and wait before SIGKILL"
+    );
+}
+
+#[tokio::test]
+async fn failed_restart_keeps_the_last_failed_output() {
+    let root = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("app")).unwrap();
+    let store = ProjectTerminals::open(state.path()).unwrap();
+    let terminals = Terminals::new();
+    let mut crash = service(
+        "crash",
+        "echo last-failure-output; cd ..; rmdir app; exit 3",
+        true,
+    );
+    crash.directory = "app".into();
+    store
+        .save(
+            "project",
+            root.path(),
+            ProjectTerminalConfig {
+                services: vec![crash],
+            },
+        )
+        .unwrap();
+    store
+        .control(&terminals, "project", root.path(), None, "start")
+        .unwrap();
+    // The restart cannot open a terminal in the removed directory.
+    wait_for(&store, root.path(), "crash", Status::Failed).await;
+    let run = store
+        .snapshot("project", root.path())
+        .unwrap()
+        .runs
+        .remove(0);
+    assert_eq!(run.exit_code, Some(3));
+    let terminal = run.terminal.expect("failed output stays available");
+    let mut events = terminals.subscribe(&terminal.id, None).unwrap();
+    let mut output = Vec::new();
+    while let Ok(Some(event)) = tokio::time::timeout(Duration::from_secs(2), events.recv()).await {
+        if let zeron_proto::TerminalEvent::Data { data, .. } = event {
+            use base64::Engine as _;
+            output.extend(
+                base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .unwrap(),
+            );
+        }
+    }
+    assert!(String::from_utf8_lossy(&output).contains("last-failure-output"));
+}
+
+#[tokio::test]
+async fn unreadable_profiles_are_set_aside_and_deleted_worktree_groups_are_pruned() {
+    let root = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let path = state.path().join("project-terminals.json");
+    std::fs::write(&path, b"{ not json").unwrap();
+    let store = ProjectTerminals::open(state.path()).unwrap();
+    assert!(
+        store
+            .snapshot("project", root.path())
+            .unwrap()
+            .config
+            .services
+            .is_empty()
+    );
+    let aside = std::fs::read_dir(state.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("project-terminals.json.invalid-")
+        })
+        .expect("the damaged file is preserved");
+    assert_eq!(std::fs::read(aside).unwrap(), b"{ not json");
+
+    let checkout = tempfile::tempdir().unwrap();
+    let config = ProjectTerminalConfig {
+        services: vec![service("backend", "exec sleep 60", false)],
+    };
+    store.save("project", root.path(), config.clone()).unwrap();
+    store
+        .save_checkout("project", root.path(), checkout.path(), config)
+        .unwrap();
+    drop(store);
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("worktree-services:")
+    );
+    drop(checkout);
+    ProjectTerminals::open(state.path()).unwrap();
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(!saved.contains("worktree-services:"));
+    assert!(saved.contains("\"project\""));
 }

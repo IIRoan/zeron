@@ -267,6 +267,9 @@ impl EngineCore {
             WorkspaceFiles::new(repos.clone(), workspace.clone(), device_id.clone());
         let terminals = Terminals::new();
         let project_actions = ProjectActionsStore::open(profile.store_root())?;
+        repos
+            .worktree_settings()
+            .bind_project_services(project_actions.project_terminals.clone(), terminals.clone());
         doc_host.set_project_action_runtime(project_actions.clone(), terminals.clone());
         let previews = zeron_preview::PreviewService::new(
             profile.store_root().join("previews.json"),
@@ -513,7 +516,12 @@ impl EngineCore {
         // recovered work while the engine is being torn down.
         self.doc_host.pause_all_queues();
         self.sessions.shutdown().await;
-        self.project_actions.project_terminals.shutdown();
+        // Services get a SIGTERM grace period; wait for it off the async workers.
+        let project_terminals = self.project_actions.project_terminals.clone();
+        if let Err(error) = tokio::task::spawn_blocking(move || project_terminals.shutdown()).await
+        {
+            tracing::warn!(%error, "project service shutdown did not finish");
+        }
         self.terminals.shutdown();
         self.agent_accounts.shutdown();
         self.change_requests.shutdown();

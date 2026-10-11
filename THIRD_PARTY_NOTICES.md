@@ -30,6 +30,24 @@ Zeron bundles the SVG icon set and filename/folder associations from
 Symbols is MIT licensed. The complete upstream license and copyright notice is
 retained at `crates/ui/assets/file-icons/LICENSE.symbols`.
 
+## Visual Studio Code Codicons
+
+The Linux Source Control icons (`crates/ui/assets/icons/vscode-*.svg`) are
+Microsoft [Visual Studio Code Codicons](https://github.com/microsoft/vscode-codicons).
+Copyright Microsoft Corporation, licensed under
+[Creative Commons Attribution 4.0 International](https://creativecommons.org/licenses/by/4.0/).
+The artwork is unchanged; Zeron only applies the theme color when rendering.
+The attribution and full license text are retained at
+`crates/ui/assets/icons/VSCODE-CODICONS-NOTICE.md` and
+`crates/ui/assets/icons/VSCODE-CODICONS-LICENSE.txt`.
+
+## Solace logo
+
+The Solace logo on the Linux workbench (`crates/ui/assets/icons/solace-logo.svg`)
+is artwork from Rocal's shared `layout/Logo` component. It identifies the
+Solace project, remains the property of its owner, and is not licensed under
+Zeron's `LICENSE`.
+
 ## Bundled theme palette adaptations
 
 Zeron includes manually curated palette adaptations derived from the projects

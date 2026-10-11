@@ -12,7 +12,11 @@
       "upstream_notes": "## What's Changed\n* Cut startup memory from ~700 MB to ~200 MB on large local profiles by @neo773 in https://github.com/zeronsh/zeron/pull/818\n* Windows browser, image previews in tool calls, selectable tool output by @Master0fFate in https://github.com/zeronsh/zeron/pull/813\n* Engine: keep turn snapshots out of the checkout's object database by @katulevskiy in https://github.com/zeronsh/zeron/pull/820\n* Harden Claude/Codex adapters: no early \"done\", Stop kills, sends never do by @wingleeio in https://github.com/zeronsh/zeron/pull/748\n\n## New Contributors\n* @Master0fFate made their first contribution in https://github.com/zeronsh/zeron/pull/813\n\n**Full Changelog**: https://github.com/zeronsh/zeron/compare/v0.2.106...v0.2.107",
       "fork_changes": [
         "Managed terminals and project services use your interactive shell PATH, including Go and Cloudflared.",
-        "Review this update and the previous upstream release in the new update summary."
+        "Review this update and the previous upstream release in the new update summary, with all notes reachable when scrolling.",
+        "Start a fresh chat with another agent in the same checkout, keeping its files, env and services.",
+        "More reliable Git actions, mixed file selection, conflict confirmations, and bounded discard recovery.",
+        "Safer worktree creation and removal, env-file handoff, and service shutdown and restart handling.",
+        "Project settings protect unsaved edits; inactive Git panels poll less often and diff colors follow your theme."
       ],
       "fork_through_commit": "85016cff1a9eb690a49c96c2c10ab39f590082ee"
     },

@@ -140,16 +140,20 @@ class UpdateUpstreamTests(unittest.TestCase):
         self.git(self.fork, "rev-parse", "--verify", "MERGE_HEAD")
         self.assertNotEqual(self.update().returncode, 0)
 
-    def test_checked_action_bundle_preserves_new_local_commits(self):
+    def checked_action_bundle(self):
         self.release()
         ci = self.root / "ci"
         self.git(self.root, "clone", "-q", str(self.fork), str(ci))
         self.git(ci, "switch", "-qc", "maintenance/upstream-42-1")
         self.git(ci, "fetch", str(self.upstream), "main")
-        self.git(ci, "merge", "--no-ff", "--no-edit", "FETCH_HEAD")
+        self.git(ci, "merge", "--no-ff", "-m", "Merge upstream v9.9.9 into Linux fork", "FETCH_HEAD")
         bundle = self.root / "checked.bundle"
         self.git(ci, "bundle", "create", str(bundle), "maintenance/upstream-42-1", "^main")
         self.mock_action(bundle)
+        return self.git(ci, "rev-parse", "HEAD")
+
+    def test_checked_action_bundle_preserves_new_local_commits(self):
+        self.checked_action_bundle()
         (self.fork / "new-local.txt").write_text("new local customization\n")
         self.commit(self.fork, "local work since the Action")
         result = self.update("--from-run", "42")
@@ -157,9 +161,20 @@ class UpdateUpstreamTests(unittest.TestCase):
         self.assertEqual((self.fork / "new-local.txt").read_text(), "new local customization\n")
         self.assertEqual((self.fork / "upstream.txt").read_text(), "upstream update\n")
         self.assertEqual(self.git(self.fork, "status", "--porcelain"), "")
+        self.assertEqual(self.git(self.fork, "log", "-1", "--format=%s"),
+                         "Merge upstream v9.9.9 from Action run 42 into Linux fork")
         head = self.git(self.fork, "rev-parse", "HEAD")
         self.assertEqual(self.update("--from-run", "42").returncode, 0)
         self.assertEqual(self.git(self.fork, "rev-parse", "HEAD"), head)
+
+    def test_checked_action_bundle_fast_forwards_an_unchanged_fork(self):
+        checked = self.checked_action_bundle()
+        result = self.update("--from-run", "42")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.git(self.fork, "rev-parse", "HEAD"), checked)
+        self.assertEqual((self.fork / "upstream.txt").read_text(), "upstream update\n")
+        self.assertEqual(self.git(self.fork, "status", "--porcelain"), "")
+        self.assertTrue(self.git(self.fork, "branch", "--list", "backup/pre-upstream-run-42-*"))
 
     def test_failed_action_cannot_be_imported(self):
         self.mock_action(self.root / "missing.bundle", conclusion="failure")

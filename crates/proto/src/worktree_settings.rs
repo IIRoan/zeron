@@ -106,7 +106,7 @@ pub enum WorktreeSetupPhase {
     Interrupted,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorktreeSetupState {
     pub phase: WorktreeSetupPhase,
@@ -115,7 +115,7 @@ pub struct WorktreeSetupState {
     pub log_available: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorktreeEnvironmentEntry {
     pub path: String,
@@ -125,7 +125,7 @@ pub struct WorktreeEnvironmentEntry {
     pub state: WorktreeSetupState,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorktreeSettingsSnapshot {
     pub defaults: WorktreeSettings,

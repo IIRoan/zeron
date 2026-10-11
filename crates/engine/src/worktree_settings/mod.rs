@@ -1,12 +1,12 @@
 //! Worktree environment lifecycle. Profiles and secrets remain on this device;
 //! preparing a checkout never blocks the UI thread or a registry watch.
-mod commands;
+pub(crate) mod commands;
 mod files;
 
 use crate::EngineError;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -31,13 +31,19 @@ struct Project {
     checkouts: BTreeMap<String, Checkout>,
 }
 
+type Discovered = (Vec<String>, Vec<String>);
+
 struct Inner {
     directory: PathBuf,
     projects: Mutex<Option<BTreeMap<String, Project>>>,
     operations: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     cancellation: Mutex<HashMap<String, CancellationToken>>,
-    discovery: Mutex<HashMap<String, (std::time::Instant, (Vec<String>, Vec<String>))>>,
+    discovery: Mutex<HashMap<String, (std::time::Instant, Discovered)>>,
+    /// Checkouts whose removal has started. A setup queued behind the removal
+    /// must not recreate files in a folder that is about to disappear.
+    removing: Mutex<HashSet<String>>,
     stopping: std::sync::atomic::AtomicBool,
+    project_services: Mutex<Option<(crate::project_terminals::ProjectTerminals, crate::Terminals)>>,
 }
 
 #[derive(Clone)]
@@ -54,9 +60,23 @@ impl WorktreeSettingsStore {
                 operations: Mutex::new(HashMap::new()),
                 cancellation: Mutex::new(HashMap::new()),
                 discovery: Mutex::new(HashMap::new()),
+                removing: Mutex::new(HashSet::new()),
                 stopping: std::sync::atomic::AtomicBool::new(false),
+                project_services: Mutex::new(None),
             }),
         }
+    }
+
+    pub fn bind_project_services(
+        &self,
+        services: crate::project_terminals::ProjectTerminals,
+        terminals: crate::Terminals,
+    ) {
+        *self
+            .inner
+            .project_services
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some((services, terminals));
     }
 
     fn with<T>(
@@ -253,6 +273,21 @@ impl WorktreeSettingsStore {
         })
     }
 
+    /// Ends a removal started by [`Self::cleanup`], whether or not it succeeded,
+    /// so an explicit setup can run again in a checkout that was kept.
+    pub fn finish_removal(&self, checkout: &Path) {
+        let cwd = checkout
+            .canonicalize()
+            .unwrap_or_else(|_| checkout.into())
+            .to_string_lossy()
+            .into_owned();
+        self.inner
+            .removing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&cwd);
+    }
+
     pub fn snapshot(
         &self,
         root: &Path,
@@ -267,6 +302,22 @@ impl WorktreeSettingsStore {
         let key = canonical(root)?;
         let cwd = checkout.map(canonical).transpose()?;
         let detected = self.detect(root)?;
+        // Folders deleted outside Zeron leave entries behind. A checkout that
+        // is still being created has no folder yet and keeps its progress.
+        let stale = |path: &String, c: &Checkout| {
+            c.state.phase != WorktreeSetupPhase::Preparing && !Path::new(path).is_dir()
+        };
+        if self.with(false, |p| {
+            Ok(p.get(&key)
+                .is_some_and(|p| p.checkouts.iter().any(|(path, c)| stale(path, c))))
+        })? {
+            self.with(true, |p| {
+                if let Some(p) = p.get_mut(&key) {
+                    p.checkouts.retain(|path, c| !stale(path, c));
+                }
+                Ok(())
+            })?;
+        }
         self.with(false, |projects| {
             let project = projects.get(&key);
             let has_overrides = cwd
@@ -465,6 +516,16 @@ impl WorktreeSettingsStore {
         self.prepare_locked(root, checkout, retry).await
     }
 
+    /// Agent dispatch prepares only worktrees Zeron created. A worktree made
+    /// outside Zeron keeps its files until the user starts a service or
+    /// prepares it explicitly.
+    pub async fn prepare_managed(&self, root: &Path, checkout: &Path) -> Result<(), EngineError> {
+        if self.owned_branch(root, checkout)?.is_none() {
+            return Ok(());
+        }
+        self.prepare(root, checkout, false).await
+    }
+
     pub fn is_prepared(&self, root: &Path, checkout: &Path) -> Result<bool, EngineError> {
         let key = canonical(root)?;
         let cwd = canonical(checkout)?;
@@ -490,29 +551,66 @@ impl WorktreeSettingsStore {
         self.ensure_running()?;
         let root_key = canonical(root)?;
         let cwd = canonical(checkout)?;
+        if self
+            .inner
+            .removing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&cwd)
+        {
+            return Err(EngineError::Other(
+                "This worktree is being removed; its environment was not prepared.".into(),
+            ));
+        }
         let settings = self.effective(root, checkout)?;
         let digest = preparation_hash(&settings)?;
-        if !retry
+        let already_prepared = !retry
             && self.with(false, |p| {
                 Ok(p.get(&root_key)
                     .and_then(|p| p.checkouts.get(&cwd))
-                    .is_some_and(|c| {
-                        c.state.phase == WorktreeSetupPhase::Ready && c.prepared_hash == digest
-                    }))
-            })?
+                    .is_some_and(|c| c.prepared_hash == digest))
+            })?;
+        let project_services = self
+            .inner
+            .project_services
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if already_prepared
+            && !project_services
+                .as_ref()
+                .map(|(services, _)| services.has_setup_services(root))
+                .transpose()?
+                .unwrap_or(false)
         {
+            self.state(
+                &root_key,
+                &cwd,
+                WorktreeSetupPhase::Ready,
+                "Environment ready",
+                None,
+            )?;
             return Ok(());
         }
         let defaults = self.defaults(root)?;
         self.with(true, |p| {
             p.entry(root_key.clone())
                 .or_insert_with(|| Project {
-                    defaults,
+                    defaults: defaults.clone(),
                     ..Project::default()
                 })
                 .checkouts
                 .entry(cwd.clone())
                 .or_default();
+            if !already_prepared {
+                p.get_mut(&root_key)
+                    .unwrap()
+                    .checkouts
+                    .get_mut(&cwd)
+                    .unwrap()
+                    .prepared_hash
+                    .clear();
+            }
             Ok(())
         })?;
         let token = self.setup_token(&cwd);
@@ -527,18 +625,35 @@ impl WorktreeSettingsStore {
             &root_key,
             &cwd,
             WorktreeSetupPhase::Preparing,
-            "Preparing environment files",
+            "Waiting for project services",
             None,
         )?;
         let log = self.log_path(&root_key, &cwd);
         files::private_directory(log.parent().unwrap())?;
-        files::private_write(&log, b"", false)?;
+        if !already_prepared {
+            files::private_write(&log, b"", false)?;
+        }
         let this = self.clone();
         let source = root.to_path_buf();
         let destination = checkout.to_path_buf();
         let config = settings.clone();
         let cancelled = token.clone();
         let result = async {
+            if let Some((services, terminals)) = project_services {
+                services
+                    .ensure_setup_services(&terminals, root, &defaults, &log, &token)
+                    .await?;
+            }
+            if already_prepared {
+                return Ok(());
+            }
+            self.state(
+                &root_key,
+                &cwd,
+                WorktreeSetupPhase::Preparing,
+                "Preparing environment files",
+                None,
+            )?;
             tokio::task::spawn_blocking(move || {
                 this.prepare_files(&source, &destination, &config, &cancelled)
             })
@@ -696,22 +811,50 @@ impl WorktreeSettingsStore {
     fn capture_active(&self, root: &Path) -> Result<(), EngineError> {
         let key = canonical(root)?;
         self.ensure_running()?;
-        let previous = self.with(false, |p| Ok(p.get(&key).and_then(|p| p.active.clone())))?;
-        if let Some(previous) = previous
-            && Path::new(&previous).is_dir()
-        {
+        let previous = self.active(&key)?;
+        if Path::new(&previous).is_dir() {
             let settings = self.effective(root, Path::new(&previous))?;
-            for rule in settings
-                .env_files
-                .iter()
-                .filter(|r| r.mode == WorktreeEnvMode::Follow)
-            {
-                let file = files::source(Path::new(&previous), &rule.path)?;
-                files::private_write(
-                    &self.vault_path(root, &settings, &rule.path)?,
-                    &files::read_env(&file)?,
+            self.capture_follow(root, Path::new(&previous), &settings)?;
+        }
+        Ok(())
+    }
+
+    /// Until another checkout is activated, the project folder holds the
+    /// followed env files, so its edits must be captured like any other.
+    fn active(&self, key: &str) -> Result<String, EngineError> {
+        self.with(false, |p| {
+            Ok(p.get(key)
+                .and_then(|p| p.active.clone())
+                .unwrap_or_else(|| key.to_string()))
+        })
+    }
+
+    /// A followed file that is missing or unreadable in the outgoing checkout
+    /// keeps the last captured copy; it must not block switching or removal.
+    fn capture_follow(
+        &self,
+        root: &Path,
+        checkout: &Path,
+        settings: &WorktreeSettings,
+    ) -> Result<(), EngineError> {
+        for rule in settings
+            .env_files
+            .iter()
+            .filter(|r| r.mode == WorktreeEnvMode::Follow)
+        {
+            let bytes = files::source(checkout, &rule.path).and_then(|file| files::read_env(&file));
+            match bytes {
+                Ok(bytes) => files::private_write(
+                    &self.vault_path(root, settings, &rule.path)?,
+                    &bytes,
                     true,
-                )?;
+                )?,
+                Err(error) => tracing::warn!(
+                    checkout = %checkout.display(),
+                    path = %rule.path,
+                    %error,
+                    "followed env file was not captured"
+                ),
             }
         }
         Ok(())
@@ -756,7 +899,7 @@ impl WorktreeSettingsStore {
         let cwd = canonical(checkout)?;
         let operation = self.operation(&key);
         let _guard = operation.lock().await;
-        let previous = self.with(false, |p| Ok(p.get(&key).and_then(|p| p.active.clone())))?;
+        let previous = Some(self.active(&key)?);
         self.capture_active(root)?;
         if cwd != key {
             self.prepare_locked(root, checkout, false).await?;
@@ -849,26 +992,36 @@ impl WorktreeSettingsStore {
                 "The project folder cannot be removed as a worktree.".into(),
             ));
         }
+        self.inner
+            .removing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(cwd.clone());
         self.cancel(checkout)?;
         let operation = self.operation(&key);
         let _guard = operation.lock().await;
         let settings = self.effective(root, checkout)?;
-        let active = self.with(false, |p| {
-            Ok(p.get(&key)
-                .and_then(|p| p.active.as_deref())
-                .is_some_and(|p| p == cwd))
-        })?;
-        for rule in settings
-            .env_files
-            .iter()
-            .filter(|r| active && r.mode == WorktreeEnvMode::Follow)
-        {
-            let path = files::source(checkout, &rule.path)?;
-            files::private_write(
-                &self.vault_path(root, &settings, &rule.path)?,
-                &files::read_env(&path)?,
-                true,
-            )?;
+        if self.active(&key)? == cwd {
+            self.capture_follow(root, checkout, &settings)?;
+            // The project folder becomes the active checkout again, so the
+            // followed files return there instead of being overwritten by a
+            // stale project copy on the next switch.
+            let project = self.effective(root, root)?;
+            for rule in project
+                .env_files
+                .iter()
+                .filter(|r| r.mode == WorktreeEnvMode::Follow)
+            {
+                if let Err(error) = self.follow_file(root, root, &project, &rule.path) {
+                    tracing::warn!(path = %rule.path, %error, "followed env file was not restored to the project");
+                }
+            }
+            self.with(true, |p| {
+                if let Some(p) = p.get_mut(&key) {
+                    p.active = None;
+                }
+                Ok(())
+            })?;
         }
         if !settings.cleanup_command.trim().is_empty() {
             self.run_tracked_workflow(
@@ -913,6 +1066,7 @@ impl WorktreeSettingsStore {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_tracked_workflow(
         &self,
         root: &Path,
@@ -1033,6 +1187,9 @@ fn preparation_hash(settings: &WorktreeSettings) -> Result<String, EngineError> 
     preparation.cleanup_command.clear();
     preparation.create_command.clear();
     preparation.remove_command.clear();
+    // The default keeps digests of checkouts prepared before the timeout was
+    // excluded unchanged in the common case.
+    preparation.command_timeout_seconds = WorktreeSettings::default().command_timeout_seconds;
     Ok(hash(
         &serde_json::to_string(&preparation).map_err(|e| EngineError::Other(e.to_string()))?,
     ))
@@ -1048,7 +1205,9 @@ pub fn detect_install(root: &Path) -> String {
     } else if root.join("package-lock.json").exists() {
         "npm ci"
     } else {
-        "npm install"
+        // Without a lockfile, a worktree install must not create one that
+        // shows up as an unrelated change in the branch.
+        "npm install --no-package-lock"
     }
     .into()
 }

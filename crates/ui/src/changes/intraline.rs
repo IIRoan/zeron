@@ -84,16 +84,10 @@ pub(super) fn collect(files: &[FileDiff]) -> Changes {
 }
 
 pub(super) fn background(theme: &Theme, added: bool, strong: bool) -> gpui::Hsla {
-    if theme.appearance.is_dark() {
-        let color: gpui::Hsla = gpui::rgb(if added { 0x9bb955 } else { 0xf14c4c }).into();
-        color.opacity(if strong { 0.34 } else { 0.15 })
+    if strong {
+        theme.diff_wash.text(added)
     } else {
-        (if added {
-            theme.diff_add
-        } else {
-            theme.diff_del
-        })
-        .opacity(if strong { 0.22 } else { 0.10 })
+        theme.diff_wash.line(added)
     }
 }
 

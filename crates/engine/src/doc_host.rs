@@ -5435,7 +5435,7 @@ impl DocHost {
                 let worktree_spec = request.worktree.take();
                 let fresh_worktree = match &worktree_spec {
                     Some(spec) => {
-                        let (cwd, fresh) = match self.materialize_worktree(chat_id, &spec).await {
+                        let (cwd, fresh) = match self.materialize_worktree(chat_id, spec).await {
                             Ok(worktree) => worktree,
                             Err(error) => {
                                 if spec.space_id.is_some()
@@ -5819,9 +5819,17 @@ impl DocHost {
         request: zeron_proto::RunRequest,
         message_id: Option<String>,
     ) -> Result<String, EngineError> {
-        if let Some(repos)=self.inner.repos.get()
-            && let Some(root)=crate::workspace_host::linked_worktree_root(std::path::Path::new(&request.cwd)) {
-            repos.worktree_settings().prepare(std::path::Path::new(&root),std::path::Path::new(&request.cwd),false).await?;
+        if let Some(repos) = self.inner.repos.get()
+            && let Some(root) =
+                crate::workspace_host::linked_worktree_root(std::path::Path::new(&request.cwd))
+        {
+            repos
+                .worktree_settings()
+                .prepare_managed(
+                    std::path::Path::new(&root),
+                    std::path::Path::new(&request.cwd),
+                )
+                .await?;
         }
         if let Some(workspace) = self.workspace()
             && let Some(context) = self.capture_source_context(&request.cwd).await

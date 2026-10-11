@@ -1,20 +1,20 @@
 //! Source-control metadata and explicit index operations. Submodules have their
 //! own index; staging their contents never stages the parent's gitlink.
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, HashSet, VecDeque},
     path::{Component, Path, PathBuf},
     time::Duration,
 };
 
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use zeron_proto::{
     CheckoutChangeSelection, CheckoutChanges, CheckoutDiff, DiffFileSummary, GitFileState,
     GitFileStatus, RepositoryChanges,
 };
 
 use crate::{
-    EngineError,
+    EngineError, checkout_git,
     diff_sync::{self, Capture},
 };
 
@@ -23,9 +23,7 @@ const MAX_REPOSITORIES: usize = 128;
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 async fn git(root: &Path, args: &[&str]) -> Result<Capture, EngineError> {
-    tokio::time::timeout(TIMEOUT, diff_sync::capture_git(root, args, LIMIT))
-        .await
-        .map_err(|_| EngineError::Other("Git operation timed out".into()))?
+    checkout_git::capture(root, args, LIMIT, TIMEOUT).await
 }
 
 pub(crate) fn relative(path: &str) -> Result<&Path, EngineError> {
@@ -41,24 +39,31 @@ pub(crate) fn relative(path: &str) -> Result<&Path, EngineError> {
     Ok(path)
 }
 
+/// Streams the whole index, so the list is always complete; the flag is kept
+/// for callers that also handle capped listings.
 pub(crate) async fn submodules(root: &Path) -> Result<(Vec<String>, bool), EngineError> {
-    let output = git(root, &["ls-files", "--stage", "-z"]).await?;
     let mut paths = Vec::new();
-    for record in output
-        .stdout
-        .split(|b| *b == 0)
-        .filter(|r| r.starts_with(b"160000 "))
-    {
-        if let Some(tab) = record.iter().position(|b| *b == b'\t') {
-            let path = std::str::from_utf8(&record[tab + 1..])
-                .map_err(|_| EngineError::Other("Non-UTF-8 submodule path".into()))?;
-            relative(path)?;
-            paths.push(path.to_string());
-        }
-    }
+    checkout_git::records(
+        root,
+        &["ls-files", "--stage", "-z"],
+        checkout_git::STREAM_TIMEOUT,
+        |record| {
+            if !record.starts_with(b"160000 ") {
+                return Ok(());
+            }
+            if let Some(tab) = record.iter().position(|b| *b == b'\t') {
+                let path = std::str::from_utf8(&record[tab + 1..])
+                    .map_err(|_| EngineError::Other("Non-UTF-8 submodule path".into()))?;
+                relative(path)?;
+                paths.push(path.to_string());
+            }
+            Ok(())
+        },
+    )
+    .await?;
     paths.sort();
     paths.dedup();
-    Ok((paths, !output.truncated))
+    Ok((paths, true))
 }
 
 pub(crate) async fn status(root: &Path) -> Result<(Vec<GitFileStatus>, bool), EngineError> {
@@ -178,12 +183,26 @@ pub async fn set_staged(root: &Path, paths: &[String], staged: bool) -> Result<(
 /// unbounded file into memory. Deleted conflicts have no text to inspect.
 pub async fn conflict_markers(root: &Path, paths: &[String]) -> Result<Vec<String>, EngineError> {
     let (files, complete) = status(root).await?;
-    if !complete { return Err(EngineError::Other("Git status is incomplete; refresh before staging".into())); }
+    if !complete {
+        return Err(EngineError::Other(
+            "Git status is incomplete; refresh before staging".into(),
+        ));
+    }
+    let files: HashMap<_, _> = files
+        .iter()
+        .map(|file| (file.path.as_str(), file))
+        .collect();
     let mut result = Vec::new();
     for path in paths {
         relative(path)?;
-        let Some(file) = files.iter().find(|file| &file.path == path) else { return Err(EngineError::Other("File changes have moved; refresh the list".into())); };
-        if !file.is_conflicted() { continue; }
+        let Some(file) = files.get(path.as_str()) else {
+            return Err(EngineError::Other(
+                "File changes have moved; refresh the list".into(),
+            ));
+        };
+        if !file.is_conflicted() {
+            continue;
+        }
         let location = crate::checkout_discard::validate_path(root, path).await?;
         let metadata = match tokio::fs::symlink_metadata(&location).await {
             Ok(metadata) => metadata,
@@ -216,8 +235,16 @@ pub async fn set_staged_checked(root: &Path, paths: &[String], staged: bool, all
             "Git status is incomplete; refresh before staging".into(),
         ));
     }
-    if staged && !allow_conflict_markers
-        && files.iter().any(|file| file.is_conflicted() && paths.contains(&file.path))
+    let files: HashMap<_, _> = files
+        .iter()
+        .map(|file| (file.path.as_str(), file))
+        .collect();
+    let selected: HashSet<_> = paths.iter().map(String::as_str).collect();
+    if staged
+        && !allow_conflict_markers
+        && selected
+            .iter()
+            .any(|path| files.get(path).is_some_and(|file| file.is_conflicted()))
         && !conflict_markers(root, paths).await?.is_empty()
     {
         return Err(EngineError::Other("Files still contain merge conflict markers; review them before staging".into()));
@@ -225,7 +252,7 @@ pub async fn set_staged_checked(root: &Path, paths: &[String], staged: bool, all
     let mut arguments = Vec::new();
     for path in paths {
         relative(path)?;
-        let file = files.iter().find(|f| &f.path == path).ok_or_else(|| {
+        let file = files.get(path.as_str()).ok_or_else(|| {
             EngineError::Other("File changes have moved; refresh the list".into())
         })?;
         arguments.push(path.clone());
@@ -238,38 +265,24 @@ pub async fn set_staged_checked(root: &Path, paths: &[String], staged: bool, all
     }
     arguments.sort();
     arguments.dedup();
-    let mut command = tokio::process::Command::new("git");
-    command.arg("-C").arg(root).arg("--literal-pathspecs");
+    let base;
+    let mut args = vec!["--literal-pathspecs"];
     if staged {
-        command.args(["add", "-A"]);
+        args.extend(["add", "-A"]);
     } else {
-        let base = diff_sync::working_diff_base(root).await?;
-        command.args(["restore", "--staged", "--source"]).arg(base);
+        base = diff_sync::working_diff_base(root).await?;
+        args.extend(["restore", "--staged", "--source", &base]);
     }
-    command
-        .args(["--pathspec-from-file=-", "--pathspec-file-nul"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    let mut child = command.spawn()?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| EngineError::Other("Git stdin unavailable".into()))?;
+    args.extend(["--pathspec-from-file=-", "--pathspec-file-nul"]);
     let payload = arguments.join("\0") + "\0";
-    let result = tokio::time::timeout(TIMEOUT, async move {
-        stdin.write_all(payload.as_bytes()).await?;
-        drop(stdin);
-        child.wait_with_output().await
-    })
-    .await
-    .map_err(|_| EngineError::Other("Staging timed out".into()))??;
-    if !result.status.success() {
-        return Err(EngineError::Other(
-            String::from_utf8_lossy(&result.stderr).trim().to_string(),
-        ));
-    }
+    checkout_git::mutate(
+        root,
+        &args,
+        Some(payload.as_bytes()),
+        checkout_git::MUTATION_TIMEOUT,
+        "Staging",
+    )
+    .await?;
     Ok(())
 }
 
@@ -331,93 +344,42 @@ pub async fn commit(
             "Commit message is invalid or too long".into(),
         ));
     }
-    let (files, complete) = status(root).await?;
-    if !complete {
+    // Untracked files never matter here, so skip listing them: in a large
+    // checkout that listing is the part that outgrows any buffer.
+    let summary = checkout_git::summary(root, "dirty").await?;
+    let state = &summary.state;
+    if state.conflicts > 0 {
         return Err(EngineError::Other(
-            "Git status is incomplete; refresh before committing".into(),
+            "Resolve and stage all conflicts before committing".into(),
         ));
     }
-    if files.iter().any(GitFileStatus::is_conflicted) {
-        return Err(EngineError::Other("Resolve and stage all conflicts before committing".into()));
+    if expected_head.is_some() && state.head.as_deref() != expected_head {
+        return Err(EngineError::Other(
+            "The branch changed; refresh before committing".into(),
+        ));
     }
-    if expected_head.is_some() || amend {
-        let state = crate::checkout_git::state(root).await?;
-        if expected_head.is_some() && state.head.as_deref() != expected_head {
-            return Err(EngineError::Other(
-                "The branch changed; refresh before committing".into(),
-            ));
-        }
-        if amend && (state.head.is_none() || state.operation.is_some()) {
-            return Err(EngineError::Other(
-                "Amend requires an existing commit and no Git operation in progress".into(),
-            ));
-        }
+    if amend && (state.head.is_none() || state.operation.is_some()) {
+        return Err(EngineError::Other(
+            "Amend requires an existing commit and no Git operation in progress".into(),
+        ));
     }
-    if !amend
-        && !files.iter().any(|file| {
-            !matches!(
-                file.index,
-                GitFileState::Unchanged | GitFileState::Untracked
-            )
-        })
-    {
+    if !amend && !summary.staged {
         return Err(EngineError::Other("Stage changes before committing".into()));
     }
-    let mut command = tokio::process::Command::new("git");
+    let mut args = vec!["commit"];
     if amend {
-        command.arg("-C").arg(root).arg("commit").arg("--amend");
-    } else {
-        command.arg("-C").arg(root).arg("commit");
+        args.push("--amend");
     }
-    command
-        .args(["--file=-", "--cleanup=verbatim"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    let mut child = command.spawn()?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| EngineError::Other("Git stdin unavailable".into()))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| EngineError::Other("Git stdout unavailable".into()))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| EngineError::Other("Git stderr unavailable".into()))?;
-    let result = tokio::time::timeout(Duration::from_secs(300), async move {
-        let write = async move {
-            let result = stdin.write_all(message.as_bytes()).await;
-            drop(stdin);
-            result
-        };
-        let (write, stdout, stderr, status) = tokio::join!(
-            write,
-            commit_output(stdout),
-            commit_output(stderr),
-            child.wait()
-        );
-        let (stdout, stderr, status) = (stdout?, stderr?, status?);
-        if !status.success() {
-            let diagnostic = if stderr.is_empty() { &stdout } else { &stderr };
-            let diagnostic = String::from_utf8_lossy(diagnostic).trim().to_owned();
-            return Err(EngineError::Other(if diagnostic.is_empty() {
-                format!("Git commit failed ({status})")
-            } else {
-                diagnostic
-            }));
-        }
-        write?;
-        Ok(())
-    })
-    .await
-    .map_err(|_| {
-        EngineError::Other("Git commit timed out; check repository status before retrying".into())
-    })?;
-    result
+    args.extend(["--file=-", "--cleanup=verbatim"]);
+    checkout_git::mutate(
+        root,
+        &args,
+        Some(message.as_bytes()),
+        checkout_git::MUTATION_TIMEOUT,
+        "Git commit",
+    )
+    .await?;
+    Ok(())
 }
 
 pub async fn file_diff(

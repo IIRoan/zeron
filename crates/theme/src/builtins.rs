@@ -352,6 +352,10 @@ fn vscode_dark() -> ThemeVariant {
         ("bracket1", "#ffd700"),
         ("bracket2", "#da70d6"),
         ("bracket3", "#179fff"),
+        ("diffInsertedLine", "#9bb95526"),
+        ("diffRemovedLine", "#f14c4c26"),
+        ("diffInsertedText", "#9bb95557"),
+        ("diffRemovedText", "#f14c4c57"),
     ] {
         theme.syntax.insert(role.into(), c(color));
     }
@@ -402,6 +406,10 @@ fn vscode_light() -> ThemeVariant {
         ("bracket1", "#8b6500"),
         ("bracket2", "#910091"),
         ("bracket3", "#005bbe"),
+        ("diffInsertedLine", "#0080001a"),
+        ("diffRemovedLine", "#a1260d1a"),
+        ("diffInsertedText", "#00800038"),
+        ("diffRemovedText", "#a1260d38"),
     ] {
         theme.syntax.insert(role.into(), c(color));
     }

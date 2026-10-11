@@ -106,7 +106,8 @@ export function derive<T>(name: string, input: Widget): Promise<T> {
             ("`${name}:${kind}`", HighlightKind::String),
             ("42", HighlightKind::Number),
             ("===", HighlightKind::Operator),
-            ("(", HighlightKind::Punctuation),
+            ("(", HighlightKind::Bracket1),
+            (";", HighlightKind::Punctuation),
             ("result", HighlightKind::Variable),
         ],
     );
@@ -122,7 +123,8 @@ export function card(props: Props): JSX.Element {
         source,
         "src/card.tsx",
         &[
-            ("type", HighlightKind::Keyword),
+            ("type", HighlightKind::KeywordStorage),
+            ("return", HighlightKind::Keyword),
             ("card", HighlightKind::Function),
             ("props", HighlightKind::Parameter),
             ("Props", HighlightKind::Type),

@@ -76,8 +76,12 @@ impl SourceControl {
                 else {
                     return None;
                 };
-                let repo = &snapshot.repositories[*repository];
-                Some(FileKey::new(&repo.path, &repo.files[*file].path, *staged))
+                let repo = snapshot.repositories.get(*repository)?;
+                Some(FileKey::new(
+                    &repo.path,
+                    &repo.files.get(*file)?.path,
+                    *staged,
+                ))
             })
             .collect()
     }
@@ -88,9 +92,10 @@ impl SourceControl {
             .flat_map(|snapshot| &snapshot.repositories)
             .flat_map(|repo| {
                 repo.files.iter().flat_map(move |file| {
-                    [true, false].into_iter().filter_map(move |staged| {
-                        in_group(file, staged).then(|| FileKey::new(&repo.path, &file.path, staged))
-                    })
+                    [true, false]
+                        .into_iter()
+                        .filter(move |staged| in_group(file, *staged))
+                        .map(move |staged| FileKey::new(&repo.path, &file.path, staged))
                 })
             })
             .collect()
@@ -174,12 +179,52 @@ impl SourceControl {
         paths
     }
 
+    pub(super) fn group_paths(
+        &self,
+        repository: &str,
+        staged: bool,
+        conflicts: bool,
+        discard: bool,
+    ) -> Vec<String> {
+        let Some(repo) = self.snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .repositories
+                .iter()
+                .find(|repo| repo.path == repository)
+        }) else {
+            return Vec::new();
+        };
+        repo.files
+            .iter()
+            .filter(|file| in_group(file, staged) && file.is_conflicted() == conflicts)
+            .filter(|file| !discard || !repo.submodules.contains(&file.path))
+            .map(|file| file.path.clone())
+            .collect()
+    }
+
     pub(super) fn prune_selection(&mut self) {
-        if self.selected_files.is_empty() && self.selection_anchor.is_none() {
+        if self.selected_files.is_empty()
+            && self.selection_anchor.is_none()
+            && self.selected.is_none()
+        {
             return;
         }
         let valid = self.valid_file_keys();
         self.selected_files.retain(|key| valid.contains(key));
+        if let Some(selection) = self.selected.as_mut() {
+            let key = FileKey::new(&selection.repository, &selection.path, selection.staged);
+            if !valid.contains(&key) {
+                // A fully staged or unstaged file keeps focus on the side it moved to.
+                if valid.contains(&FileKey {
+                    staged: !key.staged,
+                    ..key
+                }) {
+                    selection.staged = !selection.staged;
+                } else {
+                    self.selected = None;
+                }
+            }
+        }
         if self
             .selection_anchor
             .as_ref()

@@ -30,6 +30,15 @@ async fn terminals_use_interactive_login_path_and_respect_explicit_overrides() {
     let tool = bin.join("zeron-shell-only-tool");
     std::fs::write(&tool, "#!/bin/sh\nprintf 'resolved-through-shell'\n").unwrap();
     std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // The app's inherited PATH and the login shell both provide this tool, like
+    // /usr/bin/node next to an nvm-managed node. The user's shell must win.
+    let app_bin = root.path().join("app-bin");
+    std::fs::create_dir(&app_bin).unwrap();
+    for (dir, output) in [(&bin, "login-shell-copy"), (&app_bin, "app-copy")] {
+        let shared = dir.join("zeron-shared-tool");
+        std::fs::write(&shared, format!("#!/bin/sh\nprintf '{output}'\n")).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let shell = root.path().join("shell-fixture");
     // Emulate Homebrew initialization restricted to interactive shells. A
     // non-interactive service has to inherit the captured interactive PATH.
@@ -46,7 +55,7 @@ async fn terminals_use_interactive_login_path_and_respect_explicit_overrides() {
     unsafe {
         std::env::set_var("SHELL", &shell);
         std::env::set_var("HOME", root.path());
-        std::env::set_var("PATH", "/usr/bin:/bin");
+        std::env::set_var("PATH", format!("{}:/usr/bin:/bin", app_bin.display()));
         std::env::remove_var("ZERON_NO_LOGIN_SHELL");
     }
     let terminals = Terminals::new();
@@ -62,6 +71,16 @@ async fn terminals_use_interactive_login_path_and_respect_explicit_overrides() {
     assert_eq!(
         std::fs::read_to_string(root.path().join("service-output")).unwrap(),
         "resolved-through-shell"
+    );
+    terminals.close(&service.id).unwrap();
+
+    let service = terminals
+        .open_service(cwd, &HashMap::new(), "zeron-shared-tool > shared-output")
+        .unwrap();
+    assert_eq!(exit_code(&terminals, &service.id).await, 0);
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("shared-output")).unwrap(),
+        "login-shell-copy"
     );
     terminals.close(&service.id).unwrap();
 
@@ -91,4 +110,25 @@ async fn terminals_use_interactive_login_path_and_respect_explicit_overrides() {
     .await
     .expect("ordinary terminal inherits the login PATH too");
     terminals.close(&terminal.id).unwrap();
+
+    // A csh-family login shell cannot source a POSIX service script. Services
+    // fall back to /bin/sh and keep the PATH captured above.
+    let tcsh_dir = root.path().join("csh");
+    std::fs::create_dir(&tcsh_dir).unwrap();
+    let tcsh = tcsh_dir.join("tcsh");
+    std::fs::write(&tcsh, "#!/bin/sh\ntouch \"$HOME/tcsh-invoked\"\nexit 1\n").unwrap();
+    std::fs::set_permissions(&tcsh, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // SAFETY: see above.
+    unsafe { std::env::set_var("SHELL", &tcsh) };
+    let service = terminals
+        .open_service(cwd, &HashMap::new(), "zeron-shell-only-tool > csh-output")
+        .unwrap();
+    assert_eq!(service.shell, "sh");
+    assert_eq!(exit_code(&terminals, &service.id).await, 0);
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("csh-output")).unwrap(),
+        "resolved-through-shell"
+    );
+    assert!(!root.path().join("tcsh-invoked").exists());
+    terminals.close(&service.id).unwrap();
 }

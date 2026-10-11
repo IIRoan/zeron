@@ -51,6 +51,15 @@ jobs:
           save-rust-cache: 'true'
       - name: Harness, engine, sync, update, doc and preview tests
         run: scripts/ci/test-core.sh
+      - name: Fork worktree, service and terminal regressions
+        run: >-
+          cargo nextest run --config-file scripts/ci/nextest.toml --locked --no-fail-fast
+          -p zeron-engine --test local_first --test project_terminals
+          --test terminal_shell_path --test worktree_environments --test worktree_on_run
+      - name: Syntax highlighting and theme regressions
+        run: >-
+          cargo nextest run --config-file scripts/ci/nextest.toml --locked --no-fail-fast
+          -p zeron-syntax -p zeron-theme
       - name: Fork update and release note regressions
         run: |
           python3 scripts/tests/test_update_upstream.py

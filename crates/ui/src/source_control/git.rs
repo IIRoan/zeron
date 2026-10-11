@@ -137,6 +137,94 @@ mod tests {
         cx.simulate_click(last.center(), gpui::Modifiers::default());
         view.read_with(cx, |view, _| assert!(!view.actions_menu.is_open()));
     }
+
+    #[gpui::test]
+    fn mixed_selection_offers_stage_and_unstage_for_their_own_sides(cx: &mut TestAppContext) {
+        let (view, cx) = menu_setup(cx, 900.0);
+        view.update(cx, |view, _| {
+            view.snapshot.as_mut().unwrap().repositories[0].files = ["a.rs", "b.rs"]
+                .into_iter()
+                .map(|path| zeron_proto::GitFileStatus {
+                    path: path.into(),
+                    old_path: None,
+                    index: if path == "a.rs" {
+                        zeron_proto::GitFileState::Modified
+                    } else {
+                        zeron_proto::GitFileState::Unchanged
+                    },
+                    worktree: zeron_proto::GitFileState::Modified,
+                })
+                .collect();
+            view.rebuild();
+            view.select_files(FileKey::new("", "b.rs", false), false, false);
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(cx.debug_bounds("git-stage-selected").is_some());
+        assert!(cx.debug_bounds("git-unstage-selected").is_none());
+        view.update(cx, |view, _| {
+            view.select_files(FileKey::new("", "a.rs", true), false, true);
+            assert_eq!(
+                view.staging_paths(&FileKey::new("", "b.rs", false)),
+                ["b.rs"]
+            );
+            assert_eq!(
+                view.staging_paths(&FileKey::new("", "a.rs", true)),
+                ["a.rs"]
+            );
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(cx.debug_bounds("git-stage-selected").is_some());
+        assert!(cx.debug_bounds("git-unstage-selected").is_some());
+    }
+
+    #[gpui::test]
+    fn accepting_a_conflict_version_asks_first_and_names_the_rebase_sides(cx: &mut TestAppContext) {
+        let (view, cx) = menu_setup(cx, 900.0);
+        view.update(cx, |view, cx| {
+            let repo = &mut view.snapshot.as_mut().unwrap().repositories[0];
+            repo.files = vec![zeron_proto::GitFileStatus {
+                path: "file.txt".into(),
+                old_path: None,
+                index: zeron_proto::GitFileState::Unmerged,
+                worktree: zeron_proto::GitFileState::Unmerged,
+            }];
+            repo.git.as_mut().unwrap().conflicts = 1;
+            repo.git.as_mut().unwrap().operation = Some("merge".into());
+            assert_eq!(view.conflict_choice_label(false), "Accept Current Version");
+            assert_eq!(view.conflict_choice_label(true), "Accept Incoming Version");
+            view.snapshot.as_mut().unwrap().repositories[0]
+                .git
+                .as_mut()
+                .unwrap()
+                .operation = Some("rebase".into());
+            assert_eq!(view.conflict_choice_label(false), "Accept Upstream Version");
+            assert_eq!(
+                view.conflict_choice_label(true),
+                "Accept Your Commit's Version"
+            );
+            view.rebuild();
+            let key = FileKey::new("", "file.txt", false);
+            view.select_files(key.clone(), false, false);
+            view.selected = view.file_selection(&key);
+            cx.notify();
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        let accept = cx.debug_bounds("git-accept-incoming").unwrap();
+        cx.simulate_click(accept.center(), gpui::Modifiers::default());
+        view.read_with(cx, |view, _| {
+            assert!(!view.busy);
+            let confirmation = view.confirmation.as_ref().unwrap();
+            assert!(matches!(
+                &confirmation.command,
+                Command::Git(Action::ResolveConflict { path, incoming: true }) if path == "file.txt"
+            ));
+            assert!(
+                confirmation
+                    .body
+                    .contains("file.txt will be replaced with the version from your commit")
+            );
+        });
+    }
 }
 
 impl RenderOnce for GitDropdown {
@@ -154,8 +242,7 @@ impl RenderOnce for GitDropdown {
             - 2.0 * Theme::TITLEBAR_HEIGHT
             - self.trigger_height
             - 24.0)
-            .max(1.0)
-            .min(600.0)
+            .clamp(1.0, 600.0)
             .min(f32::from(limits.size.height));
         let scroll_id: SharedString = format!("{}-options", self.id).into();
         let scroll = window.with_global_id(scroll_id.clone().into(), |id, window| {
@@ -406,15 +493,13 @@ impl SourceControl {
                             view.undo_discard = None;
                         } else if let Ok(result) =
                             serde_json::from_value::<RepositoryGitActionResult>(value.clone())
+                            && let Some(text) = result.commit_message
+                            && view.active_repository == repository
+                            && view.commit_input.read(cx).text() == message
                         {
-                            if let Some(text) = result.commit_message
-                                && view.active_repository == repository
-                                && view.commit_input.read(cx).text() == message
-                            {
-                                view.commit_input
-                                    .update(cx, |input, cx| input.set_text(text, cx));
-                                view.remember_draft(cx);
-                            }
+                            view.commit_input
+                                .update(cx, |input, cx| input.set_text(text, cx));
+                            view.remember_draft(cx);
                         }
                     }
                     Err(error) => {
@@ -570,6 +655,41 @@ impl SourceControl {
         });
         self.git_panel = None;
         cx.notify();
+    }
+
+    fn rebasing(&self) -> bool {
+        self.git_state()
+            .is_some_and(|state| state.operation.as_deref() == Some("rebase"))
+    }
+
+    // During a rebase Git's "ours" (current) is the upstream being rebased
+    // onto and "theirs" (incoming) is the user's own commit being replayed.
+    pub(super) fn conflict_choice_label(&self, incoming: bool) -> &'static str {
+        match (incoming, self.rebasing()) {
+            (false, false) => "Accept Current Version",
+            (true, false) => "Accept Incoming Version",
+            (false, true) => "Accept Upstream Version",
+            (true, true) => "Accept Your Commit's Version",
+        }
+    }
+
+    pub(super) fn confirm_resolve_conflict(
+        &mut self,
+        path: String,
+        incoming: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let version = match (incoming, self.rebasing()) {
+            (false, false) => "current version (HEAD)",
+            (true, false) => "incoming version",
+            (false, true) => "upstream version being rebased onto",
+            (true, true) => "version from your commit being replayed",
+        };
+        let title = format!("{}?", self.conflict_choice_label(incoming));
+        let body = format!(
+            "The contents of {path} will be replaced with the {version}. Edits made to this file while resolving the conflict will be lost."
+        );
+        self.confirm_git(Action::ResolveConflict { path, incoming }, title, body, cx);
     }
 
     pub(super) fn accept_confirmation(&mut self, cx: &mut Context<Self>) {
@@ -1358,31 +1478,47 @@ impl SourceControl {
                     ));
                 }
                 body = body.child(div().my(px(4.0)).border_b_1().border_color(theme.border));
-                if let Some(key) = self.selected_files.iter().next().cloned() {
+                // A mixed selection offers each side's action separately, so
+                // the working-tree rows are never routed through Unstage.
+                for staged in [false, true] {
+                    let Some(key) = self
+                        .selected_files
+                        .iter()
+                        .find(|key| key.staged == staged)
+                        .cloned()
+                    else {
+                        continue;
+                    };
                     let paths = self.staging_paths(&key);
                     let discard_paths = self.discard_paths(&key);
-                    let discard_repository = key.repository.clone();
-                    let staged = key.staged;
+                    let discard_key = key.clone();
                     let complete = self.snapshot.as_ref().is_some_and(|s| {
                         s.repositories
                             .iter()
                             .any(|r| r.path == key.repository && r.complete)
                     });
+                    let id = if staged {
+                        "git-unstage-selected"
+                    } else {
+                        "git-stage-selected"
+                    };
                     body = body.child(
                         button(
-                            "git-stage-selected",
-                            if staged {
-                                "Unstage Selected Changes"
-                            } else {
-                                "Stage Selected Changes"
-                            },
+                            id,
+                            format!(
+                                "{} Selected Changes ({})",
+                                if staged { "Unstage" } else { "Stage" },
+                                paths.len()
+                            ),
                             enabled && complete,
                             &theme,
                         )
+                        .debug_selector(move || id.into())
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if complete && this.git_enabled() {
+                                let paths = this.staging_paths(&key);
                                 this.close_actions_menu(cx);
-                                this.set_staged(key.repository.clone(), paths.clone(), !staged, cx);
+                                this.set_staged(key.repository.clone(), paths, !staged, cx);
                             }
                         })),
                     );
@@ -1396,10 +1532,11 @@ impl SourceControl {
                             )
                             .on_click(cx.listener(
                                 move |this, _, _, cx| {
-                                    if complete && this.git_enabled() {
+                                    let discard_paths = this.discard_paths(&discard_key);
+                                    if complete && this.git_enabled() && !discard_paths.is_empty() {
                                         this.request_discard(
-                                            discard_repository.clone(),
-                                            discard_paths.clone(),
+                                            discard_key.repository.clone(),
+                                            discard_paths,
                                             false,
                                             cx,
                                         );
@@ -1433,47 +1570,30 @@ impl SourceControl {
                     && self.snapshot.as_ref().is_some_and(|snapshot| snapshot.repositories.iter()
                         .any(|repo| repo.path == selection.repository && repo.files.iter().any(|file| file.path == selection.path && file.is_conflicted())))
                 {
-                    let current = selection.path.clone();
-                    let incoming = current.clone();
-                    body = body
-                        .child(
+                    // Resolving replaces one file; a multi-selection would
+                    // suggest the whole batch is affected.
+                    let single = self.selected_files.len() <= 1;
+                    for (id, incoming) in
+                        [("git-accept-current", false), ("git-accept-incoming", true)]
+                    {
+                        let path = selection.path.clone();
+                        body = body.child(
                             button(
-                                "git-accept-current",
-                                "Accept Current Version",
-                                enabled,
+                                id,
+                                self.conflict_choice_label(incoming),
+                                enabled && single,
                                 &theme,
                             )
+                            .debug_selector(move || id.into())
                             .on_click(cx.listener(
                                 move |this, _, _, cx| {
-                                    this.run_git(
-                                        Action::ResolveConflict {
-                                            path: current.clone(),
-                                            incoming: false,
-                                        },
-                                        cx,
-                                    )
-                                },
-                            )),
-                        )
-                        .child(
-                            button(
-                                "git-accept-incoming",
-                                "Accept Incoming Version",
-                                enabled,
-                                &theme,
-                            )
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    this.run_git(
-                                        Action::ResolveConflict {
-                                            path: incoming.clone(),
-                                            incoming: true,
-                                        },
-                                        cx,
-                                    )
+                                    if this.selected_files.len() <= 1 {
+                                        this.confirm_resolve_conflict(path.clone(), incoming, cx)
+                                    }
                                 },
                             )),
                         );
+                    }
                 }
                 for (id, label, panel) in [
                     ("branches", "Branches…", GitPanel::Branches),

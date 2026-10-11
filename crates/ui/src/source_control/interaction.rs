@@ -108,7 +108,7 @@ impl SourceControl {
         }
     }
 
-    fn file_selection(&self, key: &FileKey) -> Option<CheckoutChangeSelection> {
+    pub(super) fn file_selection(&self, key: &FileKey) -> Option<CheckoutChangeSelection> {
         let target = self.target.as_ref()?;
         self.snapshot
             .as_ref()?
@@ -190,15 +190,18 @@ impl SourceControl {
             ));
         }
         if file.is_conflicted() {
+            // Resolving replaces only this file, so it is unavailable while
+            // the menu acts on a multi-selection.
+            let single = self.selected_files.len() <= 1;
             actions.push((
                 FileAction::AcceptCurrent,
-                "Accept Current Version".into(),
-                enabled,
+                self.conflict_choice_label(false).into(),
+                enabled && single,
             ));
             actions.push((
                 FileAction::AcceptIncoming,
-                "Accept Incoming Version".into(),
-                enabled,
+                self.conflict_choice_label(true).into(),
+                enabled && single,
             ));
         }
         actions.extend([
@@ -219,13 +222,12 @@ impl SourceControl {
         };
         self.close_file_menu(cx);
         match action {
-            FileAction::AcceptCurrent | FileAction::AcceptIncoming => self.run_git(
-                zeron_proto::RepositoryGitAction::ResolveConflict {
-                    path: key.path,
-                    incoming: matches!(action, FileAction::AcceptIncoming),
-                },
-                cx,
-            ),
+            FileAction::AcceptCurrent | FileAction::AcceptIncoming => self
+                .confirm_resolve_conflict(
+                    key.path,
+                    matches!(action, FileAction::AcceptIncoming),
+                    cx,
+                ),
             FileAction::Diff => cx.emit(SourceControlEvent::OpenDiff(selection)),
             FileAction::Open => {
                 cx.emit(SourceControlEvent::OpenFile(if key.repository.is_empty() {
@@ -305,7 +307,7 @@ impl SourceControl {
                     format!("sc-file-action-{index}"),
                 )
                 .id(gpui::SharedString::from(format!("sc-file-action-{index}")))
-                .debug_selector(move || format!("sc-file-action-{index}").into())
+                .debug_selector(move || format!("sc-file-action-{index}"))
                 .role(gpui::Role::MenuItem)
                 .aria_label(label.clone())
                 .child(label)
@@ -407,11 +409,15 @@ impl SourceControl {
                         repository,
                         file: ix,
                         staged,
-                    } => self.snapshot.as_ref().is_some_and(|s| {
-                        s.repositories[*repository].path == file.repository
-                            && s.repositories[*repository].files[*ix].path == file.path
-                            && *staged == file.staged
-                    }),
+                    } => self
+                        .snapshot
+                        .as_ref()
+                        .and_then(|s| s.repositories.get(*repository))
+                        .is_some_and(|repo| {
+                            repo.path == file.repository
+                                && repo.files.get(*ix).is_some_and(|f| f.path == file.path)
+                                && *staged == file.staged
+                        }),
                     _ => false,
                 });
                 if let Some(row) = row {

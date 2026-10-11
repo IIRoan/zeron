@@ -3584,13 +3584,21 @@ impl RpcService for EngineRpc {
                     }
                     _ => {}
                 }
-                RpcReply::value(
-                    &self
-                        .repos
-                        .worktree_settings_snapshot(&root, checkout.as_deref())
-                        .await
-                        .map_err(|e| RpcError::Failed(e.to_string()))?,
-                )
+                let mut snapshot = self.repos
+                    .worktree_settings_snapshot(&root, checkout.as_deref())
+                    .await.map_err(|e| RpcError::Failed(e.to_string()))?;
+                // Database startup and app services share one saved project configuration.
+                // Include legacy profiles in the combined defaults editor without
+                // turning inherited worktree services into checkout overrides.
+                if snapshot.defaults.services.is_none() {
+                    snapshot.defaults.services = Some(self.project_actions.project_terminals
+                        .snapshot(&space.id, &root)
+                        .map_err(|e| RpcError::Failed(e.to_string()))?.config);
+                }
+                if checkout.is_none() {
+                    snapshot.settings.services = snapshot.defaults.services.clone();
+                }
+                RpcReply::value(&snapshot)
             }
             methods::GET_PROJECT_TERMINALS
             | methods::SAVE_PROJECT_TERMINALS
@@ -3746,8 +3754,19 @@ impl RpcService for EngineRpc {
                 let cwd = resolve_open_terminal_cwd(p.cwd, chat_cwd, space_cwd)
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
                 let mut environment=std::collections::HashMap::new();
-                if let Some(root)=crate::workspace_host::linked_worktree_root(std::path::Path::new(&cwd)) {
-                    let settings=self.repos.worktree_settings().effective(std::path::Path::new(&root),std::path::Path::new(&cwd)).map_err(|e|RpcError::Failed(e.to_string()))?;
+                // A terminal opened in a subfolder still belongs to the
+                // worktree that contains it: the nearest folder with `.git`.
+                let checkout = std::path::Path::new(&cwd)
+                    .ancestors()
+                    .find(|dir| dir.join(".git").exists());
+                if let Some(checkout) = checkout
+                    && let Some(root) = crate::workspace_host::linked_worktree_root(checkout)
+                {
+                    let settings = self
+                        .repos
+                        .worktree_settings()
+                        .effective(std::path::Path::new(&root), checkout)
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
                     environment.extend(settings.variables);
                 }
                 let session = self

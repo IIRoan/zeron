@@ -1,6 +1,25 @@
 Native GPUI screenshots from the isolated `sidebar-fixture` example. All projects,
 chats, icons and PR metadata are synthetic; no engine or account is connected.
 
+In the Linux fork, **All projects** always groups active sessions by project.
+Archived sessions have their own project groups under **Archived**, with the
+same disclosure motion and row styling. Projects follow their first session in the selected sort order; sessions within
+each group keep that order. Pinned and
+custom sections retain their placement, with project names on compact rows.
+Sessions without a project use **No project**; missing projects use
+**Unavailable project**. Choosing a project restores the saved organization
+preference. Collapsed active groups are skipped by session shortcuts, and
+renaming an archived session expands its project and loads the necessary page.
+
+Review the all-projects layout with synthetic local/remote projects, pinned
+chats, archived chats, and a session without a project:
+
+```sh
+WAYLAND_DISPLAY= ZERON_SIDEBAR_COMPACT=1 ZERON_SIDEBAR_ALL_PROJECTS=1 \
+cargo run -p zeron-ui --example sidebar-fixture \
+  --features project-palette-fixture
+```
+
 ```sh
 cargo run -p zeron-ui --example sidebar-fixture --features project-palette-fixture
 ZERON_SIDEBAR_COMPACT=1 cargo run -p zeron-ui --example sidebar-fixture --features project-palette-fixture

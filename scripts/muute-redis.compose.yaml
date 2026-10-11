@@ -1,0 +1,7 @@
+# Use a named volume so rootless containers can write on SELinux hosts.
+services:
+  redis:
+    volumes:
+      - zeron_muute_redis:/data
+volumes:
+  zeron_muute_redis:

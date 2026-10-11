@@ -20,15 +20,20 @@ References:
   files and parent gitlinks do not offer an invalid editor action.
 - Shift selects a range, Ctrl toggles resources, and Ctrl+A selects this
   repository's visible resources. Mixed staged/working selections are allowed;
-  a stage or unstage action filters the appropriate index side. Clicking an
-  unselected row's action affects only that row.
+  a stage or unstage action filters the appropriate index side. For a mixed
+  selection, More Actions lists Stage Selected and Unstage Selected
+  separately, each counting only its side; Discard Selected affects only
+  working-tree rows. Clicking an unselected row's action affects only that row.
 - Arrow keys, Home/End, Shift+arrow selection, Enter, Delete and Escape work
   while the resource list has focus. Shift+F10 opens the focused row's context
   menu. Text-input shortcuts remain local to the commit input.
 - File context menus expose Open Changes, Open File, Stage/Unstage, Discard,
   Copy Path and Copy Relative Path. Conflicted files offer current/incoming
-  version choices. Paths are passed literally to Git, including spaces and
-  wildcard characters.
+  version choices, which confirm before replacing the file's contents and
+  apply to a single file only. During a rebase, Git's current side is the
+  upstream being rebased onto and its incoming side is your commit, so the
+  choices read Accept Upstream Version and Accept Your Commit's Version.
+  Paths are passed literally to Git, including spaces and wildcard characters.
 - Path, file-name and status sorting are available under More Actions.
 - Commit uses the index only. When nothing is staged, a message and Commit
   open a Stage & Commit confirmation. Cancelling preserves the index and draft.
@@ -74,4 +79,7 @@ local bare remotes, submodules, conflict handling, literal paths, hooks,
 stashes, publication and initial commits. `cargo test -p zeron-ui --lib
 source_control::` exercises selection, focus, menus and confirmation modals.
 The `source-control-fixture` feature provides a native Shell with a real engine
-and isolated repositories for end-to-end UI verification.
+and isolated repositories for end-to-end UI verification. Its Git processes
+ignore global and system Git config. Screenshots use niri when `NIRI_SOCKET`
+is set and X11 otherwise; `ZERON_FIXTURE_SCREENSHOTS=niri|x11|off` overrides
+this, and an unavailable backend skips the capture instead of failing.

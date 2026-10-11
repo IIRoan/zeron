@@ -16,11 +16,13 @@ fn main() -> anyhow::Result<()> {
         settings.sidebar_compact = std::env::var_os("ZERON_SIDEBAR_COMPACT").is_some();
         settings.sidebar_show_project_label = std::env::var_os("ZERON_SIDEBAR_HIDE_LABEL").is_none();
         let by_project = std::env::var_os("ZERON_SIDEBAR_BY_PROJECT").is_some();
+        let all_projects = std::env::var_os("ZERON_SIDEBAR_ALL_PROJECTS").is_some();
         settings.sidebar_organization = if by_project { settings::SidebarOrganization::ByProject } else { settings::SidebarOrganization::InOneList };
         settings.sidebar_width = 310.0;
         settings.sidebar_pins_mut("local".into()).extend(["chat-0".into(), "chat-1".into()]);
         let project_path = data.join("fieldnotes");
         std::fs::create_dir_all(project_path.join("public")).unwrap();
+        std::fs::create_dir_all(project_path.join(".git")).unwrap();
         std::fs::write(project_path.join("public/favicon.svg"), r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="1" y="1" width="22" height="22" rx="6" fill="#668cf5"/><path d="M7 6h11v3h-8v3h6v3h-6v4H7Z" fill="white"/></svg>"##).unwrap();
         settings.surface = zeron_theme::SurfacePreference::Frosted;
         settings.save(&data).unwrap();
@@ -77,7 +79,7 @@ fn main() -> anyhow::Result<()> {
                     change_request: Some(zeron_proto::ChangeRequestSummary { provider: "github".into(), number: 412 + ix as u64, title: chat.title.clone().unwrap(), url: "https://github.com/zeronsh/zeron/pull/412".into(), state: zeron_proto::ChangeRequestState::Open, base_ref: "main".into(), head_ref: source.branch.clone() }),
                 });
             }
-            if by_project {
+            if by_project || all_projects {
                 s.spaces[0].repository_id = Some("github.com/zeronsh/fieldnotes".into());
                 s.spaces.push(serde_json::from_value(serde_json::json!({"id":"fieldnotes-remote","deviceId":"remote","path":"/projects/fieldnotes","repositoryId":"github.com/zeronsh/fieldnotes","createdAt":chrono::Utc::now()})).unwrap());
                 for ix in [3, 7] {
@@ -86,6 +88,19 @@ fn main() -> anyhow::Result<()> {
             }
             s.chats[4].last_message_at = Some(chrono::Utc::now());
             s.chats[8].archived = true;
+            if all_projects {
+                s.selected_space = None;
+                let mut archived = s.chats[4].clone();
+                archived.id = "archived-local".into();
+                archived.title = Some("Review workspace settings".into());
+                archived.archived = true;
+                s.chats.push(archived);
+                let mut home = s.chats[0].clone();
+                home.id = "no-project".into();
+                home.title = Some("Review shell configuration".into());
+                home.space_id = None;
+                s.chats.push(home);
+            }
             s
         });
         let boot = EngineBootConfig { data_dir: data, ipc_port: 0, edge_url: String::new(), edge_token: None, org_id: None, workos_client_id: None, default_harness: HarnessId::ClaudeCode };

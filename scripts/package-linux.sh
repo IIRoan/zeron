@@ -31,6 +31,8 @@ fi
 rm -rf "$STAGE" "$TARBALL"
 mkdir -p "$STAGE"
 install -m 755 "$BIN" "$STAGE/zeron"
+install -m 755 "$ROOT/scripts/muute-database-service.sh" "$STAGE/"
+install -m 644 "$ROOT/scripts/muute-redis.compose.yaml" "$STAGE/"
 install -m 644 "$ROOT/dist/zeron.desktop" "$STAGE/zeron.desktop"
 install -m 644 "$ROOT/dist/zeron.png" "$STAGE/zeron.png"
 install -m 644 "$ROOT/LICENSE" "$ROOT/THIRD_PARTY_NOTICES.md" "$STAGE/"

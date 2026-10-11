@@ -22,10 +22,12 @@ struct Message {
 }
 
 /// Kept by the operation, so its feedback can finish after the originating
-/// tool tab is closed. An older operation cannot replace a newer notification.
+/// tool tab is closed. An older operation's success cannot replace a newer
+/// notification, but its failure is always shown.
 pub(crate) struct PendingToast {
     toasts: Entity<Toasts>,
     sequence: u64,
+    title: SharedString,
 }
 
 impl PendingToast {
@@ -35,8 +37,12 @@ impl PendingToast {
         body: SharedString,
         cx: &mut impl AppContext,
     ) -> Self {
-        let sequence = toasts.update(cx, |toasts, cx| toasts.progress(title, body, cx));
-        Self { toasts, sequence }
+        let sequence = toasts.update(cx, |toasts, cx| toasts.progress(title.clone(), body, cx));
+        Self {
+            toasts,
+            sequence,
+            title,
+        }
     }
 
     pub(crate) fn finish(
@@ -44,8 +50,9 @@ impl PendingToast {
         result: Result<SharedString, SharedString>,
         cx: &mut impl AppContext,
     ) {
-        self.toasts
-            .update(cx, |toasts, cx| toasts.finish(self.sequence, result, cx));
+        self.toasts.update(cx, |toasts, cx| {
+            toasts.finish(self.sequence, self.title, result, cx)
+        });
     }
 
     pub(crate) fn dismiss(self, cx: &mut impl AppContext) {
@@ -113,18 +120,23 @@ impl Toasts {
     fn finish(
         &mut self,
         sequence: u64,
+        title: SharedString,
         result: Result<SharedString, SharedString>,
         cx: &mut Context<Self>,
     ) {
-        if self.sequence != sequence {
-            return;
-        }
-        let Some(message) = self.popup.open_mut() else {
+        let owned = self.sequence == sequence;
+        let message = self
+            .popup
+            .open_mut()
+            .filter(|message| owned && message.kind == Kind::Progress);
+        let Some(message) = message else {
+            // The progress card was dismissed or replaced by newer feedback.
+            // A late success can be dropped; a failure must not disappear.
+            if let Err(body) = result {
+                self.show(title, body, Kind::Error, cx);
+            }
             return;
         };
-        if message.kind != Kind::Progress {
-            return;
-        }
         // Keep the same card and entrance animation when the result arrives.
         match result {
             Ok(body) => {
@@ -423,7 +435,7 @@ mod tests {
             assert_eq!(message.body, "Fetching…");
         });
         toasts.update(cx, |toasts, cx| toasts.dismiss(cx));
-        second.finish(Err("Fetch failed".into()), cx);
+        second.finish(Ok("Fetched".into()), cx);
         toasts.read_with(cx, |toasts, _| assert!(!toasts.popup.is_open()));
         cx.run_until_parked();
         cx.executor().advance_clock(Duration::from_secs(1));
@@ -436,6 +448,35 @@ mod tests {
                 assert_eq!(message.kind, Kind::Progress);
                 assert_eq!(message.body, "Fetching…");
             }
+        });
+    }
+
+    #[gpui::test]
+    fn failures_surface_after_their_progress_is_dismissed_or_replaced(cx: &mut TestAppContext) {
+        let toasts = cx.new(|_| Toasts::default());
+        let dismissed = PendingToast::start(toasts.clone(), "Git".into(), "Pushing…".into(), cx);
+        toasts.update(cx, |toasts, cx| toasts.dismiss(cx));
+        dismissed.finish(Err("Remote rejected the push".into()), cx);
+        toasts.read_with(cx, |toasts, _| {
+            let message = toasts.popup.as_open().unwrap();
+            assert_eq!(message.kind, Kind::Error);
+            assert_eq!(message.title, "Git");
+            assert_eq!(message.body, "Remote rejected the push");
+        });
+
+        let replaced = PendingToast::start(toasts.clone(), "Files".into(), "Saving…".into(), cx);
+        toasts.update(cx, |toasts, cx| {
+            toasts.success("Git".into(), "Fetched".into(), cx)
+        });
+        replaced.finish(Err("Disk is full".into()), cx);
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(30));
+        cx.run_until_parked();
+        toasts.read_with(cx, |toasts, _| {
+            let message = toasts.popup.as_open().unwrap();
+            assert_eq!(message.kind, Kind::Error);
+            assert_eq!(message.title, "Files");
+            assert_eq!(message.body, "Disk is full");
         });
     }
 

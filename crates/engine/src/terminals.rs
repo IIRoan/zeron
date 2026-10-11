@@ -39,7 +39,7 @@ const REAPER_INTERVAL: Duration = Duration::from_secs(60);
 
 struct LiveTerminal {
     service: bool,
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     service_session: Option<i32>,
     // Keep the private action script alive until the shell exits or the tab is closed.
     initial_script: Option<tempfile::NamedTempFile>,
@@ -64,16 +64,26 @@ struct LiveTerminal {
 #[derive(Debug)]
 struct ServiceKiller(i32);
 
+/// Stopping a service sends SIGTERM first so it can release ports and flush
+/// state, then SIGKILL to whatever is left after this grace period.
 #[cfg(unix)]
-impl portable_pty::ChildKiller for ServiceKiller {
-    fn kill(&mut self) -> std::io::Result<()> {
+const SERVICE_STOP_GRACE: Duration = Duration::from_secs(3);
+#[cfg(unix)]
+const SERVICE_KILL_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(unix)]
+impl ServiceKiller {
+    /// Signals every process the service owns. Signal 0 only probes. Returns
+    /// whether any process was still running when it was signalled.
+    fn signal(&self, signal: i32) -> std::io::Result<bool> {
         #[cfg(target_os = "linux")]
         {
             // Shell job control and development runners can create child job
             // groups. All still belong to this PTY's private session. Collect
-            // before killing its leader so teardown covers every group.
-            for pid in service_session_processes(self.0)? {
-                let result = unsafe { libc::kill(pid, libc::SIGKILL) };
+            // before signalling its leader so teardown covers every group.
+            let processes = service_session_processes(self.0)?;
+            for pid in &processes {
+                let result = unsafe { libc::kill(*pid, signal) };
                 if result != 0 {
                     let error = std::io::Error::last_os_error();
                     if error.raw_os_error() != Some(libc::ESRCH) {
@@ -81,23 +91,87 @@ impl portable_pty::ChildKiller for ServiceKiller {
                     }
                 }
             }
-            Ok(())
+            Ok(!processes.is_empty())
         }
         #[cfg(not(target_os = "linux"))]
         {
             // portable-pty starts the shell as its own session/process-group leader.
             // A service owns that entire group, including npm/bun child processes.
-            let result = unsafe { libc::kill(-self.0, libc::SIGKILL) };
+            let result = unsafe { libc::kill(-self.0, signal) };
             if result == 0 {
-                return Ok(());
+                return Ok(true);
             }
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() == Some(libc::ESRCH) {
-                Ok(())
+                Ok(false)
             } else {
                 Err(error)
             }
         }
+    }
+
+    /// The shell leading the session exits once its command does. Signalling
+    /// it too would hang up the PTY and SIGHUP the service before its SIGTERM
+    /// handler finishes, so the leader only gets SIGTERM when it is alone
+    /// (for example, after `exec`).
+    fn request_stop(&self) -> std::io::Result<bool> {
+        #[cfg(target_os = "linux")]
+        {
+            let processes = service_session_processes(self.0)?;
+            let children: Vec<i32> = processes
+                .iter()
+                .copied()
+                .filter(|pid| *pid != self.0)
+                .collect();
+            let targets = if children.is_empty() {
+                &processes
+            } else {
+                &children
+            };
+            for pid in targets {
+                let result = unsafe { libc::kill(*pid, libc::SIGTERM) };
+                if result != 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::ESRCH) {
+                        return Err(error);
+                    }
+                }
+            }
+            Ok(!processes.is_empty())
+        }
+        #[cfg(not(target_os = "linux"))]
+        self.signal(libc::SIGTERM)
+    }
+
+    /// SIGTERM, a grace period, then SIGKILL. Returns as soon as no process
+    /// remains, without scanning again.
+    fn terminate(&self) -> Result<(), EngineError> {
+        let started = std::time::Instant::now();
+        let mut running = self.request_stop()?;
+        while running && started.elapsed() < SERVICE_STOP_GRACE {
+            std::thread::sleep(Duration::from_millis(25));
+            running = self.signal(0)?;
+        }
+        while running {
+            if started.elapsed() >= SERVICE_STOP_GRACE + SERVICE_KILL_TIMEOUT {
+                return Err(EngineError::Other(
+                    "The previous service did not stop; no replacement was started".into(),
+                ));
+            }
+            // Also covers a child spawned while an earlier scan raced with teardown.
+            running = self.signal(libc::SIGKILL)?;
+            if running {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl portable_pty::ChildKiller for ServiceKiller {
+    fn kill(&mut self) -> std::io::Result<()> {
+        self.signal(libc::SIGKILL).map(|_| ())
     }
     fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
         Box::new(Self(self.0))
@@ -196,6 +270,26 @@ fn selected_shell() -> String {
                 "/bin/bash".into()
             }
         })
+}
+
+/// Shells that can run a service through `-l -c '. script'` (or fish's
+/// `source`). Anything else, such as csh, tcsh or nu, cannot.
+fn posix_or_fish(shell_name: &str) -> bool {
+    matches!(
+        shell_name,
+        "sh" | "bash"
+            | "zsh"
+            | "dash"
+            | "ash"
+            | "ksh"
+            | "ksh93"
+            | "mksh"
+            | "oksh"
+            | "pdksh"
+            | "yash"
+            | "posh"
+            | "fish"
+    )
 }
 
 impl Terminals {
@@ -314,11 +408,19 @@ impl Terminals {
             ));
         }
 
-        let shell = shell.map(str::to_string).unwrap_or_else(selected_shell);
-        let shell_name = std::path::Path::new(&shell)
+        let mut shell = shell.map(str::to_string).unwrap_or_else(selected_shell);
+        let mut shell_name = std::path::Path::new(&shell)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| shell.clone());
+        // Service commands are POSIX shell (or fish) scripts. csh, tcsh, nu and
+        // other shells cannot source them, so run those services with /bin/sh;
+        // the login PATH below still comes from the user's own shell.
+        let fallback = cfg!(unix) && service && !posix_or_fish(&shell_name);
+        if fallback {
+            shell = "/bin/sh".into();
+            shell_name = "sh".into();
+        }
 
         #[cfg(windows)]
         let (initial_script, bootstrap) = (None, command.map(|command| format!("{command}\r")));
@@ -350,7 +452,7 @@ impl Terminals {
                 .openpty(clamp_size(cols, rows))
                 .map_err(|e| EngineError::Other(format!("could not open a pty: {e}")))?;
             let mut cmd = CommandBuilder::new(&shell);
-            if !cfg!(windows) {
+            if !cfg!(windows) && !fallback {
                 cmd.arg("-l"); // login shell — the user's real PATH/profile
             }
             if service {
@@ -366,9 +468,11 @@ impl Terminals {
             cmd.env("COLORTERM", "truecolor");
             cmd.env("TERM_PROGRAM", "Zeron");
             // Managed services are non-interactive: rc files may only add
-            // Homebrew/version-manager tools in interactive shells. Reuse the
-            // bounded, cached login PATH used by harnesses before loading the
-            // service's profile. Explicit checkout PATH settings still win.
+            // Homebrew/version-manager tools in interactive shells. Start from
+            // the bounded, cached interactive login PATH, with its entries
+            // ahead of the app's inherited PATH so a tool the user chose in
+            // their shell wins over a same-named copy shipped with the app.
+            // Explicit checkout PATH settings still win.
             if !environment.contains_key("PATH")
                 && let Some(path) = zeron_harness::composed_login_shell_path()
             {
@@ -405,7 +509,7 @@ impl Terminals {
         let id = new_id();
         let session = Arc::new(Mutex::new(LiveTerminal {
             service,
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             service_session: service.then(|| child.process_id().expect("service pid") as i32),
             initial_script,
             #[cfg(all(test, windows))]
@@ -581,25 +685,22 @@ impl Terminals {
             Some(session) => session,
             None => return Ok(()),
         };
-        #[cfg(target_os = "linux")]
-        let service_session = lock(&session).service_session;
-        if !dispose(&session, true) {
-            return Err(EngineError::Other("Terminal cleanup did not finish".into()));
-        }
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
+        let service_session = {
+            let mut session = lock(&session);
+            session.subscribers.clear();
+            session.service_session
+        };
+        #[cfg(not(unix))]
+        let service_session: Option<i32> = None;
+        #[cfg(unix)]
         if let Some(service_session) = service_session {
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while !service_session_processes(service_session)?.is_empty() {
-                if std::time::Instant::now() >= deadline {
-                    return Err(EngineError::Other(
-                        "The previous service did not stop; no replacement was started".into(),
-                    ));
-                }
-                // Also cover a child spawned while the initial session scan
-                // raced with teardown, and allow Stop to retry after an error.
-                portable_pty::ChildKiller::kill(&mut ServiceKiller(service_session))?;
-                std::thread::sleep(Duration::from_millis(10));
-            }
+            ServiceKiller(service_session).terminate()?;
+        }
+        // Once terminate() saw the service empty, dispose must not scan or
+        // signal its session again.
+        if !dispose(&session, service_session.is_none()) {
+            return Err(EngineError::Other("Terminal cleanup did not finish".into()));
         }
         lock(&self.inner.sessions).remove(terminal_id);
         Ok(())

@@ -34,6 +34,9 @@ if $from_run; then
   git fetch "$bundle" "$ref"
   target="$(git rev-parse FETCH_HEAD)"
   release="Action run $2"
+  if [[ "$(git log -1 --format=%s "$target")" =~ ^Merge\ upstream\ (v[0-9]+\.[0-9]+\.[0-9]+)\ into\ Linux\ fork$ ]]; then
+    release="${BASH_REMATCH[1]} from Action run $2"
+  fi
   backup_label="run-$2"
 else
   git remote get-url upstream >/dev/null || fail "Missing upstream remote; see docs/LINUX_FORK.md."
@@ -56,6 +59,17 @@ backup="backup/pre-upstream-$backup_label-$(date -u +%Y%m%dT%H%M%S)-$$"
 fork_head="$(git rev-parse HEAD)"
 git branch "$backup"
 echo "Rollback point: $backup"
+# Without local commits since the Action, its checked merge applies as is; a
+# second merge commit on top would only repeat it.
+if $from_run && git merge-base --is-ancestor HEAD "$target"; then
+  git merge --ff-only "$target"
+  if ! scripts/check-linux-fork.sh; then
+    echo "Checks failed after applying the checked update. To return to your previous version: git reset --keep $backup" >&2
+    exit 1
+  fi
+  echo "Updated and checked $release. Publish when ready with: git push origin HEAD"
+  exit 0
+fi
 merge_ok=true
 if ! git merge --no-ff --no-commit "$target"; then
   merge_ok=false

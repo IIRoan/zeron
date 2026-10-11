@@ -79,6 +79,11 @@ pub struct SourceControl {
     busy: bool,
     mutation_epoch: u64,
     poll: Option<Task<()>>,
+    /// Set by every render and consumed by the poll loop's visibility probe.
+    rendered: bool,
+    /// The poll loop stopped because the view was not displayed; the next
+    /// render restarts it.
+    poll_paused: bool,
     refreshing: bool,
     refresh_feedback: Option<bool>,
     git_details: Option<zeron_proto::RepositoryGitDetails>,
@@ -167,6 +172,46 @@ fn status_color(file: &GitFileStatus, staged: bool, theme: &Theme) -> gpui::Hsla
     }
 }
 
+pub(crate) const POLL_INTERVAL_MIN: Duration = Duration::from_secs(2);
+pub(crate) const POLL_INTERVAL_MAX: Duration = Duration::from_secs(12);
+
+pub(crate) fn next_poll_interval(current: Duration, changed: bool) -> Duration {
+    if changed {
+        POLL_INTERVAL_MIN
+    } else {
+        (current + current / 2).min(POLL_INTERVAL_MAX)
+    }
+}
+
+/// Whether a polling view is still on screen. `cx.notify()` only redraws
+/// windows that display the entity in their current frame, so a view that
+/// neither rendered since the last check nor renders after a notify is hidden
+/// (another tab, a collapsed panel, or a window that is not being drawn).
+/// `None` means the view was released.
+pub(crate) async fn is_displayed<V: 'static>(
+    this: &gpui::WeakEntity<V>,
+    cx: &mut gpui::AsyncApp,
+    rendered: fn(&mut V) -> &mut bool,
+) -> Option<bool> {
+    let seen = this
+        .update(cx, |view, cx| {
+            let seen = std::mem::take(rendered(view));
+            if !seen {
+                cx.notify();
+            }
+            seen
+        })
+        .ok()?;
+    if seen {
+        return Some(true);
+    }
+    cx.background_executor()
+        .timer(Duration::from_millis(500))
+        .await;
+    this.update(cx, |view, _| std::mem::take(rendered(view)))
+        .ok()
+}
+
 impl SourceControl {
     pub(crate) fn set_notifications(&mut self, notifications: Entity<crate::toast::Toasts>) {
         self.notifications = Some(notifications);
@@ -212,11 +257,11 @@ impl SourceControl {
         let message = message.into();
         if self.load_error.as_ref() == Some(&message) { return; }
         // Polling failures notify once until the repository recovers.
-        if self.load_error.is_none() {
-            if let Some(toasts) = &self.notifications {
-                let title = self.notification_title(&self.active_repository);
-                toasts.update(cx, |toasts, cx| toasts.error(title, message.clone(), cx));
-            }
+        if self.load_error.is_none()
+            && let Some(toasts) = &self.notifications
+        {
+            let title = self.notification_title(&self.active_repository);
+            toasts.update(cx, |toasts, cx| toasts.error(title, message.clone(), cx));
         }
         self.load_error = Some(message);
         cx.notify();
@@ -287,6 +332,8 @@ impl SourceControl {
             busy: false,
             mutation_epoch: 0,
             poll: None,
+            rendered: false,
+            poll_paused: false,
             refreshing: false,
             refresh_feedback: None,
             git_details: None,
@@ -364,39 +411,80 @@ impl SourceControl {
         self.commit_followup = None;
         self.commit_primary = None;
         self.active_repository.clear();
-        self.target = target.clone();
+        self.target = target;
         self.restore_draft(cx);
         // The cached list must also refresh when its repository is cleared,
         // including when the new conversation has no checkout to poll.
         cx.notify();
-        let Some(target) = target else {
+        self.start_polling(cx);
+    }
+
+    /// Polls repository metadata while the view is displayed. Unchanged
+    /// snapshots back off from [`POLL_INTERVAL_MIN`] to [`POLL_INTERVAL_MAX`];
+    /// a change, a mutation from this view or reappearing resets the delay.
+    fn start_polling(&mut self, cx: &mut Context<Self>) {
+        self.poll = None;
+        self.poll_paused = false;
+        let Some(target) = self.target.clone() else {
             return;
         };
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
         self.poll = Some(cx.spawn(async move |this, cx| {
+            let mut interval = POLL_INTERVAL_MIN;
+            let mut last_epoch = None;
+            let mut first = true;
             loop {
-                let Ok((busy, epoch)) = this.update(cx, |view, _| (view.is_busy() || view.refreshing, view.mutation_epoch)) else { return; };
-                if !busy {
-                    let response = engine.client().call(methods::GET_CHECKOUT_CHANGES, serde_json::json!({ "cwd": target.cwd, "targetDeviceId": target.device })).await;
-                    if this.update(cx, |view, cx| {
-                        if view.target.as_ref() != Some(&target) || view.is_busy() || view.mutation_epoch != epoch { return; }
-                        match response.and_then(|value| serde_json::from_value::<CheckoutChanges>(value).map_err(|e| zeron_rpc::RpcError::Failed(e.to_string()))) {
-                            Ok(snapshot) => {
-                                let recovered = view.load_error.take().is_some();
-                                if view.snapshot.as_ref() != Some(&snapshot) {
-                                    view.apply_snapshot(snapshot, cx);
-                                    cx.notify();
-                                } else if recovered {
-                                    cx.notify();
-                                }
-                            }
-                            Err(error) => view.notify_load_error(format!("Unable to load changes: {error}"), cx),
-                        }
-                    }).is_err() { return; }
+                if !first {
+                    cx.background_executor().timer(interval).await;
                 }
-                cx.background_executor().timer(Duration::from_secs(2)).await;
+                first = false;
+                match is_displayed(&this, cx, |view: &mut Self| &mut view.rendered).await {
+                    None => return,
+                    Some(false) => {
+                        this.update(cx, |view, _| view.poll_paused = true).ok();
+                        return;
+                    }
+                    Some(true) => {}
+                }
+                let Ok((busy, epoch)) = this.update(cx, |view, _| (view.is_busy() || view.refreshing, view.mutation_epoch)) else { return; };
+                if last_epoch.replace(epoch).is_some_and(|last| last != epoch) {
+                    interval = POLL_INTERVAL_MIN;
+                }
+                if busy {
+                    continue;
+                }
+                let response = engine
+                    .client()
+                    .call(
+                        methods::GET_CHECKOUT_CHANGES,
+                        serde_json::json!({ "cwd": target.cwd, "targetDeviceId": target.device }),
+                    )
+                    .await;
+                let Ok(changed) = this.update(cx, |view, cx| {
+                    if view.target.as_ref() != Some(&target) || view.is_busy() || view.mutation_epoch != epoch { return true; }
+                    match response.and_then(|value| serde_json::from_value::<CheckoutChanges>(value).map_err(|e| zeron_rpc::RpcError::Failed(e.to_string()))) {
+                        Ok(snapshot) => {
+                            let recovered = view.load_error.take().is_some();
+                            let changed = view.snapshot.as_ref() != Some(&snapshot);
+                            if changed {
+                                view.apply_snapshot(snapshot, cx);
+                            }
+                            if changed || recovered {
+                                cx.notify();
+                            }
+                            changed || recovered
+                        }
+                        Err(error) => {
+                            view.notify_load_error(format!("Unable to load changes: {error}"), cx);
+                            false
+                        }
+                    }
+                }) else {
+                    return;
+                };
+                interval = next_poll_interval(interval, changed);
             }
         }));
     }
@@ -517,15 +605,12 @@ impl SourceControl {
                     Ok(message) => view.notify_success(&repository, message.clone(), cx),
                     Err(error) => view.error = Some(error.clone()),
                 }
-                match response {
-                    Ok(snapshot) => {
-                        let unchanged = view.selected_files == selected_files;
-                        view.apply_snapshot(snapshot, cx);
-                        if unchanged {
-                            view.follow_staging(&repository, &paths, staged, selected_files, selection_anchor);
-                        }
+                if let Ok(snapshot) = response {
+                    let unchanged = view.selected_files == selected_files;
+                    view.apply_snapshot(snapshot, cx);
+                    if unchanged {
+                        view.follow_staging(&repository, &paths, staged, selected_files, selection_anchor);
                     }
-                    Err(_) => {},
                 }
                 cx.notify();
             }).ok();
@@ -845,6 +930,7 @@ impl SourceControl {
             .into_any_element()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn action(
         &self,
         id: String,
@@ -866,7 +952,7 @@ impl SourceControl {
         let debug_id = id.clone();
         div()
             .id(SharedString::from(id))
-            .debug_selector(move || debug_id.clone().into())
+            .debug_selector(move || debug_id.clone())
             .role(gpui::Role::Button)
             .aria_label(label.clone())
             .size(px(20.0))
@@ -917,7 +1003,9 @@ impl SourceControl {
         let Some(snapshot) = &self.snapshot else {
             return div().into_any_element();
         };
-        let row_model = self.rows[row].clone();
+        let Some(row_model) = self.rows.get(row).cloned() else {
+            return div().into_any_element();
+        };
         let (repository, staged) = match row_model {
             Row::Repository(i) => (i, false),
             Row::Group {
@@ -927,7 +1015,9 @@ impl SourceControl {
                 repository, staged, ..
             } => (repository, staged),
         };
-        let repo = &snapshot.repositories[repository];
+        let Some(repo) = snapshot.repositories.get(repository) else {
+            return div().into_any_element();
+        };
         let repo_path = repo.path.clone();
         let row_group: SharedString = format!("source-control-row-{row}").into();
         let base = div()
@@ -989,19 +1079,7 @@ impl SourceControl {
             Row::Group { conflicts, .. } => {
                 let key = if conflicts { format!("{}:merge", repo.path) } else { format!("{}:{staged}", repo.path) };
                 let collapsed = self.collapsed.contains(&key);
-                let paths: Vec<_> = repo
-                    .files
-                    .iter()
-                    .filter(|f| in_group(f, staged) && f.is_conflicted() == conflicts)
-                    .map(|f| f.path.clone())
-                    .collect();
                 let enabled = repo.complete;
-                let discard_paths: Vec<_> = repo
-                    .files
-                    .iter()
-                    .filter(|f| in_group(f, staged) && !f.is_conflicted() && !repo.submodules.contains(&f.path))
-                    .map(|f| f.path.clone())
-                    .collect();
                 let discard_repository = repo_path.clone();
                 let selected_repository = repo_path.clone();
                 base.pl(px(18.0))
@@ -1043,10 +1121,12 @@ impl SourceControl {
                             .on_click(cx.listener(
                                 move |this, _, _, cx| {
                                     cx.stop_propagation();
+                                    let discard_paths =
+                                        this.group_paths(&discard_repository, false, false, true);
                                     if enabled && !discard_paths.is_empty() {
                                         this.request_discard(
                                             discard_repository.clone(),
-                                            discard_paths.clone(),
+                                            discard_paths,
                                             false,
                                             cx,
                                         );
@@ -1067,16 +1147,19 @@ impl SourceControl {
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
-                            if enabled {
+                            let paths = this.group_paths(&repo_path, staged, conflicts, false);
+                            if enabled && !paths.is_empty() {
                                 this.select_repository(repo_path.clone(), cx);
-                                this.set_staged(repo_path.clone(), paths.clone(), !staged, cx);
+                                this.set_staged(repo_path.clone(), paths, !staged, cx);
                             }
                         })),
                     )
                     .into_any_element()
             }
             Row::File { file, .. } => {
-                let file = &repo.files[file];
+                let Some(file) = repo.files.get(file) else {
+                    return div().into_any_element();
+                };
                 let submodule = repo.submodules.contains(&file.path);
                 let color = status_color(file, staged, &theme);
                 let name = file
@@ -1105,6 +1188,8 @@ impl SourceControl {
                 let marker = self.selected_row_bounds.clone();
                 let clicked_key = key.clone();
                 let debug_key = key.clone();
+                let stage_key = key.clone();
+                let discard_key = key.clone();
                 let paths = self.staging_paths(&key);
                 let path = file.path.clone();
                 let enabled = repo.complete;
@@ -1127,7 +1212,6 @@ impl SourceControl {
                             "sc-file-{}-{}-{}",
                             debug_key.repository, debug_key.staged, debug_key.path
                         )
-                        .into()
                     })
                     .cursor_pointer()
                     .border_color(if selected {
@@ -1236,10 +1320,11 @@ impl SourceControl {
                                 .on_click(cx.listener(
                                     move |this, _, _, cx| {
                                         cx.stop_propagation();
-                                        if enabled {
+                                        let discard_paths = this.discard_paths(&discard_key);
+                                        if enabled && !discard_paths.is_empty() {
                                             this.request_discard(
                                                 discard_repository.clone(),
-                                                discard_paths.clone(),
+                                                discard_paths,
                                                 false,
                                                 cx,
                                             );
@@ -1262,8 +1347,9 @@ impl SourceControl {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             if enabled {
+                                let paths = this.staging_paths(&stage_key);
                                 this.select_repository(repo_path.clone(), cx);
-                                this.set_staged(repo_path.clone(), paths.clone(), !staged, cx);
+                                this.set_staged(repo_path.clone(), paths, !staged, cx);
                             }
                         })),
                     )
@@ -1287,6 +1373,10 @@ impl SourceControl {
 impl Render for SourceControl {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::transcript::record_view_frame("source-control");
+        self.rendered = true;
+        if self.poll_paused {
+            self.start_polling(cx);
+        }
         self.ensure_loaded(cx);
         self.ensure_git_details(cx);
         let theme = Theme::of(cx).clone();
@@ -1687,6 +1777,48 @@ mod tests {
             view.select_repository("nested".into(), cx);
             assert!(view.selected_files.is_empty());
             assert!(view.selection_anchor.is_none());
+        });
+    }
+
+    #[test]
+    fn polling_backs_off_while_unchanged_and_resets_after_a_change() {
+        let mut interval = POLL_INTERVAL_MIN;
+        interval = next_poll_interval(interval, false);
+        assert!(interval > POLL_INTERVAL_MIN);
+        for _ in 0..20 {
+            interval = next_poll_interval(interval, false);
+        }
+        assert_eq!(interval, POLL_INTERVAL_MAX);
+        assert_eq!(next_poll_interval(interval, true), POLL_INTERVAL_MIN);
+    }
+
+    #[gpui::test]
+    fn focused_file_follows_a_staging_move_and_clears_when_the_file_disappears(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, cx) = selection_setup(cx);
+        view.update(cx, |view, cx| {
+            view.selected = view.file_selection(&FileKey::new("", "c.rs", false));
+            let mut snapshot = view.snapshot.clone().unwrap();
+            let file = snapshot.repositories[0]
+                .files
+                .iter_mut()
+                .find(|file| file.path == "c.rs")
+                .unwrap();
+            file.index = GitFileState::Added;
+            file.worktree = GitFileState::Unchanged;
+            view.apply_snapshot(snapshot, cx);
+            assert!(
+                view.selected
+                    .as_ref()
+                    .is_some_and(|selection| selection.path == "c.rs" && selection.staged)
+            );
+            let mut snapshot = view.snapshot.clone().unwrap();
+            snapshot.repositories[0]
+                .files
+                .retain(|file| file.path != "c.rs");
+            view.apply_snapshot(snapshot, cx);
+            assert!(view.selected.is_none());
         });
     }
 

@@ -1,5 +1,5 @@
 //! Device-private environment defaults and per-checkout overrides.
-use super::project_terminals_ui::ProjectContext;
+use super::project_terminals_ui::{DiscardPrompt, ProjectContext, ServiceFields, UnsavedForm};
 use super::*;
 use crate::settings::widgets::{self, SelectOption, SelectState};
 use zeron_proto::{
@@ -20,6 +20,7 @@ pub(super) struct WorktreeSettingsUi {
     directory: SelectState,
     lifecycle_visible: bool,
     removal: Option<removal::Removal>,
+    pub(super) discard: Option<DiscardPrompt>,
 }
 
 pub(super) struct Editor {
@@ -30,12 +31,42 @@ pub(super) struct Editor {
     drafts: std::collections::HashMap<Option<String>, Fields>,
     scroll: gpui::ScrollHandle,
     error: Option<String>,
+    /// Kept apart from `error` so a successful poll can clear it without
+    /// erasing a save or setup failure the user has not seen yet.
+    poll_error: Option<String>,
     busy: bool,
     output: Option<String>,
 }
 
+impl Editor {
+    fn new(project: ProjectContext) -> Self {
+        Self {
+            project,
+            checkout: None,
+            snapshot: None,
+            fields: None,
+            drafts: Default::default(),
+            scroll: gpui::ScrollHandle::new(),
+            error: None,
+            poll_error: None,
+            busy: false,
+            output: None,
+        }
+    }
+
+    fn is_dirty(&self, cx: &App) -> bool {
+        self.fields
+            .iter()
+            .chain(self.drafts.values())
+            .any(|fields| fields.is_dirty(cx))
+    }
+}
+
 struct Fields {
     settings: WorktreeSettings,
+    databases: Vec<ServiceFields>,
+    /// What the inputs produced when they were last loaded or saved.
+    saved: Option<WorktreeSettings>,
     prefix: Entity<ComposerInput>,
     profile: Entity<ComposerInput>,
     paths: Entity<ComposerInput>,
@@ -52,8 +83,38 @@ struct Fields {
 }
 
 impl Fields {
+    fn is_dirty(&self, cx: &App) -> bool {
+        self.settings(cx).ok() != self.saved || !self.new_file.read(cx).text().trim().is_empty()
+    }
+
     fn settings(&self, cx: &App) -> Result<WorktreeSettings, String> {
         let mut settings = self.settings.clone();
+        if !self.databases.is_empty() || settings.services.as_ref().is_some_and(|c|
+            c.services.iter().any(|s| s.setup_prerequisite.is_some())) {
+            let config = settings.services.get_or_insert_with(|| zeron_proto::ProjectTerminalConfig { services: vec![] });
+            let mut edited = Vec::new();
+            for database in &self.databases {
+                let service = database.service(cx);
+                let readiness = service.setup_prerequisite.as_ref().unwrap();
+                if service.command.trim().is_empty() || readiness.command.trim().is_empty() {
+                    return Err("Databases need a startup command and a readiness command.".into());
+                }
+                if !(1..=zeron_proto::MAX_WORKTREE_COMMAND_TIMEOUT_SECONDS).contains(&readiness.timeout_seconds) {
+                    return Err("Enter a database readiness timeout between 1 and 7200 seconds.".into());
+                }
+                edited.push(service);
+            }
+            let mut merged = Vec::new();
+            for service in &config.services {
+                if let Some(index) = edited.iter().position(|s| s.id == service.id) {
+                    merged.push(edited.remove(index));
+                } else if service.setup_prerequisite.is_none() {
+                    merged.push(service.clone());
+                }
+            }
+            merged.extend(edited);
+            config.services = merged;
+        }
         settings.branch_prefix = self.prefix.read(cx).text().into();
         settings.env_profile = self.profile.read(cx).text().into();
         settings.dependency_paths = self
@@ -129,20 +190,20 @@ impl Shell {
         self.reset_worktree_selects();
         self.worktree_settings.lifecycle_visible = false;
         self.worktree_settings.removal = None;
-        self.worktree_settings.editor = Some(Editor {
-            project,
-            checkout: None,
-            snapshot: None,
-            fields: None,
-            drafts: Default::default(),
-            scroll: gpui::ScrollHandle::new(),
-            error: None,
-            busy: false,
-            output: None,
-        });
+        self.worktree_settings.discard = None;
+        self.worktree_settings.editor = Some(Editor::new(project));
         self.worktree_settings.poll = None;
         self.poll_worktree_settings(cx);
         cx.notify();
+    }
+
+    pub(super) fn show_project_database_settings(&mut self, space: String, cx: &mut Context<Self>) {
+        if self.worktree_settings.editor.as_ref().is_some_and(|e| e.project.space == space) {
+            self.select_worktree_settings(None, cx);
+            cx.notify();
+        } else {
+            self.open_worktree_settings(space, cx);
+        }
     }
 
     pub(super) fn open_active_worktree_settings(&mut self, cx: &mut Context<Self>) {
@@ -163,8 +224,16 @@ impl Shell {
         self.worktree_settings.editor = None;
         self.worktree_settings.poll = None;
         self.worktree_settings.removal = None;
+        self.worktree_settings.discard = None;
         self.reset_worktree_selects();
         cx.notify();
+    }
+
+    pub(super) fn worktree_settings_dirty(&self, cx: &App) -> bool {
+        self.worktree_settings
+            .editor
+            .as_ref()
+            .is_some_and(|editor| editor.is_dirty(cx))
     }
 
     fn worktree_fields(&self, settings: WorktreeSettings, cx: &mut Context<Self>) -> Fields {
@@ -229,8 +298,13 @@ impl Shell {
             })
         })
         .collect();
-        Fields {
+        let databases = settings.services.as_ref().into_iter().flat_map(|c| &c.services)
+            .filter(|s| s.setup_prerequisite.is_some())
+            .map(|s| self.service_fields(s.clone(), false, cx)).collect();
+        let mut fields = Fields {
+            databases,
             settings,
+            saved: None,
             prefix,
             profile,
             paths,
@@ -244,7 +318,11 @@ impl Shell {
             timeout,
             new_file,
             _events: events,
-        }
+        };
+        // Read the baseline back through the inputs so formatting differences
+        // (such as how dependency paths are joined) never count as edits.
+        fields.saved = fields.settings(cx).ok();
+        fields
     }
 
     fn worktree_params(&self) -> Option<serde_json::Value> {
@@ -280,30 +358,10 @@ impl Shell {
                         {
                             return false;
                         }
-                        match result {
-                            Ok(snapshot) => {
-                                let needs_fields = shell
-                                    .worktree_settings
-                                    .editor
-                                    .as_ref()
-                                    .is_some_and(|e| e.fields.is_none());
-                                let fields = needs_fields
-                                    .then(|| shell.worktree_fields(snapshot.settings.clone(), cx));
-                                let editor = shell.worktree_settings.editor.as_mut().unwrap();
-                                if let Some(fields) = fields {
-                                    shell.worktree_settings.lifecycle_visible =
-                                        !fields.settings.create_command.is_empty()
-                                            || !fields.settings.remove_command.is_empty();
-                                    editor.fields = Some(fields);
-                                }
-                                editor.snapshot = Some(snapshot);
-                            }
-                            Err(error) => {
-                                shell.worktree_settings.editor.as_mut().unwrap().error =
-                                    Some(error.to_string())
-                            }
+                        let result = result.map_err(|error| error.to_string());
+                        if shell.accept_worktree_settings_poll(result, cx) {
+                            cx.notify();
                         }
-                        cx.notify();
                         true
                     })
                     .unwrap_or(false);
@@ -313,6 +371,50 @@ impl Shell {
                 cx.background_executor().timer(Duration::from_secs(2)).await;
             }
         }));
+    }
+
+    /// Applies one poll result and reports whether anything visible changed.
+    fn accept_worktree_settings_poll(
+        &mut self,
+        result: Result<WorktreeSettingsSnapshot, String>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(editor) = self.worktree_settings.editor.as_ref() else {
+            return false;
+        };
+        let snapshot = match result {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let error = Some(error);
+                let Some(editor) = self.worktree_settings.editor.as_mut() else {
+                    return false;
+                };
+                if editor.poll_error == error {
+                    return false;
+                }
+                editor.poll_error = error;
+                return true;
+            }
+        };
+        let fields = editor
+            .fields
+            .is_none()
+            .then(|| self.worktree_fields(snapshot.settings.clone(), cx));
+        let Some(editor) = self.worktree_settings.editor.as_mut() else {
+            return false;
+        };
+        let mut changed = editor.poll_error.take().is_some();
+        if let Some(fields) = fields {
+            self.worktree_settings.lifecycle_visible = !fields.settings.create_command.is_empty()
+                || !fields.settings.remove_command.is_empty();
+            editor.fields = Some(fields);
+            changed = true;
+        }
+        if editor.snapshot.as_ref() != Some(&snapshot) {
+            editor.snapshot = Some(snapshot);
+            changed = true;
+        }
+        changed
     }
 
     fn select_worktree_settings(&mut self, checkout: Option<String>, cx: &mut Context<Self>) {
@@ -332,6 +434,7 @@ impl Shell {
         editor.checkout = checkout;
         editor.output = None;
         editor.error = None;
+        editor.poll_error = None;
         editor.scroll.set_offset(gpui::point(px(0.0), px(0.0)));
         self.reset_worktree_selects();
         self.worktree_settings.epoch += 1;
@@ -353,8 +456,11 @@ impl Shell {
             return;
         };
         let resetting = method == methods::SAVE_WORKTREE_SETTINGS && settings.is_none();
+        let saving = (method == methods::SAVE_WORKTREE_SETTINGS)
+            .then(|| settings.clone())
+            .flatten();
         if method == methods::SAVE_WORKTREE_SETTINGS {
-            params["settings"] = serde_json::to_value(settings).unwrap();
+            params["settings"] = serde_json::to_value(settings).unwrap_or_default();
         }
         let epoch = self.worktree_settings.epoch;
         if let Some(editor) = self.worktree_settings.editor.as_mut() {
@@ -378,9 +484,16 @@ impl Shell {
                     Ok(snapshot) => {
                         let settings = snapshot.settings.clone();
                         editor.snapshot = Some(snapshot);
+                        if let Some(saved) = saving
+                            && let Some(fields) = editor.fields.as_mut()
+                        {
+                            fields.saved = Some(saved);
+                        }
                         if resetting {
                             let fields = shell.worktree_fields(settings, cx);
-                            shell.worktree_settings.editor.as_mut().unwrap().fields = Some(fields);
+                            if let Some(editor) = shell.worktree_settings.editor.as_mut() {
+                                editor.fields = Some(fields);
+                            }
                         }
                     }
                     Err(error) => editor.error = Some(error.to_string()),
@@ -404,6 +517,9 @@ impl Shell {
             && editor.checkout == context.checkout_override
             && let Some(fields) = editor.fields.as_mut()
         {
+            if let Some(saved) = fields.saved.as_mut() {
+                saved.services = Some(config.clone());
+            }
             fields.settings.services = Some(config);
         }
     }
@@ -926,6 +1042,52 @@ impl Shell {
                     })),
                 );
             }
+            content = content.child(section(&theme, "Databases"))
+                .child(note(&theme, "Shared database services start in the main project folder before worktree setup, migrations and app startup. Switching or removing a worktree keeps them running; Muute cleanup removes only that worktree’s database resources."));
+            if editor.checkout.is_none() {
+                for database in &fields.databases {
+                    let id = database.id.clone();
+                    content = content.child(div().mt(px(12.0)).p(px(12.0)).border_1().border_color(theme.border).rounded(px(6.0))
+                        .child(div().flex().items_center().justify_between()
+                            .child(div().text_size(px(13.0)).child("Database service"))
+                            .child(choice(&theme, format!("remove-database-{id}"), "Remove", false)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(f) = this.worktree_settings.editor.as_mut().and_then(|e| e.fields.as_mut()) {
+                                        f.databases.retain(|d| d.id != id);
+                                    }
+                                    cx.notify();
+                                }))))
+                        .child(label(&theme, "Name")).child(field(&theme, &database.name))
+                        .child(label(&theme, "Startup command")).child(field(&theme, &database.command))
+                        .child(label(&theme, "Folder relative to the main project (use . for the root)"))
+                        .child(field(&theme, &database.directory))
+                        .child(label(&theme, "Readiness command")).child(field(&theme, &database.readiness))
+                        .child(note(&theme, "Retried until it exits successfully. Setup and app startup wait for this check."))
+                        .child(label(&theme, "Readiness timeout (seconds)"))
+                        .child(field(&theme, &database.readiness_timeout)));
+                }
+                let can_add = fields.settings.services.as_ref().map_or(0, |c| c.services.iter().filter(|s| s.setup_prerequisite.is_none()).count())
+                    + fields.databases.len() < 12;
+                content = content.child(choice(&theme, "add-worktree-database", "Add database service", false)
+                    .mt(px(8.0))
+                    .when(!can_add || busy, |el| el.opacity(0.4).cursor_default())
+                    .when(can_add && !busy, |el| el.on_click(cx.listener(|this, _, _, cx| {
+                        let database = this.service_fields(zeron_proto::ProjectTerminalService {
+                            id: uuid::Uuid::new_v4().to_string(), name: "Databases".into(),
+                            command: String::new(), directory: ".".into(), restart_on_failure: false,
+                            setup_prerequisite: Some(zeron_proto::ProjectServiceReadiness { command: String::new(), timeout_seconds: 120 }),
+                        }, false, cx);
+                        if let Some(f) = this.worktree_settings.editor.as_mut().and_then(|e| e.fields.as_mut()) {
+                            f.databases.push(database);
+                        }
+                        cx.notify();
+                    }))));
+            } else {
+                content = content.child(note(&theme, "This worktree uses the shared databases from Project defaults. Muute’s setup command assigns its schema, Redis database and ports."))
+                    .child(choice(&theme, "database-project-defaults", "Configure databases in Project defaults", false)
+                        .on_click(cx.listener(|this, _, _, cx| this.select_worktree_settings(None, cx))));
+            }
+            content = content.child(note(&theme, "Save applies database settings and workflow settings together. Databases appear in Services for output and independent Start/Stop. Stop worktree services keeps them running; Stop all services also stops databases."));
             content = content.child(section(&theme, "Custom workflow"));
             if editor
                 .snapshot
@@ -1007,7 +1169,7 @@ impl Shell {
             .p(px(16.0))
             .border_t_1()
             .border_color(theme.border);
-        if let Some(error) = &editor.error {
+        if let Some(error) = editor.error.as_ref().or(editor.poll_error.as_ref()) {
             footer = footer.child(
                 div()
                     .mb(px(10.0))
@@ -1035,8 +1197,8 @@ impl Shell {
                 .child(
                     popover::btn_ghost(&theme, "Close", "close-worktree-settings")
                         .id("close-worktree-settings")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.close_worktree_settings(cx);
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.request_close_form(UnsavedForm::WorktreeSettings, window, cx);
                         })),
                 )
                 .child(
@@ -1047,24 +1209,20 @@ impl Shell {
                         })
                         .when(!busy && editor.fields.is_some(), |b| {
                             b.on_click(cx.listener(|this, _, _, cx| {
-                                let settings = this
-                                    .worktree_settings
-                                    .editor
-                                    .as_ref()
-                                    .unwrap()
-                                    .fields
-                                    .as_ref()
-                                    .unwrap()
-                                    .settings(cx);
-                                match settings {
+                                let Some(editor) = this.worktree_settings.editor.as_mut() else {
+                                    return;
+                                };
+                                let Some(fields) = editor.fields.as_ref() else {
+                                    return;
+                                };
+                                match fields.settings(cx) {
                                     Ok(settings) => this.worktree_request(
                                         methods::SAVE_WORKTREE_SETTINGS,
                                         Some(settings),
                                         cx,
                                     ),
                                     Err(error) => {
-                                        this.worktree_settings.editor.as_mut().unwrap().error =
-                                            Some(error);
+                                        editor.error = Some(error);
                                         cx.notify();
                                     }
                                 }
@@ -1226,7 +1384,8 @@ impl Shell {
             .as_ref()
             .map(|e| {
                 serde_json::json!({
-                    "checkout":e.checkout,"busy":e.busy,"error":e.error,
+                    "checkout":e.checkout,"busy":e.busy,
+                    "error":e.error.as_ref().or(e.poll_error.as_ref()),
                     "worktrees":e.snapshot.as_ref().map(|s|&s.worktrees),
                     "settings":e.fields.as_ref().and_then(|f|f.settings(cx).ok()),
                     "hasOverrides":e.snapshot.as_ref().map(|s|s.has_overrides),
@@ -1245,7 +1404,7 @@ impl Shell {
 mod tests {
     use super::*;
     use gpui::{AppContext, TestAppContext};
-    fn shell(cx: &mut TestAppContext, path: &PathBuf) -> gpui::WindowHandle<Shell> {
+    fn shell(cx: &mut TestAppContext, path: &std::path::Path) -> gpui::WindowHandle<Shell> {
         cx.update(|cx| {
             gpui_base::init(cx);
             cx.set_global(Theme::default());
@@ -1256,7 +1415,7 @@ mod tests {
             Shell::new(
                 state,
                 EngineBootConfig {
-                    data_dir: path.clone(),
+                    data_dir: path.to_path_buf(),
                     ipc_port: 0,
                     edge_url: String::new(),
                     edge_token: None,
@@ -1270,9 +1429,45 @@ mod tests {
     }
 
     #[gpui::test]
+    fn database_settings_save_with_workflow_and_preserve_app_services(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let window = shell(cx, dir.path());
+        window.update(cx, |shell, _, cx| {
+            let app = zeron_proto::ProjectTerminalService {
+                id: "backend".into(), name: "Backend".into(), command: "bun run dev".into(),
+                directory: "apps/backend".into(), restart_on_failure: false, setup_prerequisite: None,
+            };
+            let database = zeron_proto::ProjectTerminalService {
+                id: "database".into(), name: "Databases".into(), command: "start-db".into(),
+                directory: ".".into(), restart_on_failure: false,
+                setup_prerequisite: Some(zeron_proto::ProjectServiceReadiness { command: "db-ready".into(), timeout_seconds: 120 }),
+            };
+            let mut fields = shell.worktree_fields(WorktreeSettings {
+                setup_command: "muute-setup".into(),
+                services: Some(zeron_proto::ProjectTerminalConfig { services: vec![database, app.clone()] }),
+                ..Default::default()
+            }, cx);
+            assert!(!fields.is_dirty(cx));
+            fields.databases[0].readiness_timeout.update(cx, |input, cx| input.set_text("180", cx));
+            assert!(fields.is_dirty(cx));
+            let changed = fields.settings(cx).unwrap();
+            assert_eq!(changed.setup_command, "muute-setup");
+            let config = changed.services.unwrap();
+            assert_eq!(config.services[0].id, "database");
+            assert_eq!(config.services.iter().find(|s| s.id == "backend").unwrap(), &app);
+            assert_eq!(config.services.iter().find(|s| s.id == "database").unwrap()
+                .setup_prerequisite.as_ref().unwrap().timeout_seconds, 180);
+            fields.databases[0].readiness_timeout.update(cx, |input, cx| input.set_text("bad", cx));
+            assert!(fields.settings(cx).unwrap_err().contains("database readiness timeout"));
+            fields.databases.clear();
+            assert_eq!(fields.settings(cx).unwrap().services.unwrap().services, vec![app]);
+        }).unwrap();
+    }
+
+    #[gpui::test]
     fn saved_services_update_only_the_matching_project_settings_draft(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
-        let window = shell(cx, &dir.path().to_path_buf());
+        let window = shell(cx, dir.path());
         window.update(cx, |shell, _, cx| {
             let project = ProjectContext {
                 space: "project".into(), device: "local".into(), name: "Project".into(),
@@ -1282,6 +1477,7 @@ mod tests {
                 zeron_proto::ProjectTerminalService {
                     id: "backend".into(), name: "Backend".into(), command: "old command".into(),
                     directory: ".".into(), restart_on_failure: false,
+                    setup_prerequisite: None,
                 },
             ] };
             let mut next = old.clone();
@@ -1291,7 +1487,7 @@ mod tests {
                 shell.worktree_settings.editor = Some(Editor {
                     project: project.clone(), checkout: checkout.clone(), snapshot: None,
                     fields: Some(shell.worktree_fields(settings, cx)), drafts: Default::default(),
-                    scroll: gpui::ScrollHandle::new(), error: None, busy: false, output: None,
+                    scroll: gpui::ScrollHandle::new(), error: None, poll_error: None, busy: false, output: None,
                 });
                 let mut context = project.clone();
                 context.checkout_override = checkout;
@@ -1310,54 +1506,174 @@ mod tests {
     #[gpui::test]
     fn removal_requires_a_worktree_and_cancel_keeps_its_settings_open(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
-        let window = shell(cx, &dir.path().to_path_buf());
-        window.update(cx, |shell, window, cx| {
-            let defaults = WorktreeSettings::default();
-            shell.worktree_settings.editor = Some(Editor {
-                project: ProjectContext {
-                    space:"project".into(), device:"local".into(), name:"Project".into(),
-                    target:None, chat:None, cwd:"/project".into(), checkout_override:None,
-                },
-                checkout:None,
-                snapshot:Some(WorktreeSettingsSnapshot {
-                    defaults:defaults.clone(), settings:defaults.clone(), checkout:None,
-                    has_overrides:false, detected_env_files:vec![], detected_dependency_paths:vec![],
-                    detected_install_command:String::new(), detected_workflow:None,
-                    worktrees:vec![zeron_proto::WorktreeEnvironmentEntry {
-                        path:"/project-worktree".into(), branch:"feature/work".into(),
-                        has_overrides:false, managed:true, state:Default::default(),
-                    }],
-                }),
-                fields:Some(shell.worktree_fields(defaults, cx)), drafts:Default::default(),
-                scroll:gpui::ScrollHandle::new(), error:None, busy:false, output:None,
-            });
-            shell.begin_worktree_removal(window, cx);
-            assert!(shell.worktree_settings.removal.is_none(), "Project defaults cannot be removed");
-            shell.select_worktree_settings(Some("/project-worktree".into()), cx);
-            shell.begin_worktree_removal(window, cx);
-            assert!(shell.worktree_settings.removal.is_some());
-            assert!(shell.capture_escape_surface(window, cx));
-            assert!(shell.worktree_settings.removal.is_none());
-            assert_eq!(shell.worktree_settings.editor.as_ref().unwrap().checkout.as_deref(), Some("/project-worktree"));
-            shell.state.update(cx, |state, cx| {
-                state.chats = vec![serde_json::from_value(serde_json::json!({
-                    "id":"worker","deviceId":"local","cwd":"/project-worktree",
-                    "spaceId":"project","archived":false,"createdAt":Utc::now(),
-                })).unwrap()];
-                state.begin_pending_send("worker", "message", Utc::now());
-                cx.notify();
-            });
-            shell.begin_worktree_removal(window, cx);
-            assert!(shell.worktree_settings.removal.is_none());
-            assert!(shell.worktree_settings.editor.as_ref().unwrap().error.as_ref().unwrap().contains("Stop agents"));
-        }).unwrap();
+        let window = shell(cx, dir.path());
+        window
+            .update(cx, |shell, window, cx| {
+                let defaults = WorktreeSettings::default();
+                shell.worktree_settings.editor = Some(Editor {
+                    project: ProjectContext {
+                        space: "project".into(),
+                        device: "local".into(),
+                        name: "Project".into(),
+                        target: None,
+                        chat: None,
+                        cwd: "/project".into(),
+                        checkout_override: None,
+                    },
+                    checkout: None,
+                    snapshot: Some(WorktreeSettingsSnapshot {
+                        defaults: defaults.clone(),
+                        settings: defaults.clone(),
+                        checkout: None,
+                        has_overrides: false,
+                        detected_env_files: vec![],
+                        detected_dependency_paths: vec![],
+                        detected_install_command: String::new(),
+                        detected_workflow: None,
+                        worktrees: vec![zeron_proto::WorktreeEnvironmentEntry {
+                            path: "/project-worktree".into(),
+                            branch: "feature/work".into(),
+                            has_overrides: false,
+                            managed: true,
+                            state: Default::default(),
+                        }],
+                    }),
+                    fields: Some(shell.worktree_fields(defaults, cx)),
+                    drafts: Default::default(),
+                    scroll: gpui::ScrollHandle::new(),
+                    error: None,
+                    poll_error: None,
+                    busy: false,
+                    output: None,
+                });
+                shell.begin_worktree_removal(window, cx);
+                assert!(
+                    shell.worktree_settings.removal.is_none(),
+                    "Project defaults cannot be removed"
+                );
+                shell.select_worktree_settings(Some("/project-worktree".into()), cx);
+                shell.begin_worktree_removal(window, cx);
+                assert!(shell.worktree_settings.removal.is_some());
+                assert!(shell.capture_escape_surface(window, cx));
+                assert!(shell.worktree_settings.removal.is_none());
+                assert_eq!(
+                    shell
+                        .worktree_settings
+                        .editor
+                        .as_ref()
+                        .unwrap()
+                        .checkout
+                        .as_deref(),
+                    Some("/project-worktree")
+                );
+                shell.state.update(cx, |state, cx| {
+                    state.chats = vec![
+                        serde_json::from_value(serde_json::json!({
+                            "id":"worker","deviceId":"local","cwd":"/project-worktree",
+                            "spaceId":"project","archived":false,"createdAt":Utc::now(),
+                        }))
+                        .unwrap(),
+                    ];
+                    state.begin_pending_send("worker", "message", Utc::now());
+                    cx.notify();
+                });
+                shell.begin_worktree_removal(window, cx);
+                assert!(shell.worktree_settings.removal.is_none());
+                assert!(
+                    shell
+                        .worktree_settings
+                        .editor
+                        .as_ref()
+                        .unwrap()
+                        .error
+                        .as_ref()
+                        .unwrap()
+                        .contains("Stop agents")
+                );
+            })
+            .unwrap();
     }
+    #[cfg(unix)]
+    #[gpui::test]
+    fn removal_finds_unsaved_files_through_symlinks_and_relative_paths(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(real.join("project/src")).unwrap();
+        std::fs::create_dir_all(real.join("project-worktree")).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let worktree = real.join("project-worktree").to_string_lossy().into_owned();
+        let window = shell(cx, dir.path());
+        window
+            .update(cx, |shell, window, cx| {
+                let defaults = WorktreeSettings::default();
+                let mut editor = Editor::new(ProjectContext {
+                    cwd: real.join("project").to_string_lossy().into_owned(),
+                    ..test_project()
+                });
+                editor.checkout = Some(worktree.clone());
+                editor.snapshot = Some(WorktreeSettingsSnapshot {
+                    defaults: defaults.clone(),
+                    settings: defaults,
+                    checkout: Some(worktree.clone()),
+                    has_overrides: false,
+                    detected_env_files: vec![],
+                    detected_dependency_paths: vec![],
+                    detected_install_command: String::new(),
+                    detected_workflow: None,
+                    worktrees: vec![zeron_proto::WorktreeEnvironmentEntry {
+                        path: worktree.clone(),
+                        branch: "feature/work".into(),
+                        has_overrides: false,
+                        managed: true,
+                        state: Default::default(),
+                    }],
+                });
+                shell.worktree_settings.editor = Some(editor);
+                shell.state.update(cx, |state, _| {
+                    state.local_device_id = Some("local".into());
+                    state.chats =
+                        vec![serde_json::from_value(serde_json::json!({
+                        "id": "main", "deviceId": "local", "spaceId": "project",
+                        "cwd": link.join("project"), "archived": false, "createdAt": Utc::now(),
+                    }))
+                    .unwrap()];
+                });
+                shell.active_chat = "main".into();
+                fn open_dirty(
+                    shell: &mut Shell,
+                    path: &str,
+                    window: &mut Window,
+                    cx: &mut Context<Shell>,
+                ) {
+                    let owner = ("main".to_string(), shell.state.clone());
+                    shell.add_file_surface_at(owner, path.into(), None, window, cx);
+                    let id = shell.file_surface_seq;
+                    shell.file_surfaces[&id]
+                        .update(cx, |files, _| files.seed_pending_exit_test_document(true));
+                }
+                open_dirty(shell, "src/lib.rs", window, cx);
+                shell.begin_worktree_removal(window, cx);
+                assert!(
+                    shell.worktree_settings.removal.is_some(),
+                    "unsaved files elsewhere in the project do not block removal"
+                );
+                shell.dismiss_worktree_removal(window, cx);
+                open_dirty(shell, "../project-worktree/.env", window, cx);
+                shell.begin_worktree_removal(window, cx);
+                assert!(shell.worktree_settings.removal.is_none());
+                let editor = shell.worktree_settings.editor.as_ref().unwrap();
+                assert!(editor.error.as_deref().unwrap().contains("unsaved files"));
+            })
+            .unwrap();
+    }
+
     #[gpui::test]
     fn switching_settings_pages_preserves_drafts_and_closing_invalidates_late_requests(
         cx: &mut TestAppContext,
     ) {
         let dir = tempfile::tempdir().unwrap();
-        let window = shell(cx, &dir.path().to_path_buf());
+        let window = shell(cx, dir.path());
         window
             .update(cx, |shell, _, cx| {
                 let fields = shell.worktree_fields(WorktreeSettings::default(), cx);
@@ -1380,6 +1696,7 @@ mod tests {
                     drafts: Default::default(),
                     scroll: gpui::ScrollHandle::new(),
                     error: None,
+                    poll_error: None,
                     busy: false,
                     output: None,
                 });
@@ -1410,12 +1727,125 @@ mod tests {
             })
             .unwrap();
     }
+    fn test_project() -> ProjectContext {
+        ProjectContext {
+            space: "project".into(),
+            device: "local".into(),
+            name: "Project".into(),
+            target: None,
+            chat: None,
+            cwd: "/project".into(),
+            checkout_override: None,
+        }
+    }
+
+    #[gpui::test]
+    fn closing_project_settings_asks_only_when_edits_are_unsaved(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let window = shell(cx, dir.path());
+        window
+            .update(cx, |shell, window, cx| {
+                let settings = WorktreeSettings {
+                    dependency_paths: vec!["node_modules".into(), "apps/web/node_modules".into()],
+                    variables: [("APP_VALUE".to_string(), "a=b".to_string())].into(),
+                    ..Default::default()
+                };
+                let mut editor = Editor::new(test_project());
+                editor.fields = Some(shell.worktree_fields(settings.clone(), cx));
+                shell.worktree_settings.editor = Some(editor);
+                assert!(
+                    !shell.worktree_settings_dirty(cx),
+                    "loaded values are not edits"
+                );
+                shell.request_close_form(UnsavedForm::WorktreeSettings, window, cx);
+                assert!(shell.worktree_settings.editor.is_none());
+                assert!(shell.worktree_settings.discard.is_none());
+
+                let mut editor = Editor::new(test_project());
+                editor.fields = Some(shell.worktree_fields(settings, cx));
+                shell.worktree_settings.editor = Some(editor);
+                let prefix = shell
+                    .worktree_settings
+                    .editor
+                    .as_ref()
+                    .unwrap()
+                    .fields
+                    .as_ref();
+                let prefix = prefix.unwrap().prefix.clone();
+                prefix.update(cx, |input, cx| input.set_text("iiroan/", cx));
+                shell.select_worktree_settings(Some("/worktree".into()), cx);
+                assert!(
+                    shell.worktree_settings_dirty(cx),
+                    "drafts on other pages count"
+                );
+                shell.request_close_form(UnsavedForm::WorktreeSettings, window, cx);
+                assert!(shell.worktree_settings.discard.is_some());
+                assert!(shell.worktree_settings.editor.is_some());
+                assert!(shell.capture_escape_surface(window, cx));
+                assert!(shell.worktree_settings.discard.is_none());
+                assert!(
+                    shell.worktree_settings.editor.is_some(),
+                    "Escape keeps editing"
+                );
+                shell.request_close_form(UnsavedForm::WorktreeSettings, window, cx);
+                shell.discard_form(UnsavedForm::WorktreeSettings, window, cx);
+                assert!(shell.worktree_settings.discard.is_none());
+                assert!(shell.worktree_settings.editor.is_none());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn settings_polls_rerender_only_on_change_and_keep_save_errors(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let window = shell(cx, dir.path());
+        window
+            .update(cx, |shell, _, cx| {
+                let defaults = WorktreeSettings::default();
+                let snapshot = WorktreeSettingsSnapshot {
+                    defaults: defaults.clone(),
+                    settings: defaults,
+                    checkout: None,
+                    has_overrides: false,
+                    detected_env_files: vec![],
+                    detected_dependency_paths: vec![],
+                    detected_install_command: String::new(),
+                    detected_workflow: None,
+                    worktrees: vec![],
+                };
+                shell.worktree_settings.editor = Some(Editor::new(test_project()));
+                assert!(shell.accept_worktree_settings_poll(Ok(snapshot.clone()), cx));
+                assert!(
+                    shell
+                        .worktree_settings
+                        .editor
+                        .as_ref()
+                        .unwrap()
+                        .fields
+                        .is_some()
+                );
+                assert!(!shell.accept_worktree_settings_poll(Ok(snapshot.clone()), cx));
+
+                shell.worktree_settings.editor.as_mut().unwrap().error = Some("Save failed".into());
+                assert!(shell.accept_worktree_settings_poll(Err("Engine offline".into()), cx));
+                assert!(!shell.accept_worktree_settings_poll(Err("Engine offline".into()), cx));
+                assert!(shell.accept_worktree_settings_poll(Ok(snapshot), cx));
+                let editor = shell.worktree_settings.editor.as_ref().unwrap();
+                assert!(
+                    editor.poll_error.is_none(),
+                    "a successful poll clears its own error"
+                );
+                assert_eq!(editor.error.as_deref(), Some("Save failed"));
+            })
+            .unwrap();
+    }
+
     #[gpui::test]
     fn muute_preset_fills_commands_without_executing_and_variables_keep_equals(
         cx: &mut TestAppContext,
     ) {
         let dir = tempfile::tempdir().unwrap();
-        let window = shell(cx, &dir.path().to_path_buf());
+        let window = shell(cx, dir.path());
         window
             .update(cx, |shell, _, cx| {
                 let fields = shell.worktree_fields(WorktreeSettings::default(), cx);
@@ -1441,6 +1871,7 @@ mod tests {
                     drafts: Default::default(),
                     scroll: gpui::ScrollHandle::new(),
                     error: None,
+                    poll_error: None,
                     busy: false,
                     output: None,
                 });

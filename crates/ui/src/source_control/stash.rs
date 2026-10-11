@@ -257,7 +257,7 @@ impl SourceControl {
         let rows = matching(&picker.entries, picker.search.read(cx).text());
         let count = rows.len();
         let list_height =
-            px((count.min(8).max(1) * 32) as f32).min((viewport.height - px(130.0)).max(px(1.0)));
+            px((count.clamp(1, 8) * 32) as f32).min((viewport.height - px(130.0)).max(px(1.0)));
         let active = picker.active;
         let scroll = picker.scroll.clone();
         let search = picker.search.clone();

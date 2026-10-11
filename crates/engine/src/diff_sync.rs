@@ -1092,6 +1092,18 @@ async fn capture_git_in<S: AsRef<OsStr>>(
         .stdout
         .take()
         .ok_or_else(|| EngineError::Other("git stdout unavailable".into()))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| EngineError::Other("git stderr unavailable".into()))?;
+    // Drain stderr while stdout is read: a full stderr pipe stalls Git before
+    // it closes stdout. Keep a bounded diagnostic and discard the rest.
+    let stderr = tokio::spawn(async move {
+        let mut kept = Vec::new();
+        let _ = (&mut stderr).take(64 * 1024).read_to_end(&mut kept).await;
+        let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
+        kept
+    });
     let mut out: Vec<u8> = Vec::new();
     // Keep the read buffer out of nested async state: inline storage grows
     // every caller's future and can overflow a standard RPC worker's stack.
@@ -1114,15 +1126,16 @@ async fn capture_git_in<S: AsRef<OsStr>>(
         }
         out.extend_from_slice(&buf[..n]);
     }
-    let output = child
-        .wait_with_output()
+    let status = child
+        .wait()
         .await
         .map_err(|e| EngineError::Other(format!("git wait failed: {e}")))?;
-    if !output.status.success() && !truncated {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    if !status.success() && !truncated {
+        let stderr = stderr.await.unwrap_or_default();
+        let stderr = String::from_utf8_lossy(&stderr);
         let message = stderr.trim();
         return Err(EngineError::Other(if message.is_empty() {
-            format!("git exited {}", output.status)
+            format!("git exited {status}")
         } else {
             format!("git: {message}")
         }));

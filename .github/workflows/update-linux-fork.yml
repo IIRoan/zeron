@@ -82,7 +82,7 @@ jobs:
             echo
             echo "    scripts/update-upstream.sh --from-run $GITHUB_RUN_ID"
             echo
-            echo 'Checks passed: updater safety, engine Git, syntax, Source Control, file-close modals, and Linux desktop build.'
+            echo 'Checks passed: updater safety, engine Git, worktrees, services and terminals, syntax, Source Control, file-close modals, and Linux desktop build.'
             echo 'Review the result locally before pushing. This action does not update main automatically.'
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
