@@ -50,6 +50,12 @@ Custom creation must produce a linked checkout in this project at the requested 
 
 Successful setup is idempotent for unchanged environment settings. Changing a branch prefix, command timeout, service command, or service policy does not reinstall dependencies. **Prepare worktree** or **Run setup again** stops that checkout's services and explicitly reruns setup; save edits first. A failed or interrupted setup remains visible, has bounded output, and can be retried or cancelled. Worktree creation associates the checkout with the conversation even when setup fails; agent dispatch and service starts wait for successful preparation. Agent dispatch prepares only worktrees Zeron created. A linked worktree you made yourself, for example with `git worktree add`, is not changed when an agent runs in it; starting its services or choosing **Prepare worktree** prepares it. This prevents retrying an agent from creating another failed checkout. Old setup Actions remain available as a compatibility fallback when no custom setup command is configured.
 
+## Page layout
+
+Project defaults follow a worktree's lifecycle: **Branch names**, **Shared databases**, **Environment files**, **Dependencies**, **Setup workflow**, **App services** and **Advanced**. **Save settings** saves the page's own settings and, on Project defaults, its databases; it never saves app services. **App services** lists the services that apply and opens the service editor. On a worktree page, **Customize for this worktree…** gives the worktree its own app services without freezing its other settings, and **Use project services** returns to the project's list. **Use project defaults** resets the worktree's environment settings and keeps its own app services. Unsaved drafts, including database edits, stay in the dialog while you switch pages and are never replaced by background refreshes.
+
+If a window is connected to an older Zeron engine that is still running after an update, the databases section explains that Zeron must be quit completely and reopened, instead of saving databases the old engine would turn into ordinary services.
+
 ## Service groups
 
 Choose the concurrency policy in the **Service groups** dropdown in project defaults. It applies to every checkout:
@@ -72,6 +78,6 @@ bun run worktrees codex-sync --mode cleanup --source "$ZERON_PROJECT_ROOT" --wor
 
 The preset disables built-in env/dependency copying and runs from the project root. Muute owns secret copying, submodules, port/schema allocation, installation, migrations, generation, and seeding. Its cleanup can remove the worktree's database schema. Inspect or edit these commands before saving; selecting the preset itself executes nothing. Zeron does not modify Muute's source or publish any env data.
 
-Configure database startup, readiness and timeout in **Worktree settings → Project defaults → Databases** alongside the setup and cleanup workflow. Database configuration is saved with the worktree settings and remains available in Services for logs and Start/Stop. Zeron starts and checks it before Muute setup, including worktree creation and setup retries. It remains shared across checkouts. Muute's `start-db` omits Redis, which must be started separately or included in the same service command.
+Configure database startup, ready check and timeout in **Project settings → Project defaults → Shared databases**, on the same page as the setup and cleanup workflow. Zeron starts and checks them before Muute setup, including worktree creation and setup retries, and they remain shared across checkouts. Worktree pages show them read-only. Muute's `start-db` omits Redis, which must be started separately or included in the same service command.
 
 Muute's `create` command chooses its own folder path, while Zeron allocates a specific destination. Use the `codex-sync` preset for this repository so both tools agree on the worktree path. The preset clears custom Git overrides and activation commands to avoid duplicate setup. It installs dependencies independently instead of copying `node_modules`.

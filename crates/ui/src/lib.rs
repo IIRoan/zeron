@@ -233,15 +233,25 @@ pub fn run_app(config: UiConfig) {
         cx.on_app_quit(move |cx| {
             settings::flush(cx);
             app_update::install_on_quit(cx);
-            let shutdown =
-                quit_state.read(cx).engine().cloned().map(|handle| {
-                    gpui_tokio::Tokio::spawn(cx, async move { handle.shutdown().await })
+            if let Some(handle) = quit_state.read(cx).engine().cloned() {
+                // GPUI gives quit hooks 200 ms, far less than stopping agents
+                // and services takes. Returning early abandons the shutdown and
+                // leaves a windowless process that keeps the engine and its
+                // services alive, so the next launch attaches to that old
+                // engine. Wait here instead, with a bound.
+                let (done, finished) = std::sync::mpsc::channel();
+                gpui_tokio::Tokio::handle(cx).spawn(async move {
+                    handle.shutdown().await;
+                    let _ = done.send(());
                 });
-            async move {
-                if let Some(task) = shutdown {
-                    let _ = task.await;
+                if finished
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .is_err()
+                {
+                    tracing::warn!("engine shutdown did not finish within 30 seconds");
                 }
             }
+            async {}
         })
         .detach();
 

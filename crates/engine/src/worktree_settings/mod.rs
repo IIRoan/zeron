@@ -17,6 +17,10 @@ use zeron_proto::*;
 #[serde(rename_all = "camelCase", default)]
 struct Checkout {
     settings: Option<WorktreeSettings>,
+    /// The checkout's own app services, kept apart from `settings` so that
+    /// customizing services never freezes its inherited environment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    services: Option<ProjectTerminalConfig>,
     branch: Option<String>,
     prefix: String,
     prepared_hash: String,
@@ -29,6 +33,10 @@ struct Project {
     defaults: WorktreeSettings,
     active: Option<String>,
     checkouts: BTreeMap<String, Checkout>,
+    /// Project services that older versions stored in `defaults`. The project
+    /// service profile adopts them before this is cleared.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    legacy_services: Option<ProjectTerminalConfig>,
 }
 
 type Discovered = (Vec<String>, Vec<String>);
@@ -101,6 +109,16 @@ impl WorktreeSettingsStore {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
                     Err(e) => return Err(e.into()),
                 };
+            if migrate_services(&mut projects) {
+                // Keep the file as it was before the format changed.
+                let path = self.inner.directory.join("settings.json");
+                let backup = path.with_file_name(format!(
+                    "settings.json.before-service-migration-{}",
+                    chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ")
+                ));
+                files::private_write(&backup, &std::fs::read(&path)?, false)?;
+                tracing::info!(backup = %backup.display(), "moved service lists out of worktree settings");
+            }
             for project in projects.values_mut() {
                 for checkout in project.checkouts.values_mut() {
                     if checkout.state.phase == WorktreeSetupPhase::Preparing {
@@ -173,14 +191,68 @@ impl WorktreeSettingsStore {
         let cwd = canonical(checkout)?;
         let defaults = self.defaults(root)?;
         self.with(false, |projects| {
-            let mut settings = projects
-                .get(&key)
-                .and_then(|p| p.checkouts.get(&cwd))
+            let checkout = projects.get(&key).and_then(|p| p.checkouts.get(&cwd));
+            let mut settings = checkout
                 .and_then(|c| c.settings.clone())
                 .unwrap_or(defaults.clone());
+            settings.services = checkout.and_then(|c| c.services.clone());
             // A project's concurrency policy must be consistent across all its checkouts.
             settings.service_mode = defaults.service_mode;
             Ok(settings)
+        })
+    }
+
+    /// Sets or clears (None) a checkout's own app services. Its environment
+    /// settings, override or inherited, are unchanged.
+    pub fn save_services(
+        &self,
+        root: &Path,
+        checkout: &Path,
+        services: Option<ProjectTerminalConfig>,
+    ) -> Result<(), EngineError> {
+        let key = canonical(root)?;
+        let cwd = canonical(checkout)?;
+        if key == cwd {
+            return Err(EngineError::Other(
+                "The main project folder uses the project's services.".into(),
+            ));
+        }
+        let services = services
+            .map(crate::project_terminals::normalize_config)
+            .transpose()?;
+        let defaults = self.defaults(root)?;
+        self.with(true, |projects| {
+            projects
+                .entry(key)
+                .or_insert_with(|| Project {
+                    defaults,
+                    ..Project::default()
+                })
+                .checkouts
+                .entry(cwd)
+                .or_default()
+                .services = services;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn legacy_services(
+        &self,
+        root: &Path,
+    ) -> Result<Option<ProjectTerminalConfig>, EngineError> {
+        let key = canonical(root)?;
+        self.with(false, |p| {
+            Ok(p.get(&key).and_then(|p| p.legacy_services.clone()))
+        })
+    }
+
+    pub(crate) fn clear_legacy_services(&self, root: &Path) -> Result<(), EngineError> {
+        let key = canonical(root)?;
+        self.with(true, |p| {
+            if let Some(p) = p.get_mut(&key) {
+                p.legacy_services = None;
+            }
+            Ok(())
         })
     }
 
@@ -192,7 +264,16 @@ impl WorktreeSettingsStore {
     ) -> Result<(), EngineError> {
         let key = canonical(root)?;
         let cwd = checkout.map(canonical).transpose()?;
-        let settings = settings.map(normalize).transpose()?;
+        // Services are saved separately (see `save_services`); a settings page
+        // that still carries a copy of them can never overwrite them.
+        let settings = settings
+            .map(|settings| {
+                normalize(WorktreeSettings {
+                    services: None,
+                    ..settings
+                })
+            })
+            .transpose()?;
         if cwd.is_none() && settings.is_none() {
             return Err(EngineError::Other(
                 "Project defaults cannot be removed.".into(),
@@ -343,6 +424,8 @@ impl WorktreeSettingsStore {
                     .join("tools/worktrees/src/commands/codex-sync.ts")
                     .is_file()
                     .then(|| "muute".into()),
+                databases: Vec::new(),
+                app_services: Vec::new(),
                 worktrees: worktrees
                     .into_iter()
                     .map(|(path, branch)| {
@@ -350,7 +433,8 @@ impl WorktreeSettingsStore {
                         WorktreeEnvironmentEntry {
                             path,
                             branch,
-                            has_overrides: c.is_some_and(|c| c.settings.is_some()),
+                            has_overrides: c
+                                .is_some_and(|c| c.settings.is_some() || c.services.is_some()),
                             managed: c.is_some_and(|c| c.branch.is_some()),
                             state: c.map(|c| c.state.clone()).unwrap_or_default(),
                         }
@@ -1163,6 +1247,26 @@ impl Drop for SetupGuard {
                 .remove(&self.checkout);
         }
     }
+}
+
+/// Older versions kept service lists inside worktree settings. Checkout lists
+/// become checkout service overrides; the project list waits for adoption by
+/// the project service profile. Returns whether anything moved.
+fn migrate_services(projects: &mut BTreeMap<String, Project>) -> bool {
+    let mut moved = false;
+    for project in projects.values_mut() {
+        if let Some(services) = project.defaults.services.take() {
+            moved = true;
+            project.legacy_services.get_or_insert(services);
+        }
+        for checkout in project.checkouts.values_mut() {
+            if let Some(services) = checkout.settings.as_mut().and_then(|s| s.services.take()) {
+                moved = true;
+                checkout.services.get_or_insert(services);
+            }
+        }
+    }
+    moved
 }
 
 fn canonical(path: &Path) -> Result<String, EngineError> {

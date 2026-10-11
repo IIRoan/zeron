@@ -68,7 +68,9 @@ pub struct WorktreeSettings {
     pub commands_in_project: bool,
     pub command_timeout_seconds: u64,
     pub service_mode: WorktreeServiceMode,
-    /// None inherits project services; Some(empty) disables them for this checkout.
+    /// A checkout's own app services: None inherits the project's, Some(empty)
+    /// disables them. Project services and databases are stored only in the
+    /// project service profile, so saving these settings never changes them.
     pub services: Option<crate::ProjectTerminalConfig>,
 }
 
@@ -137,4 +139,12 @@ pub struct WorktreeSettingsSnapshot {
     pub detected_install_command: String,
     pub detected_workflow: Option<String>,
     pub worktrees: Vec<WorktreeEnvironmentEntry>,
+    /// The project's shared databases. Missing from engines without
+    /// `project-databases-v1`.
+    #[serde(default)]
+    pub databases: Vec<crate::ProjectTerminalService>,
+    /// App services that apply to the selected page: the checkout's own list,
+    /// or the project's.
+    #[serde(default)]
+    pub app_services: Vec<crate::ProjectTerminalService>,
 }
