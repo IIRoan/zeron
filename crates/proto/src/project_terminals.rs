@@ -11,9 +11,16 @@ pub struct ProjectTerminalService {
     pub directory: String,
     #[serde(default)]
     pub restart_on_failure: bool,
-    /// Shared project infrastructure started before checkout preparation.
+    /// Present on shared databases: project infrastructure that runs in the
+    /// main folder and must pass this check before setup or app services.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_prerequisite: Option<ProjectServiceReadiness>,
+}
+
+impl ProjectTerminalService {
+    pub fn is_database(&self) -> bool {
+        self.setup_prerequisite.is_some()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,6 +53,15 @@ pub enum ProjectTerminalStatus {
     Interrupted,
 }
 
+/// Result of a database's readiness check for its current process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ServiceReadinessState {
+    Checking,
+    Ready,
+    NotReady,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectTerminalRun {
@@ -55,6 +71,9 @@ pub struct ProjectTerminalRun {
     pub restarts: u32,
     pub message: Option<String>,
     pub terminal: Option<crate::TerminalSession>,
+    /// Databases only; cleared whenever the process stops or restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<ServiceReadinessState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

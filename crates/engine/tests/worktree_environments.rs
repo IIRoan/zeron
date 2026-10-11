@@ -133,6 +133,10 @@ async fn startup_services_gate_setup_and_stay_shared_across_worktrees() {
     );
     assert!(!f.a.join("prepared").exists());
     prepare.await.unwrap().unwrap();
+    assert_eq!(
+        services.snapshot("project", &f.root).unwrap().runs[0].readiness,
+        Some(ServiceReadinessState::Ready)
+    );
     let first = services.snapshot("project", &f.root).unwrap().runs[0]
         .terminal
         .clone()
@@ -203,6 +207,18 @@ async fn startup_services_gate_setup_and_stay_shared_across_worktrees() {
     assert_eq!(database.terminal.as_ref().unwrap().id, first);
     assert_eq!(worktree_stopped.runs.iter().find(|r| r.service_id == "backend").unwrap().status,
         ProjectTerminalStatus::Stopped);
+    // Removing a worktree stops only that worktree's processes.
+    services.stop_checkout(&f.root, &f.b).unwrap();
+    let database = services
+        .snapshot("project", &f.root)
+        .unwrap()
+        .runs
+        .into_iter()
+        .find(|r| r.service_id == "databases")
+        .unwrap();
+    assert_eq!(database.status, ProjectTerminalStatus::Running);
+    assert_eq!(database.terminal.unwrap().id, first);
+    assert_eq!(database.readiness, Some(ServiceReadinessState::Ready));
     let restarted = services.control_checkout(
         &terminals, &f.store, "project", &f.root, &f.b, None, "start",
     ).await.unwrap();
@@ -247,6 +263,19 @@ async fn startup_service_failure_and_timeout_block_worktree_setup() {
             .to_string();
         assert!(error.contains("Databases"), "{error}");
         assert_eq!(f.phase(&f.a), WorktreeSetupPhase::Failed);
+        let run = services
+            .snapshot("project", &f.root)
+            .unwrap()
+            .runs
+            .remove(0);
+        if timeout == 1 {
+            assert_eq!(run.status, ProjectTerminalStatus::Running);
+            assert_eq!(run.readiness, Some(ServiceReadinessState::NotReady));
+            assert!(run.message.unwrap().contains("not ready after 1 seconds"));
+        } else {
+            assert_eq!(run.status, ProjectTerminalStatus::Failed);
+            assert_eq!(run.readiness, None);
+        }
         assert!(!f.a.join("prepared").exists());
         assert!(!f.a.join(".env.local").exists());
         services.shutdown();
@@ -1102,10 +1131,8 @@ async fn removing_a_default_service_stops_inheriting_groups_but_keeps_worktree_o
         .save_defaults(&f.store, "project", &f.root, svc())
         .await
         .unwrap();
-    let mut override_ = f.store.effective(&f.root, &f.b).unwrap();
-    override_.services = Some(svc());
     profiles
-        .save_environment(&f.store, "project", &f.root, Some(&f.b), Some(override_))
+        .save_checkout_services(&f.store, "project", &f.root, &f.b, Some(svc()))
         .await
         .unwrap();
     profiles
@@ -1824,4 +1851,452 @@ async fn terminals_opened_in_a_worktree_subfolder_get_its_variables() {
     .await
     .expect("the terminal receives the containing worktree's variables");
     core.shutdown().await;
+}
+
+fn app(id: &str, name: &str) -> ProjectTerminalService {
+    ProjectTerminalService {
+        id: id.into(),
+        name: name.into(),
+        command: format!("echo {name}; exec sleep 60"),
+        directory: ".".into(),
+        restart_on_failure: false,
+        setup_prerequisite: None,
+    }
+}
+
+fn database(id: &str, name: &str) -> ProjectTerminalService {
+    ProjectTerminalService {
+        setup_prerequisite: Some(ProjectServiceReadiness {
+            command: "true".into(),
+            timeout_seconds: 120,
+        }),
+        ..app(id, name)
+    }
+}
+
+fn names(services: &[ProjectTerminalService]) -> Vec<(&str, bool)> {
+    services
+        .iter()
+        .map(|s| (s.name.as_str(), s.is_database()))
+        .collect()
+}
+
+/// Mirrors the reported failure: adding, editing and deleting a database in
+/// Project settings, and editing app services, must never remove, replace or
+/// resurrect the other list — including requests from stale pages and from
+/// clients that send whole service lists.
+#[tokio::test]
+async fn database_and_app_service_saves_preserve_each_other() {
+    use std::sync::Arc;
+    use zeron_rpc::methods;
+    let f = Fixture::new();
+    let core = zeron_engine::EngineCore::assemble_with_profile(
+        zeron_engine::EngineProfile::local(&f.temp.path().join("engine")).unwrap(),
+        Arc::new(zeron_engine::HarnessRegistry::new()),
+        HarnessId::Mock,
+        None,
+    )
+    .unwrap();
+    core.workspace
+        .create_space(
+            "project",
+            &core.device_id,
+            f.root.to_str().unwrap(),
+            None,
+            true,
+        )
+        .unwrap();
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let info: EngineInfo = client
+        .call_as(methods::ENGINE_INFO, serde_json::json!({}))
+        .await
+        .unwrap();
+    assert!(info.supports(capabilities::PROJECT_DATABASES_V1));
+    let project = || async {
+        client
+            .call_as::<ProjectTerminalsSnapshot>(
+                methods::GET_PROJECT_TERMINALS,
+                serde_json::json!({"spaceId":"project"}),
+            )
+            .await
+            .unwrap()
+            .config
+            .services
+    };
+    let apps = vec![
+        app("backend", "Backend"),
+        app("expo", "Expo"),
+        app("tunnel", "Cloudflared"),
+    ];
+    client
+        .call(
+            methods::SAVE_PROJECT_TERMINALS,
+            serde_json::json!({"spaceId":"project","config":{"services":apps}}),
+        )
+        .await
+        .unwrap();
+
+    // Project settings opens on its own fields; app services are reported, not owned.
+    let page: WorktreeSettingsSnapshot = client
+        .call_as(
+            methods::GET_WORKTREE_SETTINGS,
+            serde_json::json!({"spaceId":"project"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.app_services, apps);
+    assert!(page.databases.is_empty() && page.settings.services.is_none());
+
+    // Add a database. The page also carries a stray service list, as the
+    // previous build sent; it must not replace the app services.
+    let mut settings = page.settings.clone();
+    settings.setup_command = "bun run migrate".into();
+    settings.services = Some(ProjectTerminalConfig {
+        services: vec![database("db", "Databases")],
+    });
+    let saved: WorktreeSettingsSnapshot = client
+        .call_as(
+            methods::SAVE_WORKTREE_SETTINGS,
+            serde_json::json!({"spaceId":"project","settings":settings,"databases":[database("db", "Databases")]}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(saved.settings.setup_command, "bun run migrate");
+    assert_eq!(names(&saved.databases), [("Databases", true)]);
+    assert_eq!(
+        names(&project().await),
+        [
+            ("Databases", true),
+            ("Backend", false),
+            ("Expo", false),
+            ("Cloudflared", false)
+        ]
+    );
+
+    // The services editor removes Cloudflared. An older client also sends the
+    // database back as a plain service; it must stay a database.
+    let mut plain = database("db", "Databases");
+    plain.setup_prerequisite = None;
+    client
+        .call(
+            methods::SAVE_PROJECT_TERMINALS,
+            serde_json::json!({"spaceId":"project","config":{"services":[plain, app("backend","Backend"), app("expo","Expo")]}}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        names(&project().await),
+        [("Databases", true), ("Backend", false), ("Expo", false)]
+    );
+
+    // Saving the stale page (opened before that edit) with only a branch
+    // change must neither resurrect Cloudflared nor drop the database.
+    let mut stale = page.settings.clone();
+    stale.services = Some(ProjectTerminalConfig {
+        services: apps.clone(),
+    });
+    stale.branch_prefix = "feature/".into();
+    client
+        .call(
+            methods::SAVE_WORKTREE_SETTINGS,
+            serde_json::json!({"spaceId":"project","settings":stale}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        names(&project().await),
+        [("Databases", true), ("Backend", false), ("Expo", false)]
+    );
+
+    // A database named like an app service is rejected with a clear message
+    // and changes nothing.
+    let error = client
+        .call(
+            methods::SAVE_WORKTREE_SETTINGS,
+            serde_json::json!({"spaceId":"project","settings":stale,"databases":[database("db", "Backend")]}),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("“Backend” is used twice"), "{error}");
+    assert_eq!(project().await.len(), 3);
+    assert!(
+        client
+            .call(
+                methods::SAVE_WORKTREE_SETTINGS,
+                serde_json::json!({"spaceId":"project","checkoutPath":f.root,"settings":stale,"databases":[]}),
+            )
+            .await
+            .is_err(),
+        "databases are project-wide"
+    );
+
+    // Deleting the database keeps every app service.
+    client
+        .call(
+            methods::SAVE_WORKTREE_SETTINGS,
+            serde_json::json!({"spaceId":"project","settings":stale,"databases":[]}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        names(&project().await),
+        [("Backend", false), ("Expo", false)]
+    );
+    let started: ProjectTerminalsSnapshot = client
+        .call_as(
+            methods::CONTROL_PROJECT_TERMINALS,
+            serde_json::json!({"spaceId":"project","serviceId":"backend","action":"start"}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        started
+            .runs
+            .iter()
+            .any(|r| r.service_id == "backend" && r.status == ProjectTerminalStatus::Running)
+    );
+    core.shutdown().await;
+}
+
+/// Profiles written by older versions keep the project's list in worktree
+/// settings and checkout lists inside checkout settings. Both move without
+/// losing anything, and the original file is kept.
+#[tokio::test]
+async fn legacy_service_lists_migrate_without_losing_settings() {
+    let f = Fixture::new();
+    let root = f.root.canonicalize().unwrap();
+    let a = f.a.canonicalize().unwrap();
+    let state = f.temp.path().join("legacy");
+    let mut defaults = serde_json::to_value(WorktreeSettings {
+        setup_command: "bun run setup".into(),
+        ..Default::default()
+    })
+    .unwrap();
+    defaults["services"] =
+        serde_json::json!({"services":[app("backend","Backend"), app("expo","Expo")]});
+    let mut own = defaults.clone();
+    own["services"] =
+        serde_json::json!({"services":[app("worker","Worker"), database("db","Databases")]});
+    own["setupCommand"] = "custom setup".into();
+    std::fs::create_dir_all(state.join("worktree-environments")).unwrap();
+    std::fs::write(
+        state.join("worktree-environments/settings.json"),
+        serde_json::to_vec(&serde_json::json!({
+            root.to_str().unwrap(): {
+                "defaults": defaults,
+                "checkouts": { a.to_str().unwrap(): {"settings": own, "branch": "feature/a"} },
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let store = WorktreeSettingsStore::new(&state);
+    let profiles = ProjectTerminals::open(&state.join("profile")).unwrap();
+    assert!(store.defaults(&f.root).unwrap().services.is_none());
+    let checkout = store.effective(&f.root, &f.a).unwrap();
+    assert_eq!(checkout.setup_command, "custom setup");
+    assert_eq!(
+        names(&checkout.services.unwrap().services),
+        [("Worker", false), ("Databases", true)]
+    );
+    profiles
+        .adopt_legacy_services(&store, "project", &f.root)
+        .unwrap();
+    assert_eq!(
+        names(
+            &profiles
+                .snapshot("project", &f.root)
+                .unwrap()
+                .config
+                .services
+        ),
+        [("Backend", false), ("Expo", false)]
+    );
+    // The legacy copy is gone, so it can never be adopted again.
+    profiles
+        .save(
+            "project",
+            &f.root,
+            ProjectTerminalConfig {
+                services: vec![app("api", "Api")],
+            },
+        )
+        .unwrap();
+    profiles
+        .adopt_legacy_services(&store, "project", &f.root)
+        .unwrap();
+    assert_eq!(
+        names(
+            &profiles
+                .snapshot("project", &f.root)
+                .unwrap()
+                .config
+                .services
+        ),
+        [("Api", false)]
+    );
+    let backups = std::fs::read_dir(state.join("worktree-environments"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("settings.json.before-service-migration-")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(backups.len(), 1);
+    assert!(
+        std::fs::read_to_string(backups[0].path())
+            .unwrap()
+            .contains("Expo")
+    );
+    // Reopening the migrated file keeps the checkout's own list.
+    let reopened = WorktreeSettingsStore::new(&state);
+    assert_eq!(
+        names(
+            &reopened
+                .effective(&f.root, &f.a)
+                .unwrap()
+                .services
+                .unwrap()
+                .services
+        ),
+        [("Worker", false), ("Databases", true)]
+    );
+
+    // A profile that already has app services wins over the legacy copy.
+    let g = Fixture::new();
+    let profiles = ProjectTerminals::open(&g.temp.path().join("profile")).unwrap();
+    profiles
+        .save(
+            "project",
+            &g.root,
+            ProjectTerminalConfig {
+                services: vec![app("current", "Current")],
+            },
+        )
+        .unwrap();
+    let state = g.temp.path().join("old");
+    std::fs::create_dir_all(state.join("worktree-environments")).unwrap();
+    std::fs::write(
+        state.join("worktree-environments/settings.json"),
+        serde_json::to_vec(&serde_json::json!({
+            g.root.canonicalize().unwrap().to_str().unwrap():
+                {"defaults": {"services": {"services": [app("old", "Old")]}}}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let store = WorktreeSettingsStore::new(&state);
+    profiles
+        .adopt_legacy_services(&store, "project", &g.root)
+        .unwrap();
+    assert_eq!(
+        names(
+            &profiles
+                .snapshot("project", &g.root)
+                .unwrap()
+                .config
+                .services
+        ),
+        [("Current", false)]
+    );
+}
+
+/// A worktree's own app services are separate from its environment settings:
+/// customizing services keeps inheriting project defaults, saving or resetting
+/// the environment keeps the services, and databases stay project-wide.
+#[tokio::test]
+async fn worktree_service_overrides_keep_inheritance_and_never_store_databases() {
+    let f = Fixture::new();
+    let profiles = ProjectTerminals::open(&f.temp.path().join("profile")).unwrap();
+    let mut defaults = WorktreeSettings {
+        dependencies: WorktreeDependencyMode::Skip,
+        setup_command: "first".into(),
+        ..Default::default()
+    };
+    f.store.save(&f.root, None, Some(defaults.clone())).unwrap();
+    profiles
+        .save(
+            "project",
+            &f.root,
+            ProjectTerminalConfig {
+                services: vec![database("db", "Databases"), app("backend", "Backend")],
+            },
+        )
+        .unwrap();
+    profiles
+        .save_checkout_services(
+            &f.store,
+            "project",
+            &f.root,
+            &f.a,
+            Some(ProjectTerminalConfig {
+                services: vec![database("db", "Databases"), app("worker", "Worker")],
+            }),
+        )
+        .await
+        .unwrap();
+    let own = f.store.effective(&f.root, &f.a).unwrap().services.unwrap();
+    assert_eq!(
+        names(&own.services),
+        [("Worker", false)],
+        "databases are never stored per worktree"
+    );
+    defaults.setup_command = "second".into();
+    f.store.save(&f.root, None, Some(defaults.clone())).unwrap();
+    assert_eq!(
+        f.store.effective(&f.root, &f.a).unwrap().setup_command,
+        "second",
+        "still inherits"
+    );
+    let snapshot = f.store.snapshot(&f.root, Some(&f.a), vec![]).unwrap();
+    assert!(!snapshot.has_overrides);
+
+    // An environment override saved from a page without services keeps them.
+    let mut page = f.store.effective(&f.root, &f.a).unwrap();
+    page.services = None;
+    page.setup_command = "custom".into();
+    profiles
+        .save_environment(&f.store, "project", &f.root, Some(&f.a), Some(page), None)
+        .await
+        .unwrap();
+    let effective = f.store.effective(&f.root, &f.a).unwrap();
+    assert_eq!(effective.setup_command, "custom");
+    assert_eq!(
+        names(&effective.services.unwrap().services),
+        [("Worker", false)]
+    );
+    profiles
+        .save_environment(&f.store, "project", &f.root, Some(&f.a), None, None)
+        .await
+        .unwrap();
+    let effective = f.store.effective(&f.root, &f.a).unwrap();
+    assert_eq!(effective.setup_command, "second");
+    assert!(
+        effective.services.is_some(),
+        "Use project defaults keeps the worktree's services"
+    );
+
+    let shown = profiles
+        .checkout_snapshot("project", &f.root, &f.a, &effective)
+        .unwrap();
+    assert_eq!(
+        names(&shown.config.services),
+        [("Databases", true), ("Worker", false)]
+    );
+    profiles
+        .save_checkout_services(&f.store, "project", &f.root, &f.a, None)
+        .await
+        .unwrap();
+    let effective = f.store.effective(&f.root, &f.a).unwrap();
+    assert!(effective.services.is_none());
+    let shown = profiles
+        .checkout_snapshot("project", &f.root, &f.a, &effective)
+        .unwrap();
+    assert_eq!(
+        names(&shown.config.services),
+        [("Databases", true), ("Backend", false)]
+    );
 }

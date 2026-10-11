@@ -15,6 +15,9 @@ pub mod capabilities {
         "message-queue-clean-attachment-text-v1";
     pub const MESSAGE_QUEUE_EDIT_LEASE_V1: &str = "message-queue-edit-lease-v1";
     pub const HARNESS_UPDATES_V1: &str = "harness-updates-v1";
+    /// Shared databases are saved separately from app services, so either
+    /// editor preserves the other's settings.
+    pub const PROJECT_DATABASES_V1: &str = "project-databases-v1";
 
     pub const CURRENT: &[&str] = &[
         COMPOSER_REFERENCES_V1,
@@ -24,6 +27,7 @@ pub mod capabilities {
         MESSAGE_QUEUE_CLEAN_ATTACHMENT_TEXT_V1,
         MESSAGE_QUEUE_EDIT_LEASE_V1,
         HARNESS_UPDATES_V1,
+        PROJECT_DATABASES_V1,
         crate::voice::remote::CAPABILITY,
     ];
 
@@ -105,6 +109,7 @@ mod tests {
                     "message-queue-clean-attachment-text-v1",
                     "message-queue-edit-lease-v1",
                     "harness-updates-v1",
+                    "project-databases-v1",
                     "voice-client-media-v1"
                 ],
             })

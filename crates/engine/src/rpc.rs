@@ -336,6 +336,9 @@ struct ProjectTerminalsParams {
     service_id: Option<String>,
     #[serde(default)]
     action: Option<String>,
+    /// With a checkout: drop its own app services and use the project's.
+    #[serde(default)]
+    use_project_services: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -346,6 +349,10 @@ struct WorktreeSettingsParams {
     checkout_path: Option<String>,
     #[serde(default)]
     settings: Option<zeron_proto::WorktreeSettings>,
+    /// Project defaults only: replaces the project's databases. Absent from
+    /// older clients, which leave databases unchanged.
+    #[serde(default)]
+    databases: Option<Vec<zeron_proto::ProjectTerminalService>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1303,6 +1310,24 @@ impl EngineRpc {
 
 /// An RPC rejection is scoped to the requested capability. Only a broken
 /// transport means the shared device link itself cannot carry other calls.
+/// Older versions also stored project services in worktree settings; fold
+/// that copy into the single project service profile before using either.
+async fn adopt_legacy_services(
+    profiles: &crate::project_terminals::ProjectTerminals,
+    environments: &crate::worktree_settings::WorktreeSettingsStore,
+    space: &str,
+    root: &std::path::Path,
+) -> Result<(), RpcError> {
+    let (profiles, environments) = (profiles.clone(), environments.clone());
+    let (space, root) = (space.to_string(), root.to_path_buf());
+    tokio::task::spawn_blocking(move || {
+        profiles.adopt_legacy_services(&environments, &space, &root)
+    })
+    .await
+    .map_err(|e| RpcError::Failed(e.to_string()))?
+    .map_err(|e| RpcError::Failed(e.to_string()))
+}
+
 fn should_invalidate_link(error: &RpcError) -> bool {
     matches!(error, RpcError::Closed | RpcError::Transport(_))
 }
@@ -3541,16 +3566,18 @@ impl RpcService for EngineRpc {
                     None
                 };
                 let environments = self.repos.worktree_settings().clone();
+                let profiles = self.project_actions.project_terminals.clone();
+                adopt_legacy_services(&profiles, &environments, &space.id, &root).await?;
                 match method {
                     methods::SAVE_WORKTREE_SETTINGS => {
-                        self.project_actions
-                            .project_terminals
+                        profiles
                             .save_environment(
                                 &environments,
                                 &space.id,
                                 &root,
                                 checkout.as_deref(),
                                 p.settings,
+                                p.databases,
                             )
                             .await
                             .map_err(|e| RpcError::Failed(e.to_string()))?;
@@ -3587,17 +3614,25 @@ impl RpcService for EngineRpc {
                 let mut snapshot = self.repos
                     .worktree_settings_snapshot(&root, checkout.as_deref())
                     .await.map_err(|e| RpcError::Failed(e.to_string()))?;
-                // Database startup and app services share one saved project configuration.
-                // Include legacy profiles in the combined defaults editor without
-                // turning inherited worktree services into checkout overrides.
-                if snapshot.defaults.services.is_none() {
-                    snapshot.defaults.services = Some(self.project_actions.project_terminals
-                        .snapshot(&space.id, &root)
-                        .map_err(|e| RpcError::Failed(e.to_string()))?.config);
-                }
-                if checkout.is_none() {
-                    snapshot.settings.services = snapshot.defaults.services.clone();
-                }
+                // One saved list: the project service profile. Databases are
+                // the project's; app services are the page's own or inherited.
+                let project = profiles
+                    .snapshot(&space.id, &root)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .config
+                    .services;
+                let (databases, apps): (Vec<_>, Vec<_>) =
+                    project.into_iter().partition(|s| s.is_database());
+                snapshot.databases = databases;
+                snapshot.app_services = match &snapshot.settings.services {
+                    Some(own) => own
+                        .services
+                        .iter()
+                        .filter(|s| !s.is_database())
+                        .cloned()
+                        .collect(),
+                    None => apps,
+                };
                 RpcReply::value(&snapshot)
             }
             methods::GET_PROJECT_TERMINALS
@@ -3632,30 +3667,37 @@ impl RpcService for EngineRpc {
                     .root;
                 let profiles = self.project_actions.project_terminals.clone();
                 let environments = self.repos.worktree_settings().clone();
+                adopt_legacy_services(&profiles, &environments, &space.id, &root).await?;
                 if method == methods::SAVE_PROJECT_TERMINALS {
-                    let config = p.config.take().ok_or_else(|| {
-                        RpcError::Failed("Terminal configuration is required".into())
-                    })?;
-                    if p.chat_id.is_none() && p.checkout_path.is_none() {
-                        profiles
+                    let config = if p.use_project_services {
+                        None
+                    } else {
+                        Some(p.config.take().ok_or_else(|| {
+                            RpcError::Failed("Terminal configuration is required".into())
+                        })?)
+                    };
+                    let main = root.canonicalize().ok() == checkout.canonicalize().ok();
+                    match config {
+                        Some(config) if main => profiles
                             .save_defaults(&environments, &space.id, &root, config)
                             .await
-                            .map_err(|e| RpcError::Failed(e.to_string()))?;
-                    } else {
-                        let mut settings = environments
-                            .effective(&root, &checkout)
-                            .map_err(|e| RpcError::Failed(e.to_string()))?;
-                        settings.services = Some(config);
-                        profiles
-                            .save_environment(
+                            .map_err(|e| RpcError::Failed(e.to_string()))?,
+                        None if main => {
+                            return Err(RpcError::Failed(
+                                "The main project folder always uses the project's services."
+                                    .into(),
+                            ));
+                        }
+                        config => profiles
+                            .save_checkout_services(
                                 &environments,
                                 &space.id,
                                 &root,
-                                Some(&checkout),
-                                Some(settings),
+                                &checkout,
+                                config,
                             )
                             .await
-                            .map_err(|e| RpcError::Failed(e.to_string()))?;
+                            .map_err(|e| RpcError::Failed(e.to_string()))?,
                     }
                 }
                 let snapshot = if method == methods::CONTROL_PROJECT_TERMINALS {

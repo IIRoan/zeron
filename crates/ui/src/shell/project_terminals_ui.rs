@@ -1,7 +1,7 @@
 use super::*;
 use zeron_proto::{
     ProjectTerminalConfig, ProjectTerminalService, ProjectTerminalStatus as Status,
-    ProjectTerminalsSnapshot,
+    ProjectTerminalsSnapshot, ServiceReadinessState as Readiness,
 };
 use zeron_rpc::methods;
 
@@ -87,7 +87,10 @@ impl ServiceFields {
 
 pub(super) struct Editor {
     project: ProjectContext,
+    /// App services only. Databases are edited in Project settings.
     services: Vec<ServiceFields>,
+    /// Shown read-only so the list matches the Services panel.
+    databases: Vec<ProjectTerminalService>,
     selected: Option<String>,
     initialized: bool,
     scroll: gpui::ScrollHandle,
@@ -103,6 +106,7 @@ impl Editor {
         Self {
             project,
             services: Vec::new(),
+            databases: Vec::new(),
             selected: None,
             initialized: false,
             scroll: gpui::ScrollHandle::new(),
@@ -121,6 +125,20 @@ impl Editor {
 
     fn is_dirty(&self, cx: &App) -> bool {
         self.initialized && self.config(cx) != self.saved
+    }
+
+    /// The databases are sent back unchanged: an engine with
+    /// `project-databases-v1` ignores them, and an older engine that still
+    /// saves whole lists keeps them instead of dropping them.
+    fn save_payload(&self, cx: &App) -> ProjectTerminalConfig {
+        ProjectTerminalConfig {
+            services: self
+                .databases
+                .iter()
+                .cloned()
+                .chain(self.config(cx))
+                .collect(),
+        }
     }
 }
 
@@ -410,10 +428,9 @@ impl Shell {
                 }
             });
         }
-        if self.project_terminals.poll.is_some()
-            || self.project_terminals.busy
-            || self.project_terminals.handoff.is_some()
-        {
+        // Keep polling during Start/Stop and handoffs: a database can take a
+        // while to become ready, and its progress should stay visible.
+        if self.project_terminals.poll.is_some() {
             return;
         }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
@@ -468,17 +485,28 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> ServiceFields {
         let original = service.clone();
-        let name = cx.new(|cx| ComposerInput::new("Service name", cx));
-        let command = cx.new(|cx| ComposerInput::new("Command to run", cx));
-        let directory = cx.new(|cx| ComposerInput::new("Directory relative to agent checkout", cx));
-        let readiness =
-            cx.new(|cx| ComposerInput::new("Command that exits 0 when the service is ready", cx));
         let prerequisite = service.setup_prerequisite.is_some();
+        let [name, command, directory] = if prerequisite {
+            [
+                "Database name",
+                "Start command, e.g. docker compose up postgres",
+                "Folder in the main project, e.g. .",
+            ]
+        } else {
+            [
+                "Service name",
+                "Command to run",
+                "Directory relative to agent checkout",
+            ]
+        }
+        .map(|placeholder| cx.new(|cx| ComposerInput::new(placeholder, cx)));
+        let readiness =
+            cx.new(|cx| ComposerInput::new("Ready check, e.g. pg_isready -h localhost", cx));
         let timeout_seconds = service
             .setup_prerequisite
             .as_ref()
             .map_or(120, |r| r.timeout_seconds);
-        let readiness_timeout = cx.new(|cx| ComposerInput::new("Seconds to wait for readiness", cx));
+        let readiness_timeout = cx.new(|cx| ComposerInput::new("Seconds", cx));
         readiness_timeout.update(cx, |input, cx| input.set_text(timeout_seconds.to_string(), cx));
         readiness.update(cx, |input, cx| {
             input.set_text(
@@ -527,6 +555,19 @@ impl Shell {
         // re-render the whole shell.
         let mut changed = self.project_terminals.error.take().is_some()
             || self.project_terminals.snapshot.as_ref() != Some(&snapshot);
+        let (databases, apps): (Vec<_>, Vec<_>) = snapshot
+            .config
+            .services
+            .iter()
+            .cloned()
+            .partition(|s| s.is_database());
+        if let Some(editor) = self.project_terminals.editor.as_mut()
+            && editor.initialized
+            && editor.databases != databases
+        {
+            editor.databases = databases.clone();
+            changed = true;
+        }
         if self
             .project_terminals
             .editor
@@ -534,7 +575,7 @@ impl Shell {
             .is_some_and(|editor| !editor.initialized)
         {
             changed = true;
-            let seeded = snapshot.config.services.is_empty();
+            let seeded = apps.is_empty();
             let services = if seeded {
                 ["Backend", "Frontend", "Cloudflared"]
                     .into_iter()
@@ -548,7 +589,7 @@ impl Shell {
                     })
                     .collect()
             } else {
-                snapshot.config.services.clone()
+                apps
             };
             let fields = services
                 .into_iter()
@@ -556,6 +597,7 @@ impl Shell {
                 .collect();
             if let Some(editor) = &mut self.project_terminals.editor {
                 editor.services = fields;
+                editor.databases = databases;
                 editor.selected = editor.services.first().map(|service| service.id.clone());
                 editor.initialized = true;
                 editor.saved = editor.config(cx);
@@ -732,11 +774,10 @@ impl Shell {
                     Ok(snapshot) => {
                         shell.project_terminals.handoff_error = None;
                         if method == methods::SAVE_PROJECT_TERMINALS {
-                            if let Some(context) = &context {
-                                shell.update_worktree_service_fields(context, snapshot.config.clone());
-                            }
                             shell.project_terminals.editor = None;
                             shell.project_terminals.discard = None;
+                            // Project settings, if open underneath, lists them.
+                            shell.refresh_worktree_settings(cx);
                         }
                         shell.accept_project_terminal_snapshot(snapshot, cx);
                     }
@@ -768,9 +809,7 @@ impl Shell {
             cx.notify();
             return;
         }
-        let config = ProjectTerminalConfig {
-            services: editor.config(cx),
-        };
+        let config = editor.save_payload(cx);
         let params = editor
             .project
             .params(serde_json::json!({ "config": config }));
@@ -845,7 +884,20 @@ impl Shell {
                     }),
             );
         }
-        let description = if self.project_terminals.handoff.is_some() {
+        let checking = self
+            .project_terminals
+            .snapshot
+            .as_ref()
+            .filter(|_| self.project_terminals.context.as_ref() == project.as_ref())
+            .and_then(|snapshot| {
+                snapshot.config.services.iter().find(|service| {
+                    service_readiness(snapshot, &service.id) == Some(Readiness::Checking)
+                })
+            })
+            .map(|service| service.name.clone());
+        let description = if let Some(name) = checking {
+            format!("Waiting for {name} to be ready…")
+        } else if self.project_terminals.handoff.is_some() {
             "Moving services to this checkout…".to_string()
         } else if let Some(action) = self.project_terminals.pending_action {
             let target = self
@@ -862,7 +914,11 @@ impl Shell {
                         .find(|s| &s.id == id)
                 })
                 .map(|s| s.name.as_str())
-                .unwrap_or("all services");
+                .unwrap_or(if action == "stop-worktree" {
+                    "app services"
+                } else {
+                    "all services"
+                });
             format!("{} {target}…", action_label(action))
         } else if mode == TerminalMode::Services {
             let name = project
@@ -1061,7 +1117,7 @@ impl Shell {
             let popup_theme = theme.for_popup();
             let mut menu = popover::popover_card(&popup_theme)
                 .id("service-actions-menu")
-                .w(px(220.0))
+                .w(px(250.0))
                 .flex()
                 .flex_col()
                 .gap(px(2.0))
@@ -1101,21 +1157,60 @@ impl Shell {
                     )
                     .child(popover::menu_separator());
             }
-            for (label, action, glyph, enabled) in [
-                (
-                    "Start all services",
-                    "start",
-                    icons::ACTION_PLAY,
-                    configured,
-                ),
-                ("Stop all services", "stop", icons::STOP, running),
-                (
-                    "Restart all services",
-                    "restart",
-                    icons::RESTART,
-                    configured,
-                ),
-            ] {
+            // With shared databases, the everyday actions leave them running;
+            // only the last one stops them too.
+            let databases =
+                snapshot.is_some_and(|s| s.config.services.iter().any(|s| s.is_database()));
+            let apps_running = snapshot.is_some_and(|s| {
+                s.config.services.iter().any(|service| {
+                    !service.is_database() && service_is_active(service_status(s, &service.id))
+                })
+            });
+            let actions: &[(&'static str, &'static str, &'static str, bool)] = if databases {
+                &[
+                    (
+                        "Start all services",
+                        "start",
+                        icons::ACTION_PLAY,
+                        configured,
+                    ),
+                    (
+                        "Restart app services",
+                        "restart",
+                        icons::RESTART,
+                        configured,
+                    ),
+                    (
+                        "Stop app services",
+                        "stop-worktree",
+                        icons::STOP,
+                        apps_running,
+                    ),
+                    (
+                        "Stop all, including databases",
+                        "stop",
+                        icons::STOP,
+                        running,
+                    ),
+                ]
+            } else {
+                &[
+                    (
+                        "Start all services",
+                        "start",
+                        icons::ACTION_PLAY,
+                        configured,
+                    ),
+                    (
+                        "Restart all services",
+                        "restart",
+                        icons::RESTART,
+                        configured,
+                    ),
+                    ("Stop all services", "stop", icons::STOP, running),
+                ]
+            };
+            for &(label, action, glyph, enabled) in actions {
                 menu = menu.child(
                     popover::menu_row(&popup_theme, false, format!("services-menu-{action}"))
                         .id(SharedString::from(format!("services-{action}")))
@@ -1138,33 +1233,19 @@ impl Shell {
                         }),
                 );
             }
-            if snapshot.is_some_and(|s| s.config.services.iter().any(|s| s.setup_prerequisite.is_some())) {
-                let worktree_running = snapshot.is_some_and(|s| s.config.services.iter()
-                    .any(|service| service.setup_prerequisite.is_none() && service_is_active(service_status(s, &service.id))));
-                menu = menu.child(popover::menu_row(&popup_theme, false, "services-menu-stop-worktree")
-                    .id("services-stop-worktree").role(gpui::Role::Button)
-                    .aria_label("Stop worktree services")
-                    .child(icon(icons::STOP).size(px(14.0)).text_color(popup_theme.text_muted))
-                    .child("Stop worktree services")
-                    .when(busy || closing || !worktree_running, |el| el.opacity(0.4).cursor_default())
-                    .when(!busy && !closing && worktree_running, |el| el.on_click(cx.listener(|this, _, _, cx| {
-                        this.close_project_terminal_actions(cx);
-                        this.control_project_terminal(None, "stop-worktree", cx);
-                    }))));
-            }
             menu = menu
                 .child(popover::menu_separator())
                 .child(
                     popover::menu_row(&popup_theme, false, "services-menu-edit")
                         .id("services-edit")
                         .role(gpui::Role::Button)
-                        .aria_label("Edit services")
+                        .aria_label("Edit app services")
                         .child(
                             icon(icons::SETTINGS_MINIMALISTIC)
                                 .size(px(14.0))
                                 .text_color(popup_theme.text_muted),
                         )
-                        .child("Edit services…")
+                        .child("Edit app services…")
                         .when(closing, |el| el.opacity(0.4).cursor_default())
                         .when(!closing, |el| {
                             el.on_click(cx.listener(|this, _, _, cx| {
@@ -1179,13 +1260,16 @@ impl Shell {
                     popover::menu_row(&popup_theme, false, "services-menu-worktree-settings")
                         .id("services-worktree-settings")
                         .role(gpui::Role::Button)
-                        .aria_label("Worktree settings")
+                        .aria_label("Project settings")
+                        .tooltip(crate::settings::widgets::text_tooltip(
+                            "Shared databases, worktree setup and environment",
+                        ))
                         .child(
                             icon(icons::FOLDER)
                                 .size(px(14.0))
                                 .text_color(popup_theme.text_muted),
                         )
-                        .child("Worktree settings…")
+                        .child("Project settings…")
                         .when(closing, |el| el.opacity(0.4).cursor_default())
                         .when(!closing, |el| {
                             el.on_click(cx.listener(|this, _, _, cx| {
@@ -1232,8 +1316,20 @@ impl Shell {
             });
         if let (Some(context), Some(snapshot)) = (&context, &snapshot) {
             let scope = context.scope();
+            let mut previous_database = false;
             for service in &snapshot.config.services {
-                let status = service_status(snapshot, &service.id);
+                // A hairline separates shared databases from the app services.
+                if previous_database && !service.is_database() {
+                    tabs = tabs.child(
+                        div()
+                            .flex_none()
+                            .w(px(1.0))
+                            .h(px(14.0))
+                            .mx(px(2.0))
+                            .bg(theme.text.opacity(0.14)),
+                    );
+                }
+                previous_database = service.is_database();
                 let active = self.project_terminals.selected.get(&scope) == Some(&service.id);
                 let id = service.id.clone();
                 let tab_scope = scope.clone();
@@ -1251,7 +1347,16 @@ impl Shell {
                         .text_size(px(11.0))
                         .flex_none()
                         .role(gpui::Role::Tab)
-                        .aria_label(format!("{} · {}", service.name, status_label(status)))
+                        .aria_label(format!(
+                            "{}{} · {}",
+                            service.name,
+                            if service.is_database() {
+                                " (shared database)"
+                            } else {
+                                ""
+                            },
+                            service_state_label(snapshot, service)
+                        ))
                         .aria_toggled(if active {
                             gpui::Toggled::True
                         } else {
@@ -1266,7 +1371,15 @@ impl Shell {
                             theme.element_hover,
                         ))
                         .text_color(motion::mix(theme.text_muted, theme.text, progress))
-                        .child(status_dot(&theme, status))
+                        .child(status_dot(service_state_color(snapshot, service, &theme)))
+                        .when(service.is_database(), |tab| {
+                            tab.child(
+                                icon(icons::HARD_DRIVE)
+                                    .size(px(12.0))
+                                    .flex_none()
+                                    .text_color(theme.text_muted),
+                            )
+                        })
                         .child(SharedString::from(service.name.clone()))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if this.project_terminals.selected.get(&tab_scope) != Some(&id) {
@@ -1369,14 +1482,35 @@ impl Shell {
                 .find(|s| Some(&s.id) == selected)
             {
                 let run = snapshot.runs.iter().find(|r| r.service_id == service.id);
-                let status = service_status(snapshot, &service.id);
-                if let Some(message) = run.and_then(|r| r.message.as_ref()) {
+                if service_readiness(snapshot, &service.id) == Some(Readiness::Checking) {
+                    body = body.child(
+                        div()
+                            .px(px(10.0))
+                            .py(px(5.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .text_size(px(11.0))
+                            .text_color(theme.text_muted)
+                            .child(loaders::mini_mono_spinner(
+                                "database-readiness-progress",
+                                1.5,
+                                theme.warning,
+                                cx.entity_id(),
+                                cx,
+                            ))
+                            .child(SharedString::from(format!(
+                                "Waiting until {} is ready. Setup and app services start after this check passes.",
+                                service.name
+                            ))),
+                    );
+                } else if let Some(message) = run.and_then(|r| r.message.as_ref()) {
                     body = body.child(
                         div()
                             .px(px(10.0))
                             .py(px(5.0))
                             .text_size(px(11.0))
-                            .text_color(status_color(status, &theme))
+                            .text_color(service_state_color(snapshot, service, &theme))
                             .child(SharedString::from(message.clone())),
                     );
                 }
@@ -1503,14 +1637,22 @@ impl Shell {
         let compact = viewport.width < px(640.0);
         let busy = self.project_terminals.busy;
         let initialized = editor.initialized;
+        let selected_database = editor
+            .databases
+            .iter()
+            .find(|database| editor.selected.as_deref() == Some(database.id.as_str()));
         let selected = editor
             .services
             .iter()
             .find(|service| editor.selected.as_deref() == Some(service.id.as_str()))
-            .or_else(|| editor.services.first());
+            .or_else(|| editor.services.first())
+            .filter(|_| selected_database.is_none());
         let field_animation = SharedString::from(format!(
             "project-service-settings-fields-{}",
-            selected.map(|s| s.id.as_str()).unwrap_or("empty")
+            selected
+                .map(|s| s.id.as_str())
+                .or(selected_database.map(|d| d.id.as_str()))
+                .unwrap_or("empty")
         ));
         let mut list = div()
             .id("project-service-settings-list")
@@ -1521,6 +1663,61 @@ impl Shell {
             .when(compact, |list| list.flex_row().overflow_x_scroll())
             .when(!compact, |list| list.flex_col().overflow_y_scroll())
             .gap(px(4.0));
+        if !editor.databases.is_empty() {
+            if !compact {
+                list = list.child(nav_caption(&theme, "Shared databases"));
+            }
+            for database in &editor.databases {
+                let id = database.id.clone();
+                let active = selected_database.is_some_and(|d| d.id == id);
+                let key = format!("{}-service-settings-tab-{id}", cx.entity_id());
+                let progress =
+                    motion::state_t(&key, active, motion::TAB_SLIDE, self.reduced_motion);
+                list = list.child(
+                    div()
+                        .id(SharedString::from(format!("database-settings-tab-{id}")))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .px(px(10.0))
+                        .py(px(8.0))
+                        .rounded(px(7.0))
+                        .text_size(px(12.0))
+                        .text_color(if active { theme.text } else { theme.text_muted })
+                        .bg(motion::hover_blend(
+                            &key,
+                            theme.wash(0.08).opacity(progress),
+                            theme.element_hover,
+                        ))
+                        .on_hover(motion::hover_listener(key))
+                        .cursor_pointer()
+                        .role(gpui::Role::Button)
+                        .aria_label(format!("Show {} database", database.name))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(editor) = &mut this.project_terminals.editor {
+                                editor.selected = Some(id.clone());
+                            }
+                            cx.notify();
+                        }))
+                        .child(
+                            icon(icons::HARD_DRIVE)
+                                .size(px(14.0))
+                                .flex_none()
+                                .text_color(theme.text_muted),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .child(SharedString::from(database.name.clone())),
+                        ),
+                );
+            }
+            if !compact {
+                list = list.child(nav_caption(&theme, "App services"));
+            }
+        }
         for service in &editor.services {
             let id = service.id.clone();
             let active = selected.is_some_and(|selected| selected.id == id);
@@ -1583,6 +1780,8 @@ impl Shell {
         let can_add = initialized && editor.services.len() < 12;
         let add = popover::btn_ghost(&theme, "Add service", "add-project-service")
             .id("add-project-service")
+            .role(gpui::Role::Button)
+            .aria_label("Add service")
             .flex_none()
             .flex()
             .items_center()
@@ -1636,21 +1835,77 @@ impl Shell {
             .overflow_y_scroll()
             .track_scroll(&editor.scroll)
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation());
-        if let Some(service) = selected {
-            if service.prerequisite {
-                let space = editor.project.space.clone();
-                let can_open = !editor.is_dirty(cx) && !busy;
-                fields = fields.child(popover::dialog_title(&theme, "Databases"))
-                    .child(popover::dialog_body(&theme, "Database startup and readiness are configured together with the worktree setup workflow."))
-                    .child(popover::btn_ghost(&theme, "Open Worktree settings", "database-worktree-settings")
-                        .id("database-worktree-settings")
-                        .when(!can_open, |button| button.opacity(0.4).cursor_default()
-                            .tooltip(crate::settings::widgets::text_tooltip("Save or cancel your service edits first.")))
-                        .when(can_open, |button| button.on_click(cx.listener(move |this, _, _, cx| {
+        if let Some(database) = selected_database {
+            let space = editor.project.space.clone();
+            let can_open = !editor.is_dirty(cx) && !busy;
+            let readiness = database.setup_prerequisite.as_ref();
+            let detail = |label: &'static str, value: String| {
+                div().child(field_label(&theme, label)).child(
+                    div()
+                        .px(px(10.0))
+                        .py(px(7.0))
+                        .rounded(px(6.0))
+                        .bg(theme.wash(0.035))
+                        .font_family(theme.font_mono.clone())
+                        .text_size(px(12.0))
+                        .text_color(theme.text)
+                        .child(SharedString::from(value)),
+                )
+            };
+            fields = fields
+                .child(popover::dialog_title(&theme, &database.name))
+                .child(popover::dialog_body(
+                    &theme,
+                    "A shared database. It runs in the main project folder for every worktree and starts before setup and app services. Start, stop and logs are in the Services panel.",
+                ))
+                .child(detail("Start command", database.command.clone()))
+                .child(detail(
+                    "Ready when this command succeeds",
+                    readiness.map(|r| r.command.clone()).unwrap_or_default(),
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(12.0))
+                        .child(div().flex_1().child(detail(
+                            "Run in folder",
+                            if database.directory == "." {
+                                "Project root".into()
+                            } else {
+                                database.directory.clone()
+                            },
+                        )))
+                        .child(div().flex_1().child(detail(
+                            "Wait up to",
+                            format!("{} seconds", readiness.map_or(0, |r| r.timeout_seconds)),
+                        ))),
+                )
+                .child(div().flex().child(
+                    crate::settings::widgets::text_action(
+                        &theme,
+                        crate::settings::widgets::ActionTone::Outlined,
+                        "Edit in Project settings",
+                    )
+                    .id("database-worktree-settings")
+                    .role(gpui::Role::Button)
+                    .aria_label("Edit in Project settings")
+                    .mt(px(16.0))
+                    .when(!can_open, |button| {
+                        button.opacity(0.4).cursor_default().tooltip(
+                            crate::settings::widgets::text_tooltip(
+                                "Save or cancel your service edits first.",
+                            ),
+                        )
+                    })
+                    .when(can_open, |button| {
+                        button.on_click(cx.listener(move |this, _, _, cx| {
                             this.project_terminals.editor = None;
                             this.show_project_database_settings(space.clone(), cx);
-                        }))));
-            } else {
+                        }))
+                    }),
+                ));
+        } else if let Some(service) = selected {
+            {
             let id = service.id.clone();
             let restart_id = id.clone();
             let restart = service.restart;
@@ -1870,6 +2125,8 @@ impl Shell {
                     .child(
                         popover::btn_ghost(&theme, "Cancel", "cancel-project-services")
                             .id("cancel-project-services")
+                            .role(gpui::Role::Button)
+                            .aria_label("Cancel")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.request_close_form(UnsavedForm::Services, window, cx);
                             })),
@@ -1877,6 +2134,8 @@ impl Shell {
                     .child(
                         popover::btn_primary(&theme, if busy { "Saving…" } else { "Save" })
                             .id("save-project-services")
+                            .role(gpui::Role::Button)
+                            .aria_label("Save services")
                             .when(!initialized || busy, |button| {
                                 button.opacity(0.5).cursor_default()
                             })
@@ -1887,10 +2146,12 @@ impl Shell {
                             }),
                     ),
             );
+        // Same size as Project settings, which opens this editor on top of
+        // itself: it then reads as a sub-page instead of a second dialog.
         let card = popover::dialog_card(&theme)
-            .w(px(700.0))
+            .w(px(840.0))
             .max_w((viewport.width - px(40.0)).max(px(200.0)))
-            .h(px(600.0).min((viewport.height - px(64.0)).max(px(200.0))))
+            .h(px(680.0).min((viewport.height - px(64.0)).max(px(200.0))))
             .p_0()
             .bg(theme.surface_dialog)
             .border_color(theme.border)
@@ -2123,6 +2384,16 @@ impl Shell {
     }
 }
 
+fn nav_caption(theme: &Theme, label: &'static str) -> impl IntoElement {
+    div()
+        .flex_none()
+        .mt(px(6.0))
+        .px(px(10.0))
+        .text_size(px(10.5))
+        .text_color(theme.text_faint)
+        .child(label)
+}
+
 fn field_label(theme: &Theme, label: &'static str) -> impl IntoElement {
     div()
         .mt(px(14.0))
@@ -2166,19 +2437,32 @@ fn service_tooltip(
     service: &ProjectTerminalService,
 ) -> String {
     let status = service_status(snapshot, &service.id);
-    let checkout = if service.setup_prerequisite.is_some() {
-        &context.cwd
-    } else {
-        snapshot.checkout.as_deref().unwrap_or(&context.cwd)
-    };
+    let detail = service_status_detail(
+        status,
+        snapshot.runs.iter().find(|r| r.service_id == service.id),
+    );
+    if let Some(readiness) = &service.setup_prerequisite {
+        return format!(
+            "{} · {}\nShared database · runs in the main project folder for every worktree\n{}\nCommand: {}\nReady check: {} (up to {} s)\nFolder: {}",
+            service.name,
+            service_state_label(snapshot, service),
+            detail,
+            service.command,
+            readiness.command,
+            readiness.timeout_seconds,
+            if service.directory == "." {
+                "Project root"
+            } else {
+                &service.directory
+            },
+        );
+    }
+    let checkout = snapshot.checkout.as_deref().unwrap_or(&context.cwd);
     format!(
         "{} · {}\n{}\nCommand: {}\nFolder: {}\nCheckout: {}",
         service.name,
         status_label(status),
-        service_status_detail(
-            status,
-            snapshot.runs.iter().find(|r| r.service_id == service.id)
-        ),
+        detail,
         service.command,
         service_folder_label(&service.directory, checkout),
         checkout
@@ -2242,7 +2526,8 @@ fn service_summary(snapshot: &ProjectTerminalsSnapshot) -> String {
     let mut running = 0;
     let mut retrying = 0;
     let mut failed = 0;
-    for service in &snapshot.config.services {
+    let apps = snapshot.config.services.iter().filter(|s| !s.is_database());
+    for service in apps.clone() {
         match service_status(snapshot, &service.id) {
             Status::Running => running += 1,
             Status::Restarting => retrying += 1,
@@ -2250,17 +2535,55 @@ fn service_summary(snapshot: &ProjectTerminalsSnapshot) -> String {
             _ => {}
         }
     }
-    let mut label = format!("{running}/{} running", snapshot.config.services.len());
-    if retrying > 0 {
-        label.push_str(&format!(" · {retrying} retrying"));
+    let mut parts = Vec::new();
+    let databases: Vec<_> = snapshot
+        .config
+        .services
+        .iter()
+        .filter(|s| s.is_database())
+        .collect();
+    if let Some(first) = databases.first() {
+        let states: Vec<_> = databases
+            .iter()
+            .map(|db| service_state_label(snapshot, db))
+            .collect();
+        let subject = if databases.len() == 1 {
+            first.name.clone()
+        } else {
+            "Databases".into()
+        };
+        let state = if states.contains(&"Starting…") {
+            "starting…"
+        } else if states
+            .iter()
+            .any(|s| matches!(*s, "Not ready" | "Exited with error" | "Needs restart"))
+        {
+            "not ready"
+        } else if states
+            .iter()
+            .all(|s| matches!(*s, "Ready" | "Running" | "Retrying…"))
+        {
+            "ready"
+        } else {
+            "stopped"
+        };
+        parts.push(format!("{subject} {state}"));
     }
-    if failed > 0 {
-        label.push_str(&format!(
-            " · {failed} {} attention",
-            if failed == 1 { "needs" } else { "need" }
-        ));
+    let apps = apps.count();
+    if apps > 0 {
+        let mut label = format!("{running}/{apps} running");
+        if retrying > 0 {
+            label.push_str(&format!(" · {retrying} retrying"));
+        }
+        if failed > 0 {
+            label.push_str(&format!(
+                " · {failed} {} attention",
+                if failed == 1 { "needs" } else { "need" }
+            ));
+        }
+        parts.push(label);
     }
-    label
+    parts.join(" · ")
 }
 
 fn service_status_detail(status: Status, run: Option<&zeron_proto::ProjectTerminalRun>) -> String {
@@ -2296,12 +2619,43 @@ fn service_folder_label(directory: &str, checkout: &str) -> String {
     format!("{directory} · {checkout_name}")
 }
 
-fn status_dot(theme: &Theme, status: Status) -> impl IntoElement {
-    div()
-        .size(px(6.0))
-        .flex_none()
-        .rounded_full()
-        .bg(status_color(status, theme))
+fn status_dot(color: gpui::Hsla) -> impl IntoElement {
+    div().size(px(6.0)).flex_none().rounded_full().bg(color)
+}
+
+fn service_readiness(snapshot: &ProjectTerminalsSnapshot, id: &str) -> Option<Readiness> {
+    snapshot
+        .runs
+        .iter()
+        .find(|run| run.service_id == id)
+        .and_then(|run| run.readiness)
+}
+
+/// A database's readiness matters more than whether its process is alive.
+fn service_state_label(
+    snapshot: &ProjectTerminalsSnapshot,
+    service: &ProjectTerminalService,
+) -> &'static str {
+    let status = service_status(snapshot, &service.id);
+    match service_readiness(snapshot, &service.id) {
+        Some(Readiness::Checking) if service_is_active(status) => "Starting…",
+        Some(Readiness::Ready) if service_is_active(status) || status == Status::Exited => "Ready",
+        Some(Readiness::NotReady) if service_is_active(status) => "Not ready",
+        _ => status_label(status),
+    }
+}
+
+fn service_state_color(
+    snapshot: &ProjectTerminalsSnapshot,
+    service: &ProjectTerminalService,
+    theme: &Theme,
+) -> gpui::Hsla {
+    match service_state_label(snapshot, service) {
+        "Starting…" => theme.warning,
+        "Ready" => theme.success,
+        "Not ready" => theme.danger,
+        _ => status_color(service_status(snapshot, &service.id), theme),
+    }
 }
 
 fn status_color(status: Status, theme: &Theme) -> gpui::Hsla {
@@ -2335,6 +2689,7 @@ mod tests {
             restarts: 0,
             message: None,
             terminal: None,
+            readiness: None,
         };
         let snapshot = ProjectTerminalsSnapshot {
             checkout: None,
@@ -2460,6 +2815,154 @@ mod tests {
                 assert!(fields.service(cx).setup_prerequisite.is_none());
             })
             .unwrap();
+    }
+
+    fn database_service(name: &str) -> ProjectTerminalService {
+        ProjectTerminalService {
+            id: "db".into(),
+            name: name.into(),
+            command: "bun run db".into(),
+            directory: ".".into(),
+            restart_on_failure: false,
+            setup_prerequisite: Some(zeron_proto::ProjectServiceReadiness {
+                command: "pg_isready".into(),
+                timeout_seconds: 120,
+            }),
+        }
+    }
+
+    fn app_service(id: &str, name: &str) -> ProjectTerminalService {
+        ProjectTerminalService {
+            id: id.into(),
+            name: name.into(),
+            command: format!("bun run {id}"),
+            directory: ".".into(),
+            restart_on_failure: false,
+            setup_prerequisite: None,
+        }
+    }
+
+    #[gpui::test]
+    fn services_editor_shows_databases_read_only_and_saves_only_app_services(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let shell = test_shell(cx, dir.path());
+        shell
+            .update(cx, |shell, _, cx| {
+                let project = test_project(dir.path());
+                shell.project_terminals.context = Some(project.clone());
+                shell.project_terminals.editor = Some(Editor::new(project.clone()));
+                let snapshot = |db: &str| ProjectTerminalsSnapshot {
+                    checkout: None,
+                    config: ProjectTerminalConfig {
+                        services: vec![database_service(db), app_service("backend", "Backend")],
+                    },
+                    runs: vec![],
+                };
+                shell.accept_project_terminal_snapshot(snapshot("Databases"), cx);
+                let editor = shell.project_terminals.editor.as_ref().unwrap();
+                assert_eq!(editor.services.len(), 1, "databases are not editable here");
+                assert_eq!(editor.services[0].id, "backend");
+                assert_eq!(editor.databases, vec![database_service("Databases")]);
+                assert!(!editor.is_dirty(cx));
+                assert_eq!(editor.config(cx), vec![app_service("backend", "Backend")]);
+                let command = editor.services[0].command.clone();
+                command.update(cx, |input, cx| input.set_text("bun run dev:api", cx));
+                // A poll after the database was renamed in Project settings
+                // refreshes the read-only list but keeps the unsaved edit.
+                shell.accept_project_terminal_snapshot(snapshot("Postgres"), cx);
+                let editor = shell.project_terminals.editor.as_ref().unwrap();
+                assert_eq!(editor.databases[0].name, "Postgres");
+                assert_eq!(editor.services[0].command.entity_id(), command.entity_id());
+                assert_eq!(editor.config(cx)[0].command, "bun run dev:api");
+                assert!(editor.config(cx).iter().all(|s| !s.is_database()));
+                assert!(editor.is_dirty(cx));
+                let payload = editor.save_payload(cx).services;
+                assert_eq!(
+                    payload[0],
+                    database_service("Postgres"),
+                    "databases go back unchanged"
+                );
+                assert_eq!(payload[1].command, "bun run dev:api");
+
+                // A project with only a database still suggests app services,
+                // and untouched suggestions are never saved.
+                shell.project_terminals.editor = Some(Editor::new(project));
+                shell.accept_project_terminal_snapshot(
+                    ProjectTerminalsSnapshot {
+                        checkout: None,
+                        config: ProjectTerminalConfig {
+                            services: vec![database_service("Databases")],
+                        },
+                        runs: vec![],
+                    },
+                    cx,
+                );
+                let editor = shell.project_terminals.editor.as_ref().unwrap();
+                let names: Vec<_> = editor
+                    .services
+                    .iter()
+                    .map(|s| s.name.read(cx).text().to_string())
+                    .collect();
+                assert_eq!(names, ["Backend", "Frontend", "Cloudflared"]);
+                assert!(editor.config(cx).is_empty());
+                assert!(!editor.is_dirty(cx));
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn database_readiness_drives_status_and_summary() {
+        let run = |id: &str, readiness| zeron_proto::ProjectTerminalRun {
+            service_id: id.into(),
+            status: Status::Running,
+            exit_code: None,
+            restarts: 0,
+            message: None,
+            terminal: None,
+            readiness,
+        };
+        let database = database_service("Databases");
+        let mut snapshot = ProjectTerminalsSnapshot {
+            checkout: None,
+            config: ProjectTerminalConfig {
+                services: vec![
+                    database.clone(),
+                    app_service("backend", "Backend"),
+                    app_service("frontend", "Frontend"),
+                ],
+            },
+            runs: vec![run("db", Some(Readiness::Checking)), run("backend", None)],
+        };
+        assert_eq!(service_state_label(&snapshot, &database), "Starting…");
+        assert_eq!(
+            service_summary(&snapshot),
+            "Databases starting… · 1/2 running"
+        );
+        snapshot.runs[0].readiness = Some(Readiness::Ready);
+        assert_eq!(service_state_label(&snapshot, &database), "Ready");
+        assert_eq!(service_summary(&snapshot), "Databases ready · 1/2 running");
+        snapshot.runs[0].readiness = Some(Readiness::NotReady);
+        assert_eq!(service_state_label(&snapshot, &database), "Not ready");
+        assert_eq!(
+            service_summary(&snapshot),
+            "Databases not ready · 1/2 running"
+        );
+        snapshot.runs[0].status = Status::Stopped;
+        snapshot.runs[0].readiness = None;
+        assert_eq!(service_state_label(&snapshot, &database), "Not running");
+        assert_eq!(
+            service_summary(&snapshot),
+            "Databases stopped · 1/2 running"
+        );
+        let tooltip = service_tooltip(
+            &snapshot,
+            &test_project(std::path::Path::new("/p")),
+            &database,
+        );
+        assert!(tooltip.contains("Shared database"));
+        assert!(tooltip.contains("Ready check: pg_isready (up to 120 s)"));
     }
 
     #[gpui::test]

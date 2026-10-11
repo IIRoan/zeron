@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use zeron_proto::{
     ProjectTerminalConfig, ProjectTerminalRun, ProjectTerminalService,
-    ProjectTerminalStatus as Status, ProjectTerminalsSnapshot, TerminalEvent,
+    ProjectTerminalStatus as Status, ProjectTerminalsSnapshot, ServiceReadinessState as Readiness,
+    TerminalEvent,
 };
 
 use crate::{EngineError, Terminals};
@@ -413,6 +414,7 @@ impl ProjectTerminals {
                         restarts: 0,
                         message: Some(error.to_string()),
                         terminal: None,
+                        readiness: None,
                     },
                 );
                 return Err(error);
@@ -436,6 +438,7 @@ impl ProjectTerminals {
                 restarts: 0,
                 message: None,
                 terminal: Some(session.clone()),
+                readiness: None,
             },
         );
         let weak = Arc::downgrade(&self.inner);
@@ -488,6 +491,7 @@ impl ProjectTerminals {
         {
             run.status = Status::Stopped;
             run.message = None;
+            run.readiness = None;
         }
         if let Err(error) = self.write(&projects) {
             tracing::warn!(%error, "could not persist terminal stop");
@@ -522,6 +526,33 @@ impl ProjectTerminals {
         }
         if let Err(error) = self.write(&projects) {
             tracing::warn!(%error, "could not persist terminal state");
+        }
+    }
+
+    fn set_readiness(
+        &self,
+        space: &str,
+        service: &str,
+        readiness: Option<Readiness>,
+        message: Option<String>,
+    ) {
+        let mut projects = self
+            .inner
+            .projects
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(run) = projects
+            .get_mut(space)
+            .and_then(|p| p.runs.iter_mut().find(|r| r.service_id == service))
+        {
+            if run.readiness == readiness && run.message == message {
+                return;
+            }
+            run.readiness = readiness;
+            run.message = message;
+        }
+        if let Err(error) = self.write(&projects) {
+            tracing::warn!(%error, "could not persist database readiness");
         }
     }
 
@@ -676,31 +707,107 @@ impl ProjectTerminals {
         root: &Path,
         config: ProjectTerminalConfig,
     ) -> Result<(), EngineError> {
-        let operation = self
-            .inner
-            .managed_operations
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(space.into())
-            .or_default()
-            .clone();
+        let operation = self.managed_operation(space);
         let _guard = operation.lock().await;
         let this = self.clone();
         let environments = environments.clone();
         let space = space.to_string();
         let root = root.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            let mut defaults = environments.defaults(&root)?;
-            if defaults.services.is_some() {
-                defaults.services = Some(config.clone());
-                environments.save(&root, None, Some(defaults))?;
-            }
-            this.reconcile_configs(&environments, &space, &root, config)
+            let current = this.snapshot(&space, &root)?.config;
+            this.reconcile_configs(&environments, &space, &root, with_apps(&current, config))
         })
         .await
         .map_err(|e| EngineError::Other(e.to_string()))?
     }
 
+    /// Replaces the project's databases and keeps its app services. Removed
+    /// databases are stopped.
+    fn save_databases(
+        &self,
+        space: &str,
+        root: &Path,
+        databases: Vec<ProjectTerminalService>,
+    ) -> Result<(), EngineError> {
+        let current = self.snapshot(space, root)?.config;
+        self.save(space, root, with_databases(&current, databases)?)?;
+        Ok(())
+    }
+
+    /// Sets (or with None, clears) a worktree's own app services. Databases
+    /// always come from the project and are never stored per checkout.
+    pub async fn save_checkout_services(
+        &self,
+        environments: &crate::worktree_settings::WorktreeSettingsStore,
+        space: &str,
+        root: &Path,
+        checkout: &Path,
+        config: Option<ProjectTerminalConfig>,
+    ) -> Result<(), EngineError> {
+        let operation = self.managed_operation(space);
+        let _guard = operation.lock().await;
+        let this = self.clone();
+        let environments = environments.clone();
+        let space = space.to_string();
+        let root = root.to_path_buf();
+        let checkout = checkout.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let project = this.snapshot(&space, &root)?.config;
+            let apps = config.map(|config| ProjectTerminalConfig {
+                services: with_apps(&project, config)
+                    .services
+                    .into_iter()
+                    .filter(|s| !s.is_database())
+                    .collect(),
+            });
+            environments.save_services(&root, &checkout, apps)?;
+            let settings = environments.effective(&root, &checkout)?;
+            this.save_checkout(
+                &space,
+                &root,
+                &checkout,
+                settings.services.unwrap_or(project),
+            )
+        })
+        .await
+        .map_err(|e| EngineError::Other(e.to_string()))?
+    }
+
+    /// Older versions also kept the project's services in worktree settings.
+    /// Adopt that copy only when the profile has no app services of its own,
+    /// then drop it so there is a single list.
+    pub fn adopt_legacy_services(
+        &self,
+        environments: &crate::worktree_settings::WorktreeSettingsStore,
+        space: &str,
+        root: &Path,
+    ) -> Result<(), EngineError> {
+        let Some(legacy) = environments.legacy_services(root)? else {
+            return Ok(());
+        };
+        let current = self.snapshot(space, root)?.config;
+        if !current.services.iter().any(|s| !s.is_database())
+            && legacy.services.iter().any(|s| !s.is_database())
+        {
+            self.reconcile_configs(environments, space, root, with_apps(&current, legacy))?;
+            tracing::info!(space, "adopted project services from worktree settings");
+        }
+        environments.clear_legacy_services(root)
+    }
+
+    fn managed_operation(&self, space: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.inner
+            .managed_operations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(space.into())
+            .or_default()
+            .clone()
+    }
+
+    /// Saves a Project settings page. Its service lists are ignored: app
+    /// services are saved only by the services editor, and `databases`, when
+    /// given, replaces only the project's databases.
     pub async fn save_environment(
         &self,
         environments: &crate::worktree_settings::WorktreeSettingsStore,
@@ -708,15 +815,14 @@ impl ProjectTerminals {
         root: &Path,
         checkout: Option<&Path>,
         settings: Option<zeron_proto::WorktreeSettings>,
+        databases: Option<Vec<ProjectTerminalService>>,
     ) -> Result<(), EngineError> {
-        let operation = self
-            .inner
-            .managed_operations
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(space.into())
-            .or_default()
-            .clone();
+        if checkout.is_some() && databases.is_some() {
+            return Err(EngineError::Other(
+                "Databases are shared by the whole project. Edit them in Project defaults.".into(),
+            ));
+        }
+        let operation = self.managed_operation(space);
         let _guard = operation.lock().await;
         let this = self.clone();
         let environments = environments.clone();
@@ -724,37 +830,17 @@ impl ProjectTerminals {
         let root = root.to_path_buf();
         let checkout = checkout.map(Path::to_path_buf);
         tokio::task::spawn_blocking(move || {
-            if checkout.is_some()
-                && let Some(services) = settings.as_ref().and_then(|s| s.services.as_ref())
-            {
-                let defaults = this.snapshot(&space, &root)?.config;
-                let shared = |config: &ProjectTerminalConfig| {
-                    config
-                        .services
-                        .iter()
-                        .filter(|s| s.setup_prerequisite.is_some())
-                        .cloned()
-                        .collect::<Vec<_>>()
-                };
-                if shared(services) != shared(&defaults) {
-                    return Err(EngineError::Other(
-                        "Shared startup services must be edited in Project defaults.".into(),
-                    ));
-                }
+            // Validate both parts before writing either.
+            if let Some(databases) = &databases {
+                normalize_config(with_databases(
+                    &this.snapshot(&space, &root)?.config,
+                    databases.clone(),
+                )?)?;
             }
             environments.save(&root, checkout.as_deref(), settings)?;
-            let config = this.snapshot(&space, &root)?.config;
-            if let Some(cwd) = checkout {
-                let settings = environments.effective(&root, &cwd)?;
-                this.save_checkout(&space, &root, &cwd, settings.services.unwrap_or(config))
-            } else {
-                let defaults = environments.defaults(&root)?;
-                this.reconcile_configs(
-                    &environments,
-                    &space,
-                    &root,
-                    defaults.services.unwrap_or(config),
-                )
+            match databases {
+                Some(databases) => this.save_databases(&space, &root, databases),
+                None => Ok(()),
             }
         })
         .await
@@ -844,9 +930,24 @@ impl ProjectTerminals {
             let readiness = service.setup_prerequisite.as_ref().unwrap();
             let deadline =
                 tokio::time::Instant::now() + Duration::from_secs(readiness.timeout_seconds);
+            // Re-checking a ready database must not flicker its status.
+            let was_ready = self
+                .snapshot(&space, root)?
+                .runs
+                .iter()
+                .any(|r| r.service_id == service.id && r.readiness == Some(Readiness::Ready));
+            if !was_ready {
+                self.set_readiness(&space, &service.id, Some(Readiness::Checking), None);
+            }
+            let cancelled = || {
+                if !was_ready {
+                    self.set_readiness(&space, &service.id, None, None);
+                }
+                Err(EngineError::Other("Worktree setup was cancelled.".into()))
+            };
             loop {
                 if token.is_cancelled() {
-                    return Err(EngineError::Other("Worktree setup was cancelled.".into()));
+                    return cancelled();
                 }
                 let snapshot = self.snapshot(&space, root)?;
                 if !snapshot
@@ -881,10 +982,17 @@ impl ProjectTerminals {
                 }
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if remaining.is_zero() {
-                    return Err(EngineError::Other(format!(
-                        "{} was not ready after {} seconds. Open its service and setup output for details.",
+                    let message = format!(
+                        "{} was not ready after {} seconds. Check its output and the readiness command.",
                         service.name, readiness.timeout_seconds
-                    )));
+                    );
+                    self.set_readiness(
+                        &space,
+                        &service.id,
+                        Some(Readiness::NotReady),
+                        Some(message.clone()),
+                    );
+                    return Err(EngineError::Other(message));
                 }
                 let mut check_settings = settings.clone();
                 check_settings.command_timeout_seconds = remaining.as_secs().clamp(1, 5);
@@ -908,11 +1016,12 @@ impl ProjectTerminals {
                             && (r.status == Status::Running
                                 || (r.status == Status::Exited && r.exit_code == Some(0)))
                     }) {
+                        self.set_readiness(&space, &service.id, Some(Readiness::Ready), None);
                         break;
                     }
                 }
                 tokio::select! {
-                    _ = token.cancelled() => return Err(EngineError::Other("Worktree setup was cancelled.".into())),
+                    _ = token.cancelled() => return cancelled(),
                     _ = tokio::time::sleep_until((tokio::time::Instant::now() + Duration::from_millis(250)).min(deadline)) => {},
                 }
             }
@@ -941,14 +1050,7 @@ impl ProjectTerminals {
         if !matches!(action, "start" | "stop" | "restart" | "activate") {
             return Err(EngineError::Other("Unknown terminal action".into()));
         }
-        let operation = self
-            .inner
-            .managed_operations
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(space.into())
-            .or_default()
-            .clone();
+        let operation = self.managed_operation(space);
         let _guard = operation.lock().await;
         let settings = environments.effective(root, checkout)?;
         let config = self
@@ -1174,14 +1276,7 @@ impl ProjectTerminals {
         root: &Path,
         checkout: &Path,
     ) -> Result<(), EngineError> {
-        let operation = self
-            .inner
-            .managed_operations
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(space.into())
-            .or_default()
-            .clone();
+        let operation = self.managed_operation(space);
         let _guard = operation.lock().await;
         let this = self.clone();
         let source = root.to_path_buf();
@@ -1303,6 +1398,7 @@ async fn supervise(
                         }
                     }),
                     terminal: Some(session.clone()),
+                    readiness: None,
                 },
             );
             if !retry {
@@ -1348,6 +1444,7 @@ async fn supervise(
                                 restarts,
                                 message: None,
                                 terminal: Some(next.clone()),
+                                readiness: None,
                             },
                         );
                         Some(next)
@@ -1365,6 +1462,7 @@ async fn supervise(
                                 restarts,
                                 message: Some(error.to_string()),
                                 terminal: Some(failed),
+                                readiness: None,
                             },
                         );
                         None
@@ -1405,44 +1503,91 @@ fn check_root(project: &Project, root: &str) -> Result<(), EngineError> {
     Ok(())
 }
 
+/// The project's saved databases plus `apps` from an app-service editor.
+/// Entries matching a saved database by id (including copies from clients
+/// that cannot see the database flag) never replace or remove it, and new
+/// databases can only be added through [`ProjectTerminals::save_databases`].
+fn with_apps(
+    current: &ProjectTerminalConfig,
+    apps: ProjectTerminalConfig,
+) -> ProjectTerminalConfig {
+    let mut services: Vec<_> = current
+        .services
+        .iter()
+        .filter(|s| s.is_database())
+        .cloned()
+        .collect();
+    let apps = apps
+        .services
+        .into_iter()
+        .filter(|app| !app.is_database() && !services.iter().any(|db| db.id == app.id))
+        .collect::<Vec<_>>();
+    services.extend(apps);
+    ProjectTerminalConfig { services }
+}
+
+/// `databases` followed by the project's saved app services.
+fn with_databases(
+    current: &ProjectTerminalConfig,
+    mut databases: Vec<ProjectTerminalService>,
+) -> Result<ProjectTerminalConfig, EngineError> {
+    if let Some(database) = databases.iter().find(|s| !s.is_database()) {
+        return Err(EngineError::Other(format!(
+            "Add a readiness check for the database “{}”.",
+            database.name.trim()
+        )));
+    }
+    databases.extend(
+        current
+            .services
+            .iter()
+            .filter(|s| !s.is_database())
+            .cloned(),
+    );
+    Ok(ProjectTerminalConfig {
+        services: databases,
+    })
+}
+
 pub fn normalize_config(
     mut config: ProjectTerminalConfig,
 ) -> Result<ProjectTerminalConfig, EngineError> {
+    let invalid = |message: String| Err(EngineError::Other(message));
     if config.services.len() > MAX_SERVICES {
-        return Err(EngineError::Other(
-            "A project supports at most 12 named services".into(),
-        ));
+        return invalid("A project supports at most 12 services and databases.".into());
     }
     let mut ids = HashSet::new();
     let mut names = HashSet::new();
     for service in &mut config.services {
-        if let Some(readiness) = &mut service.setup_prerequisite {
-            readiness.command = readiness.command.trim().to_string();
-            if readiness.command.is_empty()
-                || readiness.command.len() > 16 * 1024
-                || readiness.command.contains('\0')
-                || !(1..=zeron_proto::MAX_WORKTREE_COMMAND_TIMEOUT_SECONDS)
-                    .contains(&readiness.timeout_seconds)
-            {
-                return Err(EngineError::Other("Startup services need a readiness command and a timeout between 1 and 7200 seconds.".into()));
-            }
-        }
         service.name = service.name.trim().to_string();
         service.command = service.command.trim().to_string();
         service.directory = service.directory.trim().to_string();
         if service.directory.is_empty() {
             service.directory = ".".into();
         }
-        if service.id.is_empty()
-            || service.id.len() > 96
-            || !ids.insert(service.id.clone())
-            || service.name.is_empty()
-            || service.name.chars().count() > 80
-            || !names.insert(service.name.to_lowercase())
-            || service.command.is_empty()
-            || service.command.len() > 16 * 1024
-            || service.command.contains('\0')
-            || service.directory.len() > 4096
+        let name = &service.name;
+        if service.id.is_empty() || service.id.len() > 96 || !ids.insert(service.id.clone()) {
+            return invalid(format!(
+                "“{name}” has a missing or duplicate id. Remove it and add it again."
+            ));
+        }
+        if name.is_empty() || name.chars().count() > 80 {
+            return invalid(
+                "Give every service and database a name of up to 80 characters.".into(),
+            );
+        }
+        if !names.insert(name.to_lowercase()) {
+            return invalid(format!(
+                "“{name}” is used twice. Give each service and database its own name."
+            ));
+        }
+        if service.command.is_empty() {
+            return invalid(format!("Enter a command for “{name}”."));
+        }
+        if service.command.len() > 16 * 1024 || service.command.contains('\0') {
+            return invalid(format!("The command for “{name}” is too long or invalid."));
+        }
+        if service.directory.len() > 4096
             || service.directory.contains('\0')
             || Path::new(&service.directory).components().any(|c| {
                 matches!(
@@ -1451,7 +1596,25 @@ pub fn normalize_config(
                 )
             })
         {
-            return Err(EngineError::Other("Services need unique names and ids, a command, and a relative directory inside the project".into()));
+            return invalid(format!(
+                "“{name}” must run in a folder inside the project, such as . or apps/api."
+            ));
+        }
+        if let Some(readiness) = &mut service.setup_prerequisite {
+            readiness.command = readiness.command.trim().to_string();
+            if readiness.command.is_empty()
+                || readiness.command.len() > 16 * 1024
+                || readiness.command.contains('\0')
+            {
+                return invalid(format!("Enter a readiness check for “{name}”."));
+            }
+            if !(1..=zeron_proto::MAX_WORKTREE_COMMAND_TIMEOUT_SECONDS)
+                .contains(&readiness.timeout_seconds)
+            {
+                return invalid(format!(
+                    "The readiness timeout for “{name}” must be between 1 and 7200 seconds."
+                ));
+            }
         }
     }
     Ok(config)
