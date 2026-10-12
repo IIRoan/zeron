@@ -159,7 +159,7 @@ impl Shell {
                 cx.notify();
             }
         });
-        self.section_dialog = Some(SectionDialog {
+        self.section_dialog.open(SectionDialog {
             profile,
             id,
             input,
@@ -170,19 +170,17 @@ impl Shell {
     }
 
     fn submit_section_dialog(&mut self, cx: &mut Context<Self>) {
-        let Some(dialog) = self.section_dialog.as_ref() else {
+        let Some(dialog) = self.section_dialog.as_open() else {
             return;
         };
         if self.active_sidebar_pin_profile_key(cx).as_ref() != Some(&dialog.profile) {
-            self.section_dialog = None;
-            cx.notify();
+            popover::close_popup(self, cx, |this| &mut this.section_dialog);
             return;
         }
         let name = dialog.input.read(cx).text().trim().to_string();
         if name.is_empty() || name.chars().count() > 120 {
             return;
         }
-        let dialog = self.section_dialog.take().unwrap();
         let change = match dialog.id.clone() {
             Some(id) => SidebarSectionChange::Rename { id, name },
             None => SidebarSectionChange::Create {
@@ -190,8 +188,8 @@ impl Shell {
                 name,
             },
         };
-        if !self.change_sidebar_section(change, cx) {
-            self.section_dialog = Some(dialog);
+        if self.change_sidebar_section(change, cx) {
+            popover::close_popup(self, cx, |this| &mut this.section_dialog);
         }
         cx.notify();
     }
@@ -278,14 +276,20 @@ impl Shell {
         let chevron = self.sidebar_disclosure_chevron(&motion_key, open, theme);
         let session_count = rows.len();
         let menu_button = show_menu.then(|| {
+            let key = format!("section-menu-{menu_id}");
             div()
-                .id(SharedString::from(format!("section-menu-{menu_id}")))
+                .id(SharedString::from(key.clone()))
                 .size(px(20.0))
                 .flex()
                 .items_center()
                 .justify_center()
                 .rounded(px(4.0))
-                .hover(|el| el.bg(theme.glass_hover()))
+                .bg(motion::hover_blend(
+                    &key,
+                    gpui::transparent_black(),
+                    theme.glass_hover(),
+                ))
+                .on_hover(motion::hover_listener(key))
                 .on_click(
                     cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
                         this.section_menu = Some((menu_id.clone(), event.position()));
@@ -482,10 +486,12 @@ impl Shell {
                 None,
             ));
         }
-        if let Some(dialog) = &mut self.section_dialog {
-            if std::mem::take(&mut dialog.focus_pending) {
-                window.focus(&dialog.input.focus_handle(cx), cx);
-            }
+        if let Some(dialog) = self.section_dialog.open_mut()
+            && std::mem::take(&mut dialog.focus_pending)
+        {
+            window.focus(&dialog.input.focus_handle(cx), cx);
+        }
+        if let Some(dialog) = self.section_dialog.get() {
             let edit = dialog.id.is_some();
             let input = dialog.input.clone();
             let name = input.read(cx).text().trim().to_string();
@@ -493,9 +499,8 @@ impl Shell {
             let card = popover::dialog_card(&theme)
                 .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                     if event.keystroke.key == "escape" {
-                        this.section_dialog = None;
+                        popover::close_popup(this, cx, |this| &mut this.section_dialog);
                         cx.stop_propagation();
-                        cx.notify();
                     }
                 }))
                 .child(
@@ -516,8 +521,7 @@ impl Shell {
                                 .justify_center()
                                 .cursor_pointer()
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.section_dialog = None;
-                                    cx.notify();
+                                    popover::close_popup(this, cx, |this| &mut this.section_dialog);
                                 }))
                                 .child(
                                     icon(icons::CLOSE)
@@ -547,17 +551,17 @@ impl Shell {
                             popover::btn_ghost(&theme, "Cancel", "section-cancel")
                                 .id("section-cancel")
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.section_dialog = None;
-                                    cx.notify();
+                                    popover::close_popup(this, cx, |this| &mut this.section_dialog);
                                 })),
                         )
                         .child(
                             popover::btn_primary(
                                 &theme,
                                 if edit { "Save" } else { "Create section" },
+                                "section-save",
                             )
                             .id("section-save")
-                            .opacity(if valid { 1.0 } else { 0.5 })
+                            .when(!valid, |button| button.opacity(0.5))
                             .on_click(cx.listener(|this, _, _, cx| this.submit_section_dialog(cx))),
                         ),
                 );
@@ -565,6 +569,7 @@ impl Shell {
                 "section-dialog",
                 viewport,
                 card.into_any_element(),
+                self.section_dialog.closing_since(),
             ));
         }
         overlays
@@ -844,17 +849,17 @@ mod tests {
                 shell.open_section_dialog(None, cx);
                 shell.submit_section_dialog(cx);
                 assert!(
-                    shell.section_dialog.is_some(),
+                    shell.section_dialog.is_open(),
                     "Empty name must not create a section"
                 );
-                let input = shell.section_dialog.as_ref().unwrap().input.clone();
+                let input = shell.section_dialog.as_open().unwrap().input.clone();
                 input.update(cx, |input, cx| input.set_text("  Review  ", cx));
                 shell.submit_section_dialog(cx);
                 let created = shell.active_sidebar_sections(cx).last().unwrap().clone();
                 assert_eq!(created.name, "Review");
                 shell.assign_sidebar_section("regular", Some(&created.id), cx);
                 shell.open_section_dialog(Some(created.id.clone()), cx);
-                let input = shell.section_dialog.as_ref().unwrap().input.clone();
+                let input = shell.section_dialog.as_open().unwrap().input.clone();
                 input.update(cx, |input, cx| input.set_text("Today", cx));
                 shell.submit_section_dialog(cx);
                 assert_eq!(

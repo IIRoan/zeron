@@ -330,8 +330,9 @@ fn button(
     theme: &Theme,
 ) -> gpui::Stateful<gpui::Div> {
     let label = label.into();
+    let id: SharedString = id.into().into();
     div()
-        .id(SharedString::from(id.into()))
+        .id(id.clone())
         .h(px(26.0))
         .flex_none()
         .px(px(7.0))
@@ -346,7 +347,12 @@ fn button(
         .child(label)
         .when(enabled, |el| {
             el.cursor_pointer()
-                .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
+                .bg(motion::hover_blend(
+                    &id,
+                    gpui::transparent_black(),
+                    theme.glass_hover(),
+                ))
+                .on_hover(motion::hover_listener(id.clone()))
         })
         .when(!enabled, |el| el.opacity(0.4))
 }
@@ -951,7 +957,13 @@ impl SourceControl {
                     .tooltip(crate::settings::widgets::text_tooltip(refresh_label))
                     .when(self.refreshing, |el| el.bg(theme.accent.opacity(0.1)))
                     .when(!self.is_busy() && !self.refreshing, |el| {
-                        el.cursor_pointer().hover(|s| s.bg(theme.glass_hover()))
+                        el.cursor_pointer()
+                            .bg(motion::hover_blend(
+                                "git-refresh",
+                                gpui::transparent_black(),
+                                theme.glass_hover(),
+                            ))
+                            .on_hover(motion::hover_listener("git-refresh"))
                     })
                     .when(self.is_busy(), |el| el.opacity(0.4))
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -983,7 +995,9 @@ impl SourceControl {
             .aria_label(label)
             .tooltip(crate::settings::widgets::text_tooltip(label))
             .when(enabled, |el| {
-                el.cursor_pointer().hover(|s| s.bg(theme.glass_hover()))
+                el.cursor_pointer()
+                    .bg(motion::hover_blend(id, gpui::transparent_black(), theme.glass_hover()))
+                    .on_hover(motion::hover_listener(id))
             })
             .when(!enabled, |el| el.opacity(0.4))
             .child(
@@ -993,7 +1007,11 @@ impl SourceControl {
             )
     }
 
-    pub(super) fn render_git_status(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_git_status(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let Some(state) = self.git_state() else {
             return gpui::Empty.into_any_element();
         };
@@ -1088,8 +1106,12 @@ impl SourceControl {
                     .when(published, |el| el.child(icon))
                     .child(SharedString::from(label))
                     .when(enabled, |el| {
-                        el.cursor_pointer()
-                            .hover(|style| style.bg(theme.glass_hover()))
+                        el.cursor_pointer().hover_bg(
+                            "git-status-sync-wash",
+                            window,
+                            gpui::transparent_black(),
+                            theme.glass_hover(),
+                        )
                     })
                     .when(!enabled, |el| el.opacity(0.5))
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -1176,6 +1198,7 @@ impl SourceControl {
         &mut self,
         enabled: bool,
         committing: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = Theme::of(cx).clone();
@@ -1200,7 +1223,7 @@ impl SourceControl {
         } else {
             theme.text_muted
         };
-        let dropdown = self.render_commit_dropdown(foreground, cx);
+        let dropdown = self.render_commit_dropdown(foreground, window, cx);
         div()
             .relative()
             .h(px(28.0))
@@ -1229,8 +1252,12 @@ impl SourceControl {
                     .role(gpui::Role::Button)
                     .aria_label(label)
                     .when(enabled, |el| {
-                        el.cursor_pointer()
-                            .hover(|s| s.bg(foreground.opacity(0.08)))
+                        el.cursor_pointer().hover_bg(
+                            "source-control-commit-wash",
+                            window,
+                            gpui::transparent_black(),
+                            foreground.opacity(0.08),
+                        )
                     })
                     .when(!enabled, |el| el.opacity(0.45))
                     .tooltip(crate::settings::widgets::text_tooltip(
@@ -1253,6 +1280,7 @@ impl SourceControl {
     pub(super) fn render_commit_dropdown(
         &mut self,
         foreground: gpui::Hsla,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = Theme::of(cx).clone();
@@ -1272,7 +1300,12 @@ impl SourceControl {
             .role(gpui::Role::Button)
             .aria_label("Commit actions")
             .cursor_pointer()
-            .hover(move |s| s.bg(foreground.opacity(0.08)))
+            .hover_bg(
+                "git-commit-dropdown-wash",
+                window,
+                gpui::transparent_black(),
+                foreground.opacity(0.08),
+            )
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(|this, _, window, _| {
@@ -1808,6 +1841,7 @@ impl SourceControl {
         selected: bool,
         count: Option<usize>,
         theme: &Theme,
+        window: &mut Window,
     ) -> gpui::Stateful<gpui::Div> {
         let enabled = enabled && !self.is_busy() && self.confirmation.is_none();
         let opacity = if enabled { 1.0 } else { 0.35 };
@@ -1815,6 +1849,7 @@ impl SourceControl {
             Some(count) if count > 1 => format!("Discard changes in {count} selected files"),
             _ => "Discard changes".into(),
         };
+        let wash = SharedString::from(format!("{id}-wash"));
         div()
             .id(SharedString::from(id))
             .size(px(20.0))
@@ -1828,7 +1863,8 @@ impl SourceControl {
             .opacity(if selected { opacity } else { 0.0 })
             .group_hover(group, move |el| el.opacity(opacity))
             .when(enabled, |el| {
-                el.cursor_pointer().hover(|s| s.bg(theme.glass_hover()))
+                el.cursor_pointer()
+                    .hover_bg(wash, window, gpui::transparent_black(), theme.glass_hover())
             })
             .tooltip(crate::settings::widgets::text_tooltip(label))
             .on_mouse_down(gpui::MouseButton::Left, |_, window, cx| {
@@ -1849,9 +1885,11 @@ impl SourceControl {
         group: SharedString,
         selected: bool,
         theme: &Theme,
+        window: &mut Window,
     ) -> gpui::Stateful<gpui::Div> {
         let enabled = enabled && !self.is_busy();
         let opacity = if enabled { 1.0 } else { 0.35 };
+        let wash = SharedString::from(format!("{id}-wash"));
         div()
             .id(SharedString::from(id))
             .size(px(20.0))
@@ -1865,7 +1903,8 @@ impl SourceControl {
             .opacity(if selected { opacity } else { 0.0 })
             .group_hover(group, move |el| el.opacity(opacity))
             .when(enabled, |el| {
-                el.cursor_pointer().hover(|s| s.bg(theme.glass_hover()))
+                el.cursor_pointer()
+                    .hover_bg(wash, window, gpui::transparent_black(), theme.glass_hover())
             })
             .tooltip(crate::settings::widgets::text_tooltip("Open File"))
             .on_mouse_down(gpui::MouseButton::Left, |_, window, cx| {

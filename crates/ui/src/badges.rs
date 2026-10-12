@@ -165,7 +165,7 @@ impl BadgeCard {
 }
 
 impl Render for BadgeCard {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = &Theme::of(cx).for_popup();
         let card = crate::popover::popover_card(theme)
             .w(px(CARD_WIDTH))
@@ -178,7 +178,7 @@ impl Render for BadgeCard {
         // scene layer. Sharing the transcript's layer let the bubble's text
         // paint over the card, since equal draw orders render quads before
         // text.
-        crate::frost::frosted(crate::popover::CARD_RADIUS, crate::frost::MENU_BLUR, card)
+        crate::popover::tooltip_surface(card, Some(crate::popover::CARD_RADIUS), window, cx)
     }
 }
 

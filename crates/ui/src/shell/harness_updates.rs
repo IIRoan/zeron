@@ -320,9 +320,11 @@ impl Shell {
                 .tab_index(if enabled { 0 } else { -1 })
                 .focus_visible(move |el| el.border_color(theme.accent))
                 .when(enabled, |button| {
+                    let key = format!("harness-update-action-{device}-{harness:?}");
                     button
                         .cursor_pointer()
-                        .hover(|el| el.opacity(0.85))
+                        .opacity(motion::lerp(1.0, 0.85, motion::hover_t(&key)))
+                        .on_hover(motion::hover_listener(key))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             if let Some(method) = method {

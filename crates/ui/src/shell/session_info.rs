@@ -309,6 +309,7 @@ impl Shell {
         for action in snapshot.actions.clone() {
             let row_id = SharedString::from(format!("session-info-action-{}", action.id));
             let group = SharedString::from(format!("session-info-action-group-{}", action.id));
+            let edit_key = format!("session-info-edit-action-{}", action.id);
             let key = key.clone();
             let run = action.clone();
             let edit = action.clone();
@@ -334,10 +335,7 @@ impl Shell {
                     .child(div().flex_1().min_w_0().truncate().child(label))
                     .child(
                         div()
-                            .id(SharedString::from(format!(
-                                "session-info-edit-action-{}",
-                                edit.id
-                            )))
+                            .id(SharedString::from(edit_key.clone()))
                             .size(px(22.0))
                             .flex_none()
                             .flex()
@@ -346,7 +344,12 @@ impl Shell {
                             .rounded(px(5.0))
                             .invisible()
                             .group_hover(group, |style| style.visible())
-                            .hover(|style| style.bg(crate::theme::ink(0.08)))
+                            .bg(motion::hover_blend(
+                                &edit_key,
+                                gpui::transparent_black(),
+                                crate::theme::ink(0.08),
+                            ))
+                            .on_hover(motion::hover_listener(edit_key))
                             .tooltip(crate::settings::widgets::text_tooltip("Edit action"))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();

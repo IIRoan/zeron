@@ -8,6 +8,7 @@ use gpui::{
 use zeron_proto::Chat;
 use zeron_rpc::methods;
 
+use crate::motion::{self, HoverFade as _};
 use crate::popover;
 use crate::settings::widgets;
 use crate::state::AppState;
@@ -93,7 +94,7 @@ impl popover::ScrollRailHost for ArchivedPage {
 }
 
 impl Render for ArchivedPage {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::toast::take_error(&mut self.error, cx);
         let theme = Theme::of(cx).for_settings_surface();
         let now = chrono::Utc::now();
@@ -158,7 +159,12 @@ impl Render for ArchivedPage {
                     .rounded(px(8.0))
                     .px(px(12.0))
                     .py(px(8.0))
-                    .hover(|s| s.bg(crate::theme::ink(0.03)))
+                    .hover_bg(
+                        ("archived-row-wash", ix),
+                        window,
+                        gpui::transparent_black(),
+                        crate::theme::ink(0.03),
+                    )
                     .child(
                         div()
                             .flex_none()
@@ -244,11 +250,17 @@ impl Render for ArchivedPage {
                             .border_1()
                             .border_color(theme.border)
                             .text_size(crate::typography::ui_rems(12.0))
-                            .text_color(theme.text_muted)
                             .opacity(0.8)
                             .when(is_busy, |el| el.opacity(0.4))
                             .cursor_pointer()
-                            .hover(|s| s.bg(theme.surface_raised).text_color(theme.text))
+                            .hover_fade(("unarchive-wash", ix), window, |el, t| {
+                                el.bg(motion::mix(
+                                    gpui::transparent_black(),
+                                    theme.surface_raised,
+                                    t,
+                                ))
+                                .text_color(motion::mix(theme.text_muted, theme.text, t))
+                            })
                             .tab_index(0)
                             .role(gpui::Role::Button)
                             .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
@@ -319,19 +331,23 @@ impl Render for ArchivedPage {
                 .items_center()
                 .justify_between()
                 .child(
-                    widgets::ghost_action(&theme)
-                        .id("archived-previous")
-                        .role(gpui::Role::Button)
-                        .aria_label("Previous archived sessions")
-                        .tab_index(0)
-                        .opacity(if page > 0 { 1.0 } else { 0.4 })
-                        .focus_visible(|s| s.border_2().border_color(theme.accent))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.page = this.page.saturating_sub(1);
-                            this.scroll.reset();
-                            cx.notify();
-                        }))
-                        .child("Previous"),
+                    widgets::action(
+                        &theme,
+                        widgets::ActionTone::Quiet,
+                        "archived-previous",
+                        window,
+                    )
+                    .role(gpui::Role::Button)
+                    .aria_label("Previous archived sessions")
+                    .tab_index(0)
+                    .opacity(if page > 0 { 1.0 } else { 0.4 })
+                    .focus_visible(|s| s.border_2().border_color(theme.accent))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.page = this.page.saturating_sub(1);
+                        this.scroll.reset();
+                        cx.notify();
+                    }))
+                    .child("Previous"),
                 )
                 .child(format!(
                     "{}–{} of {}",
@@ -340,8 +356,7 @@ impl Render for ArchivedPage {
                     count
                 ))
                 .child(
-                    widgets::ghost_action(&theme)
-                        .id("archived-next")
+                    widgets::action(&theme, widgets::ActionTone::Quiet, "archived-next", window)
                         .role(gpui::Role::Button)
                         .aria_label("Next archived sessions")
                         .tab_index(0)

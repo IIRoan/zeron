@@ -17,8 +17,8 @@
 use std::borrow::Cow;
 
 use gpui::{
-    AssetSource, Div, Hsla, ParentElement as _, Result, SharedString, Styled as _, Svg, div, px,
-    svg,
+    App, AssetSource, Div, ElementId, Hsla, ParentElement as _, Result, SharedString, Styled as _,
+    Svg, Transformation, Window, div, percentage, px, svg,
 };
 
 macro_rules! icon_assets {
@@ -280,6 +280,25 @@ pub fn claude_brand() -> Hsla {
 /// does not provide the paint input. Always set `.text_color(..)` on the icon.
 pub fn icon(path: &'static str) -> Svg {
     svg().path(path).flex_none()
+}
+
+/// A disclosure chevron: [`ALT_ARROW_RIGHT`] turning a quarter-turn down while
+/// `open`, rotating over [`crate::motion::CHEVRON`] when it flips. `key` must
+/// be unique within the rendering view.
+pub fn disclosure_chevron(
+    key: impl Into<ElementId>,
+    open: bool,
+    window: &mut Window,
+    cx: &App,
+) -> Svg {
+    let turn = crate::motion::transition(
+        window,
+        key,
+        if open { 1.0 } else { 0.0 },
+        crate::motion::CHEVRON,
+        crate::motion::reduced_motion(cx),
+    );
+    icon(ALT_ARROW_RIGHT).with_transformation(Transformation::rotate(percentage(0.25 * turn)))
 }
 
 /// The Zeron Icons sidebar glyph (icons.zeron.sh "Sidebar" / "Right

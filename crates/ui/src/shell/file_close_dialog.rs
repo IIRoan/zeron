@@ -221,7 +221,7 @@ impl Shell {
                             })),
                     )
                     .child(
-                        popover::btn_primary(&theme, "Save")
+                        popover::btn_primary(&theme, "Save", "file-close-save")
                             .id("file-close-save")
                             .debug_selector(|| "file-close-save".into())
                             .role(gpui::Role::Button)
@@ -235,6 +235,6 @@ impl Shell {
                     ),
             )
             .into_any_element();
-        Some(popover::modal("file-close-dialog", viewport, card))
+        Some(popover::modal("file-close-dialog", viewport, card, None))
     }
 }

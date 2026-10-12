@@ -14,6 +14,7 @@ use zeron_proto::ListWorkspaceDirectoryRequest;
 
 use crate::{
     composer::{ComposerInput, ComposerInputEvent},
+    motion::HoverFade as _,
     state::AppState,
 };
 
@@ -81,7 +82,12 @@ pub(super) fn toolbar_button(id: &'static str, label: &'static str) -> gpui::Sta
         .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
             window.prevent_default()
         })
-        .hover(|style| style.bg(crate::theme::wash(0.14)))
+        .bg(crate::motion::hover_blend(
+            id,
+            gpui::transparent_black(),
+            crate::theme::wash(0.14),
+        ))
+        .on_hover(crate::motion::hover_listener(id))
         .tooltip(move |_, cx| {
             cx.new(|_| preview::FileEditorTooltip { text: label.into() })
                 .into()
@@ -279,7 +285,7 @@ pub struct FilesSurface {
     mutation_hold: Option<String>,
     tree_drag: drag::TreeDrag,
     tree_rename: Option<rename::TreeRename>,
-    tree_delete: Option<rename::TreeDelete>,
+    tree_delete: crate::popover::Popup<rename::TreeDelete>,
     state: Entity<AppState>,
     chat_id: String,
     review_comment_flush_source: u64,
@@ -293,6 +299,8 @@ pub struct FilesSurface {
     tree_list: ListState,
     tree_list_rows: Vec<model::VisibleTreeRow>,
     tree_list_generation: u64,
+    /// The directory that last expanded and when: its rows fade in.
+    tree_revealed: Option<(String, std::time::Instant)>,
     /// Floating rail state for the file tree (the menu-scrollbar treatment).
     tree_bar: crate::popover::MenuScrollbarState,
     tree_focus: FocusHandle,
@@ -326,6 +334,7 @@ impl Render for FilesSurface {
         } else {
             "explorer"
         });
+        crate::motion::keyed_fade_frames(window);
         if !cx.has_active_drag() || !self.is_current_target(cx) {
             self.clear_tree_drag(window, cx);
         }
@@ -338,19 +347,19 @@ impl Render for FilesSurface {
         // directly under the titlebar: the editor's breadcrumb toolbar, or the
         // explorer's search + visibility toolbar.
         let header = if is_editor {
-            self.render_editor_header(&theme, cx)
+            self.render_editor_header(&theme, window, cx)
         } else {
-            Some(self.render_explorer_header(&theme, cx))
+            Some(self.render_explorer_header(&theme, window, cx))
         };
         let body = if is_editor {
             self.render_preview(window, cx)
         } else {
-            self.render_explorer(&theme, cx).into_any_element()
+            self.render_explorer(&theme, window, cx).into_any_element()
         };
         let editor_context_menu = self.render_editor_context_menu(&theme, cx);
         // The explorer docks its Subagents / Chats sections under the tree;
         // an editor surface has no footer.
-        let sections = (!is_editor).then(|| self.render_sections(&theme, cx));
+        let sections = (!is_editor).then(|| self.render_sections(&theme, window, cx));
         div()
             .id(SharedString::from(format!(
                 "files-surface-{}",
@@ -386,6 +395,7 @@ impl FilesSurface {
     fn render_explorer(
         &mut self,
         theme: &crate::theme::Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let projectless_root = {
@@ -428,8 +438,12 @@ impl FilesSurface {
                         .rounded(px(7.0))
                         .border_1()
                         .border_color(theme.border)
-                        .bg(crate::theme::wash(0.04))
-                        .hover(|style| style.bg(crate::theme::wash(0.09)))
+                        .hover_bg(
+                            "files-retry-root-wash",
+                            window,
+                            crate::theme::wash(0.04),
+                            crate::theme::wash(0.09),
+                        )
                         .cursor_pointer()
                         .flex()
                         .items_center()
@@ -512,7 +526,12 @@ impl FilesSurface {
                                 .role(gpui::Role::Button)
                                 .aria_label("Refresh workspace files now")
                                 .text_color(theme.text_muted)
-                                .hover(|style| style.bg(crate::theme::wash(0.07)))
+                                .hover_bg(
+                                    "files-watch-refresh-wash",
+                                    window,
+                                    gpui::transparent_black(),
+                                    crate::theme::wash(0.07),
+                                )
                                 .child("Refresh now")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.refresh(cx);
@@ -670,7 +689,7 @@ impl FilesSurface {
             mutation_hold: None,
             tree_drag: drag::TreeDrag::default(),
             tree_rename: None,
-            tree_delete: None,
+            tree_delete: crate::popover::Popup::default(),
             state,
             chat_id,
             review_comment_flush_source: NEXT_REVIEW_COMMENT_FLUSH_SOURCE
@@ -685,6 +704,7 @@ impl FilesSurface {
             tree_list,
             tree_list_rows: Vec::new(),
             tree_list_generation: 0,
+            tree_revealed: None,
             tree_bar: crate::popover::MenuScrollbarState::default(),
             tree_focus: cx.focus_handle(),
             search,
@@ -1151,12 +1171,13 @@ impl FilesSurface {
     }
 
     fn apply_target(&mut self, next: Option<FilesRequestContext>, cx: &mut Context<Self>) {
-        if let Some(dialog) = self.tree_delete.take() {
+        if let Some(dialog) = self.tree_delete.as_open() {
             cx.emit(FilesEvent::HoldMutation {
-                origin: dialog.origin,
+                origin: dialog.origin.clone(),
                 path: None,
             });
         }
+        self.tree_delete = crate::popover::Popup::default();
         self.tree_rename = None;
         self.tree_drag = drag::TreeDrag::default();
         self.mutation_hold = None;
@@ -1236,6 +1257,7 @@ impl FilesSurface {
     fn render_explorer_header(
         &mut self,
         theme: &crate::theme::Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         use gpui::Focusable;
@@ -1256,7 +1278,12 @@ impl FilesSurface {
                     .debug_selector(|| "files-search".into())
                     .overflow_hidden()
                     .cursor_text()
-                    .hover(|style| style.bg(crate::theme::ink(0.055)))
+                    .hover_bg(
+                        "files-search-wash",
+                        window,
+                        crate::theme::ink(0.035),
+                        crate::theme::ink(0.055),
+                    )
                     // Clicking the field's padding focuses the input too.
                     .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
                         window.focus(&search_focus, cx);

@@ -69,7 +69,7 @@ pub struct ProjectActionsController {
     pub cache: HashMap<ProjectActionsKey, ProjectActionsStatus>,
     pub menu: popover::Popup<()>,
     pub menu_scroll: gpui::ScrollHandle,
-    pub editor: Option<ProjectActionEditor>,
+    pub editor: popover::Popup<ProjectActionEditor>,
     pub request_task: Option<Task<()>>,
     pub mutation_task: Option<Task<()>>,
 }
@@ -83,7 +83,7 @@ impl Default for ProjectActionsController {
             cache: HashMap::new(),
             menu: popover::Popup::default(),
             menu_scroll: gpui::ScrollHandle::new(),
-            editor: None,
+            editor: popover::Popup::default(),
             request_task: None,
             mutation_task: None,
         }
@@ -99,7 +99,7 @@ impl ProjectActionsController {
         self.generation = self.generation.wrapping_add(1);
         self.menu = popover::Popup::default();
         self.menu_scroll = gpui::ScrollHandle::new();
-        self.editor = None;
+        self.editor = popover::Popup::default();
         self.request_task = None;
         self.invalidate_mutation();
         true

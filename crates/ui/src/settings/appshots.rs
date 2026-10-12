@@ -35,7 +35,7 @@ fn row(
 impl ShortcutsPage {
     pub(super) fn render_appshots(
         &mut self,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let theme = Theme::of(cx).for_settings_surface();
@@ -119,9 +119,8 @@ impl ShortcutsPage {
                 &theme,
                 cx,
             ));
-        let action = |id: &'static str, label: &'static str| {
-            widgets::ghost_action(&theme)
-                .id(id)
+        let action = |id: &'static str, label: &'static str, window: &mut Window| {
+            widgets::action(&theme, widgets::ActionTone::Quiet, id, window)
                 .role(gpui::Role::Button)
                 .aria_label(label)
                 .tab_index(0)
@@ -142,20 +141,21 @@ impl ShortcutsPage {
             } else {
                 "Allow window capture"
             };
-            window_access = window_access.child(action("appshots-capture-access", label).on_click(
-                cx.listener(|this, _, _, cx| {
-                    if this.capture_access_prompted {
-                        if let Some(url) = crate::appshots::capture_settings_url() {
-                            cx.open_url(url);
+            window_access =
+                window_access.child(action("appshots-capture-access", label, window).on_click(
+                    cx.listener(|this, _, _, cx| {
+                        if this.capture_access_prompted {
+                            if let Some(url) = crate::appshots::capture_settings_url() {
+                                cx.open_url(url);
+                            }
+                        } else {
+                            this.capture_access_prompted = true;
+                            crate::appshots::request_capture_access();
                         }
-                    } else {
-                        this.capture_access_prompted = true;
-                        crate::appshots::request_capture_access();
-                    }
-                    this.appshot_capabilities = crate::appshots::capabilities();
-                    cx.notify();
-                }),
-            ));
+                        this.appshot_capabilities = crate::appshots::capabilities();
+                        cx.notify();
+                    }),
+                ));
         }
         let mut text_access = div()
             .flex()
@@ -174,20 +174,21 @@ impl ShortcutsPage {
             } else {
                 "Enable text capture"
             };
-            text_access = text_access.child(action("appshots-semantic-access", label).on_click(
-                cx.listener(|this, _, _, cx| {
-                    if this.semantic_access_prompted {
-                        if let Some(url) = crate::appshots::semantic_settings_url() {
-                            cx.open_url(url);
+            text_access =
+                text_access.child(action("appshots-semantic-access", label, window).on_click(
+                    cx.listener(|this, _, _, cx| {
+                        if this.semantic_access_prompted {
+                            if let Some(url) = crate::appshots::semantic_settings_url() {
+                                cx.open_url(url);
+                            }
+                        } else {
+                            this.semantic_access_prompted = true;
+                            crate::appshots::request_semantic_access();
                         }
-                    } else {
-                        this.semantic_access_prompted = true;
-                        crate::appshots::request_semantic_access();
-                    }
-                    this.appshot_capabilities = crate::appshots::capabilities();
-                    cx.notify();
-                }),
-            ));
+                        this.appshot_capabilities = crate::appshots::capabilities();
+                        cx.notify();
+                    }),
+                ));
         }
         let card = widgets::section_card(&theme)
             .child(row(
@@ -241,7 +242,7 @@ impl ShortcutsPage {
         } else {
             self.conflict_notice.clone().unwrap_or_default()
         };
-        let refresh = action("appshots-refresh-permissions", "Check again")
+        let refresh = action("appshots-refresh-permissions", "Check again", window)
             .aria_label("Check permissions again")
             .on_click(cx.listener(|this, _, _, cx| {
                 this.appshot_capabilities = crate::appshots::capabilities();

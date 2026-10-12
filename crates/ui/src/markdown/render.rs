@@ -379,9 +379,9 @@ impl Render for CodeScrollbarDragGhost {
 struct CodeBlockTooltip(SharedString);
 
 impl Render for CodeBlockTooltip {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx);
-        div()
+        let card = div()
             .px(px(8.0))
             .py(px(6.0))
             .rounded(px(6.0))
@@ -392,7 +392,8 @@ impl Render for CodeBlockTooltip {
             .max_w(px(360.0))
             .text_size(px(11.0))
             .text_color(theme.text)
-            .child(self.0.clone())
+            .child(self.0.clone());
+        crate::popover::tooltip_surface(card, None, window, cx)
     }
 }
 

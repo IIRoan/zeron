@@ -49,7 +49,7 @@ fn path_within(path: &Path, root: &Path, local: bool) -> bool {
 impl Shell {
     fn worktree_removal_blocker(&self, path: &str, cx: &App) -> Option<String> {
         let state = self.state.read(cx);
-        let device = &self.worktree_settings.editor.as_ref()?.project.device;
+        let device = &self.worktree_settings.editor.as_open()?.project.device;
         let local = state.local_device_id.as_ref() == Some(device);
         let root = if local {
             canonical_path(Path::new(path))
@@ -101,7 +101,7 @@ impl Shell {
     }
 
     pub(super) fn begin_worktree_removal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(editor) = self.worktree_settings.editor.as_ref().filter(|e| !e.busy) else {
+        let Some(editor) = self.worktree_settings.editor.as_open().filter(|e| !e.busy) else {
             return;
         };
         let Some(path) = editor
@@ -119,7 +119,7 @@ impl Shell {
             return;
         }
         if let Some(error) = self.worktree_removal_blocker(&path, cx) {
-            if let Some(editor) = self.worktree_settings.editor.as_mut() {
+            if let Some(editor) = self.worktree_settings.editor.open_mut() {
                 editor.error = Some(error);
             }
             cx.notify();
@@ -129,7 +129,7 @@ impl Shell {
         let buttons = std::array::from_fn(|_| cx.focus_handle().tab_stop(true));
         let previous_focus = window.focused(cx);
         window.focus(&buttons[1], cx);
-        self.worktree_settings.removal = Some(Removal {
+        self.worktree_settings.removal.open(Removal {
             name: Path::new(&path)
                 .file_name()
                 .unwrap_or_default()
@@ -151,18 +151,19 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(removal) = self.worktree_settings.removal.take() else {
+        let Some(removal) = self.worktree_settings.removal.as_open() else {
             return false;
         };
-        if let Some(focus) = removal.previous_focus {
+        let focus = removal.previous_focus.clone();
+        popover::close_popup(self, cx, |this| &mut this.worktree_settings.removal);
+        if let Some(focus) = focus {
             window.focus(&focus, cx);
         }
-        cx.notify();
         true
     }
 
     fn confirm_worktree_removal(&mut self, cx: &mut Context<Self>) {
-        let Some(removal) = self.worktree_settings.removal.as_ref().filter(|r| !r.busy) else {
+        let Some(removal) = self.worktree_settings.removal.as_open().filter(|r| !r.busy) else {
             return;
         };
         let path = removal.path.clone();
@@ -173,8 +174,8 @@ impl Shell {
         });
         let engine = self.state.read(cx).engine().cloned();
         let (Some(removal), Some(editor)) = (
-            self.worktree_settings.removal.as_mut(),
-            self.worktree_settings.editor.as_mut(),
+            self.worktree_settings.removal.open_mut(),
+            self.worktree_settings.editor.open_mut(),
         ) else {
             return;
         };
@@ -232,20 +233,20 @@ impl Shell {
                 if epoch != shell.worktree_settings.epoch {
                     return;
                 }
-                let Some(editor) = shell.worktree_settings.editor.as_mut() else {
+                let Some(editor) = shell.worktree_settings.editor.open_mut() else {
                     return;
                 };
                 editor.busy = false;
                 match result {
                     Ok(_) => {
-                        shell.worktree_settings.removal = None;
+                        popover::close_popup(shell, cx, |this| &mut this.worktree_settings.removal);
                         shell.select_worktree_settings(None, cx);
-                        if let Some(editor) = shell.worktree_settings.editor.as_mut() {
+                        if let Some(editor) = shell.worktree_settings.editor.open_mut() {
                             editor.drafts.remove(&Some(path));
                         }
                     }
                     Err(error) => {
-                        if let Some(removal) = shell.worktree_settings.removal.as_mut() {
+                        if let Some(removal) = shell.worktree_settings.removal.open_mut() {
                             removal.busy = false;
                             removal.error = Some(error.to_string());
                         } else {
@@ -267,7 +268,7 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(removal) = self.worktree_settings.removal.as_ref() else {
+        let Some(removal) = self.worktree_settings.removal.as_open() else {
             return;
         };
         let active = removal
@@ -291,7 +292,7 @@ impl Shell {
             }
             "enter" | "space" => match active {
                 0 if !removal.busy => {
-                    if let Some(removal) = self.worktree_settings.removal.as_mut() {
+                    if let Some(removal) = self.worktree_settings.removal.open_mut() {
                         removal.discard = !removal.discard;
                     }
                     cx.notify();
@@ -313,11 +314,12 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let removal = self.worktree_settings.removal.as_mut()?;
-        if std::mem::take(&mut removal.focus_pending) {
+        if let Some(removal) = self.worktree_settings.removal.open_mut()
+            && std::mem::take(&mut removal.focus_pending)
+        {
             window.focus(&removal.buttons[1], cx);
         }
-        let removal = self.worktree_settings.removal.as_ref()?;
+        let removal = self.worktree_settings.removal.get()?;
         let theme = Theme::of(cx).for_popup();
         let busy = removal.busy;
         let card = popover::dialog_card(&theme)
@@ -333,7 +335,7 @@ impl Shell {
                 .flex().items_center().gap(px(10.0)).mt(px(16.0)).cursor_pointer()
                 .when(busy, |b| b.opacity(0.5).cursor_default())
                 .when(!busy, |b| b.on_click(cx.listener(|this, _, _, cx| {
-                    if let Some(removal) = this.worktree_settings.removal.as_mut() {
+                    if let Some(removal) = this.worktree_settings.removal.open_mut() {
                         removal.discard = !removal.discard;
                     }
                     cx.notify();
@@ -348,7 +350,7 @@ impl Shell {
                     .id("cancel-worktree-removal").debug_selector(|| "cancel-worktree-removal".into())
                     .track_focus(&removal.buttons[1]).role(gpui::Role::Button)
                     .on_click(cx.listener(|this, _, window, cx| { this.dismiss_worktree_removal(window, cx); })))
-                .child(popover::btn_danger(&theme, if busy { "Removing…" } else { "Remove worktree" })
+                .child(popover::btn_danger(&theme, if busy { "Removing…" } else { "Remove worktree" }, "confirm-worktree-removal")
                     .id("confirm-worktree-removal").debug_selector(|| "confirm-worktree-removal".into())
                     .track_focus(&removal.buttons[2]).role(gpui::Role::Button)
                     .when(busy, |b| b.opacity(0.5).cursor_default())
@@ -357,6 +359,7 @@ impl Shell {
             "remove-worktree-dialog",
             viewport,
             card.into_any_element(),
+            self.worktree_settings.removal.closing_since(),
         ))
     }
 }

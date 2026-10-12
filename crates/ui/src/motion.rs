@@ -14,6 +14,10 @@
 //! Custom easing is a closure over gpui's `Fn(f32) -> f32` easing shape; CSS
 //! `cubic-bezier()` is evaluated exactly by [`CubicBezier`].
 //!
+//! State changes (toggles, selections, hover washes, page swaps) ride a
+//! [`Tween`]: [`transition`], [`entrance`] and [`HoverFade`] keep one in
+//! element state so the rendering view drives its own frames.
+//!
 //! Reduced motion: gpui's `App::reduce_motion` flag is honored *automatically* by
 //! every `with_animation` element — oneshot animations snap to their end state,
 //! repeating ones to their start state, and no frames are scheduled. The
@@ -30,13 +34,14 @@
 //! transformations), so `menu-in`/`dialog-in` approximate their scale component
 //! with fade + translate; see the module report in ARCHITECTURE §4 follow-ups.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
     Animation, AnimationElement, App, ElementId, EntityId, Global, Hsla, IntoElement, Rgba,
-    SharedString, Styled, Window, px,
+    SharedString, StatefulInteractiveElement, Styled, Window, px,
 };
 use serde::{Deserialize, Serialize};
 
@@ -454,8 +459,8 @@ pub const COLLAPSE: MotionSpec = MotionSpec::new(180, EASE_OUT);
 /// crossfade is staged around it. Slightly longer than a utility transition,
 /// but still short enough to acknowledge a send immediately.
 pub const NEW_THREAD_TRANSITION: MotionSpec = MotionSpec::new(420, EASE_RESORT);
-/// Diff-pane chevron rotate: 200ms (§1.11; approximated as a crossfade — gpui
-/// divs have no rotation transform at the pinned rev, same caveat as scale).
+/// Disclosure chevron rotate: 200ms (§1.11). Icons are SVGs, which rotate
+/// natively — see [`crate::icons::disclosure_chevron`].
 pub const CHEVRON: MotionSpec = MotionSpec::new(200, EASE);
 /// Rail-tick / scroll-to-row glide: 500ms ease-in-out over the whole distance
 /// (Electron parity — the original rail rode the browser's native smooth
@@ -573,9 +578,12 @@ pub fn fade_in<E>(id: impl Into<ElementId>, element: E) -> AnimationElement<E>
 where
     E: Styled + IntoElement + 'static,
 {
-    element.with_animation(id, FADE_IN.animation(), |el, t| {
-        el.relative().opacity(t).top(px(4.0 * (1.0 - t)))
-    })
+    element.with_animation(id, FADE_IN.animation(), rise)
+}
+
+/// The [`fade_in`] pose at progress `t`, for entrances driven by [`entrance`].
+pub fn rise<E: Styled>(element: E, t: f32) -> E {
+    element.relative().opacity(t).top(px(4.0 * (1.0 - t)))
 }
 
 /// New-thread composition entrance: opacity 0→1 while settling 10px down into
@@ -664,6 +672,17 @@ where
 {
     element.with_animation(id, DIALOG_IN.animation(), |el, t| {
         el.relative().opacity(t).top(px(2.0 * (1.0 - t)))
+    })
+}
+
+/// Dialog exit: the reverse of [`dialog_in`] at caller-computed progress `t`,
+/// with the animation wrapper only pumping frames (see [`menu_out`]).
+pub fn dialog_out<E>(id: impl Into<ElementId>, t: f32, element: E) -> AnimationElement<E>
+where
+    E: Styled + IntoElement + 'static,
+{
+    element.with_animation(id, MENU_OUT.animation(), move |el, _| {
+        el.relative().opacity(1.0 - t).top(px(2.0 * t))
     })
 }
 
@@ -789,58 +808,221 @@ impl DisclosureMotion {
     }
 }
 
-/// Interruptible slide of a selection indicator between segment slots.
-/// `position` is measured in segments (`1.5` sits halfway between the second
-/// and third), so a retarget mid-flight continues from the drawn position
-/// instead of jumping. Pure core — callers pass `now`.
+/// Interruptible `from → to` tween over a catalog spec. A retarget mid-flight
+/// continues from the drawn value instead of jumping (a selection indicator
+/// reversing between segment slots, a hover wash flipping back). Pure core —
+/// callers pass `now`.
 #[derive(Debug, Clone, Copy)]
-pub struct IndicatorSlide {
+pub struct Tween {
     from: f32,
     to: f32,
     started: Instant,
+    spec: MotionSpec,
 }
 
-impl IndicatorSlide {
-    pub fn at(position: f32, now: Instant) -> Self {
+impl Tween {
+    /// A tween resting at `value`.
+    pub fn at(value: f32, spec: MotionSpec, now: Instant) -> Self {
         Self {
-            from: position,
-            to: position,
+            from: value,
+            to: value,
             started: now,
+            spec,
         }
     }
 
-    fn duration() -> Duration {
-        INDICATOR_SLIDE.total().mul_f32(speed_scale())
+    fn duration(&self) -> Duration {
+        self.spec.total().mul_f32(speed_scale())
     }
 
     fn progress(&self, now: Instant) -> f32 {
-        let duration = Self::duration();
+        let duration = self.duration();
         if duration.is_zero() {
             return 1.0;
         }
         let raw =
             now.saturating_duration_since(self.started).as_secs_f32() / duration.as_secs_f32();
-        INDICATOR_SLIDE.progress(raw)
+        self.spec.progress(raw)
     }
 
     pub fn value_at(&self, now: Instant) -> f32 {
         lerp(self.from, self.to, self.progress(now))
     }
 
-    /// Aim at a new slot. Reduced motion snaps.
+    /// Aim at `to`. Re-aiming at the current target keeps the running clock;
+    /// reduced motion snaps.
     pub fn retarget(&mut self, to: f32, reduced: bool, now: Instant) {
-        let from = if reduced { to } else { self.value_at(now) };
-        *self = Self {
-            from,
-            to,
-            started: now,
-        };
+        if reduced {
+            *self = Self::at(to, self.spec, now);
+        } else if to != self.to {
+            *self = Self {
+                from: self.value_at(now),
+                to,
+                started: now,
+                spec: self.spec,
+            };
+        }
     }
 
     pub fn animating_at(&self, now: Instant) -> bool {
-        self.from != self.to && now.saturating_duration_since(self.started) < Self::duration()
+        self.from != self.to && now.saturating_duration_since(self.started) < self.duration()
     }
 }
+
+// ---------------------------------------------------------------------------
+// Element-state motion (manual clocks owned by the rendering view)
+// ---------------------------------------------------------------------------
+//
+// These keep a [`Tween`] in gpui element state under a caller key that is
+// unique within the view being rendered. gpui retains that state while the
+// view keeps painting it, including frames where a cached view reuses its
+// previous scene, and drops it when the element unmounts. While a value is in
+// flight the rendering view requests its own next frame, so motion inside a
+// cached view (the file explorer, source control) never waits for the shell to
+// repaint. Unlike `with_animation`, the caller receives the
+// value, and the element tree's shape never depends on whether motion runs.
+
+fn element_tween<S: 'static>(
+    window: &mut Window,
+    key: ElementId,
+    update: impl FnOnce(Option<S>, Instant) -> S,
+    tween: impl Fn(&S) -> Tween,
+) -> f32 {
+    let now = Instant::now();
+    let (value, animating) = window.with_global_id(key, |id, window| {
+        window.with_element_state(id, |state: Option<S>, _| {
+            let state = update(state, now);
+            let tween = tween(&state);
+            ((tween.value_at(now), tween.animating_at(now)), state)
+        })
+    });
+    if animating {
+        window.request_animation_frame();
+    }
+    value
+}
+
+/// A tween running from 0 to 1 over `spec`, starting `now`.
+fn from_zero(spec: MotionSpec, reduced: bool, now: Instant) -> Tween {
+    let mut tween = Tween::at(0.0, spec, now);
+    tween.retarget(1.0, reduced, now);
+    tween
+}
+
+/// Ease toward `target`. The first read rests at `target` (mounting never
+/// animates); a changed target eases from the drawn value over `spec`.
+pub fn transition(
+    window: &mut Window,
+    key: impl Into<ElementId>,
+    target: f32,
+    spec: MotionSpec,
+    reduced: bool,
+) -> f32 {
+    element_tween(
+        window,
+        key.into(),
+        |tween: Option<Tween>, now| {
+            let mut tween = tween.unwrap_or_else(|| Tween::at(target, spec, now));
+            tween.retarget(target, reduced, now);
+            tween
+        },
+        |tween| *tween,
+    )
+}
+
+/// Entrance progress (0 → 1 over `spec`) that plays once when `key` first
+/// renders and holds at 1 while it stays mounted.
+pub fn entrance(
+    window: &mut Window,
+    key: impl Into<ElementId>,
+    spec: MotionSpec,
+    reduced: bool,
+) -> f32 {
+    element_tween(
+        window,
+        key.into(),
+        |tween: Option<Tween>, now| tween.unwrap_or_else(|| from_zero(spec, reduced, now)),
+        |tween| *tween,
+    )
+}
+
+/// Entrance progress for content swapped in place under one wrapper (a page
+/// outlet): it holds at 1 when first mounted — the surrounding page brings its
+/// own entrance — and replays over `spec` whenever `shown` changes.
+pub fn swap_entrance(
+    window: &mut Window,
+    key: impl Into<ElementId>,
+    shown: u64,
+    spec: MotionSpec,
+    reduced: bool,
+) -> f32 {
+    element_tween(
+        window,
+        key.into(),
+        |state: Option<(u64, Tween)>, now| match state {
+            Some((last, tween)) if last == shown => (last, tween),
+            Some(_) => (shown, from_zero(spec, reduced, now)),
+            None => (shown, Tween::at(1.0, spec, now)),
+        },
+        |(_, tween)| *tween,
+    )
+}
+
+/// The faded counterpart of gpui's `.hover(...)` — CSS `transition-colors`
+/// parity for elements built inside a view's render. `style` receives the
+/// element and its hover progress (0 at rest, 1 hovered); blend colors with
+/// [`mix`]. `key` must be unique within the rendering view. Builders with no
+/// `Window` keep using [`hover_blend`]/[`hover_listener`].
+pub trait HoverFade: StatefulInteractiveElement {
+    fn hover_fade(
+        self,
+        key: impl Into<ElementId>,
+        window: &mut Window,
+        style: impl FnOnce(Self, f32) -> Self,
+    ) -> Self {
+        let now = Instant::now();
+        let owner = window.current_view();
+        let fade = window.with_global_id(key.into(), |id, window| {
+            window.with_element_state(id, |fade: Option<Rc<Cell<Tween>>>, _| {
+                let fade =
+                    fade.unwrap_or_else(|| Rc::new(Cell::new(Tween::at(0.0, HOVER_FADE, now))));
+                (fade.clone(), fade)
+            })
+        });
+        let tween = fade.get();
+        if tween.animating_at(now) {
+            window.request_animation_frame();
+        }
+        let mut element = style(self, tween.value_at(now));
+        element.interactivity().on_hover(move |hovered, _, cx| {
+            let mut tween = fade.get();
+            let target = if *hovered { 1.0 } else { 0.0 };
+            tween.retarget(target, reduced_motion(cx), Instant::now());
+            fade.set(tween);
+            // Only the owning view repaints; its render keeps frames coming
+            // until the wash lands.
+            cx.notify(owner);
+        });
+        element
+    }
+
+    /// `.hover(|s| s.bg(hover))`, fading from `rest` (transparent when the
+    /// element has no resting fill).
+    fn hover_bg(
+        self,
+        key: impl Into<ElementId>,
+        window: &mut Window,
+        rest: Hsla,
+        hover: Hsla,
+    ) -> Self
+    where
+        Self: Styled,
+    {
+        self.hover_fade(key, window, |element, t| element.bg(mix(rest, hover, t)))
+    }
+}
+
+impl<E: StatefulInteractiveElement> HoverFade for E {}
 
 /// Per-key hover progress store. Pure core (explicit `now`) — unit-testable;
 /// the thread-local wrappers below feed it wall time.
@@ -916,6 +1098,13 @@ impl HoverFades {
         });
         active
     }
+
+    fn in_flight_at(&self, now: Instant) -> bool {
+        let duration = Self::duration();
+        self.entries
+            .values()
+            .any(|entry| !entry.settled(now, duration))
+    }
 }
 
 thread_local! {
@@ -956,6 +1145,15 @@ pub fn hover_listener(
 /// while any hover fade is mid-flight and frames must keep coming.
 pub fn hover_fades_active() -> bool {
     HOVER_FADES.with(|fades| fades.borrow_mut().tick_at(Instant::now()))
+}
+
+/// The shell tail's frames skip cached views. A cached view whose menus or
+/// dialog buttons use keyed fades calls this from render so it keeps painting
+/// while one is in flight.
+pub fn keyed_fade_frames(window: &Window) {
+    if HOVER_FADES.with(|fades| fades.borrow().in_flight_at(Instant::now())) {
+        window.request_animation_frame();
+    }
 }
 
 /// Blend two colors by `t` the way the browser transitions them: component
@@ -1352,9 +1550,9 @@ fn refresh_system(_cx: &mut App) {}
 mod tests {
 
     #[test]
-    fn indicator_slide_is_interruptible_and_snaps_when_reduced() {
+    fn tween_is_interruptible_and_snaps_when_reduced() {
         let t0 = Instant::now();
-        let mut slide = IndicatorSlide::at(0.0, t0);
+        let mut slide = Tween::at(0.0, INDICATOR_SLIDE, t0);
         assert!(!slide.animating_at(t0));
         slide.retarget(2.0, false, t0);
         assert_eq!(slide.value_at(t0), 0.0);
@@ -1362,6 +1560,10 @@ mod tests {
         let mid = t0 + Duration::from_millis(80);
         let drawn = slide.value_at(mid);
         assert!(drawn > 0.0 && drawn < 2.0);
+        // Re-aiming at the same slot keeps the running clock.
+        slide.retarget(2.0, false, mid);
+        assert_eq!(slide.value_at(mid), drawn);
+        assert_eq!(slide.value_at(t0 + INDICATOR_SLIDE.total()), 2.0);
         // Reversing continues from where the thumb is drawn.
         slide.retarget(0.0, false, mid);
         assert_eq!(slide.value_at(mid), drawn);
@@ -1372,6 +1574,173 @@ mod tests {
         assert_eq!(slide.value_at(end), 1.0);
         assert!(!slide.animating_at(end));
     }
+
+    /// Draw `window` once, then deliver the frame callbacks it requested.
+    /// Returns how many callbacks ran (0 once all motion has landed).
+    fn draw_frame(window: gpui::AnyWindowHandle, cx: &mut gpui::TestAppContext) -> usize {
+        use gpui::AppContext as _;
+        cx.update_window(window, |_, window, cx| {
+            window.draw(cx).clear();
+            window.simulate_next_frame(cx)
+        })
+        .unwrap()
+    }
+
+    #[gpui::test]
+    fn hover_fade_paints_its_cached_view_until_the_wash_lands(cx: &mut gpui::TestAppContext) {
+        use gpui::{AppContext as _, Context, Entity, Render, div, prelude::*};
+
+        struct Row {
+            hover: Rc<Cell<f32>>,
+            renders: Rc<Cell<usize>>,
+        }
+        impl Render for Row {
+            fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.renders.set(self.renders.get() + 1);
+                let hover = self.hover.clone();
+                div()
+                    .id("row")
+                    .size(px(40.0))
+                    .hover_fade("row-wash", window, move |row, t| {
+                        hover.set(t);
+                        row.opacity(t)
+                    })
+            }
+        }
+        // The host never repaints the row: only the fade itself can.
+        struct Host(Entity<Row>);
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .child(self.0.clone().cached(gpui::StyleRefinement::default()))
+            }
+        }
+
+        let (hover, renders) = (Rc::new(Cell::new(0.0)), Rc::new(Cell::new(0)));
+        let window = cx
+            .add_window(|_, cx| {
+                Host(cx.new(|_| Row {
+                    hover: hover.clone(),
+                    renders: renders.clone(),
+                }))
+            })
+            .into();
+        assert_eq!(draw_frame(window, cx), 0, "a resting row requests nothing");
+
+        let mut visual = gpui::VisualTestContext::from_window(window, cx);
+        visual.simulate_mouse_move(
+            gpui::point(px(10.0), px(10.0)),
+            None,
+            gpui::Modifiers::default(),
+        );
+        let painted = renders.get();
+        assert!(draw_frame(window, cx) > 0, "hovering starts the fade");
+        assert!(renders.get() > painted, "the hover repaints the cached row");
+        let painted = renders.get();
+        draw_frame(window, cx);
+        assert!(
+            renders.get() > painted,
+            "the fade keeps its own view painting"
+        );
+
+        std::thread::sleep(HOVER_FADE.total() + Duration::from_millis(20));
+        draw_frame(window, cx);
+        assert_eq!(hover.get(), 1.0);
+        assert_eq!(
+            draw_frame(window, cx),
+            0,
+            "a landed fade stops requesting frames"
+        );
+    }
+
+    #[gpui::test]
+    fn entrance_plays_once_per_key(cx: &mut gpui::TestAppContext) {
+        use gpui::{Context, Render, div};
+
+        struct Page {
+            key: &'static str,
+            seen: Rc<Cell<f32>>,
+        }
+        impl Render for Page {
+            fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let t = entrance(window, self.key, FADE_QUICK, false);
+                self.seen.set(t);
+                rise(div().size_full(), t)
+            }
+        }
+
+        let seen = Rc::new(Cell::new(1.0));
+        let handle = cx.add_window(|_, _| Page {
+            key: "settings",
+            seen: seen.clone(),
+        });
+        let window = handle.into();
+        assert!(draw_frame(window, cx) > 0, "a new page fades in");
+        assert!(seen.get() < 1.0);
+
+        std::thread::sleep(FADE_QUICK.total() + Duration::from_millis(20));
+        draw_frame(window, cx);
+        assert_eq!(seen.get(), 1.0);
+        handle.update(cx, |_, window, _| window.refresh()).unwrap();
+        assert_eq!(
+            draw_frame(window, cx),
+            0,
+            "a landed page stops requesting frames"
+        );
+        assert_eq!(seen.get(), 1.0, "a mounted page never replays");
+
+        handle
+            .update(cx, |page, _, cx| {
+                page.key = "chat";
+                cx.notify();
+            })
+            .unwrap();
+        assert!(draw_frame(window, cx) > 0, "a swapped page plays again");
+        assert!(seen.get() < 1.0);
+    }
+
+    #[gpui::test]
+    fn swap_entrance_waits_for_a_swap(cx: &mut gpui::TestAppContext) {
+        use gpui::{Context, Render, div};
+
+        struct Outlet {
+            shown: u64,
+            seen: Rc<Cell<f32>>,
+        }
+        impl Render for Outlet {
+            fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let t = swap_entrance(window, "outlet", self.shown, FADE_QUICK, false);
+                self.seen.set(t);
+                rise(div().size_full(), t)
+            }
+        }
+
+        let seen = Rc::new(Cell::new(0.0));
+        let handle = cx.add_window(|_, _| Outlet {
+            shown: 0,
+            seen: seen.clone(),
+        });
+        let window = handle.into();
+        assert_eq!(draw_frame(window, cx), 0, "first mount rests");
+        assert_eq!(seen.get(), 1.0);
+
+        handle
+            .update(cx, |outlet, _, cx| {
+                outlet.shown = 1;
+                cx.notify();
+            })
+            .unwrap();
+        assert!(draw_frame(window, cx) > 0, "a swap plays the entrance");
+        assert!(seen.get() < 1.0);
+
+        std::thread::sleep(FADE_QUICK.total() + Duration::from_millis(20));
+        draw_frame(window, cx);
+        assert_eq!(seen.get(), 1.0);
+        handle.update(cx, |_, window, _| window.refresh()).unwrap();
+        assert_eq!(draw_frame(window, cx), 0, "the same content never replays");
+    }
+
     #[test]
     fn reduced_activity_pulse_is_slow_uniform_and_gentle() {
         for phase in [0.0, 0.1, 0.25, 0.5, 0.75, 0.9] {

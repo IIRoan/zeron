@@ -156,6 +156,7 @@ impl Pickers {
         &mut self,
         ix: usize,
         row: &ModelRowData,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = Theme::of(cx).for_popup();
@@ -286,7 +287,12 @@ impl Pickers {
                     .justify_center()
                     // Quiet until the row is hovered or the model is starred.
                     .when(!favorite && !hovered, |el| el.opacity(0.0))
-                    .hover(|s| s.bg(crate::theme::ink(0.08)))
+                    .hover_bg(
+                        ("compact-model-star-hover", ix),
+                        window,
+                        gpui::transparent_black(),
+                        crate::theme::ink(0.08),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
                         this.toggle_model_favorite(harness, &model, cx);
@@ -410,7 +416,11 @@ impl Pickers {
     /// tabs. Each tab jumps the list to its group, and the group at the top
     /// of the scroll lights its tab. The strip fades at both edges over the
     /// tabs scrolled past them.
-    pub(super) fn compact_model_back_header(&mut self, cx: &mut Context<Self>) -> gpui::Div {
+    pub(super) fn compact_model_back_header(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
         let theme = Theme::of(cx).for_popup();
         let searching = !self.search.read(cx).text().trim().is_empty();
         let groups = if searching {
@@ -481,8 +491,18 @@ impl Pickers {
                         .cursor_pointer()
                         .when(viewed, |el| el.bg(crate::theme::ink(0.08)))
                         .when(!viewed, |el| {
-                            el.opacity(0.7)
-                                .hover(|s| s.bg(crate::theme::ink(0.05)).opacity(1.0))
+                            el.hover_fade(
+                                format!("compact-group-hover-{start}"),
+                                window,
+                                |el, t| {
+                                    el.bg(motion::mix(
+                                        gpui::transparent_black(),
+                                        crate::theme::ink(0.05),
+                                        t,
+                                    ))
+                                    .opacity(motion::lerp(0.7, 1.0, t))
+                                },
+                            )
                         })
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.compact_keyboard = false;
@@ -528,7 +548,12 @@ impl Pickers {
                     .items_center()
                     .justify_center()
                     .cursor_pointer()
-                    .hover(|s| s.bg(crate::theme::ink(0.05)))
+                    .hover_bg(
+                        "compact-model-back-hover",
+                        window,
+                        gpui::transparent_black(),
+                        crate::theme::ink(0.05),
+                    )
                     .on_click(cx.listener(|this, _, _, cx| this.show_compact_panel(cx)))
                     .child(
                         crate::icons::icon(crate::icons::ALT_ARROW_LEFT)
@@ -734,7 +759,7 @@ impl Pickers {
             window.request_animation_frame();
         }
         let content = match page {
-            CompactPage::Models => self.render_harness_model_popover(cx),
+            CompactPage::Models => self.render_harness_model_popover(window, cx),
             CompactPage::Panel => self.render_compact_model_panel(window, cx),
         };
         let now = std::time::Instant::now();
@@ -1471,7 +1496,7 @@ mod tests {
 
 struct PickerHint(SharedString);
 impl Render for PickerHint {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).for_popup();
         let card = popover::popover_card(&theme)
             .max_w(px(320.0))
@@ -1480,6 +1505,6 @@ impl Render for PickerHint {
             .line_height(px(17.0))
             .text_color(theme.text)
             .child(self.0.clone());
-        crate::frost::frosted(popover::CARD_RADIUS, crate::frost::MENU_BLUR, card)
+        popover::tooltip_surface(card, Some(popover::CARD_RADIUS), window, cx)
     }
 }

@@ -153,7 +153,12 @@ impl Shell {
                     theme.text_muted
                 })
                 .cursor_pointer()
-                .hover(|el| el.bg(theme.glass_hover()))
+                .bg(motion::hover_blend(
+                    id,
+                    gpui::transparent_black(),
+                    theme.glass_hover(),
+                ))
+                .on_hover(motion::hover_listener(id))
                 .tooltip(settings::widgets::text_tooltip(label))
                 .on_click(
                     cx.listener(move |this, _, window, cx| this.select_tool(tool, window, cx)),

@@ -376,7 +376,7 @@ impl PullRequestDetailPage {
             let prompt = prompt(kind, detail, &self.url, self.verification_platform);
             let id = kind.id();
             let summary = kind.summary();
-            widgets::action_button(theme, widgets::ActionTone::Filled)
+            widgets::action_button(theme, widgets::ActionTone::Filled, id)
                 .id(id)
                 .debug_selector(move || id.to_owned())
                 .role(gpui::Role::Button)
@@ -423,8 +423,12 @@ impl PullRequestDetailPage {
                     .gap(px(8.0))
                     .child(error.clone())
                     .children(device.map(|device| {
-                        widgets::action_button(theme, widgets::ActionTone::Filled)
-                            .id("pr-add-checkout")
+                        widgets::action_button(
+                            theme,
+                            widgets::ActionTone::Filled,
+                            "pr-add-checkout",
+                        )
+                        .id("pr-add-checkout")
                             .role(gpui::Role::Button)
                             .aria_label("Add project on this device")
                             .tab_index(0)

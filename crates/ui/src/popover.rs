@@ -22,7 +22,7 @@ use gpui::{
 };
 use std::time::{Duration, Instant};
 
-use crate::motion::{self, ZERON_PULSE};
+use crate::motion::{self, AnimationExt as _, ZERON_PULSE};
 use crate::theme::{Theme, hairline, ink};
 
 // ---------------------------------------------------------------------------
@@ -134,6 +134,12 @@ impl<T> Popup<T> {
         }
     }
 
+    /// [`Self::get`], mutably — for render-time bookkeeping (scroll reveals)
+    /// that must keep running through the exit animation.
+    pub fn get_mut(&mut self) -> Option<&mut T> {
+        self.inner.as_mut().map(|(value, _)| value)
+    }
+
     /// Enter the exit phase. Returns `true` when this call started it (the
     /// caller then schedules [`reap_popup`]); `false` if already closing or
     /// closed.
@@ -209,6 +215,20 @@ pub fn reap_popup<V: 'static, T: 'static>(
         .ok();
     })
     .detach();
+}
+
+/// Close the popup `popup` re-borrows from `view` through its exit animation:
+/// [`Popup::begin_close`], the [`reap_popup`] timer and a repaint. A popup
+/// that is already closing or closed is left alone.
+pub fn close_popup<V: 'static, T: 'static>(
+    view: &mut V,
+    cx: &mut gpui::Context<V>,
+    popup: impl Fn(&mut V) -> &mut Popup<T> + 'static,
+) {
+    if popup(view).begin_close() {
+        reap_popup(cx, popup);
+        cx.notify();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -338,6 +358,31 @@ pub fn popover_card(theme: &Theme) -> gpui::Div {
         .overflow_hidden()
         .text_size(crate::typography::ui_rems(13.0))
         .text_color(theme.text)
+}
+
+/// A tooltip or hover card's entrance: a quick fade, with the backdrop blur
+/// ramping alongside when the card is frosted (`frost` = its corner radius).
+/// gpui builds a fresh view each time a tooltip shows, so this plays on every
+/// appearance and holds while the pointer stays.
+pub fn tooltip_surface(
+    card: gpui::Div,
+    frost: Option<f32>,
+    window: &mut Window,
+    cx: &gpui::App,
+) -> AnyElement {
+    let t = motion::entrance(
+        window,
+        "tooltip-in",
+        motion::FADE_QUICK,
+        motion::reduced_motion(cx),
+    );
+    let card = card.opacity(t);
+    match frost {
+        Some(radius) => {
+            crate::frost::frosted(radius, crate::frost::MENU_BLUR * t, card).into_any_element()
+        }
+        None => card.into_any_element(),
+    }
 }
 
 /// [`popover_card`] without the shared inset — for popovers that manage their
@@ -847,17 +892,19 @@ pub(crate) fn scrim_alpha(alpha_dark: f32) -> gpui::Hsla {
     crate::theme::scrim(alpha_dark)
 }
 
-/// Full-window modal: dim scrim + centered card with the `dialog-in` entrance.
-/// The scrim swallows clicks; the caller wires its own dismiss/confirm.
-/// `viewport` is the window size (an `anchored` layer sizes to its children,
-/// so the scrim needs explicit dimensions). The frost radius matches
-/// [`dialog_card`]'s 16px rounding.
+/// Full-window modal: dim scrim + centered card. The scrim, the card's frost
+/// and the card itself enter together over `dialog-in`; `closing` (the
+/// [`Popup`] exit phase) plays them back out. The scrim swallows clicks; the
+/// caller wires its own dismiss/confirm. `viewport` is the window size (an
+/// `anchored` layer sizes to its children, so the scrim needs explicit
+/// dimensions). The frost radius matches [`dialog_card`]'s 16px rounding.
 pub fn modal(
     id: impl Into<ElementId>,
     viewport: gpui::Size<Pixels>,
     card: AnyElement,
+    closing: Option<Instant>,
 ) -> AnyElement {
-    modal_with(id, viewport, card, 16.0, 0.35)
+    modal_with(id.into(), viewport, card, 16.0, closing)
 }
 
 /// [`modal`] with custom rounding for glass palettes. Both use a light
@@ -868,34 +915,64 @@ pub fn modal_glass(
     viewport: gpui::Size<Pixels>,
     card: AnyElement,
     corner_radius: f32,
+    closing: Option<Instant>,
 ) -> AnyElement {
-    modal_with(id, viewport, card, corner_radius, 0.35)
+    modal_with(id.into(), viewport, card, corner_radius, closing)
 }
 
 fn modal_with(
-    id: impl Into<ElementId>,
+    id: ElementId,
     viewport: gpui::Size<Pixels>,
     card: AnyElement,
     corner_radius: f32,
-    scrim: f32,
+    closing: Option<Instant>,
 ) -> AnyElement {
-    let card =
-        crate::frost::frosted(corner_radius, crate::frost::MENU_BLUR, card).into_any_element();
+    let scrim = scrim_alpha(0.35);
+    let layer = div()
+        .occlude()
+        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+        .w(viewport.width)
+        .h(viewport.height)
+        .flex()
+        .items_center()
+        .justify_center();
+    let child_id = |name: &'static str| ElementId::NamedChild(id.clone().into(), name.into());
+    // The backdrop blur ignores element opacity, so it rides the same
+    // progress as the card instead of popping in or out at full strength.
+    let layer = match closing.map(exit_progress) {
+        None => {
+            let card = crate::frost::frosted(corner_radius, 0.0, card).with_animation(
+                child_id("frost"),
+                motion::DIALOG_IN.animation(),
+                |card, t| card.blur(crate::frost::MENU_BLUR * t),
+            );
+            layer
+                .child(motion::dialog_in(id.clone(), div().child(card)))
+                .with_animation(
+                    child_id("scrim"),
+                    motion::DIALOG_IN.animation(),
+                    move |layer, t| layer.bg(scrim.opacity(t)),
+                )
+                .into_any_element()
+        }
+        Some(t) => {
+            let card =
+                crate::frost::frosted(corner_radius, crate::frost::MENU_BLUR * (1.0 - t), card);
+            // The dying dialog's buttons must not take clicks.
+            let card = div()
+                .relative()
+                .child(card)
+                .child(div().absolute().inset_0().occlude());
+            layer
+                .bg(scrim.opacity(1.0 - t))
+                .child(motion::dialog_out(child_id("out"), t, card))
+                .into_any_element()
+        }
+    };
     gpui::deferred(
         gpui::anchored()
             .position(gpui::point(px(0.0), px(0.0)))
-            .child(
-                div()
-                    .occlude()
-                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                    .w(viewport.width)
-                    .h(viewport.height)
-                    .bg(scrim_alpha(scrim))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(motion::dialog_in(id, div().child(card))),
-            ),
+            .child(layer),
     )
     .priority(2)
     .into_any_element()
@@ -1344,34 +1421,39 @@ pub fn btn_ghost(theme: &Theme, label: &str, fade_key: impl Into<SharedString>) 
     btn
 }
 
-/// Primary button (`btnPrimary`): white fill, near-black text.
-pub fn btn_primary(theme: &Theme, label: &str) -> gpui::Div {
-    div()
-        .px(px(12.0))
-        .py(px(6.0))
-        .rounded(px(8.0))
-        .bg(theme.text)
-        .text_size(crate::typography::ui_rems(13.0))
-        .font_weight(gpui::FontWeight::MEDIUM)
-        .text_color(theme.on_solid)
-        .cursor_pointer()
-        .hover(|s| s.opacity(0.9))
-        .child(SharedString::from(label.to_string()))
+/// Primary button (`btnPrimary`): white fill, near-black text, dimming to 90%
+/// on hover over `transition-colors`. Caller adds id + click; `fade_key` as
+/// in [`menu_row`].
+pub fn btn_primary(theme: &Theme, label: &str, fade_key: impl Into<SharedString>) -> gpui::Div {
+    solid_button(theme.text, theme.on_solid, label, fade_key.into())
 }
 
-/// Destructive button (`btnDestructive`): the muted red fill.
-pub fn btn_danger(theme: &Theme, label: &str) -> gpui::Div {
-    div()
+/// Destructive button (`btnDestructive`): the muted red fill, otherwise as
+/// [`btn_primary`].
+pub fn btn_danger(theme: &Theme, label: &str, fade_key: impl Into<SharedString>) -> gpui::Div {
+    solid_button(theme.danger_strong, gpui::white(), label, fade_key.into())
+}
+
+fn solid_button(
+    fill: gpui::Hsla,
+    text: gpui::Hsla,
+    label: &str,
+    fade_key: SharedString,
+) -> gpui::Div {
+    let mut btn = div()
         .px(px(12.0))
         .py(px(6.0))
         .rounded(px(8.0))
-        .bg(theme.danger_strong)
+        .bg(fill)
         .text_size(crate::typography::ui_rems(13.0))
         .font_weight(gpui::FontWeight::MEDIUM)
-        .text_color(gpui::white())
+        .text_color(text)
         .cursor_pointer()
-        .hover(|s| s.opacity(0.9))
-        .child(SharedString::from(label.to_string()))
+        .opacity(1.0 - 0.1 * motion::hover_t(&fade_key))
+        .child(SharedString::from(label.to_string()));
+    btn.interactivity()
+        .on_hover(motion::hover_listener(fade_key));
+    btn
 }
 
 /// Pulsing skeleton rows shown while a list loads (zeron:

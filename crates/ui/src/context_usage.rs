@@ -1,11 +1,17 @@
 //! Context occupancy is read from the replicated chat snapshot, never local CLI state.
+use crate::motion::HoverFade as _;
 use crate::theme::Theme;
 use gpui::{IntoElement, PathBuilder, SharedString, canvas, div, point, prelude::*, px};
 use zeron_proto::ContextUsage;
 
 /// The context ring's trigger chip; the footer ([`crate::account_usage`])
 /// opens [`card`] from it on click.
-pub fn chip(usage: Option<ContextUsage>, open: bool, theme: &Theme) -> gpui::Stateful<gpui::Div> {
+pub fn chip(
+    usage: Option<ContextUsage>,
+    open: bool,
+    theme: &Theme,
+    window: &mut gpui::Window,
+) -> gpui::Stateful<gpui::Div> {
     let fraction = usage.and_then(ContextUsage::fraction);
     let color = match fraction {
         Some(f) if f >= 0.9 => theme.danger,
@@ -24,6 +30,7 @@ pub fn chip(usage: Option<ContextUsage>, open: bool, theme: &Theme) -> gpui::Sta
         label,
         open,
         theme,
+        window,
     )
 }
 
@@ -38,7 +45,14 @@ pub(crate) fn ring_chip(
     label: String,
     open: bool,
     theme: &Theme,
+    window: &mut gpui::Window,
 ) -> gpui::Stateful<gpui::Div> {
+    let wash = crate::theme::ink(0.05);
+    let rest = if open {
+        wash
+    } else {
+        gpui::transparent_black()
+    };
     div()
         .id(id)
         .flex_none()
@@ -51,8 +65,7 @@ pub(crate) fn ring_chip(
         .text_size(px(11.0))
         .text_color(text)
         .cursor_pointer()
-        .when(open, |s| s.bg(crate::theme::ink(0.05)))
-        .hover(|s| s.bg(crate::theme::ink(0.05)))
+        .hover_bg(id, window, rest, wash)
         .child(ring(fraction, arc, theme))
         .child(SharedString::from(label))
 }

@@ -2,8 +2,9 @@
 //! transcript converged on (zeron composer.tsx `Notice` / chat-view.tsx
 //! `ErrorChip`).
 
-use gpui::{AnyElement, Div, FontWeight, SharedString, div, prelude::*, px};
+use gpui::{AnyElement, Div, ElementId, FontWeight, SharedString, Window, div, prelude::*, px};
 
+use crate::motion::HoverFade as _;
 use crate::theme::Theme;
 
 /// The chip's header icon treatment, which also picks its metrics: the bare
@@ -35,6 +36,8 @@ pub fn notice_chip(
     label: &'static str,
     message: impl Into<SharedString>,
     icon: NoticeChipIcon,
+    copy_key: impl Into<ElementId>,
+    window: &mut Window,
 ) -> Div {
     let (accent, muted) = if warning {
         (theme.warning, theme.warning_muted)
@@ -110,7 +113,12 @@ pub fn notice_chip(
                     .items_center()
                     .justify_center()
                     .cursor_pointer()
-                    .hover(move |s| s.bg(accent.opacity(0.12)))
+                    .hover_bg(
+                        copy_key,
+                        window,
+                        gpui::transparent_black(),
+                        accent.opacity(0.12),
+                    )
                     // The composer chip dismisses on click; copying must
                     // not take the notice with it.
                     .on_click(move |_, _, cx| {

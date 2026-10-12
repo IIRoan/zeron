@@ -26,6 +26,7 @@ use crate::{
     comments::{self, ReviewComment},
     composer::{ComposerInput, ComposerInputEvent},
     icons::{self, icon},
+    motion::HoverFade as _,
     syntax_cache::{DocumentHighlightKey, SyntaxHighlightCache},
     theme::Theme,
 };
@@ -502,7 +503,7 @@ pub(super) struct FileEditorTooltip {
 }
 
 impl Render for FileEditorTooltip {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx);
         let card = div()
             .max_w(px(360.0))
@@ -516,7 +517,7 @@ impl Render for FileEditorTooltip {
             .text_size(px(10.5))
             .text_color(theme.text_muted)
             .child(self.text.clone());
-        crate::frost::frosted(6.0, crate::frost::MENU_BLUR, card)
+        crate::popover::tooltip_surface(card, Some(6.0), window, cx)
     }
 }
 
@@ -2364,10 +2365,11 @@ impl FilesSurface {
     pub(super) fn render_editor_header(
         &mut self,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let path = self.preview.active.clone()?;
-        Some(self.render_breadcrumb(&path, theme, cx))
+        Some(self.render_breadcrumb(&path, theme, window, cx))
     }
 
     /// Where the system's default app can open `path`. Only a workspace on
@@ -2384,6 +2386,7 @@ impl FilesSurface {
         &mut self,
         path: &str,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let markdown = super::markdown_preview::is_markdown(path);
@@ -2556,7 +2559,12 @@ impl FilesSurface {
                                 .cursor_pointer()
                                 .role(gpui::Role::Button)
                                 .aria_label("Save file")
-                                .hover(|style| style.bg(crate::theme::wash(0.14)))
+                                .hover_bg(
+                                    "files-save-status-wash",
+                                    window,
+                                    gpui::transparent_black(),
+                                    crate::theme::wash(0.14),
+                                )
                                 .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
                                     window.prevent_default()
                                 })
@@ -2827,7 +2835,7 @@ impl FilesSurface {
             editor.update(cx, |state, _| {
                 state.set_editor_style(super::editor_adapter::editor_style(theme));
             });
-            let overlays = self.render_editor_comment_overlays(path, &editor, theme, cx);
+            let overlays = self.render_editor_comment_overlays(path, &editor, theme, window, cx);
             return div()
                 .id("files-editor-body")
                 .flex_1()
@@ -2926,6 +2934,7 @@ impl FilesSurface {
         path: &str,
         editor: &Entity<super::editor::FileEditorState>,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let Some(layout) = editor.read_with(cx, |state, _| editor_overlay_layout(state)) else {
@@ -2940,6 +2949,7 @@ impl FilesSurface {
         let mut overlays = Vec::with_capacity(layout.rows.len() + 1);
         for row in &layout.rows {
             let group: SharedString = format!("file-comment-gutter-{}-{}", path, row.line).into();
+            let wash = ("file-comment-gutter-wash", row.line as usize);
             let cell = div()
                 .id(("file-comment-gutter", row.line as usize))
                 .absolute()
@@ -2953,11 +2963,10 @@ impl FilesSurface {
             if let Some(comment) = comments_by_line.get(&row.line) {
                 let id = comment.id.clone();
                 overlays.push(
-                    cell.bg(theme.surface_card)
-                        .cursor_pointer()
+                    cell.cursor_pointer()
                         .role(gpui::Role::Button)
                         .aria_label(format!("Open comment on line {}", row.line))
-                        .hover(|style| style.bg(crate::theme::wash(0.08)))
+                        .hover_bg(wash, window, theme.surface_card, crate::theme::wash(0.08))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.toggle_editor_comment(id.clone(), cx)
                         }))
@@ -2976,7 +2985,7 @@ impl FilesSurface {
                         .cursor_pointer()
                         .role(gpui::Role::Button)
                         .aria_label(format!("Comment on line {line}"))
-                        .hover(|style| style.bg(theme.surface_card))
+                        .hover_bg(wash, window, gpui::transparent_black(), theme.surface_card)
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.open_editor_comment_draft(target.clone(), line, window, cx)
                         }))

@@ -21,7 +21,7 @@ use zeron_theme::{
 use crate::appearance::{self, AppearanceMode};
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::icons;
-use crate::motion::ReduceMotion;
+use crate::motion::{HoverFade as _, ReduceMotion};
 use crate::popover::{self, Popup};
 use crate::settings::widgets;
 use crate::theme::{Appearance, Theme};
@@ -312,9 +312,9 @@ pub struct AppearancePage {
     surface_select: widgets::SelectState,
     background_effect_select: widgets::SelectState,
     reduce_motion_select: widgets::SelectState,
-    import_dialog: Option<ImportDialog>,
-    background_adjustment_dialog: Option<BackgroundAdjustmentDialog>,
-    review_entry: Option<String>,
+    import_dialog: Popup<ImportDialog>,
+    background_adjustment_dialog: Popup<BackgroundAdjustmentDialog>,
+    review_entry: Popup<String>,
     library_error: Option<SharedString>,
     background_error: Option<SharedString>,
 }
@@ -370,7 +370,7 @@ impl AppearancePage {
     fn render_transcript_width(
         &self,
         theme: &Theme,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         use crate::settings::{
@@ -502,8 +502,13 @@ impl AppearancePage {
                                 div()
                                     .id("reset-transcript-width")
                                     .cursor_pointer()
-                                    .text_color(theme.text_muted)
-                                    .hover(|style| style.text_color(theme.text))
+                                    .hover_fade("reset-transcript-width-wash", window, |el, t| {
+                                        el.text_color(crate::motion::mix(
+                                            theme.text_muted,
+                                            theme.text,
+                                            t,
+                                        ))
+                                    })
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.pending_width = None;
                                         crate::settings::set_transcript_width(
@@ -576,9 +581,9 @@ impl AppearancePage {
             surface_select: widgets::SelectState::default(),
             background_effect_select: widgets::SelectState::default(),
             reduce_motion_select: widgets::SelectState::default(),
-            import_dialog: None,
-            background_adjustment_dialog: None,
-            review_entry: None,
+            import_dialog: Popup::default(),
+            background_adjustment_dialog: Popup::default(),
+            review_entry: Popup::default(),
             library_error: None,
             background_error: None,
         }
@@ -859,10 +864,13 @@ impl AppearancePage {
     /// (import, else the mapping review) first, so it never closes Settings
     /// under it. Returns whether it did.
     pub(crate) fn dismiss_on_escape(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.import_dialog.take().is_none() && self.review_entry.take().is_none() {
+        if self.import_dialog.is_open() {
+            popover::close_popup(self, cx, |this| &mut this.import_dialog);
+        } else if self.review_entry.is_open() {
+            popover::close_popup(self, cx, |this| &mut this.review_entry);
+        } else {
             return false;
         }
-        cx.notify();
         true
     }
 
@@ -878,9 +886,9 @@ impl AppearancePage {
             ComposerInputEvent::Edited => {
                 let source = this
                     .import_dialog
-                    .as_ref()
+                    .as_open()
                     .map(|dialog| PathBuf::from(dialog.input.read(cx).text().trim()));
-                if let Some(dialog) = this.import_dialog.as_mut()
+                if let Some(dialog) = this.import_dialog.open_mut()
                     && dialog
                         .compilation
                         .as_ref()
@@ -897,7 +905,7 @@ impl AppearancePage {
             ComposerInputEvent::Submitted => {
                 if this
                     .import_dialog
-                    .as_ref()
+                    .as_open()
                     .is_some_and(|dialog| dialog.compilation.is_some())
                 {
                     this.finish_import(cx);
@@ -907,7 +915,7 @@ impl AppearancePage {
             }
             _ => {}
         });
-        self.import_dialog = Some(ImportDialog {
+        self.import_dialog.open(ImportDialog {
             input,
             _events: events,
             focus: cx.focus_handle(),
@@ -922,7 +930,7 @@ impl AppearancePage {
     }
 
     fn compile_import(&mut self, cx: &mut Context<Self>) {
-        let Some(dialog) = self.import_dialog.as_mut() else {
+        let Some(dialog) = self.import_dialog.open_mut() else {
             return;
         };
         let source = dialog.input.read(cx).text().trim().to_owned();
@@ -969,7 +977,7 @@ impl AppearancePage {
                 return;
             };
             let _ = this.update(cx, |page, cx| {
-                if let Some(dialog) = page.import_dialog.as_mut() {
+                if let Some(dialog) = page.import_dialog.open_mut() {
                     dialog.input.update(cx, |input, cx| {
                         input.set_text(path.display().to_string(), cx)
                     });
@@ -1064,33 +1072,34 @@ impl AppearancePage {
         let zoom_focus = cx.focus_handle();
         let return_focus = window.focused(cx);
         window.focus(&focus, cx);
-        self.background_adjustment_dialog = Some(BackgroundAdjustmentDialog {
-            focus,
-            zoom_focus,
-            end_focus: cx.focus_handle(),
-            return_focus,
-            path: background.path,
-            source: None,
-            draft: background.adjustment.normalized(),
-            preview_bounds: Rc::default(),
-            zoom_bounds: Rc::default(),
-            drag: None,
-            pinch: None,
-        });
+        self.background_adjustment_dialog
+            .open(BackgroundAdjustmentDialog {
+                focus,
+                zoom_focus,
+                end_focus: cx.focus_handle(),
+                return_focus,
+                path: background.path,
+                source: None,
+                draft: background.adjustment.normalized(),
+                preview_bounds: Rc::default(),
+                zoom_bounds: Rc::default(),
+                drag: None,
+                pinch: None,
+            });
         cx.notify();
     }
 
     fn dismiss_background_adjustment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(dialog) = self.background_adjustment_dialog.take()
-            && let Some(focus) = dialog.return_focus
+        if let Some(dialog) = self.background_adjustment_dialog.as_open()
+            && let Some(focus) = &dialog.return_focus
         {
-            window.focus(&focus, cx);
+            window.focus(focus, cx);
         }
-        cx.notify();
+        popover::close_popup(self, cx, |this| &mut this.background_adjustment_dialog);
     }
 
     fn apply_background_adjustment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(dialog) = self.background_adjustment_dialog.as_ref() else {
+        let Some(dialog) = self.background_adjustment_dialog.as_open() else {
             return;
         };
         // A shuffle or replacement must not receive a draft for another image.
@@ -1107,7 +1116,7 @@ impl AppearancePage {
     }
 
     fn reset_background_adjustment(&mut self, cx: &mut Context<Self>) {
-        if let Some(dialog) = self.background_adjustment_dialog.as_mut() {
+        if let Some(dialog) = self.background_adjustment_dialog.open_mut() {
             dialog.draft = Default::default();
             dialog.drag = None;
             dialog.pinch = None;
@@ -1122,7 +1131,7 @@ impl AppearancePage {
     fn set_background_zoom_from_x(&mut self, x: Pixels, cx: &mut Context<Self>) {
         let Some(bounds) = self
             .background_adjustment_dialog
-            .as_ref()
+            .as_open()
             .and_then(|dialog| dialog.zoom_bounds.get())
         else {
             return;
@@ -1136,7 +1145,7 @@ impl AppearancePage {
         anchor: Option<Point<Pixels>>,
         cx: &mut Context<Self>,
     ) {
-        let Some(dialog) = self.background_adjustment_dialog.as_mut() else {
+        let Some(dialog) = self.background_adjustment_dialog.open_mut() else {
             return;
         };
         if dialog.source.is_none() {
@@ -1169,7 +1178,7 @@ impl AppearancePage {
     }
 
     fn pan_background(&mut self, delta: Point<f32>, cx: &mut Context<Self>) {
-        let Some(dialog) = self.background_adjustment_dialog.as_mut() else {
+        let Some(dialog) = self.background_adjustment_dialog.open_mut() else {
             return;
         };
         let (Some(bounds), Some(source)) = (dialog.preview_bounds.get(), dialog.source.as_ref())
@@ -1189,7 +1198,7 @@ impl AppearancePage {
     }
 
     fn drag_background(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
-        let Some(dialog) = self.background_adjustment_dialog.as_ref() else {
+        let Some(dialog) = self.background_adjustment_dialog.as_open() else {
             return;
         };
         let Some((start, initial)) = dialog.drag else {
@@ -1199,14 +1208,14 @@ impl AppearancePage {
             f32::from(position.x - start.x),
             f32::from(position.y - start.y),
         );
-        if let Some(dialog) = self.background_adjustment_dialog.as_mut() {
+        if let Some(dialog) = self.background_adjustment_dialog.open_mut() {
             dialog.draft = initial;
         }
         self.pan_background(delta, cx);
     }
 
     fn finish_background_drag(&mut self, cx: &mut Context<Self>) {
-        if let Some(dialog) = self.background_adjustment_dialog.as_mut()
+        if let Some(dialog) = self.background_adjustment_dialog.open_mut()
             && dialog.drag.take().is_some()
         {
             cx.notify();
@@ -1214,7 +1223,7 @@ impl AppearancePage {
     }
 
     fn finish_import(&mut self, cx: &mut Context<Self>) {
-        let Some(dialog) = self.import_dialog.as_mut() else {
+        let Some(dialog) = self.import_dialog.open_mut() else {
             return;
         };
         if dialog.selected.is_empty() {
@@ -1227,7 +1236,7 @@ impl AppearancePage {
         };
         let selected = dialog.selected.iter().cloned().collect::<Vec<_>>();
         match theme_library::install(compilation.clone(), &selected, dialog.mode, cx) {
-            Ok(_) => self.import_dialog = None,
+            Ok(_) => popover::close_popup(self, cx, |this| &mut this.import_dialog),
             Err(error) => {
                 dialog.compilation = Some(compilation);
                 dialog.error = Some(error.to_string().into());
@@ -1547,8 +1556,10 @@ fn compact_action(
     theme: &Theme,
     label: &str,
     id: impl Into<SharedString>,
+    window: &mut Window,
 ) -> gpui::Stateful<gpui::Div> {
-    widgets::text_action(theme, widgets::ActionTone::Outlined, label).id(id.into())
+    widgets::action(theme, widgets::ActionTone::Outlined, id.into(), window)
+        .child(SharedString::from(label))
 }
 
 fn import_scene_preview(variant: &zeron_theme::ThemeVariant) -> AnyElement {
@@ -2047,14 +2058,13 @@ impl AppearancePage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        if let Some(dialog) = self.import_dialog.open_mut()
+            && std::mem::take(&mut dialog.focus_pending)
         {
-            let dialog = self.import_dialog.as_mut()?;
-            if std::mem::take(&mut dialog.focus_pending) {
-                let input_focus = dialog.input.focus_handle(cx);
-                window.focus(&input_focus, cx);
-            }
+            let input_focus = dialog.input.focus_handle(cx);
+            window.focus(&input_focus, cx);
         }
-        let dialog = self.import_dialog.as_ref()?;
+        let dialog = self.import_dialog.get()?;
         let input = dialog.input.clone();
         let focus = dialog.focus.clone();
         let mode = dialog.mode;
@@ -2065,7 +2075,10 @@ impl AppearancePage {
         let ready = compilation.is_some() && !selected.is_empty();
         let hairline = crate::theme::hairline(0.08);
 
-        let mode_control = |label: &'static str, description: &'static str, value: InstallMode| {
+        let mode_control = |label: &'static str,
+                            description: &'static str,
+                            value: InstallMode,
+                            window: &mut Window| {
             let active = mode == value;
             div()
                 .id(SharedString::from(format!(
@@ -2078,20 +2091,21 @@ impl AppearancePage {
                 .rounded(px(9.0))
                 .border_1()
                 .border_color(if active { theme.accent } else { theme.border })
-                .bg(if active {
-                    theme.accent_wash
-                } else {
-                    theme.surface_raised.opacity(0.28)
-                })
+                .when(active, |control| control.bg(theme.accent_wash))
                 .cursor_pointer()
                 .when(!active, |control| {
-                    control.hover(|style| style.bg(theme.surface_raised_hover))
+                    control.hover_bg(
+                        SharedString::from(format!("theme-import-mode-wash-{}", slug(label))),
+                        window,
+                        theme.surface_raised.opacity(0.28),
+                        theme.surface_raised_hover,
+                    )
                 })
                 .tab_index(0)
                 .role(gpui::Role::Button)
                 .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    if let Some(dialog) = this.import_dialog.as_mut() {
+                    if let Some(dialog) = this.import_dialog.open_mut() {
                         dialog.mode = value;
                     }
                     cx.notify();
@@ -2169,7 +2183,7 @@ impl AppearancePage {
                             .items_center(),
                     )
                     .child(
-                        compact_action(theme, "Browse…", "theme-import-browse")
+                        compact_action(theme, "Browse…", "theme-import-browse", window)
                             .h(px(36.0))
                             .px(px(12.0))
                             .flex_none()
@@ -2191,11 +2205,13 @@ impl AppearancePage {
                                 "Import a copy",
                                 "Works independently from the original file.",
                                 InstallMode::Snapshot,
+                                window,
                             ))
                             .child(mode_control(
                                 "Link to source",
                                 "Reload changes from the file on disk.",
                                 InstallMode::Link,
+                                window,
                             )),
                     ),
             );
@@ -2298,10 +2314,10 @@ impl AppearancePage {
                                         .on_click(cx.listener({
                                             let variant_id = variant_id.clone();
                                             move |this, _, _, cx| {
-                                                if let Some(dialog) = this.import_dialog.as_mut() {
-                                                    if !dialog.selected.remove(&variant_id) {
-                                                        dialog.selected.insert(variant_id.clone());
-                                                    }
+                                                if let Some(dialog) = this.import_dialog.open_mut()
+                                                    && !dialog.selected.remove(&variant_id)
+                                                {
+                                                    dialog.selected.insert(variant_id.clone());
                                                 }
                                                 cx.notify();
                                             }
@@ -2335,6 +2351,7 @@ impl AppearancePage {
                                             "Details"
                                         },
                                         format!("theme-import-review-{variant_id}"),
+                                        window,
                                     )
                                     .tab_index(0)
                                     .role(gpui::Role::Button)
@@ -2344,7 +2361,7 @@ impl AppearancePage {
                                     .on_click(cx.listener({
                                         let variant_id = variant_id.clone();
                                         move |this, _, _, cx| {
-                                            if let Some(dialog) = this.import_dialog.as_mut() {
+                                            if let Some(dialog) = this.import_dialog.open_mut() {
                                                 dialog.review_variant =
                                                     if dialog.review_variant.as_deref()
                                                         == Some(variant_id.as_str())
@@ -2457,17 +2474,20 @@ impl AppearancePage {
                     .rounded(px(7.0))
                     .border_1()
                     .border_color(theme.border)
-                    .bg(theme.surface_raised.opacity(0.28))
                     .flex()
                     .items_center()
                     .justify_center()
                     .cursor_pointer()
-                    .hover(|style| style.bg(theme.surface_raised_hover))
+                    .hover_bg(
+                        "theme-import-close-wash",
+                        window,
+                        theme.surface_raised.opacity(0.28),
+                        theme.surface_raised_hover,
+                    )
                     .tab_index(0).role(gpui::Role::Button)
 .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
 .on_click(cx.listener(|this, _, _, cx| {
-                        this.import_dialog = None;
-                        cx.notify();
+                        popover::close_popup(this, cx, |this| &mut this.import_dialog);
                     }))
                     .child(
                         icons::icon(icons::CLOSE)
@@ -2487,53 +2507,50 @@ impl AppearancePage {
             .justify_end()
             .gap(px(8.0))
             .child(
-                compact_action(theme, "Cancel", "theme-import-cancel")
+                compact_action(theme, "Cancel", "theme-import-cancel", window)
                     .h(px(34.0))
                     .px(px(13.0))
                     .tab_index(0)
                     .role(gpui::Role::Button)
                     .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.import_dialog = None;
-                        cx.notify();
+                        popover::close_popup(this, cx, |this| &mut this.import_dialog);
                     })),
             )
             .child(
-                widgets::text_action(
-                    theme,
-                    widgets::ActionTone::Solid,
-                    if compilation.is_some() {
+                widgets::action(theme, widgets::ActionTone::Solid, "theme-import-action", window)
+                    .child(if compilation.is_some() {
                         "Import selected"
                     } else {
                         "Analyze theme"
-                    },
-                )
-                .id("theme-import-action")
-                .h(px(34.0))
-                .px(px(14.0))
-                .py(px(0.0))
-                .flex()
-                .items_center()
-                .when(compilation.is_some() && !ready, |button| {
-                    button.opacity(0.45)
-                })
-                .when(compilation.is_none() || ready, |button| {
-                    button
-                        .tab_index(0)
-                        .role(gpui::Role::Button)
-                        .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if this
-                                .import_dialog
-                                .as_ref()
-                                .is_some_and(|dialog| dialog.compilation.is_some())
-                            {
-                                this.finish_import(cx);
-                            } else {
-                                this.compile_import(cx);
-                            }
-                        }))
-                }),
+                    })
+                    .h(px(34.0))
+                    .px(px(14.0))
+                    .py(px(0.0))
+                    .flex()
+                    .items_center()
+                    .when(compilation.is_some() && !ready, |button| {
+                        button.opacity(0.45)
+                    })
+                    .when(compilation.is_none() || ready, |button| {
+                        button
+                            .tab_index(0)
+                            .role(gpui::Role::Button)
+                            .focus_visible(|s| {
+                                s.border_2().border_color(theme.accent).opacity(1.0)
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if this
+                                    .import_dialog
+                                    .as_open()
+                                    .is_some_and(|dialog| dialog.compilation.is_some())
+                                {
+                                    this.finish_import(cx);
+                                } else {
+                                    this.compile_import(cx);
+                                }
+                            }))
+                    }),
             );
 
         let card = popover::dialog_card(theme)
@@ -2551,13 +2568,12 @@ impl AppearancePage {
                 ) {
                     popover::MenuKey::Escape => {
                         cx.stop_propagation();
-                        this.import_dialog = None;
-                        cx.notify();
+                        popover::close_popup(this, cx, |this| &mut this.import_dialog);
                     }
                     popover::MenuKey::Enter | popover::MenuKey::ModEnter => {
                         if this
                             .import_dialog
-                            .as_ref()
+                            .as_open()
                             .is_some_and(|dialog| dialog.compilation.is_some())
                         {
                             this.finish_import(cx);
@@ -2569,24 +2585,29 @@ impl AppearancePage {
                 }
             }))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.import_dialog = None;
-                cx.notify();
+                popover::close_popup(this, cx, |this| &mut this.import_dialog);
             }))
             .child(header)
             .child(widgets::scroll_faded("theme-import-main-fade", main))
             .child(footer)
             .into_any_element();
 
-        Some(popover::modal("theme-import-dialog", viewport, card))
+        Some(popover::modal(
+            "theme-import-dialog",
+            viewport,
+            card,
+            self.import_dialog.closing_since(),
+        ))
     }
 
     fn render_background_adjustment_dialog(
         &mut self,
         viewport: gpui::Size<Pixels>,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let dialog = self.background_adjustment_dialog.as_ref()?;
+        let dialog = self.background_adjustment_dialog.get()?;
         let focus = dialog.focus.clone();
         let zoom_focus = dialog.zoom_focus.clone();
         let end_focus = dialog.end_focus.clone();
@@ -2616,7 +2637,7 @@ impl AppearancePage {
         let ready = source.is_some();
         let preview_size =
             background_preview_size(viewport, settings.sidebar_width, settings.sidebar_collapsed);
-        if let Some(dialog) = self.background_adjustment_dialog.as_mut() {
+        if let Some(dialog) = self.background_adjustment_dialog.open_mut() {
             dialog.source = source.clone();
         }
 
@@ -2645,7 +2666,7 @@ impl AppearancePage {
                         ScrollDelta::Pixels(delta) => f32::from(delta.y),
                         ScrollDelta::Lines(delta) => delta.y * 40.0,
                     };
-                    let Some(dialog) = this.background_adjustment_dialog.as_ref() else {
+                    let Some(dialog) = this.background_adjustment_dialog.as_open() else {
                         return;
                     };
                     let zoom = dialog.draft.zoom * (delta * 0.0025).clamp(-2.0, 2.0).exp();
@@ -2655,7 +2676,7 @@ impl AppearancePage {
                 }),
             )
             .on_pinch(cx.listener(|this, event: &gpui::PinchEvent, window, cx| {
-                let Some(dialog) = this.background_adjustment_dialog.as_mut() else {
+                let Some(dialog) = this.background_adjustment_dialog.open_mut() else {
                     return;
                 };
                 if event.phase == gpui::TouchPhase::Ended {
@@ -2677,7 +2698,7 @@ impl AppearancePage {
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
-                    let Some(dialog) = this.background_adjustment_dialog.as_mut() else {
+                    let Some(dialog) = this.background_adjustment_dialog.open_mut() else {
                         return;
                     };
                     if dialog.source.is_none() {
@@ -2797,7 +2818,7 @@ impl AppearancePage {
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
-                    if let Some(dialog) = this.background_adjustment_dialog.as_ref() {
+                    if let Some(dialog) = this.background_adjustment_dialog.as_open() {
                         window.focus(&dialog.zoom_focus, cx);
                     }
                     this.set_background_zoom_from_x(event.position.x, cx);
@@ -2812,7 +2833,7 @@ impl AppearancePage {
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 let Some(current) = this
                     .background_adjustment_dialog
-                    .as_ref()
+                    .as_open()
                     .map(|dialog| dialog.draft.zoom)
                 else {
                     return;
@@ -2870,7 +2891,7 @@ impl AppearancePage {
             .justify_between()
             .gap(px(12.0))
             .child(
-                compact_action(theme, "Reset", "new-thread-background-adjustment-reset")
+                compact_action(theme, "Reset", "new-thread-background-adjustment-reset", window)
                     .tab_index(0)
                     .role(gpui::Role::Button)
                     .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
@@ -2882,21 +2903,22 @@ impl AppearancePage {
                     .items_center()
                     .gap(px(6.0))
                     .child(
-                        compact_action(theme, "−", "new-thread-background-adjustment-zoom-out")
-                            .tab_index(0)
-                            .role(gpui::Role::Button)
-                            .aria_label("Zoom out")
-                            .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                let Some(dialog) = this.background_adjustment_dialog.as_ref()
-                                else {
-                                    return;
-                                };
-                                this.set_background_zoom(
-                                    dialog.draft.zoom - BACKGROUND_ZOOM_STEP,
-                                    cx,
-                                );
-                            })),
+                        compact_action(
+                            theme,
+                            "−",
+                            "new-thread-background-adjustment-zoom-out",
+                            window,
+                        )
+                        .tab_index(0)
+                        .role(gpui::Role::Button)
+                        .aria_label("Zoom out")
+                        .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let Some(dialog) = this.background_adjustment_dialog.as_open() else {
+                                return;
+                            };
+                            this.set_background_zoom(dialog.draft.zoom - BACKGROUND_ZOOM_STEP, cx);
+                        })),
                     )
                     .child(zoom_slider)
                     .child(
@@ -2908,21 +2930,22 @@ impl AppearancePage {
                             .child(format!("{:.0}%", draft.zoom * 100.0)),
                     )
                     .child(
-                        compact_action(theme, "+", "new-thread-background-adjustment-zoom-in")
-                            .tab_index(0)
-                            .role(gpui::Role::Button)
-                            .aria_label("Zoom in")
-                            .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                let Some(dialog) = this.background_adjustment_dialog.as_ref()
-                                else {
-                                    return;
-                                };
-                                this.set_background_zoom(
-                                    dialog.draft.zoom + BACKGROUND_ZOOM_STEP,
-                                    cx,
-                                );
-                            })),
+                        compact_action(
+                            theme,
+                            "+",
+                            "new-thread-background-adjustment-zoom-in",
+                            window,
+                        )
+                        .tab_index(0)
+                        .role(gpui::Role::Button)
+                        .aria_label("Zoom in")
+                        .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let Some(dialog) = this.background_adjustment_dialog.as_open() else {
+                                return;
+                            };
+                            this.set_background_zoom(dialog.draft.zoom + BACKGROUND_ZOOM_STEP, cx);
+                        })),
                     ),
             );
 
@@ -2936,7 +2959,7 @@ impl AppearancePage {
             .justify_end()
             .gap(px(8.0))
             .child(
-                compact_action(theme, "Cancel", "new-thread-background-adjustment-cancel")
+                compact_action(theme, "Cancel", "new-thread-background-adjustment-cancel", window)
                     .h(px(34.0))
                     .px(px(13.0))
                     .tab_index(0)
@@ -2947,23 +2970,28 @@ impl AppearancePage {
                     })),
             )
             .child(
-                widgets::text_action(theme, widgets::ActionTone::Solid, "Apply")
-                    .id("new-thread-background-adjustment-apply")
-                    .h(px(34.0))
-                    .px(px(14.0))
-                    .py(px(0.0))
-                    .flex()
-                    .items_center()
-                    .when(!ready, |button| button.opacity(0.45))
-                    .when(ready, |button| {
-                        button
-                            .tab_index(0)
-                            .role(gpui::Role::Button)
-                            .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.apply_background_adjustment(window, cx)
-                            }))
-                    }),
+                widgets::action(
+                    theme,
+                    widgets::ActionTone::Solid,
+                    "new-thread-background-adjustment-apply",
+                    window,
+                )
+                .child("Apply")
+                .h(px(34.0))
+                .px(px(14.0))
+                .py(px(0.0))
+                .flex()
+                .items_center()
+                .when(!ready, |button| button.opacity(0.45))
+                .when(ready, |button| {
+                    button
+                        .tab_index(0)
+                        .role(gpui::Role::Button)
+                        .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.apply_background_adjustment(window, cx)
+                        }))
+                }),
             );
 
         let header = div()
@@ -2987,12 +3015,16 @@ impl AppearancePage {
                     .rounded(px(7.0))
                     .border_1()
                     .border_color(theme.border)
-                    .bg(theme.surface_raised.opacity(0.28))
                     .flex()
                     .items_center()
                     .justify_center()
                     .cursor_pointer()
-                    .hover(|style| style.bg(theme.surface_raised_hover))
+                    .hover_bg(
+                        "new-thread-background-adjustment-close-wash",
+                        window,
+                        theme.surface_raised.opacity(0.28),
+                        theme.surface_raised_hover,
+                    )
                     .tab_index(0)
                     .role(gpui::Role::Button)
                     .aria_label("Close background adjustment")
@@ -3053,14 +3085,14 @@ impl AppearancePage {
                             "+" | "=" => {
                                 let zoom = this
                                     .background_adjustment_dialog
-                                    .as_ref()
+                                    .as_open()
                                     .map_or(1.0, |dialog| dialog.draft.zoom + BACKGROUND_ZOOM_STEP);
                                 this.set_background_zoom(zoom, cx);
                             }
                             "-" => {
                                 let zoom = this
                                     .background_adjustment_dialog
-                                    .as_ref()
+                                    .as_open()
                                     .map_or(1.0, |dialog| dialog.draft.zoom - BACKGROUND_ZOOM_STEP);
                                 this.set_background_zoom(zoom, cx);
                             }
@@ -3094,6 +3126,7 @@ impl AppearancePage {
             "new-thread-background-adjustment-dialog",
             viewport,
             card,
+            self.background_adjustment_dialog.closing_since(),
         ))
     }
 
@@ -3101,9 +3134,10 @@ impl AppearancePage {
         &mut self,
         viewport: gpui::Size<gpui::Pixels>,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let entry_id = self.review_entry.as_ref()?;
+        let entry_id = self.review_entry.get()?;
         let entry = theme_library::entries(cx)
             .into_iter()
             .find(|entry| &entry.id == entry_id)?;
@@ -3133,14 +3167,13 @@ impl AppearancePage {
         }
         card = card.child(
             div().mt(px(16.0)).flex().justify_end().child(
-                widgets::text_action(theme, widgets::ActionTone::Solid, "Done")
-                    .id("theme-review-close")
+                widgets::action(theme, widgets::ActionTone::Solid, "theme-review-close", window)
+                    .child("Done")
                     .tab_index(0)
                     .role(gpui::Role::Button)
                     .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.review_entry = None;
-                        cx.notify();
+                        popover::close_popup(this, cx, |this| &mut this.review_entry);
                     })),
             ),
         );
@@ -3148,6 +3181,7 @@ impl AppearancePage {
             "theme-review-dialog",
             viewport,
             widgets::scroll_faded("theme-review-fade", card).into_any_element(),
+            self.review_entry.closing_since(),
         ))
     }
 
@@ -3155,6 +3189,7 @@ impl AppearancePage {
         &mut self,
         entry: CustomThemeEntry,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id = entry.id.clone();
@@ -3208,7 +3243,7 @@ impl AppearancePage {
                     .gap(px(2.0))
                     .when(linked, |actions| {
                         actions.child(
-                            compact_action(theme, "Reload", format!("theme-reload-{id}"))
+                            compact_action(theme, "Reload", format!("theme-reload-{id}"), window)
                                 .tab_index(0)
                                 .role(gpui::Role::Button)
                                 .focus_visible(|s| {
@@ -3224,7 +3259,7 @@ impl AppearancePage {
                         )
                     })
                     .child(
-                        compact_action(theme, "Reveal", format!("theme-reveal-{id}"))
+                        compact_action(theme, "Reveal", format!("theme-reveal-{id}"), window)
                             .tab_index(0)
                             .role(gpui::Role::Button)
                             .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
@@ -3239,14 +3274,14 @@ impl AppearancePage {
                             })),
                     )
                     .child(
-                        compact_action(theme, "Review", format!("theme-review-{id}"))
+                        compact_action(theme, "Review", format!("theme-review-{id}"), window)
                             .tab_index(0)
                             .role(gpui::Role::Button)
                             .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
                             .on_click(cx.listener({
                                 let id = id.clone();
                                 move |this, _, _, cx| {
-                                    this.review_entry = Some(id.clone());
+                                    this.review_entry.open(id.clone());
                                     cx.notify();
                                 }
                             })),
@@ -3256,6 +3291,7 @@ impl AppearancePage {
                             theme,
                             "Duplicate as editable",
                             format!("theme-duplicate-{id}"),
+                            window,
                         )
                         .tab_index(0)
                         .role(gpui::Role::Button)
@@ -3272,7 +3308,7 @@ impl AppearancePage {
                     )
                     .when(linked, |actions| {
                         actions.child(
-                            compact_action(theme, "Unlink", format!("theme-unlink-{id}"))
+                            compact_action(theme, "Unlink", format!("theme-unlink-{id}"), window)
                                 .tab_index(0)
                                 .role(gpui::Role::Button)
                                 .focus_visible(|s| {
@@ -3290,7 +3326,7 @@ impl AppearancePage {
                         )
                     })
                     .child(
-                        compact_action(theme, "Remove", format!("theme-remove-{id}"))
+                        compact_action(theme, "Remove", format!("theme-remove-{id}"), window)
                             .text_color(theme.danger)
                             .tab_index(0)
                             .role(gpui::Role::Button)
@@ -3309,6 +3345,7 @@ impl AppearancePage {
     fn render_theme_library_rows(
         &mut self,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let entries = theme_library::entries(cx);
@@ -3324,8 +3361,8 @@ impl AppearancePage {
                         .child(widgets::row_title(theme, "Theme library")),
                 )
                 .child(
-                    widgets::text_action(theme, widgets::ActionTone::Solid, "Add theme")
-                        .id("theme-library-add")
+                    widgets::action(theme, widgets::ActionTone::Solid, "theme-library-add", window)
+                        .child("Add theme")
                         .tab_index(0)
                         .role(gpui::Role::Button)
                         .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
@@ -3349,7 +3386,7 @@ impl AppearancePage {
             rows.extend(
                 imported
                     .into_iter()
-                    .map(|entry| self.render_library_entry(entry, theme, cx)),
+                    .map(|entry| self.render_library_entry(entry, theme, window, cx)),
             );
         }
         if !linked.is_empty() {
@@ -3368,7 +3405,7 @@ impl AppearancePage {
             rows.extend(
                 linked
                     .into_iter()
-                    .map(|entry| self.render_library_entry(entry, theme, cx)),
+                    .map(|entry| self.render_library_entry(entry, theme, window, cx)),
             );
         }
         rows
@@ -3617,6 +3654,7 @@ impl Render for AppearancePage {
                                             &theme,
                                             "Adjust",
                                             "new-thread-background-adjust",
+                                            window,
                                         )
                                         .tab_index(0)
                                         .role(gpui::Role::Button)
@@ -3635,6 +3673,7 @@ impl Render for AppearancePage {
                                         &theme,
                                         "Replace image",
                                         "new-thread-background-replace",
+                                        window,
                                     )
                                     .tab_index(0)
                                     .role(gpui::Role::Button)
@@ -3650,6 +3689,7 @@ impl Render for AppearancePage {
                                         &theme,
                                         "Remove",
                                         "new-thread-background-remove",
+                                        window,
                                     )
                                     .text_color(theme.danger)
                                     .tab_index(0)
@@ -3668,6 +3708,7 @@ impl Render for AppearancePage {
                                     &theme,
                                     "Choose image",
                                     "new-thread-background-choose",
+                                    window,
                                 )
                                 .tab_index(0)
                                 .role(gpui::Role::Button)
@@ -3712,17 +3753,22 @@ impl Render for AppearancePage {
                         .flex()
                         .gap(px(8.0))
                         .child(
-                            compact_action(&theme, "Choose folder", "wallpaper-folder-choose")
-                                .tab_index(0)
-                                .role(gpui::Role::Button)
-                                .focus_visible(|s| s.border_2().border_color(theme.accent))
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.choose_wallpaper_folder(cx)),
-                                ),
+                            compact_action(
+                                &theme,
+                                "Choose folder",
+                                "wallpaper-folder-choose",
+                                window,
+                            )
+                            .tab_index(0)
+                            .role(gpui::Role::Button)
+                            .focus_visible(|s| s.border_2().border_color(theme.accent))
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.choose_wallpaper_folder(cx)),
+                            ),
                         )
                         .when(wallpaper_settings.wallpaper_folder.is_some(), |row| {
                             row.child(
-                                compact_action(&theme, "Shuffle", "wallpaper-shuffle")
+                                compact_action(&theme, "Shuffle", "wallpaper-shuffle", window)
                                     .tab_index(0)
                                     .role(gpui::Role::Button)
                                     .focus_visible(|s| s.border_2().border_color(theme.accent))
@@ -3865,15 +3911,15 @@ impl Render for AppearancePage {
                 )
                 .into_any_element(),
         ];
-        let library_rows = self.render_theme_library_rows(&theme, cx);
+        let library_rows = self.render_theme_library_rows(&theme, window, cx);
         let library_warning = self
             .library_error
             .clone()
             .or_else(|| theme_library::load_warning(cx).map(SharedString::from));
         let modal = self
-            .render_background_adjustment_dialog(window.viewport_size(), &theme, cx)
+            .render_background_adjustment_dialog(window.viewport_size(), &theme, window, cx)
             .or_else(|| self.render_import_dialog(window.viewport_size(), &theme, window, cx))
-            .or_else(|| self.render_review_dialog(window.viewport_size(), &theme, cx));
+            .or_else(|| self.render_review_dialog(window.viewport_size(), &theme, window, cx));
 
         let ui_picker = self.render_font_picker(
             FontKind::Ui,
@@ -4086,7 +4132,7 @@ mod tests {
     }
 
     fn ready_background_preview(page: &mut AppearancePage) {
-        page.background_adjustment_dialog.as_mut().unwrap().source = Some(Arc::new(
+        page.background_adjustment_dialog.open_mut().unwrap().source = Some(Arc::new(
             gpui::RenderImage::new([image::Frame::new(image::RgbaImage::new(4, 4))]),
         ));
     }
@@ -4107,17 +4153,17 @@ mod tests {
             .update(cx, |page, window, cx| {
                 window.focus(&page.width_focus, cx);
                 page.open_background_adjustment(window, cx);
-                let dialog = page.background_adjustment_dialog.as_mut().unwrap();
+                let dialog = page.background_adjustment_dialog.open_mut().unwrap();
                 dialog.drag = Some((point(px(0.0), px(0.0)), dialog.draft));
                 dialog.pinch = Some((2.0, 1.0));
                 page.reset_background_adjustment(cx);
-                let dialog = page.background_adjustment_dialog.as_ref().unwrap();
+                let dialog = page.background_adjustment_dialog.as_open().unwrap();
                 assert_eq!(dialog.draft, Default::default());
                 assert!(dialog.drag.is_none());
                 assert!(dialog.pinch.is_none());
                 assert_eq!(crate::settings::current(cx), original);
                 page.dismiss_background_adjustment(window, cx);
-                assert!(page.background_adjustment_dialog.is_none());
+                assert!(!page.background_adjustment_dialog.is_open());
                 assert!(page.width_focus.is_focused(window));
                 assert_eq!(crate::settings::current(cx), original);
                 assert!(!crate::settings::UiSettings::path(dir.path()).exists());
@@ -4142,13 +4188,13 @@ mod tests {
                 window.focus(&page.width_focus, cx);
                 page.open_background_adjustment(window, cx);
                 page.apply_background_adjustment(window, cx);
-                assert!(page.background_adjustment_dialog.is_some());
+                assert!(page.background_adjustment_dialog.is_open());
                 assert_eq!(crate::settings::current(cx), original);
                 ready_background_preview(page);
                 page.reset_background_adjustment(cx);
                 assert_eq!(crate::settings::current(cx), original);
                 page.apply_background_adjustment(window, cx);
-                assert!(page.background_adjustment_dialog.is_none());
+                assert!(!page.background_adjustment_dialog.is_open());
                 assert!(page.width_focus.is_focused(window));
                 let mut expected = original.clone();
                 expected
@@ -4188,7 +4234,7 @@ mod tests {
                 let replacement = crate::settings::current(cx);
                 page.apply_background_adjustment(window, cx);
                 assert_eq!(crate::settings::current(cx), replacement);
-                assert!(page.background_adjustment_dialog.is_some());
+                assert!(page.background_adjustment_dialog.is_open());
                 crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| {
                     settings.new_thread_composer_background = None;
                 });
@@ -4198,7 +4244,7 @@ mod tests {
                         .new_thread_composer_background
                         .is_none()
                 );
-                assert!(page.background_adjustment_dialog.is_some());
+                assert!(page.background_adjustment_dialog.is_open());
             })
             .unwrap();
     }

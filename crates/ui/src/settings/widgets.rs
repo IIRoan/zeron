@@ -6,6 +6,7 @@ use std::rc::Rc;
 
 use gpui::{AnyElement, Context, Pixels, ScrollHandle, SharedString, Window, div, prelude::*, px};
 
+use crate::motion::HoverFade as _;
 use crate::popover::{self, MenuScrollbarMetrics, MenuScrollbarState, ScrollRailHost};
 use crate::theme::Theme;
 
@@ -677,19 +678,6 @@ struct SwitchVisual {
     key: SharedString,
 }
 
-struct SwitchTravel {
-    from: f32,
-    target: f32,
-    started: std::time::Instant,
-}
-
-impl SwitchTravel {
-    fn value(&self, now: std::time::Instant) -> f32 {
-        let t = (now.duration_since(self.started).as_secs_f32() / 0.18).min(1.0);
-        self.from + (self.target - self.from) * (1.0 - (1.0 - t).powi(3))
-    }
-}
-
 fn switch_track_color(theme: &Theme, on: bool) -> gpui::Hsla {
     let dark = theme.appearance.is_dark();
     if on {
@@ -746,34 +734,13 @@ fn switch_surface_tones(theme: &Theme, base: gpui::Hsla, thumb: bool) -> (gpui::
 
 impl RenderOnce for SwitchVisual {
     fn render(self, window: &mut gpui::Window, cx: &mut gpui::App) -> impl IntoElement {
-        let now = std::time::Instant::now();
-        let target = if self.on { 1.0 } else { 0.0 };
-        let reduced = crate::motion::reduced_motion(cx);
-        let position = window.with_global_id(self.key.into(), |id, window| {
-            window.with_element_state(id, |previous: Option<SwitchTravel>, _| {
-                let mut travel = previous.unwrap_or(SwitchTravel {
-                    from: target,
-                    target,
-                    started: now,
-                });
-                let current = travel.value(now);
-                if travel.target != target {
-                    travel = SwitchTravel {
-                        from: current,
-                        target,
-                        started: now,
-                    };
-                }
-                if reduced {
-                    travel.from = target;
-                    travel.target = target;
-                }
-                (travel.value(now), travel)
-            })
-        });
-        if (position - target).abs() > 0.001 {
-            window.request_animation_frame();
-        }
+        let position = crate::motion::transition(
+            window,
+            self.key,
+            if self.on { 1.0 } else { 0.0 },
+            crate::motion::TAB_SLIDE,
+            crate::motion::reduced_motion(cx),
+        );
         let dark = self.theme.appearance.is_dark();
         let track = switch_track_color(&self.theme, self.on);
         let (track_light, track_shade) = switch_surface_tones(&self.theme, track, false);
@@ -892,35 +859,6 @@ mod switch_tests {
     use super::*;
 
     #[test]
-    fn tab_selection_reverses_from_its_current_opacity() {
-        use std::time::{Duration, Instant};
-
-        let start = Instant::now();
-        let forward = TabSelectionTravel {
-            from: 0.0,
-            target: 1.0,
-            started: start,
-        };
-        let halfway = start + Duration::from_millis(75);
-        let current = forward.value(halfway);
-        let reverse = TabSelectionTravel {
-            from: current,
-            target: 0.0,
-            started: halfway,
-        };
-        assert_eq!(reverse.value(halfway), current);
-        assert_eq!(
-            reverse.value(
-                halfway
-                    + crate::motion::TAB_SLIDE
-                        .total()
-                        .mul_f32(crate::motion::speed_scale())
-            ),
-            0.0
-        );
-    }
-
-    #[test]
     fn dropdowns_stay_in_the_settings_content_pane() {
         for (width, sidebar) in [(600.0, 224.0), (1200.0, 256.0), (1200.0, 400.0)] {
             let viewport = gpui::size(px(width), px(700.0));
@@ -979,42 +917,6 @@ mod switch_tests {
             (light_on, light_on)
         );
     }
-
-    #[test]
-    fn switch_reversal_keeps_current_position_and_settles() {
-        use std::time::{Duration, Instant};
-        let now = Instant::now();
-        let forward = SwitchTravel {
-            from: 0.0,
-            target: 1.0,
-            started: now,
-        };
-        let halfway = now + Duration::from_millis(90);
-        let current = forward.value(halfway);
-        let reverse = SwitchTravel {
-            from: current,
-            target: 0.0,
-            started: halfway,
-        };
-        assert_eq!(reverse.value(halfway), current);
-        assert_eq!(reverse.value(halfway + Duration::from_millis(180)), 0.0);
-        assert_eq!(forward.value(now + Duration::from_millis(180)), 1.0);
-    }
-}
-
-struct TabSelectionTravel {
-    from: f32,
-    target: f32,
-    started: std::time::Instant,
-}
-
-impl TabSelectionTravel {
-    fn value(&self, now: std::time::Instant) -> f32 {
-        let seconds = crate::motion::TAB_SLIDE.total().as_secs_f32() * crate::motion::speed_scale();
-        let elapsed = now.saturating_duration_since(self.started).as_secs_f32();
-        let progress = crate::motion::TAB_SLIDE.progress((elapsed / seconds).min(1.0));
-        self.from + (self.target - self.from) * progress
-    }
 }
 
 /// Retargetable selected-state fade for a settings tab. First paint and
@@ -1025,34 +927,13 @@ pub fn tab_selection_t(
     selected: bool,
     reduced_motion: bool,
 ) -> f32 {
-    let now = std::time::Instant::now();
-    let target = if selected { 1.0 } else { 0.0 };
-    let value = window.with_global_id(key.into().into(), |id, window| {
-        window.with_element_state(id, |previous: Option<TabSelectionTravel>, _| {
-            let mut travel = previous.unwrap_or(TabSelectionTravel {
-                from: target,
-                target,
-                started: now,
-            });
-            let current = travel.value(now);
-            if travel.target != target {
-                travel = TabSelectionTravel {
-                    from: current,
-                    target,
-                    started: now,
-                };
-            }
-            if reduced_motion {
-                travel.from = target;
-                travel.target = target;
-            }
-            (travel.value(now), travel)
-        })
-    });
-    if (value - target).abs() > 0.001 {
-        window.request_animation_frame();
-    }
-    value
+    crate::motion::transition(
+        window,
+        key.into(),
+        if selected { 1.0 } else { 0.0 },
+        crate::motion::TAB_SLIDE,
+        reduced_motion,
+    )
 }
 
 /// One treatment for settings section tabs: the selected wash and text ease
@@ -1545,7 +1426,7 @@ pub enum ActionTone {
     Solid,
 }
 
-pub fn action_button(theme: &Theme, tone: ActionTone) -> gpui::Div {
+fn action_rest(theme: &Theme, tone: ActionTone) -> gpui::Div {
     let button = div()
         .flex()
         .flex_row()
@@ -1558,36 +1439,68 @@ pub fn action_button(theme: &Theme, tone: ActionTone) -> gpui::Div {
         .text_size(crate::typography::ui_rems(12.5))
         .cursor_pointer();
     match tone {
-        ActionTone::Quiet => button
-            .text_color(theme.text_muted)
-            .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text)),
+        ActionTone::Quiet => button.text_color(theme.text_muted),
         ActionTone::Outlined => button
             .bg(theme.input_glass_bg())
             .border_1()
             .border_color(theme.border)
-            .text_color(theme.text)
-            .hover(|s| s.bg(theme.glass_hover()).border_color(theme.border_strong)),
-        ActionTone::Filled => {
-            let lifted = select_fill(theme, true);
-            button
-                .bg(select_fill(theme, false))
-                .text_color(theme.text)
-                .hover(move |s| s.bg(lifted))
-        }
+            .text_color(theme.text),
+        ActionTone::Filled => button.bg(select_fill(theme, false)).text_color(theme.text),
         ActionTone::Solid => button
             .bg(theme.solid)
             .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(theme.on_solid)
-            .hover(|s| s.opacity(0.9)),
+            .text_color(theme.on_solid),
     }
 }
 
-pub fn text_action(theme: &Theme, tone: ActionTone, label: impl Into<SharedString>) -> gpui::Div {
-    action_button(theme, tone).child(label.into())
+/// A settings action whose hover fades in. `id` also keys the fade, so it
+/// must be unique within the rendering view.
+pub fn action(
+    theme: &Theme,
+    tone: ActionTone,
+    id: impl Into<gpui::ElementId>,
+    window: &mut Window,
+) -> gpui::Stateful<gpui::Div> {
+    let id = id.into();
+    action_rest(theme, tone)
+        .id(id.clone())
+        .hover_fade(id, window, |button, t| action_hover(button, theme, tone, t))
 }
 
-pub fn ghost_action(theme: &Theme) -> gpui::Div {
-    action_button(theme, ActionTone::Quiet)
+/// [`action`] for builders with no `Window`: the hover fades through the
+/// keyed store, so `fade_key` must be unique app-wide (the caller's element
+/// id is a good choice). The caller adds the id.
+pub fn action_button(
+    theme: &Theme,
+    tone: ActionTone,
+    fade_key: impl Into<SharedString>,
+) -> gpui::Div {
+    let fade_key = fade_key.into();
+    let t = crate::motion::hover_t(&fade_key);
+    let mut button = action_hover(action_rest(theme, tone), theme, tone, t);
+    button
+        .interactivity()
+        .on_hover(crate::motion::hover_listener(fade_key));
+    button
+}
+
+/// Each tone's hover treatment at progress `t`.
+fn action_hover<E: Styled>(button: E, theme: &Theme, tone: ActionTone, t: f32) -> E {
+    use crate::motion::{lerp, mix};
+    match tone {
+        ActionTone::Quiet => button
+            .bg(mix(gpui::transparent_black(), theme.glass_hover(), t))
+            .text_color(mix(theme.text_muted, theme.text, t)),
+        ActionTone::Outlined => button
+            .bg(mix(theme.input_glass_bg(), theme.glass_hover(), t))
+            .border_color(mix(theme.border, theme.border_strong, t)),
+        ActionTone::Filled => button.bg(mix(
+            select_fill(theme, false),
+            select_fill(theme, true),
+            t,
+        )),
+        ActionTone::Solid => button.opacity(lerp(1.0, 0.9, t)),
+    }
 }
 
 /// The dismissible red error strip (`flex items-start gap-2 rounded-xl border
@@ -1695,7 +1608,7 @@ const TOOLTIP_ABOVE_GAP: f32 = 20.0;
 impl Render for TextTooltip {
     fn render(
         &mut self,
-        _window: &mut gpui::Window,
+        window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) -> impl IntoElement {
         let theme = Theme::of(cx);
@@ -1710,7 +1623,7 @@ impl Render for TextTooltip {
             .text_size(px(11.0))
             .text_color(theme.text_muted)
             .child(self.text.clone());
-        let card = crate::frost::frosted(6.0, crate::frost::MENU_BLUR, card);
+        let card = crate::popover::tooltip_surface(card, Some(6.0), window, cx);
         if !self.above {
             return card.into_any_element();
         }

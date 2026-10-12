@@ -25,6 +25,7 @@ use zeron_proto::{
 use zeron_rpc::methods;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
+use crate::motion::HoverFade as _;
 use crate::popover::{self, Loadable};
 use crate::settings::widgets;
 use crate::state::AppState;
@@ -496,7 +497,7 @@ pub struct AccountsPage {
     busy_account: Option<String>,
     /// The account whose `⋯` actions menu is open.
     row_menu: popover::Popup<String>,
-    login: Option<LoginFlow>,
+    login: popover::Popup<LoginFlow>,
     login_attempts: u64,
     error: Option<SharedString>,
     code_input: Entity<ComposerInput>,
@@ -546,7 +547,7 @@ impl AccountsPage {
             refreshing: false,
             busy_account: None,
             row_menu: popover::Popup::default(),
-            login: None,
+            login: popover::Popup::default(),
             login_attempts: 0,
             error: None,
             code_input,
@@ -576,7 +577,7 @@ impl AccountsPage {
         // A different device = a different accounts world: drop in-flight
         // login/action state and reload with a forced usage probe (the new
         // device's cache is cold).
-        self.login = None;
+        popover::close_popup(self, cx, |this| &mut this.login);
         self.busy_account = None;
         self.error = None;
         self.load(force_usage_for(LoadTrigger::Mount), cx);
@@ -585,7 +586,7 @@ impl AccountsPage {
     pub(crate) fn set_embedded_harness(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
         if self.embedded_harness != Some(harness) {
             self.embedded_harness = Some(harness);
-            self.login = None;
+            popover::close_popup(self, cx, |this| &mut this.login);
             self.error = None;
             cx.notify();
         }
@@ -833,7 +834,7 @@ impl AccountsPage {
         };
         self.login_attempts += 1;
         let attempt = self.login_attempts;
-        self.login = Some(LoginFlow {
+        self.login.open(LoginFlow {
             harness,
             provider,
             attempt,
@@ -870,7 +871,7 @@ impl AccountsPage {
         result: Result<AgentLoginStart, String>,
         cx: &mut Context<Self>,
     ) {
-        let Some(flow) = self.login.as_mut().filter(|flow| flow.attempt == attempt) else {
+        let Some(flow) = self.login.open_mut().filter(|flow| flow.attempt == attempt) else {
             return;
         };
         match result {
@@ -907,7 +908,7 @@ impl AccountsPage {
             step: LoginStep::PasteCode { submitting, .. },
             attempt,
             ..
-        }) = &mut self.login
+        }) = self.login.open_mut()
         else {
             return;
         };
@@ -930,12 +931,12 @@ impl AccountsPage {
                 .call(methods::COMPLETE_AGENT_LOGIN, params)
                 .await;
             this.update(cx, |page, cx| {
-                let Some(flow) = page.login.as_mut().filter(|f| f.attempt == attempt) else {
+                let Some(flow) = page.login.open_mut().filter(|f| f.attempt == attempt) else {
                     return;
                 };
                 match result {
                     Ok(_) => {
-                        page.login = None;
+                        popover::close_popup(page, cx, |this| &mut this.login);
                         page.load(force_usage_for(LoadTrigger::PostLogin), cx);
                     }
                     Err(err) => {
@@ -959,7 +960,7 @@ impl AccountsPage {
             login_id: Some(login_id),
             attempt,
             ..
-        }) = &self.login
+        }) = self.login.as_open()
         else {
             return;
         };
@@ -1000,13 +1001,13 @@ impl AccountsPage {
         result: Result<AgentLoginPoll, String>,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(flow) = self.login.as_mut().filter(|flow| flow.attempt == attempt) else {
+        let Some(flow) = self.login.open_mut().filter(|flow| flow.attempt == attempt) else {
             return true;
         };
         let finished = match result {
             Ok(poll) => match poll.status {
                 AgentLoginStatus::Done => {
-                    self.login = None;
+                    popover::close_popup(self, cx, |this| &mut this.login);
                     self.load(force_usage_for(LoadTrigger::PostLogin), cx);
                     true
                 }
@@ -1044,15 +1045,16 @@ impl AccountsPage {
     }
 
     fn cancel_login(&mut self, cx: &mut Context<Self>) {
-        let login_id = match self.login.take() {
+        let login_id = match self.login.as_open() {
             // A failed login is already over engine-side.
             Some(LoginFlow {
                 login_id: Some(login_id),
                 step: LoginStep::Browser { .. } | LoginStep::PasteCode { .. },
                 ..
-            }) => Some(login_id),
+            }) => Some(login_id.clone()),
             _ => None,
         };
+        popover::close_popup(self, cx, |this| &mut this.login);
         self.poll_task = None;
         if let (Some(login_id), Some(engine)) = (login_id, self.state.read(cx).engine().cloned()) {
             let params = self.params(serde_json::json!({ "loginId": login_id }));
@@ -1072,7 +1074,7 @@ impl AccountsPage {
     /// Escape that reached Settings unclaimed cancels an open login first,
     /// so it never closes Settings under the dialog. Returns whether it did.
     pub(crate) fn dismiss_on_escape(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.login.is_none() {
+        if !self.login.is_open() {
             return false;
         }
         self.cancel_login(cx);
@@ -1080,7 +1082,7 @@ impl AccountsPage {
     }
 
     fn retry_login(&mut self, cx: &mut Context<Self>) {
-        if let Some((harness, provider)) = self.login.as_ref().map(|f| (f.harness, f.provider)) {
+        if let Some((harness, provider)) = self.login.as_open().map(|f| (f.harness, f.provider)) {
             self.start_login(harness, provider, cx);
         }
     }
@@ -1151,6 +1153,7 @@ impl AccountsPage {
         first: bool,
         theme: &Theme,
         now: DateTime<Utc>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let email: SharedString = account
@@ -1261,8 +1264,9 @@ impl AccountsPage {
         let menu_open = self.row_menu.get() == Some(&account.id);
         let menu_account = account.clone();
         let menu_trigger_id = account.id.clone();
-        let mut more = widgets::action_button(theme, widgets::ActionTone::Quiet)
-            .id(("account-more", ix))
+        // Rows restart `ix` per provider; the account id keys the fade.
+        let more_id = format!("account-more-{}", account.id);
+        let mut more = widgets::action(theme, widgets::ActionTone::Quiet, more_id, window)
             .w(px(28.0))
             .px_0()
             .justify_center()
@@ -1470,21 +1474,14 @@ impl AccountsPage {
     /// line for the code field.
     fn render_login_dialog(
         &mut self,
-        viewport: gpui::Size<gpui::Pixels>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let theme = Theme::of(cx).for_popup();
         let red_text = theme.danger_muted.opacity(0.9); // red-300
-        let login = self.login.as_ref()?;
+        let login = self.login.get()?;
         let title = login.title();
         let failed = matches!(login.step, LoginStep::Failed { .. });
-        let action = |id: &'static str, tone: widgets::ActionTone, label: &'static str| {
-            widgets::text_action(&theme, tone, label)
-                .id(id)
-                .tab_index(0)
-                .role(gpui::Role::Button)
-                .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
-        };
         let copy = match login.step {
             LoginStep::PasteCode { .. } => {
                 "Your browser opened Claude's sign-in page. Approve access, then paste the \
@@ -1500,10 +1497,11 @@ impl AccountsPage {
                 .id("login-open-url")
                 .mt(px(6.0))
                 .text_size(crate::typography::ui_rems(12.0))
-                .text_color(theme.text_muted)
                 .truncate()
                 .cursor_pointer()
-                .hover(|s| s.text_color(theme.text))
+                .hover_fade("login-open-url-wash", window, |el, t| {
+                    el.text_color(crate::motion::mix(theme.text_muted, theme.text, t))
+                })
                 .tab_index(0)
                 .role(gpui::Role::Button)
                 .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
@@ -1553,6 +1551,13 @@ impl AccountsPage {
                 .mt(px(16.0))
                 .child(error_line(message.clone()))
                 .into_any_element(),
+        };
+        let mut action = |id: &'static str, tone: widgets::ActionTone, label: &'static str| {
+            widgets::action(&theme, tone, id, window)
+                .child(label)
+                .tab_index(0)
+                .role(gpui::Role::Button)
+                .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
         };
         let buttons = div()
             .mt(px(16.0))
@@ -1612,7 +1617,12 @@ impl AccountsPage {
             .child(middle)
             .child(buttons)
             .into_any_element();
-        Some(popover::modal("add-account-dialog", viewport, card))
+        Some(popover::modal(
+            "add-account-dialog",
+            window.viewport_size(),
+            card,
+            self.login.closing_since(),
+        ))
     }
 
     /// A ghost account row (zeron settings.agents.tsx `SkeletonRow`): avatar,
@@ -1717,6 +1727,7 @@ impl AccountsPage {
         theme: &Theme,
         now: DateTime<Utc>,
         dialog: Option<AnyElement>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let refreshing = self.refreshing || matches!(self.snapshot, Loadable::Loading);
@@ -1747,7 +1758,7 @@ impl AccountsPage {
                         .into_iter()
                         .enumerate()
                         .map(|(ix, account)| {
-                            self.render_account_row(account, ix, ix == 0, theme, now, cx)
+                            self.render_account_row(account, ix, ix == 0, theme, now, window, cx)
                         })
                         .collect();
                     let empty = rows.is_empty();
@@ -1767,22 +1778,26 @@ impl AccountsPage {
                             .children(login_options(harness).into_iter().enumerate().map(
                                 |(ix, option)| {
                                     let label = add_option_label(harness, option, empty);
-                                    widgets::action_button(theme, widgets::ActionTone::Quiet)
-                                        .id(("accounts-add", ix))
-                                        .when(ix == 0, |el| el.ml(px(-10.0)))
-                                        .role(gpui::Role::Button)
-                                        .aria_label(label.clone())
-                                        .tab_index(0)
-                                        .focus_visible(|s| s.border_2().border_color(theme.accent))
-                                        .on_click(cx.listener(move |page, _, _, cx| {
-                                            page.start_login(harness, option.provider, cx)
-                                        }))
-                                        .child(
-                                            crate::icons::icon(crate::icons::PLUS)
-                                                .size(px(14.0))
-                                                .text_color(theme.text_muted),
-                                        )
-                                        .child(SharedString::from(label))
+                                    widgets::action(
+                                        theme,
+                                        widgets::ActionTone::Quiet,
+                                        ("accounts-add", ix),
+                                        window,
+                                    )
+                                    .when(ix == 0, |el| el.ml(px(-10.0)))
+                                    .role(gpui::Role::Button)
+                                    .aria_label(label.clone())
+                                    .tab_index(0)
+                                    .focus_visible(|s| s.border_2().border_color(theme.accent))
+                                    .on_click(cx.listener(move |page, _, _, cx| {
+                                        page.start_login(harness, option.provider, cx)
+                                    }))
+                                    .child(
+                                        crate::icons::icon(crate::icons::PLUS)
+                                            .size(px(14.0))
+                                            .text_color(theme.text_muted),
+                                    )
+                                    .child(SharedString::from(label))
                                 },
                             ))
                     });
@@ -1813,28 +1828,32 @@ impl AccountsPage {
                     )
                     .child(div().flex_1())
                     .child(
-                        widgets::action_button(theme, widgets::ActionTone::Quiet)
-                            .id("accounts-refresh")
-                            // Optically align the glyph with the badges'
-                            // right edge below.
-                            .mr(px(-8.0))
-                            .w(px(32.0))
-                            .px_0()
-                            .justify_center()
-                            .when(refreshing, |el| el.opacity(0.5))
-                            .role(gpui::Role::Button)
-                            .aria_label("Refresh accounts")
-                            .tooltip(widgets::text_tooltip("Refresh usage"))
-                            .tab_index(0)
-                            .focus_visible(|s| s.border_2().border_color(theme.accent))
-                            .on_click(cx.listener(|page, _, _, cx| {
-                                page.load(force_usage_for(LoadTrigger::Refresh), cx)
-                            }))
-                            .child(
-                                crate::icons::icon(crate::icons::REFRESH)
-                                    .size(px(14.0))
-                                    .text_color(theme.text_muted),
-                            ),
+                        widgets::action(
+                            theme,
+                            widgets::ActionTone::Quiet,
+                            "accounts-refresh",
+                            window,
+                        )
+                        // Optically align the glyph with the badges'
+                        // right edge below.
+                        .mr(px(-8.0))
+                        .w(px(32.0))
+                        .px_0()
+                        .justify_center()
+                        .when(refreshing, |el| el.opacity(0.5))
+                        .role(gpui::Role::Button)
+                        .aria_label("Refresh accounts")
+                        .tooltip(widgets::text_tooltip("Refresh usage"))
+                        .tab_index(0)
+                        .focus_visible(|s| s.border_2().border_color(theme.accent))
+                        .on_click(cx.listener(|page, _, _, cx| {
+                            page.load(force_usage_for(LoadTrigger::Refresh), cx)
+                        }))
+                        .child(
+                            crate::icons::icon(crate::icons::REFRESH)
+                                .size(px(14.0))
+                                .text_color(theme.text_muted),
+                        ),
                     ),
             )
             .children(match &self.snapshot {
@@ -1868,9 +1887,9 @@ impl Render for AccountsPage {
         crate::toast::take_error(&mut self.error, cx);
         let theme = Theme::of(cx).for_settings_surface();
         let now = Utc::now();
-        let dialog = self.render_login_dialog(window.viewport_size(), cx);
+        let dialog = self.render_login_dialog(window, cx);
         if let Some(harness) = self.embedded_harness {
-            return self.render_embedded_provider(harness, &theme, now, dialog, cx);
+            return self.render_embedded_provider(harness, &theme, now, dialog, window, cx);
         }
         let refreshing = self.refreshing || matches!(self.snapshot, Loadable::Loading);
         let account_count = self
@@ -2009,7 +2028,15 @@ impl Render for AccountsPage {
                             .iter()
                             .enumerate()
                             .map(|(ix, account)| {
-                                self.render_account_row(account, ix, ix == 0, &theme, now, cx)
+                                self.render_account_row(
+                                    account,
+                                    ix,
+                                    ix == 0,
+                                    &theme,
+                                    now,
+                                    window,
+                                    cx,
+                                )
                             })
                             .collect();
                         let add_id: SharedString = format!("add-account-{name}").into();
@@ -2072,32 +2099,34 @@ impl Render for AccountsPage {
                                                 |(ix, option)| {
                                                     let label =
                                                         add_option_label(harness, option, empty);
-                                                    widgets::ghost_action(&theme)
-                                                        .id((add_id.clone(), ix))
-                                                        .tab_index(0)
-                                                        .role(gpui::Role::Button)
-                                                        .focus_visible(|s| {
-                                                            s.border_2()
-                                                                .border_color(theme.accent)
-                                                                .opacity(1.0)
-                                                        })
-                                                        .on_click(cx.listener(
-                                                            move |this, _, _, cx| {
-                                                                this.start_login(
-                                                                    harness,
-                                                                    option.provider,
-                                                                    cx,
-                                                                );
-                                                            },
-                                                        ))
-                                                        .child(
-                                                            crate::icons::icon(
-                                                                crate::icons::ADD_CIRCLE,
-                                                            )
-                                                            .size(px(16.0))
-                                                            .text_color(theme.text_muted),
+                                                    widgets::action(
+                                                        &theme,
+                                                        widgets::ActionTone::Quiet,
+                                                        (add_id.clone(), ix),
+                                                        window,
+                                                    )
+                                                    .tab_index(0)
+                                                    .role(gpui::Role::Button)
+                                                    .focus_visible(|s| {
+                                                        s.border_2()
+                                                            .border_color(theme.accent)
+                                                            .opacity(1.0)
+                                                    })
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.start_login(
+                                                            harness,
+                                                            option.provider,
+                                                            cx,
+                                                        );
+                                                    }))
+                                                    .child(
+                                                        crate::icons::icon(
+                                                            crate::icons::ADD_CIRCLE,
                                                         )
-                                                        .child(SharedString::from(label))
+                                                        .size(px(16.0))
+                                                        .text_color(theme.text_muted),
+                                                    )
+                                                    .child(SharedString::from(label))
                                                 },
                                             ),
                                         )
@@ -2149,26 +2178,30 @@ impl Render for AccountsPage {
                                         // `text-[12.5px]` + leading 16px Refresh icon,
                                         // dimmed while a refresh is in flight (zeron
                                         // `disabled:opacity-50`).
-                                        widgets::ghost_action(&theme)
-                                            .id("accounts-refresh")
-                                            .flex_none()
-                                            .text_size(crate::typography::ui_rems(12.5))
-                                            .when(refreshing, |el| el.opacity(0.5))
-                                            .tab_index(0)
+                                        widgets::action(
+                                            &theme,
+                                            widgets::ActionTone::Quiet,
+                                            "accounts-refresh",
+                                            window,
+                                        )
+                                        .flex_none()
+                                        .text_size(crate::typography::ui_rems(12.5))
+                                        .when(refreshing, |el| el.opacity(0.5))
+                                        .tab_index(0)
 .role(gpui::Role::Button)
 .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
 .on_click(cx.listener(|this, _, _, cx| {
-                                                this.load(
-                                                    force_usage_for(LoadTrigger::Refresh),
-                                                    cx,
-                                                )
-                                            }))
-                                            .child(
-                                                crate::icons::icon(crate::icons::REFRESH)
-                                                    .size(px(16.0))
-                                                    .text_color(theme.text_muted),
+                                            this.load(
+                                                force_usage_for(LoadTrigger::Refresh),
+                                                cx,
                                             )
-                                            .child(SharedString::from("Refresh")),
+                                        }))
+                                        .child(
+                                            crate::icons::icon(crate::icons::REFRESH)
+                                                .size(px(16.0))
+                                                .text_color(theme.text_muted),
+                                        )
+                                        .child(SharedString::from("Refresh")),
                                     )
                                     .child(self.render_device_switcher(&theme, cx)),
                             )
@@ -2431,8 +2464,8 @@ mod tests {
         window
             .update(cx, |page, _, cx| {
                 // Starting: the dialog's progress line before any page.
-                page.login = Some(waiting(HarnessId::Antigravity, 1));
-                let flow = page.login.as_ref().unwrap();
+                page.login.open(waiting(HarnessId::Antigravity, 1));
+                let flow = page.login.as_open().unwrap();
                 assert_eq!(flow.title(), "Sign in to Antigravity");
                 assert_eq!(flow.status().as_ref(), "Starting sign-in…");
                 // The page arrives with a poll: opened once, then waited on.
@@ -2442,7 +2475,7 @@ mod tests {
                     Ok(poll(AgentLoginStatus::Pending, None, Some(url))),
                     cx
                 ));
-                let flow = page.login.as_ref().unwrap();
+                let flow = page.login.as_open().unwrap();
                 assert_eq!(flow.url.as_deref(), Some(url));
                 assert_eq!(
                     flow.status().as_ref(),
@@ -2450,14 +2483,14 @@ mod tests {
                 );
                 // A reply for an older attempt never touches this one.
                 assert!(page.apply_poll(0, Ok(poll(AgentLoginStatus::Done, None, None)), cx));
-                assert!(page.login.is_some());
+                assert!(page.login.is_open());
                 // An already-signed-in agent finishes at once: the dialog
                 // closes and the list reloads to show the account.
                 assert!(page.apply_poll(1, Ok(poll(AgentLoginStatus::Done, None, None)), cx));
-                assert!(page.login.is_none());
+                assert!(!page.login.is_open());
 
                 // A failure stays on screen, in the dialog, with Retry.
-                page.login = Some(waiting(HarnessId::Codex, 2));
+                page.login.open(waiting(HarnessId::Codex, 2));
                 assert!(page.apply_poll(
                     2,
                     Ok(poll(
@@ -2468,27 +2501,27 @@ mod tests {
                     cx
                 ));
                 assert_eq!(
-                    page.login.as_ref().unwrap().step,
+                    page.login.as_open().unwrap().step,
                     LoginStep::Failed {
                         message: "Port 1455 is in use".into()
                     }
                 );
                 // So does a lost poll or a start that never got going.
-                page.login = Some(waiting(HarnessId::Cursor, 3));
+                page.login.open(waiting(HarnessId::Cursor, 3));
                 assert!(page.apply_poll(3, Err("engine gone".into()), cx));
                 assert!(matches!(
-                    &page.login.as_ref().unwrap().step,
+                    &page.login.as_open().unwrap().step,
                     LoginStep::Failed { message } if message.contains("engine gone")
                 ));
-                page.login = Some(waiting(HarnessId::ClaudeCode, 4));
+                page.login.open(waiting(HarnessId::ClaudeCode, 4));
                 page.apply_start(4, Err("no network".into()), cx);
                 assert!(matches!(
-                    &page.login.as_ref().unwrap().step,
+                    &page.login.as_open().unwrap().step,
                     LoginStep::Failed { message } if message.contains("Couldn't start the sign-in")
                 ));
                 // Closing a failed dialog clears it.
                 page.cancel_login(cx);
-                assert!(page.login.is_none());
+                assert!(!page.login.is_open());
             })
             .unwrap();
     }
@@ -2536,7 +2569,7 @@ mod tests {
                     ],
                     warnings: vec![],
                 });
-                page.login = Some(LoginFlow {
+                page.login.open(LoginFlow {
                     provider: Some("github-copilot"),
                     url: Some("https://github.com/login/device".into()),
                     step: LoginStep::Browser {
@@ -2545,11 +2578,11 @@ mod tests {
                     ..waiting(HarnessId::Opencode, 1)
                 });
                 assert_eq!(
-                    page.login.as_ref().unwrap().status().as_ref(),
+                    page.login.as_open().unwrap().status().as_ref(),
                     "Enter the code ABCD-1234 on GitHub."
                 );
                 assert_eq!(
-                    page.login.as_ref().unwrap().title(),
+                    page.login.as_open().unwrap().title(),
                     "Sign in to GitHub Copilot for OpenCode"
                 );
             })
@@ -2563,7 +2596,7 @@ mod tests {
         let window = page(cx);
         window
             .update(cx, |page, _, cx| {
-                page.login = Some(LoginFlow {
+                page.login.open(LoginFlow {
                     login_id: None,
                     ..waiting(HarnessId::ClaudeCode, 1)
                 });
@@ -2577,7 +2610,7 @@ mod tests {
                     }),
                     cx,
                 );
-                let flow = page.login.as_ref().unwrap();
+                let flow = page.login.as_open().unwrap();
                 assert_eq!(flow.title(), "Sign in to Claude Code");
                 assert_eq!(flow.login_id.as_deref(), Some("login-1"));
                 assert_eq!(

@@ -3,7 +3,9 @@
 use crate::{
     composer::{ComposerInput, ComposerInputEvent},
     file_icons::{self, FileIconIdentity},
-    icons, popover,
+    icons,
+    motion::{self, HoverFade as _},
+    popover,
     state::AppState,
     theme::Theme,
 };
@@ -65,6 +67,8 @@ pub struct SourceControl {
     snapshot: Option<CheckoutChanges>,
     rows: Vec<Row>,
     collapsed: HashSet<String>,
+    /// The repository or group that last expanded and when: its rows fade in.
+    revealed: Option<(String, std::time::Instant)>,
     selected: Option<CheckoutChangeSelection>,
     selected_files: HashSet<FileKey>,
     selection_anchor: Option<FileKey>,
@@ -95,7 +99,7 @@ pub struct SourceControl {
     form_second: Entity<ComposerInput>,
     _form_events: Vec<gpui::Subscription>,
     confirmation: Option<Confirmation>,
-    confirmation_dialog: Option<ConfirmationDialog>,
+    confirmation_dialog: popover::Popup<ConfirmationDialog>,
     undo_discard: Option<UndoDiscard>,
     operation_label: Option<SharedString>,
     amend: bool,
@@ -126,6 +130,15 @@ fn in_group(file: &GitFileStatus, staged: bool) -> bool {
         )
     } else {
         file.worktree != GitFileState::Unchanged || file.index == GitFileState::Unmerged
+    }
+}
+
+/// The `collapsed` key of a repository's file group.
+fn group_key(repository: &str, staged: bool, conflicts: bool) -> String {
+    if conflicts {
+        format!("{repository}:merge")
+    } else {
+        format!("{repository}:{staged}")
     }
 }
 
@@ -318,6 +331,7 @@ impl SourceControl {
             snapshot: None,
             rows: Vec::new(),
             collapsed: HashSet::new(),
+            revealed: None,
             selected: None,
             selected_files: HashSet::new(),
             selection_anchor: None,
@@ -345,7 +359,7 @@ impl SourceControl {
             form_second,
             _form_events: form_events,
             confirmation: None,
-            confirmation_dialog: None,
+            confirmation_dialog: popover::Popup::default(),
             undo_discard: None,
             operation_label: None,
             amend: false,
@@ -520,7 +534,7 @@ impl SourceControl {
                     continue;
                 }
                 self.rows.push(Row::Group { repository, staged, conflicts });
-                let key = if conflicts { format!("{}:merge", repo.path) } else { format!("{}:{staged}", repo.path) };
+                let key = group_key(&repo.path, staged, conflicts);
                 if self.collapsed.contains(&key) {
                     continue;
                 }
@@ -534,7 +548,9 @@ impl SourceControl {
     }
 
     fn toggle(&mut self, key: String, cx: &mut Context<Self>) {
-        if !self.collapsed.remove(&key) {
+        if self.collapsed.remove(&key) {
+            self.revealed = Some((key, std::time::Instant::now()));
+        } else {
             self.collapsed.insert(key);
         }
         self.rebuild();
@@ -874,7 +890,7 @@ impl SourceControl {
         .detach();
     }
 
-    fn render_commit(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(snapshot) = &self.snapshot else {
             return gpui::Empty.into_any_element();
         };
@@ -926,7 +942,7 @@ impl SourceControl {
                     .bg(theme.input_glass_bg())
                     .child(self.commit_input.clone()),
             )
-            .child(self.render_commit_button(enabled, committing, cx))
+            .child(self.render_commit_button(enabled, committing, window, cx))
             .into_any_element()
     }
 
@@ -940,6 +956,7 @@ impl SourceControl {
         selected: bool,
         selection_count: Option<usize>,
         theme: &Theme,
+        window: &mut Window,
     ) -> gpui::Stateful<gpui::Div> {
         let enabled = enabled && !self.is_busy();
         let opacity = if enabled { 1.0 } else { 0.35 };
@@ -950,6 +967,7 @@ impl SourceControl {
             None => format!("{verb} all changes"),
         };
         let debug_id = id.clone();
+        let wash = SharedString::from(format!("{id}-wash"));
         div()
             .id(SharedString::from(id))
             .debug_selector(move || debug_id.clone())
@@ -964,7 +982,8 @@ impl SourceControl {
             .opacity(if selected { opacity } else { 0.0 })
             .group_hover(row_group, move |el| el.opacity(opacity))
             .when(enabled, |el| {
-                el.cursor_pointer().hover(|s| s.bg(theme.glass_hover()))
+                el.cursor_pointer()
+                    .hover_bg(wash, window, gpui::transparent_black(), theme.glass_hover())
             })
             .tooltip(crate::settings::widgets::text_tooltip(label))
             .on_mouse_down(gpui::MouseButton::Left, |_, window, cx| {
@@ -998,7 +1017,12 @@ impl SourceControl {
             .child(count.to_string())
     }
 
-    fn render_row(&mut self, row: usize, cx: &mut Context<Self>) -> AnyElement {
+    fn render_row(
+        &mut self,
+        row: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let Some(snapshot) = &self.snapshot else {
             return div().into_any_element();
@@ -1020,6 +1044,32 @@ impl SourceControl {
         };
         let repo_path = repo.path.clone();
         let row_group: SharedString = format!("source-control-row-{row}").into();
+        // Rows under a repository or group that just expanded fade in; rows
+        // that scroll into view later never do.
+        let reveal = self
+            .revealed
+            .as_ref()
+            .filter(|(key, at)| {
+                at.elapsed() < motion::FADE_QUICK.total()
+                    && match row_model {
+                        Row::Repository(_) => false,
+                        Row::Group { .. } => *key == repo.path,
+                        Row::File { file, staged, .. } => {
+                            *key == repo.path
+                                || repo.files.get(file).is_some_and(|file| {
+                                    *key == group_key(&repo.path, staged, file.is_conflicted())
+                                })
+                        }
+                    }
+            })
+            .map(|_| {
+                motion::entrance(
+                    window,
+                    ("sc-reveal", row),
+                    motion::FADE_QUICK,
+                    motion::reduced_motion(cx),
+                )
+            });
         let base = div()
             .id(("source-control-row", row))
             .group(row_group.clone())
@@ -1031,23 +1081,30 @@ impl SourceControl {
             .pr(px(10.0))
             .border_l_2()
             .border_color(gpui::transparent_black())
-            .text_size(px(13.0));
+            .text_size(px(13.0))
+            .when_some(reveal, |el, t| el.opacity(t));
         match row_model {
             Row::Repository(_) => {
                 let collapsed = self.collapsed.contains(&repo.path);
                 base.pl(px(6.0))
                     .cursor_pointer()
-                    .hover(|s| s.bg(theme.glass_hover()))
+                    .hover_bg(
+                        ("sc-row-wash", row),
+                        window,
+                        gpui::transparent_black(),
+                        theme.glass_hover(),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.select_repository(repo_path.clone(), cx);
                         this.toggle(repo_path.clone(), cx);
                     }))
                     .child(
-                        icons::icon(if collapsed {
-                            icons::ALT_ARROW_RIGHT
-                        } else {
-                            icons::ALT_ARROW_DOWN
-                        })
+                        icons::disclosure_chevron(
+                            SharedString::from(format!("sc-chevron-{}", repo.path)),
+                            !collapsed,
+                            window,
+                            cx,
+                        )
                         .size(px(12.0))
                         .text_color(theme.text_muted),
                     )
@@ -1077,26 +1134,28 @@ impl SourceControl {
                     .into_any_element()
             }
             Row::Group { conflicts, .. } => {
-                let key = if conflicts { format!("{}:merge", repo.path) } else { format!("{}:{staged}", repo.path) };
+                let key = group_key(&repo.path, staged, conflicts);
                 let collapsed = self.collapsed.contains(&key);
+                let chevron = SharedString::from(format!("sc-chevron-{key}"));
                 let enabled = repo.complete;
                 let discard_repository = repo_path.clone();
                 let selected_repository = repo_path.clone();
                 base.pl(px(18.0))
                     .cursor_pointer()
-                    .hover(|s| s.bg(theme.glass_hover()))
+                    .hover_bg(
+                        ("sc-row-wash", row),
+                        window,
+                        gpui::transparent_black(),
+                        theme.glass_hover(),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.select_repository(selected_repository.clone(), cx);
                         this.toggle(key.clone(), cx);
                     }))
                     .child(
-                        icons::icon(if collapsed {
-                            icons::ALT_ARROW_RIGHT
-                        } else {
-                            icons::ALT_ARROW_DOWN
-                        })
-                        .size(px(12.0))
-                        .text_color(theme.text_muted),
+                        icons::disclosure_chevron(chevron, !collapsed, window, cx)
+                            .size(px(12.0))
+                            .text_color(theme.text_muted),
                     )
                     .child(
                         div()
@@ -1117,6 +1176,7 @@ impl SourceControl {
                                 false,
                                 None,
                                 &theme,
+                                window,
                             )
                             .on_click(cx.listener(
                                 move |this, _, _, cx| {
@@ -1144,6 +1204,7 @@ impl SourceControl {
                             false,
                             None,
                             &theme,
+                            window,
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
@@ -1224,7 +1285,14 @@ impl SourceControl {
                     } else {
                         gpui::transparent_black()
                     })
-                    .when(!selected, |el| el.hover(|s| s.bg(theme.glass_hover())))
+                    .when(!selected, |el| {
+                        el.hover_bg(
+                            ("sc-row-wash", row),
+                            window,
+                            gpui::transparent_black(),
+                            theme.glass_hover(),
+                        )
+                    })
                     .when(self.file_menu.get().is_none() && self.confirmation.is_none(), |row| row.tooltip(crate::settings::widgets::text_tooltip(format!(
                         "{full_path} ({})",
                         if staged { "Index" } else { "Working Tree" },
@@ -1296,6 +1364,7 @@ impl SourceControl {
                                 row_group.clone(),
                                 selected,
                                 &theme,
+                                window,
                             )
                             .on_click(cx.listener(
                                 move |_, _, _, cx| {
@@ -1316,6 +1385,7 @@ impl SourceControl {
                                     selected,
                                     Some(discard_paths.len()),
                                     &theme,
+                                    window,
                                 )
                                 .on_click(cx.listener(
                                     move |this, _, _, cx| {
@@ -1343,6 +1413,7 @@ impl SourceControl {
                             selected,
                             Some(paths.len()),
                             &theme,
+                            window,
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
@@ -1373,6 +1444,7 @@ impl SourceControl {
 impl Render for SourceControl {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::transcript::record_view_frame("source-control");
+        crate::motion::keyed_fade_frames(window);
         self.rendered = true;
         if self.poll_paused {
             self.start_polling(cx);
@@ -1417,9 +1489,9 @@ impl Render for SourceControl {
                         uniform_list(
                             "source-control-files",
                             self.rows.len(),
-                            cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
+                            cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
                                 range
-                                    .map(|i| this.render_row(i, cx))
+                                    .map(|i| this.render_row(i, window, cx))
                                     .collect::<Vec<AnyElement>>()
                             }),
                         )
@@ -1443,7 +1515,7 @@ impl Render for SourceControl {
                         .child("No changes"),
                 )
             })
-            .child(self.render_git_status(cx))
+            .child(self.render_git_status(window, cx))
             .children(file_menu)
             .child(stash_picker)
             .child(confirmation)
@@ -1481,7 +1553,7 @@ mod tests {
 
     struct FileHost(Entity<SourceControl>);
     impl Render for FileHost {
-        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             self.0.update(cx, |view, cx| {
                 let content = div()
                     .track_focus(&view.list_focus)
@@ -1499,7 +1571,7 @@ mod tests {
                     )
                     .children(
                         (0..view.rows.len())
-                            .map(|row| view.render_row(row, cx))
+                            .map(|row| view.render_row(row, window, cx))
                             .collect::<Vec<_>>(),
                     ).children(view.render_file_menu(cx));
                 view.selection_surface(content, cx)

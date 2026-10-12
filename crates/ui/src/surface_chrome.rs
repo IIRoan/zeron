@@ -73,12 +73,21 @@ pub(crate) fn tab_frame(
         .when(selected, |el| el.bg(crate::theme::wash(0.10)))
 }
 
+/// [`tab_frame`] with a hover wash fading over `transition-colors`. Its id
+/// doubles as the fade key, so it must be unique app-wide.
 pub(crate) fn tab(
     id: impl Into<gpui::ElementId>,
     selected: bool,
     theme: &Theme,
 ) -> gpui::Stateful<Div> {
+    let id = id.into();
+    let key = id.to_string();
     tab_frame(id, selected, theme).when(!selected, |el| {
-        el.hover(|style| style.bg(crate::theme::wash(0.06)))
+        el.bg(crate::motion::hover_blend(
+            &key,
+            gpui::transparent_black(),
+            crate::theme::wash(0.06),
+        ))
+        .on_hover(crate::motion::hover_listener(key))
     })
 }

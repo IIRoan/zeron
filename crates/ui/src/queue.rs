@@ -18,7 +18,7 @@ use zeron_rpc::methods;
 
 use crate::composer::{Composer, QUEUE_COMPOSER_OVERLAP};
 use crate::icons::{self, icon};
-use crate::motion::{self, AnimationExt as _, TAB_SLIDE};
+use crate::motion::{self, AnimationExt as _, HoverFade as _, TAB_SLIDE};
 use crate::settings::shortcuts::modifier_send_label;
 use crate::terminal::panel::{drop_index, slide_offset};
 use crate::theme::Theme;
@@ -56,7 +56,7 @@ struct QueueActionTooltip {
 }
 
 impl Render for QueueActionTooltip {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx);
         let card = div()
             .px(px(8.0))
@@ -68,7 +68,7 @@ impl Render for QueueActionTooltip {
             .text_size(px(10.5))
             .text_color(theme.text_muted)
             .child(self.label.clone());
-        crate::frost::frosted(6.0, crate::frost::MENU_BLUR, card)
+        crate::popover::tooltip_surface(card, Some(6.0), window, cx)
     }
 }
 
@@ -408,6 +408,7 @@ impl Composer {
                 show_latest_shortcut,
                 true,
                 &theme,
+                window,
                 cx,
             );
             // Frosted like a menu: the rows sliding beneath read as blurred
@@ -453,6 +454,7 @@ impl Composer {
                     show_latest_shortcut,
                     false,
                     &theme,
+                    window,
                     cx,
                 )
             }),
@@ -517,6 +519,7 @@ impl Composer {
         show_latest_shortcut: bool,
         lifted: bool,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         // The lifted copy is a separate element from the row left in place.
@@ -550,6 +553,7 @@ impl Composer {
             icons::PEN,
             !being_removed,
             theme,
+            window,
             cx.listener(move |this, _, _, cx| {
                 this.begin_queue_edit(edit_id.clone(), cx);
             }),
@@ -566,6 +570,7 @@ impl Composer {
             icons::TRASH_BIN_MINIMALISTIC,
             !being_removed,
             theme,
+            window,
             cx.listener(move |this, _, _, cx| {
                 this.remove_queued(drop_id.clone(), cx);
             }),
@@ -589,6 +594,7 @@ impl Composer {
                 resolved_primary.is_some() && !being_removed,
             ),
             theme,
+            window,
             cx.listener(move |this, _, _, cx| {
                 this.activate_queued_primary(primary_id.clone(), primary_action, cx);
             }),
@@ -600,6 +606,7 @@ impl Composer {
             icons::QUEUE_CHECK,
             !self.queue_edit_finishing,
             theme,
+            window,
             cx.listener(|this, _, _, cx| {
                 this.commit_queue_edit(cx);
             }),
@@ -611,6 +618,7 @@ impl Composer {
             icons::QUEUE_CLOSE,
             !self.queue_edit_finishing,
             theme,
+            window,
             cx.listener(|this, _, _, cx| {
                 this.cancel_queue_edit(cx);
             }),
@@ -652,7 +660,12 @@ impl Composer {
             .rounded(px(ROW_RADIUS))
             .when(being_edited, |el| el.bg(crate::theme::ink(0.06)))
             .when(!being_edited && !being_removed, |el| {
-                el.hover(|s| s.bg(crate::theme::ink(0.04)))
+                el.hover_bg(
+                    format!("{key}-row-hover"),
+                    window,
+                    gpui::transparent_black(),
+                    crate::theme::ink(0.04),
+                )
             })
             .when(being_removed, |el| el.opacity(0.55))
             .cursor(gpui::CursorStyle::Arrow)
@@ -697,7 +710,7 @@ impl Composer {
                 let hidden = queue_hidden_attachments_label(&labels, limit);
                 el.children(tiled.iter().zip(&labels).take(limit).enumerate().map(
                     |(index, (path, label))| {
-                        self.queue_thumbnail(&key, index, path, label.into(), cx)
+                        self.queue_thumbnail(&key, index, path, label.into(), window, cx)
                     },
                 ))
                 .when_some(hidden, |el, hidden| {
@@ -958,6 +971,7 @@ impl Composer {
         index: usize,
         path: &str,
         label: SharedString,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         use crate::attachments;
@@ -1022,7 +1036,9 @@ impl Composer {
                     .aria_label(format!("Preview {}", label))
                     .tab_index(0)
                     .focus_visible(move |style| style.border_color(accent))
-                    .hover(move |style| style.border_color(accent))
+                    .hover_fade(format!("{key}-image-{index}-hover"), window, |el, t| {
+                        el.border_color(motion::mix(crate::theme::hairline(0.1), accent, t))
+                    })
                     .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -1077,6 +1093,7 @@ impl Composer {
         glyph: &'static str,
         enabled: bool,
         theme: &Theme,
+        window: &mut Window,
         on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
     ) -> AnyElement {
         let own = SharedString::from(format!("{key}-{slot}-grp"));
@@ -1092,10 +1109,15 @@ impl Composer {
             .items_center()
             .justify_center()
             .rounded(px(ROW_CONTROL_RADIUS))
-            .opacity(0.72)
             .when(enabled, |el| {
                 el.cursor_pointer()
-                    .hover(|s| s.opacity(1.0).bg(crate::theme::ink(0.07)))
+                    .hover_fade(format!("{key}-{slot}-hover"), window, |el, t| {
+                        el.opacity(motion::lerp(0.72, 1.0, t)).bg(motion::mix(
+                            gpui::transparent_black(),
+                            crate::theme::ink(0.07),
+                            t,
+                        ))
+                    })
                     .tab_index(0)
                     .focus_visible(move |s| s.bg(accent.opacity(0.18)).text_color(accent))
                     .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -1131,6 +1153,7 @@ impl Composer {
         enabled: bool,
         show_shortcut: bool,
         theme: &Theme,
+        window: &mut Window,
         on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
     ) -> AnyElement {
         let tooltip = if enabled {
@@ -1158,7 +1181,18 @@ impl Composer {
             .when(enabled, |el| {
                 el.cursor_pointer()
                     .tab_index(0)
-                    .hover(|s| s.bg(crate::theme::ink(0.07)).text_color(theme.text))
+                    .hover_fade(format!("{key}-primary-hover"), window, |el, t| {
+                        el.bg(motion::mix(
+                            gpui::transparent_black(),
+                            crate::theme::ink(0.07),
+                            t,
+                        ))
+                        .text_color(motion::mix(
+                            theme.text_muted,
+                            theme.text,
+                            t,
+                        ))
+                    })
                     .focus_visible(move |s| s.bg(accent.opacity(0.18)).text_color(accent))
                     .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(move |event, window, cx| {

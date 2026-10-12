@@ -48,7 +48,7 @@ use crate::markdown::parser::{
 };
 use crate::markdown::render::{self, RenderCache, RenderOptions};
 use crate::markdown::veil::RowVeil;
-use crate::motion::{self, AnimationExt as _};
+use crate::motion::{self, AnimationExt as _, HoverFade as _};
 use crate::notice::{NoticeChipIcon::Tile, notice_chip};
 use crate::state::AppState;
 use crate::syntax_cache::{DocumentHighlightKey, SyntaxHighlightCache};
@@ -6226,7 +6226,7 @@ impl Transcript {
         text: SharedString,
         mentions: Arc<Vec<crate::composer::SentMentionSpan>>,
         theme: &Theme,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let chip_overlays = self.chip_overlays(row_id, &mentions, theme, cx);
@@ -6352,6 +6352,7 @@ impl Transcript {
                     collapsed_h,
                     measured_h,
                     theme,
+                    window,
                     cx,
                 ))
             })
@@ -6368,6 +6369,7 @@ impl Transcript {
         collapsed_h: f32,
         measured_h: Rc<Cell<f32>>,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let toggle_key = row_id.clone();
@@ -6392,9 +6394,10 @@ impl Transcript {
             .gap(px(5.0))
             .text_size(crate::typography::ui_rems(14.0))
             .line_height(crate::typography::ui_rems(USER_LINE_HEIGHT))
-            .text_color(theme.text_muted)
             .cursor_pointer()
-            .hover(|s| s.text_color(theme.text))
+            .hover_fade(format!("{row_id}-expander-hover"), window, |el, t| {
+                el.text_color(motion::mix(theme.text_muted, theme.text, t))
+            })
             .child(label)
             .child(
                 crate::icons::icon(glyph)
@@ -6682,7 +6685,7 @@ impl Transcript {
         &mut self,
         row_id: &SharedString,
         atts: &[crate::attachments::UserImageAttachment],
-        _window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         use crate::attachments::AttachmentSnapshot;
@@ -6728,7 +6731,12 @@ impl Transcript {
                     .rounded(px(14.0))
                     .p(px(8.0))
                     .gap(px(6.0))
-                    .hover(|style| style.bg(crate::theme::ink(0.045)));
+                    .hover_bg(
+                        format!("{row_id}-appshot-{aix}-hover"),
+                        window,
+                        gpui::transparent_black(),
+                        crate::theme::ink(0.045),
+                    );
                 let image_frame = div()
                     .w_full()
                     .h(px(128.0))
@@ -7451,6 +7459,7 @@ impl Transcript {
                 *worked_secs,
                 *compact_shell,
                 &theme,
+                window,
                 cx,
             ),
             RowKind::InputChip { header, resolved } => {
@@ -7462,7 +7471,9 @@ impl Transcript {
                 name,
                 mime_type,
             } => self.render_generated_image(&row.id, owner, path, name, mime_type, cx),
-            RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
+            RowKind::ErrorChip { message } => {
+                error_chip(&row.id, message.clone(), &theme, window)
+            }
             RowKind::ForkMarker { source_title, .. } => fork_marker(source_title.clone(), &theme),
         };
         // Diagram fences this row just requested start rendering after layout.
@@ -7830,6 +7841,7 @@ impl Transcript {
         worked_secs: Option<i64>,
         compact_shell: bool,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let mut fold = self.folds.get(row_id).copied().unwrap_or_default();
@@ -8186,8 +8198,9 @@ impl Transcript {
             // broke" (user report). Failures still show on the individual
             // chips (destructive tint, zeron tool-chip.tsx) and in the
             // summary's "· N failed" count.
-            .text_color(theme.text_muted)
-            .hover(|s| s.text_color(theme.text))
+            .hover_fade(format!("{row_id}-hdr-hover"), window, |el, t| {
+                el.text_color(motion::mix(theme.text_muted, theme.text, t))
+            })
             .on_click(cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
                 this.toggle_fold(toggle_id.clone(), viewport_height, effective_auto_open, cx);
@@ -8301,6 +8314,7 @@ impl Transcript {
                         collapses,
                         theme,
                         cx.entity_id(),
+                        window,
                         cx,
                     );
                 }
@@ -8319,6 +8333,7 @@ impl Transcript {
                             file_opener.as_ref(),
                             theme,
                             cx.entity_id(),
+                            window,
                             cx,
                         ),
                         row_height,
@@ -8380,6 +8395,7 @@ impl Transcript {
                                 file_opener.as_ref(),
                                 theme,
                                 cx.entity_id(),
+                                window,
                                 cx,
                             )),
                     );
@@ -8440,7 +8456,13 @@ impl Transcript {
                         if !loading {
                             row = row
                                 .cursor_pointer()
-                                .hover(|s| s.text_color(theme.text_muted))
+                                .hover_fade(format!("{key}-blob-hover"), window, |el, t| {
+                                    el.text_color(motion::mix(
+                                        theme.text_faint,
+                                        theme.text_muted,
+                                        t,
+                                    ))
+                                })
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.spawn_blob_fetch(blob_ref.clone(), cx);
                                     cx.notify();
@@ -8947,12 +8969,17 @@ fn user_file_pill(name: &str, theme: &Theme) -> AnyElement {
 /// WRAPS instead of truncating: startup-crash errors carry the agent's exit
 /// status and stderr, and a one-line ellipsis was exactly what made
 /// zeronsh/comet#95 undiagnosable from the screenshot.
-fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
+fn error_chip(
+    row_id: &SharedString,
+    message: SharedString,
+    theme: &Theme,
+    window: &mut Window,
+) -> AnyElement {
     div()
         .py(px(4.0))
         .w_full()
         .child(
-            notice_chip(theme, false, "Error", message, Tile)
+            notice_chip(theme, false, "Error", message, Tile, format!("{row_id}-copy"), window)
                 .overflow_hidden()
                 .w_full(),
         )
@@ -9361,6 +9388,7 @@ fn chip_header_row(
     file_opener: Option<&ToolFileOpener>,
     theme: &Theme,
     view: gpui::EntityId,
+    window: &mut Window,
     cx: &mut gpui::App,
 ) -> gpui::Div {
     let (label, detail) = match tool.kind {
@@ -9475,6 +9503,11 @@ fn chip_header_row(
                     theme.text.opacity(0.85)
                 })
                 .child(if let Some(path) = file_path {
+                    let badge_text = if failed {
+                        theme.danger
+                    } else {
+                        theme.text.opacity(0.85)
+                    };
                     let badge = div()
                         .min_w_0()
                         .h(px(22.0))
@@ -9486,11 +9519,7 @@ fn chip_header_row(
                         .bg(theme.ink(0.06))
                         .pl(px(1.0))
                         .pr(px(6.0))
-                        .text_color(if failed {
-                            theme.danger
-                        } else {
-                            theme.text.opacity(0.85)
-                        })
+                        .text_color(badge_text)
                         .child(
                             div()
                                 .size(px(20.0))
@@ -9532,9 +9561,21 @@ fn chip_header_row(
                                     badge
                                         .debug_selector(|| "tool-file-badge".into())
                                         .cursor_pointer()
-                                        .hover(|style| {
-                                            style.bg(theme.ink(0.1)).text_color(theme.text)
-                                        })
+                                        .hover_fade(
+                                            format!("tool-file-badge-{}", tool.part_id),
+                                            window,
+                                            |badge, t| {
+                                                badge
+                                                    .bg(motion::mix(
+                                                        theme.ink(0.06),
+                                                        theme.ink(0.1),
+                                                        t,
+                                                    ))
+                                                    .text_color(motion::mix(
+                                                        badge_text, theme.text, t,
+                                                    ))
+                                            },
+                                        )
                                         .on_click(move |_, window, cx| {
                                             cx.stop_propagation();
                                             opener.open(&path, window, cx);
@@ -9647,6 +9688,7 @@ fn chip_header(
     file_opener: Option<&ToolFileOpener>,
     theme: &Theme,
     view: gpui::EntityId,
+    window: &mut Window,
     cx: &mut gpui::App,
 ) -> gpui::Div {
     chip_header_row(
@@ -9655,6 +9697,7 @@ fn chip_header(
         file_opener,
         theme,
         view,
+        window,
         cx,
     )
 }
@@ -9851,6 +9894,7 @@ fn tool_chip(
     file_opener: Option<&ToolFileOpener>,
     theme: &Theme,
     view: gpui::EntityId,
+    window: &mut Window,
     cx: &mut gpui::App,
 ) -> AnyElement {
     let row_height = if rail {
@@ -9896,7 +9940,7 @@ fn tool_chip(
                         .top(px(4.0 * (1.0 - content_reveal)))
                         .opacity(content_reveal)
                 })
-                .child(chip_header_row(tool, None, file_opener, theme, view, cx)),
+                .child(chip_header_row(tool, None, file_opener, theme, view, window, cx)),
         )
         .into_any_element()
 }
@@ -9913,8 +9957,10 @@ fn subagent_chip(
     rail: bool,
     theme: &Theme,
     view: gpui::EntityId,
+    window: &mut Window,
     cx: &mut gpui::App,
 ) -> AnyElement {
+    let hover_key = format!("{id}-hover");
     div()
         .h(px(CHIP_HEIGHT))
         .w_full()
@@ -9945,9 +9991,13 @@ fn subagent_chip(
                 .rounded(px(9.0))
                 .border_1()
                 .border_color(crate::theme::hairline(0.07))
-                .bg(crate::theme::ink(0.03))
                 .cursor_pointer()
-                .hover(|s| s.bg(crate::theme::ink(0.05)))
+                .hover_bg(
+                    hover_key,
+                    window,
+                    crate::theme::ink(0.03),
+                    crate::theme::ink(0.05),
+                )
                 .on_click(on_open)
                 .child(chip_header_row(
                     tool,
@@ -9955,6 +10005,7 @@ fn subagent_chip(
                     None,
                     theme,
                     view,
+                    window,
                     cx,
                 )),
         )
@@ -10201,7 +10252,7 @@ impl Render for Transcript {
                     .ok();
             });
         }
-        let rail = self.render_rail(cx);
+        let rail = self.render_rail(window, cx);
         // The scroll-to-bottom pill is rendered by the SHELL (conversation
         // region overlay): it must float just above the composer and paint
         // OVER the bottom fade gradient, which is a later sibling of this
@@ -10365,46 +10416,67 @@ mod tests {
         transcript.update(cx, |this, cx| this.sync(cx));
     }
 
+    /// Runs `f` once inside a window draw: the tool group's hover fades keep
+    /// element state, which gpui only serves while drawing.
+    fn in_draw(cx: &mut gpui::App, f: impl FnOnce(&mut Window, &mut gpui::App) + 'static) {
+        struct Draw(Option<Box<dyn FnOnce(&mut Window, &mut gpui::App)>>);
+        impl Render for Draw {
+            fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                if let Some(f) = self.0.take() {
+                    f(window, cx);
+                }
+                gpui::Empty
+            }
+        }
+        // Opening draws the window once.
+        cx.open_window(Default::default(), |_, cx| cx.new(|_| Draw(Some(Box::new(f)))))
+            .unwrap();
+    }
+
     fn assert_replayed_group_is_closed(transcript: &Entity<Transcript>, cx: &mut gpui::App) {
-        transcript.update(cx, |this, cx| {
-            let row = this
-                .rows
-                .iter()
-                .find(|row| matches!(row.kind, RowKind::ToolGroup { .. }))
-                .unwrap()
-                .clone();
-            let RowKind::ToolGroup {
-                tools,
-                auto_open,
-                summary,
-                ..
-            } = &row.kind
-            else {
-                unreachable!()
-            };
-            assert!(!auto_open);
-            let _ = this.render_tool_group(
-                &row.id,
-                tools,
-                summary,
-                *auto_open,
-                None,
-                false,
-                &Theme::dark(),
-                cx,
-            );
-            let reveal = &this.tool_group_reveals[&row.id];
-            assert_eq!(
-                reveal.rendered_open,
-                Some(false),
-                "history flashed open on its first render"
-            );
-            assert_eq!(
-                reveal.rendered_height, 0.0,
-                "history replayed a stale closing tween"
-            );
-            assert!(reveal.header_started_at.is_none());
-            assert!(reveal.starts.iter().all(Option::is_none));
+        let group = transcript.clone();
+        in_draw(cx, move |window, cx| {
+            group.update(cx, |this, cx| {
+                let row = this
+                    .rows
+                    .iter()
+                    .find(|row| matches!(row.kind, RowKind::ToolGroup { .. }))
+                    .unwrap()
+                    .clone();
+                let RowKind::ToolGroup {
+                    tools,
+                    auto_open,
+                    summary,
+                    ..
+                } = &row.kind
+                else {
+                    unreachable!()
+                };
+                assert!(!auto_open);
+                let _ = this.render_tool_group(
+                    &row.id,
+                    tools,
+                    summary,
+                    *auto_open,
+                    None,
+                    false,
+                    &Theme::dark(),
+                    window,
+                    cx,
+                );
+                let reveal = &this.tool_group_reveals[&row.id];
+                assert_eq!(
+                    reveal.rendered_open,
+                    Some(false),
+                    "history flashed open on its first render"
+                );
+                assert_eq!(
+                    reveal.rendered_height, 0.0,
+                    "history replayed a stale closing tween"
+                );
+                assert!(reveal.header_started_at.is_none());
+                assert!(reveal.starts.iter().all(Option::is_none));
+            });
         });
     }
 
@@ -10982,35 +11054,39 @@ mod tests {
             transcript.update(cx, |this, cx| this.sync(cx));
             // Cached replay can land without an intervening pending frame.
             replay_tool_group(&state, &transcript, "chat-a", cx);
-            transcript.update(cx, |this, cx| {
-                let row = this.rows[0].clone();
-                let RowKind::ToolGroup {
-                    tools,
-                    auto_open,
-                    summary,
-                    ..
-                } = &row.kind
-                else {
-                    panic!("expected tools")
-                };
-                let _ = this.render_tool_group(
-                    &row.id,
-                    tools,
-                    summary,
-                    *auto_open,
-                    None,
-                    false,
-                    &Theme::dark(),
-                    cx,
-                );
-                assert_eq!(this.folds[&row.id].open, Some(true));
-                assert_eq!(this.tool_group_reveals[&row.id].rendered_open, Some(true));
-                assert!(
-                    this.tool_group_reveals[&row.id]
-                        .starts
-                        .iter()
-                        .all(Option::is_none)
-                );
+            let group = transcript.clone();
+            in_draw(cx, move |window, cx| {
+                group.update(cx, |this, cx| {
+                    let row = this.rows[0].clone();
+                    let RowKind::ToolGroup {
+                        tools,
+                        auto_open,
+                        summary,
+                        ..
+                    } = &row.kind
+                    else {
+                        panic!("expected tools")
+                    };
+                    let _ = this.render_tool_group(
+                        &row.id,
+                        tools,
+                        summary,
+                        *auto_open,
+                        None,
+                        false,
+                        &Theme::dark(),
+                        window,
+                        cx,
+                    );
+                    assert_eq!(this.folds[&row.id].open, Some(true));
+                    assert_eq!(this.tool_group_reveals[&row.id].rendered_open, Some(true));
+                    assert!(
+                        this.tool_group_reveals[&row.id]
+                            .starts
+                            .iter()
+                            .all(Option::is_none)
+                    );
+                });
             });
             state.update(cx, |state, _| {
                 state.transcript.push(assistant(
@@ -11020,33 +11096,37 @@ mod tests {
                 ));
                 state.transcript_revision += 1;
             });
-            transcript.update(cx, |this, cx| {
-                this.sync(cx);
-                let row = this.rows.last().unwrap().clone();
-                let RowKind::ToolGroup {
-                    tools,
-                    auto_open,
-                    summary,
-                    ..
-                } = &row.kind
-                else {
-                    panic!("expected tools")
-                };
-                assert!(*auto_open);
-                let _ = this.render_tool_group(
-                    &row.id,
-                    tools,
-                    summary,
-                    *auto_open,
-                    None,
-                    false,
-                    &Theme::dark(),
-                    cx,
-                );
-                let reveal = &this.tool_group_reveals[&row.id];
-                assert!(reveal.header_started_at.is_some());
-                assert!(reveal.starts.iter().all(Option::is_some));
-                assert_eq!(reveal.rendered_open, Some(true));
+            let group = transcript.clone();
+            in_draw(cx, move |window, cx| {
+                group.update(cx, |this, cx| {
+                    this.sync(cx);
+                    let row = this.rows.last().unwrap().clone();
+                    let RowKind::ToolGroup {
+                        tools,
+                        auto_open,
+                        summary,
+                        ..
+                    } = &row.kind
+                    else {
+                        panic!("expected tools")
+                    };
+                    assert!(*auto_open);
+                    let _ = this.render_tool_group(
+                        &row.id,
+                        tools,
+                        summary,
+                        *auto_open,
+                        None,
+                        false,
+                        &Theme::dark(),
+                        window,
+                        cx,
+                    );
+                    let reveal = &this.tool_group_reveals[&row.id];
+                    assert!(reveal.header_started_at.is_some());
+                    assert!(reveal.starts.iter().all(Option::is_some));
+                    assert_eq!(reveal.rendered_open, Some(true));
+                });
             });
         });
     }
@@ -15652,7 +15732,7 @@ mod tests {
             toggles: Rc<Cell<usize>>,
         }
         impl Render for ChipFixture {
-            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
                 let theme = Theme::of(cx).clone();
                 let toggles = self.toggles.clone();
                 div().w(px(600.0)).child(
@@ -15666,6 +15746,7 @@ mod tests {
                             Some(&self.opener),
                             &theme,
                             cx.entity_id(),
+                            window,
                             cx,
                         )),
                 )

@@ -55,7 +55,7 @@ use crate::history::{
     GitHistoryViewButton,
 };
 use crate::markdown::render;
-use crate::motion::{self, AnimationExt as _, CHEVRON, COLLAPSE};
+use crate::motion::{self, AnimationExt as _, COLLAPSE, HoverFade as _};
 use crate::popover::{self, Popup};
 use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
@@ -1738,9 +1738,9 @@ impl gpui::EventEmitter<ChangesEvent> for Changes {}
 struct DiffHeaderTooltip(&'static str);
 
 impl Render for DiffHeaderTooltip {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx);
-        div()
+        let card = div()
             .px(px(8.0))
             .py(px(6.0))
             .rounded(px(6.0))
@@ -1750,7 +1750,8 @@ impl Render for DiffHeaderTooltip {
             .shadow_md()
             .text_size(px(11.0))
             .text_color(theme.text)
-            .child(self.0)
+            .child(self.0);
+        crate::popover::tooltip_surface(card, None, window, cx)
     }
 }
 
@@ -3459,6 +3460,7 @@ impl Changes {
                     &fold,
                     FileHeaderPresentation::Row,
                     &theme,
+                    window,
                     cx,
                 )
             }
@@ -3722,6 +3724,7 @@ impl Changes {
         fold: &FileFold,
         presentation: FileHeaderPresentation,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let collapsed = fold.collapsed;
@@ -3742,33 +3745,18 @@ impl Changes {
         };
 
         // Chevron (zeron checkout-diff-sidebar): chevron-right closed,
-        // chevron-down open; gpui divs have no rotation transform at the
-        // pinned rev, so the glyph swap crossfades over the same 200 ms.
-        let chevron_icon = if collapsed {
-            crate::icons::ALT_ARROW_RIGHT
-        } else {
-            crate::icons::ALT_ARROW_DOWN
-        };
+        // chevron-down open.
+        let prefix = presentation.key_prefix();
         let chevron = div().flex_none().size(px(14.0)).child(
-            crate::icons::icon(chevron_icon)
-                .size(px(13.0))
-                .text_color(theme.text_muted.opacity(0.7)),
+            crate::icons::disclosure_chevron(
+                format!("chev-{prefix}-{path}"),
+                !collapsed,
+                window,
+                cx,
+            )
+            .size(px(13.0))
+            .text_color(theme.text_muted.opacity(0.7)),
         );
-        let chevron: AnyElement = if fold.animating() {
-            chevron
-                .with_animation(
-                    SharedString::from(format!(
-                        "chev-{}-{path}-{}",
-                        presentation.key_prefix(),
-                        fold.epoch
-                    )),
-                    CHEVRON.animation(),
-                    |el, t| el.opacity(0.25 + 0.75 * t),
-                )
-                .into_any_element()
-        } else {
-            chevron.into_any_element()
-        };
 
         // Header row: chevron + mono path (one quiet tone) + right-aligned
         // +N / −N counts on a slightly raised wash. The header carries the
@@ -3793,9 +3781,8 @@ impl Changes {
             .items_center()
             .gap(px(8.0))
             .px(px(Theme::SPACE_MD))
-            .bg(rest_bg)
             .cursor_pointer()
-            .hover(move |s| s.bg(hover_bg))
+            .hover_bg(format!("diff-header-hover-{prefix}-{path}"), window, rest_bg, hover_bg)
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.toggle_fold(ix, cx);
                 cx.notify();
@@ -3857,7 +3844,12 @@ impl Changes {
                     .items_center()
                     .justify_center()
                     .rounded(px(crate::surface_chrome::CONTROL_RADIUS))
-                    .hover(|s| s.bg(theme.ink(0.08)))
+                    .hover_bg(
+                        format!("diff-open-file-hover-{prefix}-{ix}"),
+                        window,
+                        gpui::transparent_black(),
+                        theme.ink(0.08),
+                    )
                     .on_mouse_down(gpui::MouseButton::Left, |_, window, cx| {
                         window.prevent_default();
                         cx.stop_propagation();
@@ -3880,6 +3872,7 @@ impl Changes {
     fn render_sticky_file_header(
         &mut self,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let scroll_top = self.list.logical_scroll_top();
@@ -3909,6 +3902,7 @@ impl Changes {
             &fold,
             FileHeaderPresentation::Sticky,
             theme,
+            window,
             cx,
         );
         let paint = sticky_file_header_paint(theme);
@@ -5320,7 +5314,7 @@ fn render_file_body_upto(
 }
 
 impl Render for Changes {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.rendered = true;
         if self.file_watch_paused {
             self.watch_task = None;
@@ -5440,7 +5434,7 @@ impl Render for Changes {
                     .into_any_element(),
                 DiffPhase::List => {
                     if self.parsed.is_some() {
-                        let sticky_header = self.render_sticky_file_header(&theme, cx);
+                        let sticky_header = self.render_sticky_file_header(&theme, window, cx);
                         div()
                             .flex_1()
                             .min_h_0()
