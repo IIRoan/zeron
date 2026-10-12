@@ -60,7 +60,7 @@ pub enum SourceControlEvent {
 
 pub struct SourceControl {
     state: Entity<AppState>,
-    notifications: Option<Entity<crate::toast::Toasts>>,
+    notifications: Option<Entity<crate::progress_toast::Toasts>>,
     target: Option<Target>,
     snapshot: Option<CheckoutChanges>,
     rows: Vec<Row>,
@@ -213,7 +213,7 @@ pub(crate) async fn is_displayed<V: 'static>(
 }
 
 impl SourceControl {
-    pub(crate) fn set_notifications(&mut self, notifications: Entity<crate::toast::Toasts>) {
+    pub(crate) fn set_notifications(&mut self, notifications: Entity<crate::progress_toast::Toasts>) {
         self.notifications = Some(notifications);
     }
 
@@ -226,9 +226,9 @@ impl SourceControl {
             .unwrap_or_else(|| "Source Control".into()).into()
     }
 
-    fn begin_notification(&self, repository: &str, label: &'static str, cx: &mut Context<Self>) -> Option<crate::toast::PendingToast> {
+    fn begin_notification(&self, repository: &str, label: &'static str, cx: &mut Context<Self>) -> Option<crate::progress_toast::PendingToast> {
         self.notifications.as_ref().map(|toasts| {
-            crate::toast::PendingToast::start(toasts.clone(), self.notification_title(repository), label.into(), cx)
+            crate::progress_toast::PendingToast::start(toasts.clone(), self.notification_title(repository), label.into(), cx)
         })
     }
 
@@ -1957,7 +1957,7 @@ mod tests {
     #[gpui::test]
     fn an_unavailable_commit_reports_a_toast_and_keeps_the_draft_and_staging(cx: &mut TestAppContext) {
         let (view, cx) = commit_setup(cx);
-        let toasts = cx.new(|_| crate::toast::Toasts::default());
+        let toasts = cx.new(|_| crate::progress_toast::Toasts::default());
         view.update(cx, |view, cx| {
             view.set_notifications(toasts.clone());
             view.commit_input.update(cx, |input, cx| input.set_text("Keep this message", cx));
@@ -1975,7 +1975,7 @@ mod tests {
     #[gpui::test]
     fn background_load_errors_notify_once_until_recovery(cx: &mut TestAppContext) {
         let (view, cx) = commit_setup(cx);
-        let toasts = cx.new(|_| crate::toast::Toasts::default());
+        let toasts = cx.new(|_| crate::progress_toast::Toasts::default());
         view.update(cx, |view, cx| {
             view.set_notifications(toasts.clone());
             view.notify_load_error("offline", cx);
