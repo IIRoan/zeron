@@ -58,7 +58,7 @@ fn setup(cx: &mut TestAppContext) -> (tempfile::TempDir, Entity<Shell>, &mut Vis
         shell.test_time = Some(std::time::Instant::now());
         shell
     });
-    cx.simulate_resize(gpui::size(px(1600.0), px(900.0)));
+    cx.simulate_resize(window(1600.0));
     (dir, shell, cx)
 }
 
@@ -127,6 +127,69 @@ fn near(actual: f32, expected: f32) {
         (actual - expected).abs() <= 0.5,
         "expected {expected}px, got {actual}px"
     );
+}
+
+/// A window whose columns measure `width`: Linux adds its activity bar.
+fn window(width: f32) -> gpui::Size<Pixels> {
+    gpui::size(px(width + ACTIVITY_WIDTH), px(900.0))
+}
+
+/// The Linux workbench mirrors upstream's columns: the activity bar, Files
+/// and the surface host lead, the conversation follows, the sidebar trails.
+fn conversation_left(frame: &Frame) -> f32 {
+    if cfg!(target_os = "linux") {
+        ACTIVITY_WIDTH + frame.widths[1] + frame.widths[2]
+    } else {
+        frame.widths[0]
+    }
+}
+
+/// The surface host's leading edge, where its titlebar strip starts.
+fn surface_left(frame: &Frame) -> f32 {
+    if cfg!(target_os = "linux") {
+        ACTIVITY_WIDTH + frame.widths[1]
+    } else {
+        frame.widths[0] + frame.widths[3]
+    }
+}
+
+/// Upstream's trailing titlebar strip follows the surface host beneath it.
+/// The Linux workbench titlebar lays the surface tabs out itself.
+#[track_caller]
+fn strip_follows_surface(frame: &Frame) {
+    if !cfg!(target_os = "linux") {
+        near(f32::from(frame.strip.unwrap().left()), surface_left(frame));
+    }
+}
+
+/// The seam between the conversation and the surface host, and the pointer
+/// direction that widens the surface.
+fn surface_seam(frame: &Frame) -> (f32, f32) {
+    if cfg!(target_os = "linux") {
+        (conversation_left(frame), 1.0)
+    } else {
+        (surface_left(frame), -1.0)
+    }
+}
+
+/// The new-session canvas: upstream keeps the sidebar beside it; the Linux
+/// canvas shows the conversation alone across the whole window.
+fn canvas() -> [f32; 4] {
+    if cfg!(target_os = "linux") {
+        [0.0, 0.0, 0.0, 1600.0 + ACTIVITY_WIDTH]
+    } else {
+        [300.0, 0.0, 0.0, 1300.0]
+    }
+}
+
+/// A point `inset` px into the window from the sidebar's outer edge.
+fn from_sidebar_edge(inset: f32) -> Point<Pixels> {
+    let x = if cfg!(target_os = "linux") {
+        1600.0 + ACTIVITY_WIDTH - inset
+    } else {
+        inset
+    };
+    gpui::point(px(x), px(400.0))
 }
 
 #[track_caller]
@@ -202,13 +265,10 @@ fn panels_share_space_and_keep_rendered_geometry_through_their_lifecycle(cx: &mu
             );
             near(
                 f32::from(frame.composer.left()),
-                frame.widths[0] + (frame.widths[3] - composer_width) / 2.0,
+                conversation_left(&frame) + (frame.widths[3] - composer_width) / 2.0,
             );
             if frame.widths[2] > 128.0 {
-                near(
-                    f32::from(frame.strip.unwrap().left()),
-                    frame.widths[0] + frame.widths[3],
-                );
+                strip_follows_surface(&frame);
             }
             previous = width;
         }
@@ -216,9 +276,9 @@ fn panels_share_space_and_keep_rendered_geometry_through_their_lifecycle(cx: &mu
     }
     let wide = settled(&shell, cx);
     expect(wide, [0.0, 377.0, 611.5, 611.5]);
-    near(f32::from(wide.strip.unwrap().left()), 611.5);
+    strip_follows_surface(&wide);
     // A collapsed sidebar leaves the left edge to the window's own resize.
-    let edge = |x| gpui::point(px(x), px(400.0));
+    let edge = from_sidebar_edge;
     cx.simulate_mouse_down(edge(3.0), MouseButton::Left, Default::default());
     for x in [40.0, 80.0] {
         cx.simulate_mouse_move(edge(x), Some(MouseButton::Left), Default::default());
@@ -234,11 +294,13 @@ fn panels_share_space_and_keep_rendered_geometry_through_their_lifecycle(cx: &mu
     let reopening = draw(&shell, cx, 40);
     change(&shell, cx, |s, _, cx| s.toggle_sidebar(cx));
     continuous(reopening, draw(&shell, cx, 0));
-    expect(settled(&shell, cx), [300.0, 377.0, 461.5, 461.5]);
+    let shared = settled(&shell, cx);
+    expect(shared, [300.0, 377.0, 461.5, 461.5]);
 
     // A drag holds until a toggle; a seam reset restores the allocation.
-    let seam = gpui::point(px(761.5), px(400.0));
-    let dragged = gpui::point(px(723.0), px(400.0));
+    let (seam_x, widen) = surface_seam(&shared);
+    let seam = gpui::point(px(seam_x), px(400.0));
+    let dragged = gpui::point(px(seam_x + 38.5 * widen), px(400.0));
     cx.simulate_mouse_down(seam, MouseButton::Left, Default::default());
     for _ in 0..2 {
         cx.simulate_mouse_move(dragged, Some(MouseButton::Left), Default::default());
@@ -268,7 +330,7 @@ fn panels_share_space_and_keep_rendered_geometry_through_their_lifecycle(cx: &mu
 
     // Narrowing hides the oldest open column without closing it. Asking
     // for it promotes it; closing a neighbour makes room for its return.
-    cx.simulate_resize(gpui::size(px(1000.0), px(900.0)));
+    cx.simulate_resize(window(1000.0));
     let narrow = draw(&shell, cx, 0);
     expect(narrow, [300.0, 0.0, 360.0, 340.0]);
     assert!(shell.read_with(cx, |s, cx| s.files_panel_open(cx)));
@@ -276,12 +338,13 @@ fn panels_share_space_and_keep_rendered_geometry_through_their_lifecycle(cx: &mu
     expect(settled(&shell, cx), [300.0, 286.0, 0.0, 414.0]);
     change(&shell, cx, |s, window, cx| s.toggle_files_panel(window, cx));
     expect(settled(&shell, cx), [300.0, 0.0, 360.0, 340.0]);
-    cx.simulate_resize(gpui::size(px(1600.0), px(900.0)));
+    cx.simulate_resize(window(1600.0));
     change(&shell, cx, |s, window, cx| s.toggle_files_panel(window, cx));
     let ordinary = settled(&shell, cx);
     expect(ordinary, [300.0, 286.0, 507.0, 507.0]);
     // The sidebar's seam follows the pointer, not a tween behind it.
-    let sidebar_seam = |x| gpui::point(px(x), px(400.0));
+    // At a sidebar width of `x`.
+    let sidebar_seam = from_sidebar_edge;
     cx.simulate_mouse_down(sidebar_seam(300.0), MouseButton::Left, Default::default());
     // The first move starts the drag; the following ones move the seam.
     for x in [310.0, 320.0, 340.0] {
@@ -298,10 +361,10 @@ fn panels_share_space_and_keep_rendered_geometry_through_their_lifecycle(cx: &mu
     );
     cx.simulate_mouse_up(sidebar_seam(300.0), MouseButton::Left, Default::default());
     // A squeezed sidebar lays its rows and menus out within its column.
-    cx.simulate_resize(gpui::size(px(1130.0), px(900.0)));
+    cx.simulate_resize(window(1130.0));
     near(draw(&shell, cx, 0).widths[0], 250.0);
     near(shell.read_with(cx, |s, _| s.sidebar_content_width()), 250.0);
-    cx.simulate_resize(gpui::size(px(1600.0), px(900.0)));
+    cx.simulate_resize(window(1600.0));
     expect(settled(&shell, cx), ordinary.widths);
 
     // Fullscreen clips the conversation, retaining its composer layout.
@@ -326,8 +389,8 @@ fn panels_share_space_and_keep_rendered_geometry_through_their_lifecycle(cx: &mu
     change(&shell, cx, |s, _, cx| s.toggle_right_pane(cx));
     draw(&shell, cx, 75);
     change(&shell, cx, |s, _, cx| select(s, None, cx));
-    expect(draw(&shell, cx, 0), [300.0, 0.0, 0.0, 1300.0]);
-    expect(settled(&shell, cx), [300.0, 0.0, 0.0, 1300.0]);
+    expect(draw(&shell, cx, 0), canvas());
+    expect(settled(&shell, cx), canvas());
     change(&shell, cx, |s, _, cx| select(s, Some("a"), cx));
     expect(settled(&shell, cx), [300.0, 286.0, 0.0, 1014.0]);
     change(&shell, cx, |s, _, cx| {
@@ -340,7 +403,7 @@ fn panels_share_space_and_keep_rendered_geometry_through_their_lifecycle(cx: &mu
 
     // Window resizing and reduced motion apply directly, without a lagging tween.
     for width in [1024.0, 800.0, 600.0, 800.0, 1600.0] {
-        cx.simulate_resize(gpui::size(px(width), px(900.0)));
+        cx.simulate_resize(window(width));
         let frame = draw(&shell, cx, 0);
         near(frame.widths.iter().sum(), width);
         expect(draw(&shell, cx, 300), frame.widths);

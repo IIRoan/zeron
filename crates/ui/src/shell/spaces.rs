@@ -3259,12 +3259,11 @@ impl Shell {
         } else {
             let lifted = transfer.pointer - transfer.cursor_offset;
             // Over the sidebar it keeps its column for reordering; anywhere
-            // else it follows the pointer.
-            let x = if transfer.pointer.x <= list.right() {
-                origin.x
-            } else {
-                lifted.x
-            };
+            // else it follows the pointer. The sidebar trails the
+            // conversation on Linux, so test its span, not one edge.
+            let over_sidebar =
+                transfer.pointer.x >= list.left() && transfer.pointer.x <= list.right();
+            let x = if over_sidebar { origin.x } else { lifted.x };
             (f32::from(x), f32::from(lifted.y))
         };
         for (slide, target) in [
