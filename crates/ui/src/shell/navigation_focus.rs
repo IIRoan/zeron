@@ -88,7 +88,7 @@ impl Shell {
     }
 
     pub(super) fn navigation_focus_fallback(&self, cx: &App) -> (FocusHandle, FocusHandle) {
-        if let Some(dialog) = &self.release_notes_dialog {
+        if let Some(dialog) = self.release_notes_dialog.as_open() {
             (dialog.buttons[4].clone(), dialog.buttons[4].clone())
         } else if matches!(self.route, Route::Settings(_)) {
             (self.settings_focus.clone(), self.unfocused.clone())

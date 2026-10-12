@@ -25,7 +25,7 @@ use zeron_proto::{TodoItem, TodoStatus, ToolCall};
 
 use crate::composer::{Composer, QUEUE_COMPOSER_OVERLAP};
 use crate::icons::{self, icon};
-use crate::motion::{self, AnimationExt as _};
+use crate::motion::{self, AnimationExt as _, HoverFade as _};
 use crate::theme::Theme;
 
 /// Lists longer than this fold to a [`FOCUS_WINDOW`] around the current item.
@@ -306,7 +306,9 @@ impl Composer {
         let theme = Theme::of(cx).clone();
         let view = cx.entity_id();
         // Dismissable whenever the turn is idle, finished or not.
-        let header = self.todo_header(&chat_id, &items, summary, expanded, !live, &theme, cx);
+        let header = self.todo_header(
+            &chat_id, &items, summary, expanded, !live, &theme, window, cx,
+        );
 
         let surface =
             crate::queue::queue_panel_surface(&theme, cx.has_active_drag()).child(header);
@@ -317,7 +319,7 @@ impl Composer {
                     .map(|row| match row {
                         TodoRow::Item(ix) => todo_item_row(ix, &items[ix], live, &theme, view, cx),
                         TodoRow::Fold { side, count, open } => {
-                            self.todo_fold_row(&chat_id, side, count, open, &theme, cx)
+                            self.todo_fold_row(&chat_id, side, count, open, &theme, window, cx)
                         }
                     }),
             );
@@ -384,6 +386,7 @@ impl Composer {
         expanded: bool,
         dismissable: bool,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let accent = theme.accent;
@@ -416,7 +419,12 @@ impl Composer {
                 .items_center()
                 .gap(px(8.0))
                 .cursor_pointer()
-                .hover(|s| s.bg(theme.element_hover))
+                .hover_bg(
+                    "todo-panel-toggle-hover",
+                    window,
+                    gpui::transparent_black(),
+                    theme.element_hover,
+                )
                 .tab_index(0)
                 .focus_visible(move |s| s.bg(accent.opacity(0.14)))
                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -504,7 +512,12 @@ impl Composer {
                         .justify_center()
                         .rounded(px(5.0))
                         .cursor_pointer()
-                        .hover(|s| s.bg(theme.element_hover))
+                        .hover_bg(
+                            "todo-panel-dismiss-hover",
+                            window,
+                            gpui::transparent_black(),
+                            theme.element_hover,
+                        )
                         .tab_index(0)
                         .focus_visible(move |s| s.bg(accent.opacity(0.18)))
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -535,6 +548,7 @@ impl Composer {
         count: usize,
         open: bool,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let accent = theme.accent;
@@ -565,7 +579,12 @@ impl Composer {
             .items_center()
             .gap(px(8.0))
             .cursor_pointer()
-            .hover(|s| s.bg(theme.element_hover))
+            .hover_bg(
+                format!("todo-fold-{noun}-hover"),
+                window,
+                gpui::transparent_black(),
+                theme.element_hover,
+            )
             .tab_index(0)
             .focus_visible(move |s| s.bg(accent.opacity(0.14)))
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -1058,13 +1077,25 @@ mod composer_tests {
             .unwrap();
     }
 
-    /// Whether the tray is on screen for the selected chat right now.
+    /// Whether the tray is on screen for the selected chat right now. It
+    /// renders inside a window draw: hover fades keep element state.
     fn rendered(handle: &gpui::WindowHandle<Composer>, cx: &mut gpui::TestAppContext) -> bool {
-        handle
-            .update(cx, |composer, window, cx| {
-                composer.render_todo_panel(false, window, cx).is_some()
-            })
-            .unwrap()
+        struct Probe(gpui::Entity<Composer>, std::rc::Rc<std::cell::Cell<bool>>);
+        impl Render for Probe {
+            fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let shown = self.0.update(cx, |composer, cx| {
+                    composer.render_todo_panel(false, window, cx).is_some()
+                });
+                self.1.set(shown);
+                gpui::Empty
+            }
+        }
+        let composer = handle.root(cx).unwrap();
+        let shown = std::rc::Rc::new(std::cell::Cell::new(false));
+        let probe = shown.clone();
+        // Opening draws the window once.
+        cx.add_window(move |_, _| Probe(composer, probe));
+        shown.get()
     }
 
     #[gpui::test]

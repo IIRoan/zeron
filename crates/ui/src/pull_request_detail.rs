@@ -6,6 +6,7 @@ mod handoff;
 #[path = "pull_request_interactions.rs"]
 mod interactions;
 use crate::{
+    motion::HoverFade as _,
     settings::{self, PullRequestDestination, widgets},
     state::AppState,
     theme::Theme,
@@ -386,7 +387,7 @@ pub struct PullRequestDetailPage {
     diff_refresh_owed: bool,
     tab: Tab,
     checks_expanded: bool,
-    tab_slide: crate::motion::IndicatorSlide,
+    tab_slide: crate::motion::Tween,
     tab_focus: [gpui::FocusHandle; 3],
     /// The file tree is one Tab stop; arrow keys move between files.
     tree_focus: gpui::FocusHandle,
@@ -457,7 +458,11 @@ impl PullRequestDetailPage {
             diff_refresh_owed: false,
             tab: Tab::Summary,
             checks_expanded: false,
-            tab_slide: crate::motion::IndicatorSlide::at(tab_slot(Tab::Summary), Instant::now()),
+            tab_slide: crate::motion::Tween::at(
+                tab_slot(Tab::Summary),
+                crate::motion::INDICATOR_SLIDE,
+                Instant::now(),
+            ),
             tab_focus: [cx.focus_handle(), cx.focus_handle(), cx.focus_handle()],
             tree_focus: cx.focus_handle().tab_stop(true),
             files_focus: cx.focus_handle().tab_stop(true),
@@ -1182,7 +1187,7 @@ fn action(id: &'static str, label: &'static str, theme: &Theme) -> gpui::Statefu
         "pr-files" => Some(crate::icons::FILE_TREE),
         _ => None,
     };
-    widgets::ghost_action(theme)
+    widgets::action_button(theme, widgets::ActionTone::Quiet, id)
         .id(id)
         .debug_selector(move || id.to_owned())
         .role(gpui::Role::Button)
@@ -1621,13 +1626,19 @@ impl Render for PullRequestDetailPage {
                                 .items_center()
                                 .gap(px(8.0))
                                 .cursor_pointer()
-                                .hover(|style| style.bg(theme.glass_hover()))
+                                .hover_bg(
+                                    "pr-checks-toggle-hover",
+                                    window,
+                                    gpui::transparent_black(),
+                                    theme.glass_hover(),
+                                )
                                 .child(
-                                    crate::icons::icon(if self.checks_expanded {
-                                        crate::icons::ALT_ARROW_DOWN
-                                    } else {
-                                        crate::icons::ALT_ARROW_RIGHT
-                                    })
+                                    crate::icons::disclosure_chevron(
+                                        "pr-checks-chevron",
+                                        self.checks_expanded,
+                                        window,
+                                        cx,
+                                    )
                                     .size(px(14.0))
                                     .flex_none()
                                     .text_color(theme.text_muted),
@@ -1646,9 +1657,21 @@ impl Render for PullRequestDetailPage {
                                     cx.notify();
                                 })),
                         );
+                        // The checks body mounts only while open; it fades in.
+                        let checks_reveal = if self.checks_expanded {
+                            crate::motion::entrance(
+                                window,
+                                "pr-checks-body",
+                                crate::motion::FADE_QUICK,
+                                crate::motion::reduced_motion(cx),
+                            )
+                        } else {
+                            1.0
+                        };
                         if self.checks_expanded && detail.status_check_rollup.is_empty() {
                             checks = checks.child(
                                 div()
+                                    .opacity(checks_reveal)
                                     .p(px(16.0))
                                     .text_color(theme.text_muted)
                                     .child(assessment_ci_empty_copy(detail)),
@@ -1688,6 +1711,7 @@ impl Render for PullRequestDetailPage {
                                 .unwrap_or_default();
                             checks = checks.child(
                                 widgets::card_row(&theme, false)
+                                    .opacity(checks_reveal)
                                     .mx_0()
                                     .px(px(16.0))
                                     .min_h(px(36.0))
@@ -1716,7 +1740,12 @@ impl Render for PullRequestDetailPage {
                                             .role(gpui::Role::Link)
                                             .tab_index(0)
                                             .aria_label(format!("Open {name}"))
-                                            .hover(|style| style.bg(theme.glass_hover()))
+                                            .hover_bg(
+                                                format!("pr-check-{index}-hover"),
+                                                window,
+                                                gpui::transparent_black(),
+                                                theme.glass_hover(),
+                                            )
                                             .on_click(move |_, _, cx| cx.open_url(&link))
                                     }),
                             );
@@ -1803,6 +1832,7 @@ impl Render for PullRequestDetailPage {
                                             &detail.url
                                         },
                                         &theme,
+                                        window,
                                         cx,
                                     )),
                             );
@@ -2020,6 +2050,8 @@ impl Render for PullRequestDetailPage {
                                                 if comment.reply_to.is_some() {
                                                     details.push("Reply");
                                                 }
+                                                let location_hover =
+                                                    format!("pr-inline-location-{index}-hover");
                                                 div()
                                                     .debug_selector(move || {
                                                         format!("pr-inline-thread-{index}")
@@ -2061,11 +2093,24 @@ impl Render for PullRequestDetailPage {
                                                                 )
                                                                 .tab_index(0)
                                                                 .cursor_pointer()
-                                                                .hover(|style| {
-                                                                    style
-                                                                        .bg(theme.ink(0.07))
-                                                                        .text_color(theme.text)
-                                                                })
+                                                                .hover_fade(
+                                                                    location_hover,
+                                                                    window,
+                                                                    |el, t| {
+                                                                        el.bg(crate::motion::mix(
+                                                                            theme.ink(0.035),
+                                                                            theme.ink(0.07),
+                                                                            t,
+                                                                        ))
+                                                                        .text_color(
+                                                                            crate::motion::mix(
+                                                                                theme.text_muted,
+                                                                                theme.text,
+                                                                                t,
+                                                                            ),
+                                                                        )
+                                                                    },
+                                                                )
                                                                 .child(
                                                                     crate::icons::icon(
                                                                         crate::icons::ARROW_UP_RIGHT,
@@ -2206,7 +2251,8 @@ impl Render for PullRequestDetailPage {
         if self.tab_slide.animating_at(Instant::now()) {
             window.request_animation_frame();
         }
-        let composer = (self.tab == Tab::Activity).then(|| self.comment_composer(&theme, cx));
+        let composer =
+            (self.tab == Tab::Activity).then(|| self.comment_composer(&theme, window, cx));
         let mut root = div()
             .size_full()
             .relative()

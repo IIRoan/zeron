@@ -27,7 +27,7 @@ use gpui::{
 use zeron_proto::{TerminalEvent, TerminalSession};
 use zeron_rpc::methods;
 
-use crate::motion::{self, AnimationExt as _, TAB_SLIDE};
+use crate::motion::{self, AnimationExt as _, HoverFade as _, TAB_SLIDE};
 use crate::popover::{MenuScrollbarMetrics, MenuScrollbarState, ScrollRailHost};
 use crate::settings::{TERMINAL_MAX_VH, TERMINAL_MIN_HEIGHT};
 use crate::state::{AppState, CANVAS_PANEL_PREFIX, EngineHandle};
@@ -1525,7 +1525,12 @@ impl TerminalPanel {
 
     // ---- render ----
 
-    fn render_tab_bar(&mut self, chat: &str, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn render_tab_bar(
+        &mut self,
+        chat: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         let theme = Theme::of(cx).clone();
         let tabs = self.chats.get(chat);
         let (active, count) = tabs.map(|t| (t.active, t.tabs.len())).unwrap_or((0, 0));
@@ -1623,7 +1628,12 @@ impl TerminalPanel {
                             .rounded(px(6.0))
                             .when(!selected, |el| el.invisible())
                             .cursor_pointer()
-                            .hover(|s| s.bg(crate::theme::ink(0.09)))
+                            .hover_bg(
+                                ("terminal-tab-close-hover", key),
+                                window,
+                                gpui::transparent_black(),
+                                crate::theme::ink(0.09),
+                            )
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 this.close_tab(&chat_close2, key, window, cx);
@@ -1845,7 +1855,7 @@ impl Render for TerminalPanel {
         // Embedded (right-pane surface host): the shell's surface tabs
         // replace the internal bar.
         let tab_bar: Option<gpui::AnyElement> =
-            (!self.embedded).then(|| self.render_tab_bar(&chat, cx).into_any_element());
+            (!self.embedded).then(|| self.render_tab_bar(&chat, window, cx).into_any_element());
         div()
             .size_full()
             .flex()

@@ -34,7 +34,7 @@ use zeron_rpc::{RpcError, methods};
 use crate::appshots::{self, CapturedAppshot};
 use crate::attachments::{self, StagedAttachment};
 use crate::composer_markdown::{self, in_code};
-use crate::motion;
+use crate::motion::{self, HoverFade as _};
 use crate::notice::{NoticeChipIcon, notice_chip};
 use crate::pickers::Pickers;
 use crate::settings::{ComposerSendBehavior, platform_combo};
@@ -548,9 +548,9 @@ pub const APPSHOT_TILE_HEIGHT: f32 = 192.0;
 struct AppshotActionTooltip(SharedString);
 
 impl Render for AppshotActionTooltip {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx);
-        div()
+        let card = div()
             .px(px(8.0))
             .py(px(6.0))
             .rounded(px(6.0))
@@ -560,7 +560,8 @@ impl Render for AppshotActionTooltip {
             .shadow_md()
             .text_size(px(11.0))
             .text_color(theme.text)
-            .child(self.0.clone())
+            .child(self.0.clone());
+        crate::popover::tooltip_surface(card, None, window, cx)
     }
 }
 
@@ -2607,12 +2608,9 @@ impl ComposerInput {
                 if next != input.mention_tooltip {
                     input.mention_tooltip = next;
                     input.mention_tooltip_task = None;
-                    if let MentionTooltipPhase::Visible { target, generation } =
-                        &input.mention_tooltip
-                    {
+                    if let MentionTooltipPhase::Visible { target, .. } = &input.mention_tooltip {
                         input.mention_tooltip_view = Some(cx.new(|_| MentionPathTooltip {
                             path: target.path.clone(),
-                            activation: *generation,
                         }));
                     }
                     cx.notify();
@@ -4798,15 +4796,14 @@ struct ComposerTextElement {
     max_content_height: f32,
 }
 
+/// Built once per `Waiting → Visible` promotion, so each activation gets
+/// exactly one fresh fade-in.
 struct MentionPathTooltip {
     path: SharedString,
-    /// Stable for one `Waiting → Visible` promotion; a later activation gets
-    /// a new key and therefore exactly one fresh fade-in.
-    activation: u64,
 }
 
 impl Render for MentionPathTooltip {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).for_popup();
         let card = crate::popover::popover_card(&theme)
             .max_w(px(480.0))
@@ -4819,14 +4816,7 @@ impl Render for MentionPathTooltip {
             .text_size(px(11.0))
             .text_color(theme.text_muted)
             .child(div().min_w_0().truncate().child(self.path.clone()));
-        motion::fade_quick(
-            ("file-mention-path-tooltip", self.activation),
-            div().child(crate::frost::frosted(
-                crate::popover::CARD_RADIUS,
-                crate::frost::MENU_BLUR,
-                card,
-            )),
-        )
+        crate::popover::tooltip_surface(card, Some(crate::popover::CARD_RADIUS), window, cx)
     }
 }
 
@@ -7191,7 +7181,12 @@ impl Composer {
                 .rounded(px(14.0))
                 .overflow_hidden()
                 .cursor_pointer()
-                .hover(|style| style.bg(crate::theme::ink(0.045)))
+                .hover_bg(
+                    ("composer-appshot-hover", ix),
+                    window,
+                    gpui::transparent_black(),
+                    crate::theme::ink(0.045),
+                )
                 .tooltip(move |_, cx| {
                     cx.new(|_| AppshotActionTooltip(preview_label.clone()))
                         .into()
@@ -10055,11 +10050,15 @@ impl Composer {
                         gpui::Empty.into_any_element()
                     })
                     .child(
-                        crate::popover::btn_primary(&theme, if last { "Submit" } else { "Next" })
-                            .id("wizard-submit")
-                            .px(px(16.0))
-                            .when(!can_advance, |el| el.opacity(0.4))
-                            .on_click(cx.listener(|this, _, _, cx| this.wizard_advance(cx))),
+                        crate::popover::btn_primary(
+                            &theme,
+                            if last { "Submit" } else { "Next" },
+                            "wizard-submit",
+                        )
+                        .id("wizard-submit")
+                        .px(px(16.0))
+                        .when(!can_advance, |el| el.opacity(0.4))
+                        .on_click(cx.listener(|this, _, _, cx| this.wizard_advance(cx))),
                     ),
             );
         crate::frost::frosted(COMPOSER_RADIUS, crate::frost::MENU_BLUR, panel).into_any_element()
@@ -10252,7 +10251,11 @@ impl Composer {
                 ))
             })
             .when(t > 0.0, |el| {
-                glass::accent(el, &theme, t, glow).hover(|style| style.opacity(0.85))
+                glass::accent(el, &theme, t, glow).opacity(motion::lerp(
+                    1.0,
+                    0.85,
+                    motion::hover_t(&hover_key),
+                ))
             })
             .focus_visible(|style| style.border_1().border_color(theme.accent))
             .tooltip(crate::settings::widgets::text_tooltip(tooltip))
@@ -10342,6 +10345,7 @@ impl Composer {
     fn dictation_action_button(
         &self,
         active: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let theme = Theme::of(cx);
@@ -10363,9 +10367,15 @@ impl Composer {
             .flex()
             .items_center()
             .rounded_full()
-            .text_color(theme.text_muted)
             .cursor_pointer()
-            .hover(|s| s.bg(theme.surface_raised_hover).text_color(theme.text))
+            .hover_fade("dictation-dismiss-hover", window, |el, t| {
+                el.bg(motion::mix(
+                    gpui::transparent_black(),
+                    theme.surface_raised_hover,
+                    t,
+                ))
+                .text_color(motion::mix(theme.text_muted, theme.text, t))
+            })
             .focus_visible(|s| s.border_1().border_color(theme.accent))
             .on_click(cx.listener(|this, _, _, cx| this.dismiss_dictation(cx)))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
@@ -10381,7 +10391,11 @@ impl Composer {
             })
     }
 
-    fn render_dictation_status(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+    fn render_dictation_status(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
         // Live dictation renders inside the composer; only outcomes that
         // need reading (no speech, errors) appear below it.
         let phase = self.input.read(cx).dictation.phase.clone();
@@ -10435,7 +10449,7 @@ impl Composer {
                             .child(div().min_w_0().text_color(theme.text_muted).child(detail)),
                     )
                     .child(
-                        self.dictation_action_button(false, cx)
+                        self.dictation_action_button(false, window, cx)
                             .mt(px(-3.0))
                             .child("Dismiss"),
                     ),
@@ -10577,6 +10591,7 @@ impl Composer {
     fn render_send_button(
         &mut self,
         mode: SendButtonMode,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let theme = Theme::of(cx);
@@ -10593,7 +10608,9 @@ impl Composer {
                 .items_center()
                 .justify_center()
                 .cursor_pointer()
-                .hover(|s| s.opacity(0.85))
+                .hover_fade("composer-stop-hover", window, |el, t| {
+                    el.opacity(motion::lerp(1.0, 0.85, t))
+                })
                 .on_click(cx.listener(|this, _, _, cx| this.interrupt_selected(cx)))
                 .tooltip(crate::settings::widgets::text_tooltip("Stop"))
                 .child(div().size(px(11.0)).rounded(px(3.0)).bg(theme.bg))
@@ -10602,7 +10619,7 @@ impl Composer {
                 // Share the submission guard with Enter, including pending
                 // edits and the new-session runnable-agent check.
                 let blocked = self.send_blocked(cx);
-                send_circle("composer-send", blocked, theme)
+                send_circle("composer-send", blocked, theme, window)
                     .when(!blocked, |el| {
                         el.on_click(cx.listener(|this, _, _, cx| this.on_submit(cx)))
                     })
@@ -10626,6 +10643,7 @@ pub(crate) fn send_circle(
     id: &'static str,
     blocked: bool,
     theme: &Theme,
+    window: &mut Window,
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
@@ -10639,7 +10657,8 @@ pub(crate) fn send_circle(
         .justify_center()
         .when(blocked, |el| el.opacity(0.35))
         .when(!blocked, |el| {
-            el.cursor_pointer().hover(|s| s.opacity(0.85))
+            el.cursor_pointer()
+                .hover_fade(id, window, |el, t| el.opacity(motion::lerp(1.0, 0.85, t)))
         })
         .child(
             crate::icons::icon(crate::icons::ARROW_UP)
@@ -10909,6 +10928,8 @@ impl Render for Composer {
                         if offline { "Warning" } else { "Error" },
                         message,
                         NoticeChipIcon::Plain,
+                        "composer-failure-copy",
+                        window,
                     )
                     .id("composer-failure")
                     .mx(px(4.0))
@@ -11169,7 +11190,7 @@ impl Render for Composer {
             }
         });
 
-        let send_button = self.render_send_button(mode, cx);
+        let send_button = self.render_send_button(mode, window, cx);
         let (voice_t, voice_frame) = self.update_voice(window, cx);
         let dictating = self.input.read(cx).dictation.phase.active();
         let microphone = self.render_dictation_button(voice_t, voice_frame.as_ref(), cx);
@@ -11519,13 +11540,13 @@ impl Render for Composer {
         };
         let new_thread_target_selectors = (new_thread_chrome_opacity > 0.0).then(|| {
             self.pickers.update(cx, |pickers, cx| {
-                pickers.render_new_thread_target_selectors(cx)
+                pickers.render_new_thread_target_selectors(window, cx)
             })
         });
         let new_thread_git_selectors = (new_thread_chrome_opacity > 0.0)
             .then(|| {
                 self.pickers.update(cx, |pickers, cx| {
-                    pickers.render_new_thread_git_selectors(cx)
+                    pickers.render_new_thread_git_selectors(window, cx)
                 })
             })
             .flatten();
@@ -11595,7 +11616,7 @@ impl Render for Composer {
         } else {
             container
         };
-        let dictation_status = self.render_dictation_status(cx);
+        let dictation_status = self.render_dictation_status(window, cx);
         let container = container.child(
             div()
                 .track_focus(&self.dictation_focus)
@@ -11626,7 +11647,7 @@ impl Render for Composer {
         let container = if bottom_slot > 0.0 {
             let footer = (session_chrome_opacity > 0.0 && !self.side_chat).then(|| {
                 self.pickers
-                    .update(cx, |pickers, cx| pickers.render_footer(cx))
+                    .update(cx, |pickers, cx| pickers.render_footer(window, cx))
             });
             if session_chrome_opacity > 0.0 {
                 let harness = (!self.side_chat)

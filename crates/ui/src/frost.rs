@@ -35,6 +35,14 @@ pub struct Frosted {
     child: AnyElement,
 }
 
+impl Frosted {
+    /// Replace the blur radius — entrances ramp it with their progress.
+    pub fn blur(mut self, blur_radius: f32) -> Self {
+        self.blur_radius = blur_radius;
+        self
+    }
+}
+
 impl Element for Frosted {
     type RequestLayoutState = ();
     type PrepaintState = ();

@@ -12,6 +12,7 @@ pub(super) struct TreeRename {
     revision: Option<String>,
     _events: Subscription,
 }
+#[derive(Clone)]
 pub(super) struct TreeDelete {
     pub path: String,
     pub origin: mutations::WorkspaceInteractionOrigin,
@@ -224,7 +225,7 @@ impl FilesSurface {
             .tree
             .node(&path)
             .and_then(|node| node.entry.mutation_revision.clone());
-        self.tree_delete = Some(TreeDelete {
+        self.tree_delete.open(TreeDelete {
             path,
             origin,
             focus,
@@ -239,9 +240,10 @@ impl FilesSurface {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(dialog) = self.tree_delete.take() else {
+        let Some(dialog) = self.tree_delete.as_open().cloned() else {
             return;
         };
+        popover::close_popup(self, cx, |this| &mut this.tree_delete);
         cx.emit(FilesEvent::HoldMutation {
             origin: dialog.origin.clone(),
             path: None,
@@ -270,7 +272,7 @@ impl FilesSurface {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let dialog = self.tree_delete.as_ref()?;
+        let dialog = self.tree_delete.get()?;
         let theme = theme.for_popup();
         let directory = self
             .tree
@@ -294,13 +296,16 @@ impl FilesSurface {
                 match event.keystroke.key.as_str() {
                     "escape" => this.dismiss_tree_delete(false, window, cx),
                     "tab" | "left" | "right" => {
-                        if let Some(dialog) = this.tree_delete.as_mut() {
+                        if let Some(dialog) = this.tree_delete.open_mut() {
                             dialog.confirm_focused = !dialog.confirm_focused;
                             cx.notify();
                         }
                     }
                     "enter" => {
-                        let confirm = this.tree_delete.as_ref().is_some_and(|d| d.confirm_focused);
+                        let confirm = this
+                            .tree_delete
+                            .as_open()
+                            .is_some_and(|d| d.confirm_focused);
                         this.dismiss_tree_delete(confirm, window, cx);
                     }
                     _ => {}
@@ -328,7 +333,7 @@ impl FilesSurface {
                             })),
                     )
                     .child(
-                        popover::btn_danger(&theme, "Delete")
+                        popover::btn_danger(&theme, "Delete", "tree-delete-confirm")
                             .id("tree-delete-confirm")
                             .role(gpui::Role::Button)
                             .aria_label("Delete")
@@ -344,6 +349,7 @@ impl FilesSurface {
             "tree-delete-dialog",
             window.viewport_size(),
             card.into_any_element(),
+            self.tree_delete.closing_since(),
         ))
     }
 }
@@ -520,7 +526,7 @@ mod tests {
         files.update_in(cx, |files, window, cx| {
             files.tree_rename = None;
             files.begin_tree_delete("folder".into(), window, cx);
-            assert!(!files.tree_delete.as_ref().unwrap().confirm_focused);
+            assert!(!files.tree_delete.as_open().unwrap().confirm_focused);
             files.dismiss_tree_delete(false, window, cx);
         });
         cx.run_until_parked();

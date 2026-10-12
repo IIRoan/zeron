@@ -106,7 +106,7 @@ impl FilesSurface {
             })
             && !self.mutation_busy()
             && self.tree_rename.is_none()
-            && self.tree_delete.is_none()
+            && !self.tree_delete.is_open()
             && self
                 .mutation_capabilities
                 .is_some_and(|caps| caps.move_entry)
@@ -296,7 +296,7 @@ impl FilesSurface {
                 .tree_rename
                 .as_ref()
                 .is_some_and(|rename| !rename.submitted)
-            || self.tree_delete.is_some()
+            || self.tree_delete.is_open()
         {
             self.interaction_generation = self.interaction_generation.wrapping_add(1);
             self.tree_drag = TreeDrag::default();
@@ -308,12 +308,14 @@ impl FilesSurface {
             {
                 self.tree_rename = None;
             }
-            if let Some(dialog) = self.tree_delete.take() {
+            if let Some(dialog) = self.tree_delete.as_open() {
                 cx.emit(FilesEvent::HoldMutation {
-                    origin: dialog.origin,
+                    origin: dialog.origin.clone(),
                     path: None,
                 });
             }
+            // Hidden explorer: nobody would see an exit animation.
+            self.tree_delete = crate::popover::Popup::default();
             cx.notify();
         }
     }

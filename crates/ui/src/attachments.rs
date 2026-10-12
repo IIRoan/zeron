@@ -1213,6 +1213,13 @@ pub(crate) fn lightbox_with_size(
     let close_on_key = on_close.clone();
     let press_state = preview.viewer.clone();
     let click_state = preview.viewer.clone();
+    // Scrim and image arrive together, like a dialog.
+    let entrance = crate::motion::entrance(
+        window,
+        "attachment-lightbox-in",
+        crate::motion::DIALOG_IN,
+        crate::motion::reduced_motion(cx),
+    );
     gpui::deferred(
         gpui::anchored()
             .position(gpui::point(px(0.0), px(0.0)))
@@ -1220,6 +1227,7 @@ pub(crate) fn lightbox_with_size(
                 div()
                     .id("attachment-lightbox")
                     .occlude()
+                    .opacity(entrance)
                     .track_focus(focus)
                     .w(viewport.width)
                     .h(viewport.height)

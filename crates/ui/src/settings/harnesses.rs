@@ -29,7 +29,7 @@ use zeron_proto::{HarnessId, HarnessUpdatePhase, HarnessUpdatePolicy, HarnessUpd
 
 use zeron_rpc::methods;
 
-use crate::motion;
+use crate::motion::{self, HoverFade as _};
 use crate::pickers::visible_harnesses;
 use crate::popover::{self, Loadable};
 use crate::settings::accounts::{self, AccountsPage};
@@ -246,6 +246,7 @@ impl HarnessesPage {
         &self,
         harness: HarnessId,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let accounts = accounts::signs_in(harness)
@@ -265,11 +266,13 @@ impl HarnessesPage {
             .child(self.render_completion_for(harness, theme, cx))
             .children(self.render_updates_for(harness, theme, cx))
             .when_some(accounts, |details, accounts| details.child(accounts));
-        if motion::reduced_motion(cx) {
-            content.into_any_element()
-        } else {
-            motion::menu_in(format!("agent-details-{harness:?}"), content).into_any_element()
-        }
+        let t = motion::entrance(
+            window,
+            format!("agent-details-{harness:?}"),
+            motion::FADE_QUICK,
+            motion::reduced_motion(cx),
+        );
+        motion::rise(content, t).into_any_element()
     }
 
     /// The expanded provider's Updates section: the update policy, short
@@ -789,7 +792,7 @@ impl HarnessesPage {
         .into_any_element()
     }
 
-    fn rows(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+    fn rows(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let theme = Theme::of(cx).for_settings_surface();
         let Loadable::Ready(list) = &self.harnesses else {
             return Vec::new();
@@ -917,16 +920,24 @@ impl HarnessesPage {
                             .text_size(crate::typography::ui_rems(11.0))
                             .cursor_pointer()
                             .map(|button| {
+                                let wash = ("harness-update-wash", ix);
                                 if primary {
                                     button
-                                        .bg(theme.accent_wash)
                                         .font_weight(gpui::FontWeight::MEDIUM)
                                         .text_color(theme.accent)
-                                        .hover(|style| style.bg(theme.accent.opacity(0.16)))
+                                        .hover_bg(
+                                            wash,
+                                            window,
+                                            theme.accent_wash,
+                                            theme.accent.opacity(0.16),
+                                        )
                                 } else {
-                                    button
-                                        .text_color(theme.text_muted)
-                                        .hover(|style| style.bg(crate::theme::ink(0.05)))
+                                    button.text_color(theme.text_muted).hover_bg(
+                                        wash,
+                                        window,
+                                        gpui::transparent_black(),
+                                        crate::theme::ink(0.05),
+                                    )
                                 }
                             })
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -941,148 +952,158 @@ impl HarnessesPage {
                             .child(label),
                     )
                 });
-                let header = widgets::card_row(&theme, ix == 0)
-                    .id(("harness-row", ix))
-                    .when(!installed && self.installing != Some(harness), |el| {
-                        el.opacity(0.55)
-                    })
-                    .child(
-                        div()
-                            .id(("harness-details-trigger", ix))
-                            .group(format!("harness-details-{ix}"))
-                            .flex_1()
-                            .min_w(px(180.0))
-                            .min_h(px(44.0))
-                            .px(px(4.0))
-                            .rounded(px(8.0))
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(12.0))
-                            .when(enabled, |el| {
-                                el.role(gpui::Role::Button)
-                                    .aria_label(format!("{} preferences", descriptor.name))
-                                    .aria_expanded(expanded)
-                                    .tab_index(0)
-                                    .cursor_pointer()
-                                    // No hover slab (it stopped short of the
-                                    // toggle and boxed the row); the chevron
-                                    // lifts instead, like a list disclosure.
-                                    .focus_visible(|s| s.border_2().border_color(theme.accent))
-                                    .on_click(cx.listener(move |page, _, _, cx| {
-                                        page.toggle_agent_details(harness, cx)
-                                    }))
-                                    .on_key_down(cx.listener(
-                                        move |page, event: &gpui::KeyDownEvent, _, cx| {
-                                            if !event.is_held
-                                                && matches!(
-                                                    event.keystroke.key.as_str(),
-                                                    "enter" | "space"
-                                                )
-                                            {
-                                                page.toggle_agent_details(harness, cx);
-                                                cx.stop_propagation();
-                                            }
-                                        },
-                                    ))
-                            })
-                            .child(tile)
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .flex()
-                                    .flex_col()
-                                    .child(widgets::row_title(&theme, descriptor.name.clone()))
-                                    .when(!meta.is_empty(), |label| {
-                                        label.child(widgets::meta_line(&theme, meta))
-                                    }),
-                            )
-                            .children(update_action)
-                            .when(enabled, |el| {
-                                el.child(
-                                    crate::icons::icon(if expanded {
-                                        crate::icons::ALT_ARROW_DOWN
-                                    } else {
-                                        crate::icons::ALT_ARROW_RIGHT
-                                    })
-                                    .size(px(14.0))
-                                    .text_color(theme.text_muted)
-                                    .group_hover(format!("harness-details-{ix}"), |s| {
-                                        s.text_color(theme.text)
-                                    }),
+                let header =
+                    widgets::card_row(&theme, ix == 0)
+                        .id(("harness-row", ix))
+                        .when(!installed && self.installing != Some(harness), |el| {
+                            el.opacity(0.55)
+                        })
+                        .child(
+                            div()
+                                .id(("harness-details-trigger", ix))
+                                .group(format!("harness-details-{ix}"))
+                                .flex_1()
+                                .min_w(px(180.0))
+                                .min_h(px(44.0))
+                                .px(px(4.0))
+                                .rounded(px(8.0))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(12.0))
+                                .when(enabled, |el| {
+                                    el.role(gpui::Role::Button)
+                                        .aria_label(format!("{} preferences", descriptor.name))
+                                        .aria_expanded(expanded)
+                                        .tab_index(0)
+                                        .cursor_pointer()
+                                        // No hover slab (it stopped short of the
+                                        // toggle and boxed the row); the chevron
+                                        // lifts instead, like a list disclosure.
+                                        .focus_visible(|s| s.border_2().border_color(theme.accent))
+                                        .on_click(cx.listener(move |page, _, _, cx| {
+                                            page.toggle_agent_details(harness, cx)
+                                        }))
+                                        .on_key_down(cx.listener(
+                                            move |page, event: &gpui::KeyDownEvent, _, cx| {
+                                                if !event.is_held
+                                                    && matches!(
+                                                        event.keystroke.key.as_str(),
+                                                        "enter" | "space"
+                                                    )
+                                                {
+                                                    page.toggle_agent_details(harness, cx);
+                                                    cx.stop_propagation();
+                                                }
+                                            },
+                                        ))
+                                })
+                                .child(tile)
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .flex()
+                                        .flex_col()
+                                        .child(widgets::row_title(&theme, descriptor.name.clone()))
+                                        .when(!meta.is_empty(), |label| {
+                                            label.child(widgets::meta_line(&theme, meta))
+                                        }),
                                 )
-                            }),
-                    )
-                    .when(
-                        offers_install(harness, installed, descriptor.can_install)
-                            && self.installing != Some(harness),
-                        |el| {
-                            el.child(
-                                widgets::ghost_action(&theme)
-                                    .id(("harness-install", ix))
+                                .children(update_action)
+                                .when(enabled, |el| {
+                                    el.child(
+                                        crate::icons::disclosure_chevron(
+                                            ("harness-chevron", ix),
+                                            expanded,
+                                            window,
+                                            cx,
+                                        )
+                                        .size(px(14.0))
+                                        .text_color(theme.text_muted)
+                                        .group_hover(format!("harness-details-{ix}"), |s| {
+                                            s.text_color(theme.text)
+                                        }),
+                                    )
+                                }),
+                        )
+                        .when(
+                            offers_install(harness, installed, descriptor.can_install)
+                                && self.installing != Some(harness),
+                            |el| {
+                                el.child(
+                                    widgets::action(
+                                        &theme,
+                                        widgets::ActionTone::Quiet,
+                                        ("harness-install", ix),
+                                        window,
+                                    )
                                     .when(self.installing.is_none(), |el| {
                                         el.on_click(cx.listener(move |this, _, _, cx| {
                                             this.install(harness, cx)
                                         }))
                                     })
                                     .child("Install"),
-                            )
-                        },
-                    )
-                    .when(self.installing == Some(harness), |el| {
-                        el.child(
-                            widgets::ghost_action(&theme)
-                                .id(("harness-cancel-install", ix))
+                                )
+                            },
+                        )
+                        .when(self.installing == Some(harness), |el| {
+                            el.child(
+                                widgets::action(
+                                    &theme,
+                                    widgets::ActionTone::Quiet,
+                                    ("harness-cancel-install", ix),
+                                    window,
+                                )
                                 .on_click(cx.listener(|this, _, _, cx| this.cancel_install(cx)))
                                 .child("Cancel"),
-                        )
-                    })
-                    .child(
-                        widgets::toggle_switch(
-                            &theme,
-                            enabled,
-                            format!("harness-switch-{harness:?}"),
-                        )
-                        .id(("harness-toggle", ix))
-                        .when(!interactive && !enabled, |el| el.opacity(0.55))
-                        .when(interactive, |el| {
-                            el.cursor_pointer()
-                                .tab_index(0)
-                                .role(gpui::Role::Switch)
-                                .aria_label(descriptor.name.clone())
-                                .aria_toggled(if enabled {
-                                    gpui::Toggled::True
-                                } else {
-                                    gpui::Toggled::False
-                                })
-                                .focus_visible(|s| {
-                                    s.border_2().border_color(theme.accent).opacity(1.0)
-                                })
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.toggle(harness, !enabled, cx);
-                                }))
-                                .on_key_down(cx.listener(
-                                    move |this, event: &gpui::KeyDownEvent, _, cx| {
-                                        if !event.is_held
-                                            && matches!(
-                                                event.keystroke.key.as_str(),
-                                                "enter" | "space"
-                                            )
-                                        {
-                                            this.toggle(harness, !enabled, cx);
-                                            cx.stop_propagation();
-                                        }
-                                    },
-                                ))
-                        }),
-                    );
+                            )
+                        })
+                        .child(
+                            widgets::toggle_switch(
+                                &theme,
+                                enabled,
+                                format!("harness-switch-{harness:?}"),
+                            )
+                            .id(("harness-toggle", ix))
+                            .when(!interactive && !enabled, |el| el.opacity(0.55))
+                            .when(interactive, |el| {
+                                el.cursor_pointer()
+                                    .tab_index(0)
+                                    .role(gpui::Role::Switch)
+                                    .aria_label(descriptor.name.clone())
+                                    .aria_toggled(if enabled {
+                                        gpui::Toggled::True
+                                    } else {
+                                        gpui::Toggled::False
+                                    })
+                                    .focus_visible(|s| {
+                                        s.border_2().border_color(theme.accent).opacity(1.0)
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.toggle(harness, !enabled, cx);
+                                    }))
+                                    .on_key_down(cx.listener(
+                                        move |this, event: &gpui::KeyDownEvent, _, cx| {
+                                            if !event.is_held
+                                                && matches!(
+                                                    event.keystroke.key.as_str(),
+                                                    "enter" | "space"
+                                                )
+                                            {
+                                                this.toggle(harness, !enabled, cx);
+                                                cx.stop_propagation();
+                                            }
+                                        },
+                                    ))
+                            }),
+                        );
                 div()
                     .flex()
                     .flex_col()
                     .child(header)
                     .when(expanded, |row| {
-                        row.child(self.render_agent_details(harness, &theme, cx))
+                        row.child(self.render_agent_details(harness, &theme, window, cx))
                     })
                     .into_any_element()
             })
@@ -1106,7 +1127,7 @@ impl popover::ScrollRailHost for HarnessesPage {
 }
 
 impl Render for HarnessesPage {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).for_settings_surface();
         let supports_updates = self.supports_updates(cx);
 
@@ -1126,22 +1147,26 @@ impl Render for HarnessesPage {
                 div()
                     .child(widgets::error_strip(&theme, message))
                     .child(
-                        widgets::ghost_action(&theme)
-                            .id("harnesses-retry")
-                            .mt(px(8.0))
-                            .tab_index(0)
-                            .role(gpui::Role::Button)
-                            .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
-                            .on_click(cx.listener(|page, _, _, cx| {
-                                page.load(cx);
-                                cx.notify();
-                            }))
-                            .child(SharedString::from("Retry")),
+                        widgets::action(
+                            &theme,
+                            widgets::ActionTone::Quiet,
+                            "harnesses-retry",
+                            window,
+                        )
+                        .mt(px(8.0))
+                        .tab_index(0)
+                        .role(gpui::Role::Button)
+                        .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
+                        .on_click(cx.listener(|page, _, _, cx| {
+                            page.load(cx);
+                            cx.notify();
+                        }))
+                        .child(SharedString::from("Retry")),
                     )
                     .into_any_element()
             }
             Loadable::Ready(_) => {
-                let rows = self.rows(cx);
+                let rows = self.rows(window, cx);
                 widgets::section_card(&theme)
                     .children(rows)
                     .into_any_element()
@@ -1156,14 +1181,18 @@ impl Render for HarnessesPage {
                         format!("Agent updates: {message}"),
                     ))
                     .child(
-                        widgets::ghost_action(&theme)
-                            .id("harness-updates-retry")
-                            .mt(px(8.0))
-                            .on_click(cx.listener(|page, _, _, cx| {
-                                page.load(cx);
-                                cx.notify();
-                            }))
-                            .child("Retry updates"),
+                        widgets::action(
+                            &theme,
+                            widgets::ActionTone::Quiet,
+                            "harness-updates-retry",
+                            window,
+                        )
+                        .mt(px(8.0))
+                        .on_click(cx.listener(|page, _, _, cx| {
+                            page.load(cx);
+                            cx.notify();
+                        }))
+                        .child("Retry updates"),
                     )
                     .into_any_element(),
             ),
@@ -1181,7 +1210,12 @@ impl Render for HarnessesPage {
             .text_size(crate::typography::ui_rems(11.0))
             .text_color(theme.text_muted)
             .cursor_pointer()
-            .hover(|style| style.bg(crate::theme::ink(0.05)))
+            .hover_bg(
+                "check-harness-updates-wash",
+                window,
+                gpui::transparent_black(),
+                crate::theme::ink(0.05),
+            )
             .opacity(if can_control { 1.0 } else { 0.4 })
             .when(can_control, |button| {
                 button.on_click(cx.listener(|this, _, _, cx| this.check_updates(cx)))

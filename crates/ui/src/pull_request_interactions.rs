@@ -235,7 +235,12 @@ impl PullRequestDetailPage {
         );
     }
 
-    pub(super) fn comment_composer(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn comment_composer(
+        &self,
+        theme: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let sending = self.submission.is_some();
         let can_send = !sending
             && self.detail.is_some()
@@ -414,7 +419,12 @@ impl PullRequestDetailPage {
                                         cx,
                                     ))
                             } else {
-                                crate::composer::send_circle("pr-send-comment", !can_send, theme)
+                                crate::composer::send_circle(
+                                    "pr-send-comment",
+                                    !can_send,
+                                    theme,
+                                    window,
+                                )
                             }
                             .debug_selector(|| "pr-send-comment".into())
                             .role(gpui::Role::Button)

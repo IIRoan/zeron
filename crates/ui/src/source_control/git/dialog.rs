@@ -2,6 +2,9 @@ use super::*;
 use gpui::{FocusHandle, Subscription};
 
 pub(crate) struct ConfirmationDialog {
+    /// What the card shows while `SourceControl::confirmation` is gone and
+    /// the exit animation plays.
+    confirmation: Confirmation,
     buttons: [FocusHandle; 2],
     previous_focus: Option<FocusHandle>,
     _key_interceptor: Subscription,
@@ -13,13 +16,14 @@ impl SourceControl {
     }
 
     fn sync_confirmation_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.confirmation.is_none() {
+        let Some(confirmation) = &self.confirmation else {
             self.restore_confirmation_focus(window, cx);
             return;
-        }
-        if self.confirmation_dialog.is_some() {
+        };
+        if self.confirmation_dialog.is_open() {
             return;
         }
+        let confirmation = confirmation.clone();
         // Bound actions run before Div key listeners. Intercept this window's
         // keys while the modal is open so editor and Git shortcuts cannot
         // bypass the question and affect the background.
@@ -36,25 +40,28 @@ impl SourceControl {
             });
         });
         let dialog = ConfirmationDialog {
+            confirmation,
             buttons: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             previous_focus: window.focused(cx),
             _key_interceptor: interceptor,
         };
         // Destructive actions start with Cancel focused.
         window.focus(&dialog.buttons[0], cx);
-        self.confirmation_dialog = Some(dialog);
+        self.confirmation_dialog.open(dialog);
     }
 
     fn restore_confirmation_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(dialog) = self.confirmation_dialog.take()
-            && dialog.buttons.iter().any(|focus| focus.is_focused(window))
-        {
-            if let Some(focus) = dialog.previous_focus {
-                window.focus(&focus, cx);
+        let Some(dialog) = self.confirmation_dialog.as_open() else {
+            return;
+        };
+        if dialog.buttons.iter().any(|focus| focus.is_focused(window)) {
+            if let Some(focus) = &dialog.previous_focus {
+                window.focus(focus, cx);
             } else {
                 window.blur();
             }
         }
+        popover::close_popup(self, cx, |this| &mut this.confirmation_dialog);
     }
 
     fn finish_confirmation(&mut self, accept: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -75,7 +82,7 @@ impl SourceControl {
     ) -> bool {
         let Some(dialog) = self
             .confirmation_dialog
-            .as_ref()
+            .as_open()
             .filter(|_| self.has_confirmation())
         else {
             return false;
@@ -100,7 +107,7 @@ impl SourceControl {
                 let _ = view.update(cx, |view, cx| {
                     if view
                         .confirmation_dialog
-                        .as_ref()
+                        .as_open()
                         .is_some_and(|dialog| dialog.buttons[0] == identity)
                     {
                         view.finish_confirmation(accept, window, cx);
@@ -117,10 +124,10 @@ impl SourceControl {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         self.sync_confirmation_dialog(window, cx);
-        let Some(confirmation) = &self.confirmation else {
+        let Some(dialog) = self.confirmation_dialog.get() else {
             return gpui::Empty.into_any_element();
         };
-        let dialog = self.confirmation_dialog.as_ref().unwrap();
+        let confirmation = self.confirmation.as_ref().unwrap_or(&dialog.confirmation);
         let viewport = window.viewport_size();
         let theme = Theme::of(cx).for_popup();
         let label = match &confirmation.command {
@@ -167,22 +174,29 @@ impl SourceControl {
                     )
                     .child(
                         (if matches!(confirmation.command, Command::StageAndCommit(_)) {
-                            popover::btn_primary(&theme, label)
-                        } else { popover::btn_danger(&theme, label) })
-                            .id("git-confirm-accept")
-                            .debug_selector(|| "git-confirm-accept".into())
-                            .role(gpui::Role::Button)
-                            .track_focus(&dialog.buttons[1])
-                            .border_1()
-                            .border_color(gpui::transparent_black())
-                            .focus_visible(|style| style.border_color(theme.text_muted))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.finish_confirmation(true, window, cx)
-                            })),
+                            popover::btn_primary(&theme, label, "git-confirm-accept")
+                        } else {
+                            popover::btn_danger(&theme, label, "git-confirm-accept")
+                        })
+                        .id("git-confirm-accept")
+                        .debug_selector(|| "git-confirm-accept".into())
+                        .role(gpui::Role::Button)
+                        .track_focus(&dialog.buttons[1])
+                        .border_1()
+                        .border_color(gpui::transparent_black())
+                        .focus_visible(|style| style.border_color(theme.text_muted))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.finish_confirmation(true, window, cx)
+                        })),
                     ),
             )
             .into_any_element();
-        popover::modal("git-confirm-dialog", viewport, card)
+        popover::modal(
+            "git-confirm-dialog",
+            viewport,
+            card,
+            self.confirmation_dialog.closing_since(),
+        )
     }
 }
 
@@ -292,7 +306,7 @@ mod tests {
             cx.update(|window, cx| {
                 let view = host.read(cx).view.read(cx);
                 assert!(
-                    view.confirmation_dialog.as_ref().unwrap().buttons[button].is_focused(window)
+                    view.confirmation_dialog.as_open().unwrap().buttons[button].is_focused(window)
                 );
             });
         }

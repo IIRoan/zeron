@@ -18,16 +18,16 @@ impl Shell {
     ) {
         // A startup summary waits for the workspace and any existing modal.
         // It must never steal a save/discard decision or a project setup form.
-        if self.release_notes_dialog.is_some()
+        if self.release_notes_dialog.is_open()
             || self.file_close_dialog.is_some()
             || self.pending_exit.is_some()
-            || self.worktree_settings.editor.is_some()
-            || self.project_terminals.editor.is_some()
-            || self.command_palette.is_some()
-            || self.add_space.is_some()
-            || self.delete_confirm.is_some()
-            || self.delete_space_confirm.is_some()
-            || self.discard_working_tree.is_some()
+            || self.worktree_settings.editor.is_open()
+            || self.project_terminals.editor.is_open()
+            || self.command_palette.is_open()
+            || self.add_space.is_open()
+            || self.delete_confirm.is_open()
+            || self.delete_space_confirm.is_open()
+            || self.discard_working_tree.is_open()
             || self.sync_flow.has_visible_overlay()
             || crate::app_update::AppUpdate::global(cx)
                 .is_some_and(|update| update.read(cx).prompt().is_some())
@@ -67,28 +67,23 @@ impl Shell {
         self.composer
             .update(cx, |composer, _| composer.focus_pending = false);
         window.focus(&dialog.buttons[4], cx);
-        self.release_notes_dialog = Some(dialog);
+        self.release_notes_dialog.open(dialog);
     }
 
     fn close_release_notes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(dialog) = self.release_notes_dialog.take() else {
+        let Some(dialog) = self.release_notes_dialog.as_open() else {
             return;
         };
+        let previous_focus = dialog.previous_focus.clone();
+        popover::close_popup(self, cx, |this| &mut this.release_notes_dialog);
         if let Some(notes) = ReleaseNotes::global(cx) {
             notes.update(cx, |notes, cx| notes.dismiss(cx));
         }
-        window.focus(
-            dialog
-                .previous_focus
-                .as_ref()
-                .unwrap_or(&self.shortcut_focus),
-            cx,
-        );
-        cx.notify();
+        window.focus(previous_focus.as_ref().unwrap_or(&self.shortcut_focus), cx);
     }
 
     pub(super) fn select_release_notes(&mut self, selected: usize, cx: &mut Context<Self>) {
-        if let Some(dialog) = self.release_notes_dialog.as_mut() {
+        if let Some(dialog) = self.release_notes_dialog.open_mut() {
             dialog.selected = selected;
             dialog.cache = Default::default();
             dialog.scroll.set_offset(gpui::point(px(0.0), px(0.0)));
@@ -97,7 +92,7 @@ impl Shell {
     }
 
     fn release_notes_url(&self, cx: &App) -> Option<String> {
-        let selected = self.release_notes_dialog.as_ref()?.selected;
+        let selected = self.release_notes_dialog.get()?.selected;
         let notes = ReleaseNotes::global(cx)?;
         let notes = notes.read(cx);
         let catalog = notes.catalog.as_ref()?;
@@ -114,7 +109,7 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(dialog) = self.release_notes_dialog.as_ref() else {
+        let Some(dialog) = self.release_notes_dialog.as_open() else {
             return false;
         };
         if self.file_close_dialog.is_some() {
@@ -157,7 +152,7 @@ impl Shell {
             let shell = cx.weak_entity();
             window.defer(cx, move |window, cx| {
                 let _ = shell.update(cx, |shell, cx| {
-                    if shell.release_notes_dialog.is_none() {
+                    if !shell.release_notes_dialog.is_open() {
                         return;
                     }
                     match action {
@@ -189,7 +184,7 @@ impl Shell {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let dialog = self.release_notes_dialog.as_ref()?;
+        let dialog = self.release_notes_dialog.get()?;
         let notes = ReleaseNotes::global(cx)?;
         let notes = notes.read(cx);
         let theme = Theme::of(cx).for_popup();
@@ -372,7 +367,7 @@ impl Shell {
                         )
                     })
                     .child(
-                        popover::btn_primary(&theme, "Got it")
+                        popover::btn_primary(&theme, "Got it", "release-notes-close")
                             .id("release-notes-close")
                             .debug_selector(|| "release-notes-close".into())
                             .role(gpui::Role::Button)
@@ -399,7 +394,12 @@ impl Shell {
             .child(body)
             .child(footer)
             .into_any_element();
-        Some(popover::modal("release-notes-dialog", viewport, card))
+        Some(popover::modal(
+            "release-notes-dialog",
+            viewport,
+            card,
+            self.release_notes_dialog.closing_since(),
+        ))
     }
 }
 

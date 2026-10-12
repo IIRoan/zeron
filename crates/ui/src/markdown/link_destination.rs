@@ -26,10 +26,17 @@ fn breakable_url(url: &str) -> String {
 pub fn destination_card(
     url: &str,
     bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
-    window: &Window,
+    window: &mut Window,
     cx: &App,
 ) -> AnyElement {
     let theme = Theme::of(cx);
+    // Fades in each time the disclosure appears, like every tooltip.
+    let entrance = crate::motion::entrance(
+        window,
+        "destination-in",
+        crate::motion::FADE_QUICK,
+        crate::motion::reduced_motion(cx),
+    );
     let (max_width, height) = viewport_limits(
         window.viewport_size().width.into(),
         window.viewport_size().height.into(),
@@ -50,6 +57,7 @@ pub fn destination_card(
     div()
         .id("web-destination-card")
         .relative()
+        .opacity(entrance)
         .child(
             gpui::canvas(|_, _, _| (), move |rect, _, _, _| bounds.set(Some(rect)))
                 .absolute()

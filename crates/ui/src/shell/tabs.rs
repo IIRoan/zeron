@@ -117,11 +117,11 @@ impl Shell {
     fn navigation_overlay_open(&self, cx: &App) -> bool {
         self.overlay_owns_keyboard(cx)
             || self.sync_flow.has_visible_overlay()
-            || self.delete_confirm.is_some()
-            || self.delete_space_confirm.is_some()
+            || self.delete_confirm.is_open()
+            || self.delete_space_confirm.is_open()
             || self.chat_rename.is_some()
-            || self.rename_space_dialog.is_some()
-            || self.discard_working_tree.is_some()
+            || self.rename_space_dialog.is_open()
+            || self.discard_working_tree.is_open()
             || self.chat_menu.get().is_some()
             || self.space_menu.get().is_some()
             || self.user_menu.get().is_some()
@@ -213,7 +213,7 @@ impl Shell {
 
     /// Open a session from the sidebar: select it, the main area follows.
     pub(crate) fn open_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
-        self.command_palette = None;
+        self.dismiss_command_palette(cx);
         // Opening any session steps the voice stage aside — including the one
         // already selected under it. The call keeps running in the background.
         self.set_voice_stage_open(false, cx);
@@ -238,7 +238,7 @@ impl Shell {
     pub(super) fn open_new_session(&mut self, project: Option<String>, cx: &mut Context<Self>) {
         let pickers = self.composer.read(cx).pickers().clone();
         pickers.update(cx, |pickers, cx| pickers.clear_reused_checkout(cx));
-        self.command_palette = None;
+        self.dismiss_command_palette(cx);
         self.set_voice_stage_open(false, cx);
         self.set_route(Route::Chat, cx);
         self.focus_composer(cx);

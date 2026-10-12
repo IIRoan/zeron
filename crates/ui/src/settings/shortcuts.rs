@@ -559,6 +559,7 @@ fn binding_control(
         .items_center()
         .gap(px(20.0))
         .when(non_default && !is_recording, |el| {
+            let hover_key = format!("shortcut-reset-{ix}-hover");
             el.child(
                 div()
                     .id(("shortcut-reset", ix))
@@ -568,9 +569,13 @@ fn binding_control(
                     .tab_index(0)
                     .focus_visible(move |style| style.border_2().border_color(accent))
                     .text_size(crate::typography::ui_rems(11.0))
-                    .text_color(theme.text_muted)
+                    .text_color(crate::motion::hover_blend(
+                        &hover_key,
+                        theme.text_muted,
+                        theme.text,
+                    ))
                     .cursor_pointer()
-                    .hover(|s| s.text_color(theme.text))
+                    .on_hover(crate::motion::hover_listener(hover_key))
                     .on_click(move |_, window, cx| on_reset(window, cx))
                     .child(SharedString::from("Reset")),
             )
@@ -1040,33 +1045,33 @@ impl Render for ShortcutsPage {
                                         // `disabled:opacity-35` when nothing is
                                         // customized or while recording.
                                         let disabled = !customized || recording.is_some();
-                                        widgets::ghost_action(&theme)
-                                            .id("shortcuts-restore-defaults")
-                                            .flex_none()
-                                            .when(disabled, |el| el.opacity(0.35))
-                                            .when(!disabled, |el| {
-                                                el.on_click(
-                                                    cx.listener(|this, _, _, cx| {
-                                                        this.keymap = KeymapConfig::default();
-                                                        this.stop_recording();
-                                                        this.conflict_notice = None;
-                                                        this.commit(cx);
-                                                        this.set_escape_stops_active_agent(
-                                                            false, cx,
-                                                        );
-                                                        this.set_composer_send_behavior(
-                                                            ComposerSendBehavior::Enter,
-                                                            cx,
-                                                        );
-                                                    }),
-                                                )
-                                            })
-                                            .child(
-                                                crate::icons::icon(crate::icons::RESTART)
-                                                    .size(px(14.0))
-                                                    .text_color(theme.text_muted),
-                                            )
-                                            .child(SharedString::from("Restore defaults"))
+                                        widgets::action(
+                                            &theme,
+                                            widgets::ActionTone::Quiet,
+                                            "shortcuts-restore-defaults",
+                                            window,
+                                        )
+                                        .flex_none()
+                                        .when(disabled, |el| el.opacity(0.35))
+                                        .when(!disabled, |el| {
+                                            el.on_click(cx.listener(|this, _, _, cx| {
+                                                this.keymap = KeymapConfig::default();
+                                                this.stop_recording();
+                                                this.conflict_notice = None;
+                                                this.commit(cx);
+                                                this.set_escape_stops_active_agent(false, cx);
+                                                this.set_composer_send_behavior(
+                                                    ComposerSendBehavior::Enter,
+                                                    cx,
+                                                );
+                                            }))
+                                        })
+                                        .child(
+                                            crate::icons::icon(crate::icons::RESTART)
+                                                .size(px(14.0))
+                                                .text_color(theme.text_muted),
+                                        )
+                                        .child(SharedString::from("Restore defaults"))
                                     }),
                             )
                             .child(

@@ -61,6 +61,7 @@ impl Render for ModalSelectionHarness {
                     popover::dialog_card(theme)
                         .child(popover::dialog_field(self.input.clone().into_any_element()))
                         .into_any_element(),
+                    None,
                 ))
             })
     }

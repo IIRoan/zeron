@@ -216,7 +216,7 @@ struct ProjectIconTooltip {
 }
 
 impl Render for ProjectIconTooltip {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx);
         let card = div()
             .max_w(px(320.0))
@@ -249,7 +249,7 @@ impl Render for ProjectIconTooltip {
                     .text_color(theme.text_muted)
                     .child(self.device.clone()),
             );
-        crate::frost::frosted(6.0, crate::frost::MENU_BLUR, card)
+        crate::popover::tooltip_surface(card, Some(6.0), window, cx)
     }
 }
 

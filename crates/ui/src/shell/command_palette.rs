@@ -81,6 +81,12 @@ impl<T: Default> WorkspaceQuery<T> {
         };
     }
 
+    /// Stop the request in flight, keeping the shown results.
+    fn cancel(&mut self) {
+        self.generation += 1;
+        self.task = None;
+    }
+
     /// Start a request; the returned generation identifies its answer.
     fn begin(&mut self) -> u64 {
         self.generation += 1;
@@ -462,13 +468,13 @@ impl CommandPalette {
 
 impl Shell {
     pub(super) fn reset_command_palette_key_state(&mut self) {
-        if let Some(palette) = self.command_palette.as_mut() {
+        if let Some(palette) = self.command_palette.open_mut() {
             palette.enter_press.release();
         }
     }
 
     pub(super) fn toggle_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.command_palette.is_some() {
+        if self.command_palette.is_open() {
             self.close_command_palette(window, cx);
             return;
         }
@@ -478,7 +484,7 @@ impl Shell {
         });
         let events = cx.subscribe(&search, |this, _, event, cx| {
             if matches!(event, ComposerInputEvent::Edited) {
-                if let Some(palette) = this.command_palette.as_mut() {
+                if let Some(palette) = this.command_palette.open_mut() {
                     palette.reset_active();
                     palette.scroll.set_offset(gpui::point(px(0.0), px(0.0)));
                 }
@@ -487,7 +493,7 @@ impl Shell {
             }
         });
         let previous_focus = window.focused(cx);
-        self.command_palette = Some(CommandPalette {
+        self.command_palette.open(CommandPalette {
             recent_chats: false,
             search,
             focus: cx.focus_handle(),
@@ -510,10 +516,10 @@ impl Shell {
 
     /// Every previous chat, most recent first, archived ones included.
     pub(super) fn open_recent_chats(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.command_palette.is_none() {
+        if !self.command_palette.is_open() {
             self.toggle_command_palette(window, cx);
         }
-        if let Some(palette) = self.command_palette.as_mut() {
+        if let Some(palette) = self.command_palette.open_mut() {
             palette.recent_chats = true;
         }
         self.select_palette_tab(Tab::Threads, cx);
@@ -521,7 +527,7 @@ impl Shell {
     }
 
     pub(super) fn select_palette_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
-        let Some(palette) = self.command_palette.as_mut() else {
+        let Some(palette) = self.command_palette.open_mut() else {
             return;
         };
         if palette.tab != tab {
@@ -533,19 +539,30 @@ impl Shell {
     }
 
     pub(super) fn close_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(palette) = self.command_palette.take() {
-            if let Some(focus) = palette.previous_focus {
+        if let Some(palette) = self.command_palette.as_open() {
+            let previous_focus = palette.previous_focus.clone();
+            self.dismiss_command_palette(cx);
+            if let Some(focus) = previous_focus {
                 window.focus(&focus, cx);
             }
-            cx.notify();
         }
+    }
+
+    /// Close through the exit animation. Workspace searches stop now rather
+    /// than when the faded palette is reaped.
+    pub(super) fn dismiss_command_palette(&mut self, cx: &mut Context<Self>) {
+        if let Some(palette) = self.command_palette.open_mut() {
+            palette.files.cancel();
+            palette.content.cancel();
+        }
+        popover::close_popup(self, cx, |this| &mut this.command_palette);
     }
 
     /// Look the query up in the focused workspace: file names at once,
     /// contents once typing pauses.
     fn search_palette_workspace(&mut self, cx: &mut Context<Self>) {
         let workspace = palette_workspace(self, cx);
-        let Some(palette) = self.command_palette.as_mut() else {
+        let Some(palette) = self.command_palette.open_mut() else {
             return;
         };
         let query = palette.search.read(cx).text().trim().to_owned();
@@ -601,7 +618,7 @@ impl Shell {
                 let target = target.clone();
                 let retry = this
                     .update(cx, |shell, cx| {
-                        let Some(palette) = shell.command_palette.as_mut() else {
+                        let Some(palette) = shell.command_palette.open_mut() else {
                             return false;
                         };
                         if ready {
@@ -644,7 +661,7 @@ impl Shell {
                     .map(|found| (found.matches, found.indexing));
                 let retry = this
                     .update(cx, |shell, cx| {
-                        let Some(palette) = shell.command_palette.as_mut() else {
+                        let Some(palette) = shell.command_palette.open_mut() else {
                             return false;
                         };
                         if !palette.content.finish(generation, result, "content") {
@@ -668,7 +685,7 @@ impl Shell {
 
     /// The open palette's sections for its tab and query.
     fn palette_sections(&self, cx: &App) -> Vec<PaletteSection> {
-        let Some(palette) = &self.command_palette else {
+        let Some(palette) = self.command_palette.get() else {
             return Vec::new();
         };
         let query = palette.search.read(cx).text().trim().to_lowercase();
@@ -788,7 +805,7 @@ impl Shell {
         let state = self.state.read(cx);
         let everything = self
             .command_palette
-            .as_ref()
+            .get()
             .is_some_and(|palette| palette.recent_chats);
         let mut chats: Vec<_> = state
             .chats
@@ -853,7 +870,7 @@ impl Shell {
     /// two rows. Motion only: rows scrolling under a resting pointer must not
     /// steal the keyboard's place.
     fn hover_command(&mut self, key: RowKey, ix: usize, cx: &mut Context<Self>) {
-        if let Some(palette) = self.command_palette.as_mut()
+        if let Some(palette) = self.command_palette.open_mut()
             && palette.active.as_ref() != Some(&key)
         {
             palette.active = Some(key);
@@ -866,7 +883,7 @@ impl Shell {
         let sections = self.palette_sections(cx);
         let rows = flat_rows(&sections);
         let count = rows.len();
-        let Some(palette) = self.command_palette.as_mut() else {
+        let Some(palette) = self.command_palette.open_mut() else {
             return;
         };
         if count == 0 {
@@ -896,7 +913,7 @@ impl Shell {
         let rows = flat_rows(&sections);
         let Some(row) = self
             .command_palette
-            .as_ref()
+            .as_open()
             .and_then(|palette| rows.get(palette.active_position(&rows)))
             .map(|row| (*row).clone())
         else {
@@ -1185,10 +1202,13 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let sections = self.palette_sections(cx);
-        let palette = self.command_palette.as_mut()?;
-        if std::mem::take(&mut palette.focus_pending) {
+        if let Some(palette) = self.command_palette.open_mut()
+            && std::mem::take(&mut palette.focus_pending)
+        {
             window.focus(&palette.search.focus_handle(cx), cx);
         }
+        let closing = self.command_palette.closing_since();
+        let palette = self.command_palette.get()?;
         let row_count = sections
             .iter()
             .map(|section| section.rows.len())
@@ -1297,7 +1317,7 @@ impl Shell {
                         "enter" => {
                             let activate = this
                                 .command_palette
-                                .as_mut()
+                                .open_mut()
                                 .is_some_and(|palette| palette.enter_press.press(event.is_held));
                             if !activate {
                                 cx.stop_propagation();
@@ -1309,7 +1329,7 @@ impl Shell {
                             let forward = !event.keystroke.modifiers.shift;
                             if let Some(tab) = this
                                 .command_palette
-                                .as_ref()
+                                .as_open()
                                 .map(|palette| palette.tab.step(forward))
                             {
                                 this.select_palette_tab(tab, cx);
@@ -1323,7 +1343,7 @@ impl Shell {
             )
             .on_key_up(cx.listener(|this, event: &gpui::KeyUpEvent, _, cx| {
                 if event.keystroke.key == "enter" {
-                    if let Some(palette) = this.command_palette.as_mut() {
+                    if let Some(palette) = this.command_palette.open_mut() {
                         palette.enter_press.release();
                     }
                     cx.stop_propagation();
@@ -1345,7 +1365,7 @@ impl Shell {
                     .child(command_key_hint(&theme, "↵", "Open"))
                     .child(command_key_hint(&theme, "Esc", "Close")),
             );
-        Some(palette_overlay(viewport, card))
+        Some(palette_overlay("command-palette", viewport, card, closing))
     }
 }
 
@@ -1458,32 +1478,15 @@ pub(super) fn palette_footer() -> gpui::Div {
         .gap(px(12.0))
 }
 
-/// Mount a palette card over the scrimmed window, frosted like the composer.
+/// Mount a palette card over the scrimmed window, frosted like the composer
+/// (16px corners) and entering/leaving like every other modal.
 pub(super) fn palette_overlay(
+    id: &'static str,
     viewport: gpui::Size<Pixels>,
     card: gpui::Stateful<gpui::Div>,
+    closing: Option<std::time::Instant>,
 ) -> AnyElement {
-    // Match the composer's 16px backdrop blur, including its opaque fallback.
-    let card = crate::frost::frosted(16.0, crate::frost::MENU_BLUR, card);
-    gpui::deferred(
-        gpui::anchored()
-            .position(gpui::point(px(0.0), px(0.0)))
-            .child(
-                div()
-                    .occlude()
-                    .w(viewport.width)
-                    .h(viewport.height)
-                    // Match glass modals: quiet the background while
-                    // preserving its color through the frosted palette.
-                    .bg(popover::scrim_alpha(0.35))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(card),
-            ),
-    )
-    .priority(2)
-    .into_any_element()
+    popover::modal_glass(id, viewport, card.into_any_element(), 16.0, closing)
 }
 
 /// A footer legend: the keys on a key cap (footers keep their caps, unlike
@@ -1575,7 +1578,7 @@ mod tests {
     fn search_chats(shell: &Shell, query: &str, cx: &mut Context<Shell>) -> Vec<String> {
         shell
             .command_palette
-            .as_ref()
+            .as_open()
             .unwrap()
             .search
             .update(cx, |input, cx| {
@@ -1720,7 +1723,7 @@ mod tests {
                 shell.toggle_command_palette(window, cx);
                 shell
                     .command_palette
-                    .as_ref()
+                    .as_open()
                     .unwrap()
                     .search
                     .update(cx, |input, cx| input.set_text("new", cx));
@@ -1823,7 +1826,7 @@ mod tests {
                 });
                 shell.open_new_session(None, cx);
                 shell.open_recent_chats(window, cx);
-                let palette = shell.command_palette.as_ref().unwrap();
+                let palette = shell.command_palette.as_open().unwrap();
                 assert_eq!(palette.tab, Tab::Threads);
                 assert!(palette.recent_chats);
                 assert_eq!(
@@ -1839,7 +1842,7 @@ mod tests {
                     window,
                     cx,
                 );
-                assert!(shell.command_palette.is_none());
+                assert!(!shell.command_palette.is_open());
                 assert_eq!(
                     shell.state.read(cx).selected_chat.as_deref(),
                     Some("archived-session")
@@ -1847,7 +1850,7 @@ mod tests {
                 assert!(matches!(shell.route, Route::Chat));
                 // The ordinary palette keeps upstream's recent list.
                 shell.toggle_command_palette(window, cx);
-                let palette = shell.command_palette.as_ref().unwrap();
+                let palette = shell.command_palette.as_open().unwrap();
                 assert_eq!(palette.tab, Tab::All);
                 assert!(!palette.recent_chats);
             })
@@ -1970,7 +1973,7 @@ mod tests {
             .update(cx, |shell, _, cx| {
                 shell
                     .command_palette
-                    .as_ref()
+                    .as_open()
                     .unwrap()
                     .search
                     .update(cx, |input, cx| input.set_text(query, cx));
@@ -2172,7 +2175,7 @@ mod tests {
         window
             .update(cx, |shell, _, cx| {
                 shell.select_palette_tab(Tab::Files, cx);
-                shell.command_palette.as_mut().unwrap().active = Some(selected.clone());
+                shell.command_palette.open_mut().unwrap().active = Some(selected.clone());
             })
             .unwrap();
 
@@ -2197,7 +2200,7 @@ mod tests {
             .read_with(cx, |shell, cx| {
                 let sections = shell.palette_sections(cx);
                 let rows = flat_rows(&sections);
-                let palette = shell.command_palette.as_ref().unwrap();
+                let palette = shell.command_palette.as_open().unwrap();
                 assert_eq!(rows[palette.active_position(&rows)].key(), selected);
             })
             .unwrap();
@@ -2387,7 +2390,7 @@ mod tests {
         let selected = |cx: &mut TestAppContext| {
             window
                 .read_with(cx, |shell, _| {
-                    shell.command_palette.as_ref().unwrap().active.clone()
+                    shell.command_palette.as_open().unwrap().active.clone()
                 })
                 .unwrap()
         };
@@ -2414,7 +2417,7 @@ mod tests {
                     },
                 );
                 shell.activate_palette_row(row, window, cx);
-                assert!(shell.command_palette.is_none());
+                assert!(!shell.command_palette.is_open());
                 assert!(
                     shell
                         .file_surface_paths
@@ -2527,7 +2530,7 @@ mod tests {
         window
             .update(cx, |shell, _, cx| {
                 shell.select_palette_tab(Tab::Files, cx);
-                shell.command_palette.as_mut().unwrap().active = Some(selected.clone());
+                shell.command_palette.open_mut().unwrap().active = Some(selected.clone());
             })
             .unwrap();
 
@@ -2554,7 +2557,7 @@ mod tests {
             .read_with(cx, |shell, cx| {
                 let sections = shell.palette_sections(cx);
                 let rows = flat_rows(&sections);
-                let palette = shell.command_palette.as_ref().unwrap();
+                let palette = shell.command_palette.as_open().unwrap();
                 assert_eq!(rows[palette.active_position(&rows)].key(), selected);
             })
             .unwrap();
@@ -2744,7 +2747,7 @@ mod tests {
 
     fn palette_tab(window: gpui::WindowHandle<Shell>, cx: &mut TestAppContext) -> Option<Tab> {
         window
-            .read_with(cx, |shell, _| shell.command_palette.as_ref().map(|p| p.tab))
+            .read_with(cx, |shell, _| shell.command_palette.as_open().map(|p| p.tab))
             .unwrap()
     }
 

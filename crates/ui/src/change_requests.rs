@@ -64,7 +64,7 @@ pub(crate) struct ChangeRequestTooltip {
 }
 
 impl Render for ChangeRequestTooltip {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx);
         let card = div()
             .max_w(px(320.0))
@@ -97,7 +97,7 @@ impl Render for ChangeRequestTooltip {
                     .text_color(theme.text_muted)
                     .child(self.model.title.clone()),
             );
-        crate::frost::frosted(6.0, crate::frost::MENU_BLUR, card)
+        crate::popover::tooltip_surface(card, Some(6.0), window, cx)
     }
 }
 
@@ -195,7 +195,7 @@ fn render_badge_model(
     let accessible_label = format!("Open pull request {}: {}", model.number, model.title);
 
     div()
-        .id(id)
+        .id(id.clone())
         .h(px(if composer { 20.0 } else { 16.0 }))
         .flex_none()
         .flex()
@@ -214,7 +214,13 @@ fn render_badge_model(
                 .tab_index(0)
                 .focus_visible(|style| style.border_2().border_color(theme.accent))
                 .cursor_pointer()
-                .hover(move |style| style.bg(color.opacity(0.16)).text_color(color))
+                .bg(crate::motion::hover_blend(
+                    &id,
+                    color.opacity(0.08),
+                    color.opacity(0.16),
+                ))
+                .text_color(crate::motion::hover_blend(&id, color.opacity(0.85), color))
+                .on_hover(crate::motion::hover_listener(id))
                 .on_click(move |_, window, cx| {
                     cx.stop_propagation();
                     crate::pull_request_detail::open_on_device(&url, device.clone(), window, cx);

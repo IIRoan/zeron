@@ -19,6 +19,7 @@ use zeron_proto::change_request_assessment::{Blocker, CiState, Facts};
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::icons::{self, icon};
+use crate::motion::HoverFade as _;
 use crate::popover;
 use crate::settings::widgets;
 use crate::state::AppState;
@@ -226,7 +227,12 @@ pub(crate) fn star_key(url: &str) -> String {
     parsed.to_string().to_ascii_lowercase()
 }
 
-pub(crate) fn star_button(url: &str, theme: &Theme, cx: &gpui::App) -> gpui::Stateful<gpui::Div> {
+pub(crate) fn star_button(
+    url: &str,
+    theme: &Theme,
+    window: &mut Window,
+    cx: &gpui::App,
+) -> gpui::Stateful<gpui::Div> {
     let key = star_key(url);
     let starred = crate::settings::current(cx)
         .pull_request_stars
@@ -256,7 +262,12 @@ pub(crate) fn star_button(url: &str, theme: &Theme, cx: &gpui::App) -> gpui::Sta
         .border_1()
         .border_color(gpui::transparent_black())
         .cursor_pointer()
-        .hover(|style| style.bg(theme.glass_hover()))
+        .hover_bg(
+            format!("pr-star-hover-{key}"),
+            window,
+            gpui::transparent_black(),
+            theme.glass_hover(),
+        )
         .tooltip(widgets::text_tooltip(label))
         .child(
             icon(if starred {
@@ -1819,8 +1830,12 @@ impl PullRequestsPage {
                 .gap(px(Theme::SPACE_SM))
                 .child(
                     // A filled, borderless button: the list's own material.
-                    widgets::action_button(theme, widgets::ActionTone::Filled)
-                        .id("pull-requests-load-more")
+                    widgets::action_button(
+                        theme,
+                        widgets::ActionTone::Filled,
+                        "pull-requests-load-more",
+                    )
+                    .id("pull-requests-load-more")
                         .debug_selector(|| "pull-requests-load-more".to_string())
                         .role(gpui::Role::Button)
                         .aria_label(label.clone())
@@ -1847,7 +1862,12 @@ impl PullRequestsPage {
         )
     }
 
-    fn render_device_switcher(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn render_device_switcher(
+        &mut self,
+        theme: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let (devices, local_id) = {
             let state = self.state.read(cx);
             (
@@ -1894,7 +1914,12 @@ impl PullRequestsPage {
                 gpui::transparent_black()
             })
             .when(!open, |element| {
-                element.hover(|style| style.bg(crate::theme::ink(0.04)))
+                element.hover_bg(
+                    "pull-requests-device-hover",
+                    window,
+                    gpui::transparent_black(),
+                    crate::theme::ink(0.04),
+                )
             })
             .on_mouse_down(
                 gpui::MouseButton::Left,
@@ -2133,7 +2158,7 @@ impl PullRequestsPage {
 }
 
 fn empty_action(id: &'static str, label: &'static str, theme: &Theme) -> gpui::Stateful<gpui::Div> {
-    widgets::ghost_action(theme)
+    widgets::action_button(theme, widgets::ActionTone::Quiet, id)
         .id(id)
         .debug_selector(move || id.into())
         .role(gpui::Role::Button)
@@ -2354,7 +2379,12 @@ impl Render for PullRequestsPage {
                                     .cursor_pointer()
                                     .border_1()
                                     .border_color(gpui::transparent_black())
-                                    .hover(|style| style.bg(crate::theme::ink(0.04)))
+                                    .hover_bg(
+                                        "pull-requests-refresh-hover",
+                                        window,
+                                        gpui::transparent_black(),
+                                        crate::theme::ink(0.04),
+                                    )
                                     .when(loading, |el| el.opacity(0.5))
                                     .on_click(cx.listener(|page, _, _, cx| page.refresh(cx)))
                                     .child(if refreshing {
@@ -2375,7 +2405,7 @@ impl Render for PullRequestsPage {
                                     .tooltip(widgets::text_tooltip(freshness)),
                             )
                             .child(self.render_repository_menu(&theme, window, cx))
-                            .child(self.render_device_switcher(&theme, cx)),
+                            .child(self.render_device_switcher(&theme, window, cx)),
                     ),
             )
 
@@ -2569,8 +2599,13 @@ impl Render for PullRequestsPage {
                                         .shadow(crate::theme::card_selected_shadows())
                                 })
                                 .when(!selected, |el| {
-                                    el.bg(crate::theme::ink(0.035)).hover(|style| {
-                                        style.bg(crate::theme::ink(0.07)).text_color(theme.text)
+                                    el.hover_fade(format!("{id}-hover"), window, |el, t| {
+                                        el.bg(crate::motion::mix(
+                                            crate::theme::ink(0.035),
+                                            crate::theme::ink(0.07),
+                                            t,
+                                        ))
+                                        .text_color(crate::motion::mix(color, theme.text, t))
                                     })
                                 })
                                 .child(
@@ -2740,7 +2775,7 @@ impl PullRequestsPage {
     fn render_board_row(
         &mut self,
         index: usize,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let Some(board) = self.board.clone() else {
@@ -2757,7 +2792,7 @@ impl PullRequestsPage {
                 closed,
                 first,
             } => self
-                .render_group_header(group, count, closed, &theme, cx)
+                .render_group_header(group, count, closed, &theme, window, cx)
                 .when(!first, |el| el.pt(px(32.0)))
                 .pb(px(8.0))
                 .into_any_element(),
@@ -2783,6 +2818,7 @@ impl PullRequestsPage {
                         last,
                         self.selected_url.as_deref() == Some(item.url.as_str()),
                         &theme,
+                        window,
                         cx,
                     ))
                     .into_any_element()
@@ -2813,6 +2849,7 @@ impl PullRequestsPage {
         count: usize,
         closed: bool,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let reveal = crate::motion::state_t(
@@ -2841,7 +2878,12 @@ impl PullRequestsPage {
                 .border_1()
                 .border_color(gpui::transparent_black())
                 .cursor_pointer()
-                .hover(|style| style.bg(crate::theme::ink(0.025)))
+                .hover_bg(
+                    format!("pr-group-hover-{}", group.key()),
+                    window,
+                    gpui::transparent_black(),
+                    crate::theme::ink(0.025),
+                )
                 .on_click(cx.listener(move |page, _, _, cx| {
                     if !page.collapsed_groups.remove(&group) {
                         page.collapsed_groups.insert(group);
@@ -2947,9 +2989,10 @@ fn render_table_row(
     last: bool,
     selected: bool,
     theme: &Theme,
+    window: &mut Window,
     cx: &gpui::App,
 ) -> AnyElement {
-    let star = star_button(&item.url, theme, cx);
+    let star = star_button(&item.url, theme, window, cx);
     let url = item.url.clone();
     let row = table_row_shell(layout, first, last, theme)
         .id(SharedString::from(format!(
@@ -2966,9 +3009,17 @@ fn render_table_row(
             status_description(item)
         ))
         .tab_index(0)
-        .when(selected, |el| el.bg(theme.glass_hover()))
         .cursor_pointer()
-        .hover(|style| style.bg(theme.glass_hover()))
+        .hover_bg(
+            format!("pull-request-row-hover-{}", pull_request_key(item)),
+            window,
+            if selected {
+                theme.glass_hover()
+            } else {
+                gpui::transparent_black()
+            },
+            theme.glass_hover(),
+        )
         .on_click(move |_, window, cx| {
             cx.stop_propagation();
             crate::pull_request_detail::open(&url, window, cx);
@@ -3644,6 +3695,7 @@ mod tests {
                 true,
                 false,
                 Theme::of(cx),
+                window,
                 cx,
             ))
         }

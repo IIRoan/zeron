@@ -7,7 +7,7 @@
 //! in free functions with unit tests; rendering is an `impl Transcript`
 //! extension since the rail shares the transcript's rows and `ListState`.
 
-use gpui::{AnyElement, Context, ListOffset, SharedString, div, prelude::*, px};
+use gpui::{AnyElement, Context, ListOffset, SharedString, Window, div, prelude::*, px};
 use std::time::{Duration, Instant};
 
 use zeron_doc::{MessagePart, MessageRole, SessionMessageEntry};
@@ -408,7 +408,7 @@ impl Transcript {
     }
 
     /// The rail element — an absolute overlay along the transcript's left edge.
-    pub fn render_rail(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    pub fn render_rail(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         if !self.rail_enabled() {
             return gpui::Empty.into_any_element();
         }
@@ -457,6 +457,16 @@ impl Transcript {
         let active = active_tick(&tick_rows, top_row);
         let hover = self.rail_hover();
         let theme = Theme::of(cx).clone();
+        let reduced = motion::reduced_motion(cx);
+        // The preview card fades in when the pointer reaches the rail, then
+        // follows it from tick to tick without replaying.
+        let card_in = motion::transition(
+            window,
+            "rail-card",
+            if hover.is_some() { 1.0 } else { 0.0 },
+            motion::FADE_QUICK,
+            reduced,
+        );
 
         // Fixed footprint (shadcn Transcript Outline): a compact stack of at
         // most MAX_RAIL_TICKS marks — past that, ticks become even buckets
@@ -489,13 +499,21 @@ impl Transcript {
                 let bucket_len = end - start;
                 let is_active = active_bucket == Some(ix);
                 let is_hovered = hover == Some(ix);
+                let grow = motion::transition(
+                    window,
+                    ("rail-tick-hover", ix),
+                    if is_hovered { 1.0 } else { 0.0 },
+                    motion::HOVER_FADE,
+                    reduced,
+                );
                 // Only hover grows the tick; the active one just reads brighter
                 // (message-rail.tsx: w-3 rest, w-5 hovered).
-                let bar_width = if is_hovered { 20.0 } else { 12.0 };
-                let bar_color = if is_active || is_hovered {
-                    theme.text.opacity(0.8)
+                let bar_width = motion::lerp(12.0, 20.0, grow);
+                let lit = theme.text.opacity(0.8);
+                let bar_color = if is_active {
+                    lit
                 } else {
-                    crate::theme::ink(0.16)
+                    motion::mix(crate::theme::ink(0.16), lit, grow)
                 };
                 let prompt = truncate_preview(&tick.prompt, PREVIEW_PROMPT_CHARS);
                 let reply = tick
@@ -536,7 +554,12 @@ impl Transcript {
                         });
                     // Mounted straight through deferred/anchored (not a popover
                     // mount helper), so the frost wrap happens here.
-                    crate::frost::frosted(12.0, crate::frost::MENU_BLUR, card).into_any_element()
+                    crate::frost::frosted(
+                        12.0,
+                        crate::frost::MENU_BLUR * card_in,
+                        card.opacity(card_in),
+                    )
+                    .into_any_element()
                 });
                 div()
                     .id(("rail-tick", ix))

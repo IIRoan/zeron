@@ -99,6 +99,9 @@ pub(super) struct Editor {
     /// Set by a rejected save, so empty commands are flagged only after the
     /// user tried to save them.
     show_missing: bool,
+    /// Set when a save closes the editor, so it still reads "Saving…" while it
+    /// animates out.
+    closed_by_save: bool,
 }
 
 impl Editor {
@@ -112,6 +115,7 @@ impl Editor {
             scroll: gpui::ScrollHandle::new(),
             saved: Vec::new(),
             show_missing: false,
+            closed_by_save: false,
         }
     }
 
@@ -160,8 +164,8 @@ pub(super) enum UnsavedForm {
 pub(super) struct ProjectTerminalUi {
     pub drawer: bool,
     pub mode: TerminalMode,
-    pub editor: Option<Editor>,
-    pub(super) discard: Option<DiscardPrompt>,
+    pub editor: popover::Popup<Editor>,
+    pub(super) discard: popover::Popup<DiscardPrompt>,
     pub panel: Option<Entity<TerminalPanel>>,
     context: Option<ProjectContext>,
     snapshot: Option<ProjectTerminalsSnapshot>,
@@ -387,22 +391,22 @@ impl Shell {
         context: ProjectContext,
         cx: &mut Context<Self>,
     ) {
-        self.project_terminals.editor = Some(Editor::new(context));
-        self.project_terminals.discard = None;
+        self.project_terminals.editor.open(Editor::new(context));
+        self.project_terminals.discard = popover::Popup::default();
         self.project_terminals.poll = None;
         self.ensure_project_terminals(cx);
         cx.notify();
     }
 
     pub(super) fn ensure_project_terminals(&mut self, cx: &mut Context<Self>) {
-        if !self.project_terminals.drawer && self.project_terminals.editor.is_none() {
+        if !self.project_terminals.drawer && !self.project_terminals.editor.is_open() {
             self.project_terminals.poll = None;
             return;
         }
         let context = self
             .project_terminals
             .editor
-            .as_ref()
+            .as_open()
             .map(|editor| editor.project.clone())
             .or_else(|| self.terminal_project_context(None, cx));
         let Some(context) = context else {
@@ -467,7 +471,7 @@ impl Shell {
                                 }
                             }
                         }
-                        shell.project_terminals.drawer || shell.project_terminals.editor.is_some()
+                        shell.project_terminals.drawer || shell.project_terminals.editor.is_open()
                     })
                     .unwrap_or(false);
                 if !keep_polling {
@@ -561,7 +565,7 @@ impl Shell {
             .iter()
             .cloned()
             .partition(|s| s.is_database());
-        if let Some(editor) = self.project_terminals.editor.as_mut()
+        if let Some(editor) = self.project_terminals.editor.open_mut()
             && editor.initialized
             && editor.databases != databases
         {
@@ -571,7 +575,7 @@ impl Shell {
         if self
             .project_terminals
             .editor
-            .as_ref()
+            .as_open()
             .is_some_and(|editor| !editor.initialized)
         {
             changed = true;
@@ -595,7 +599,7 @@ impl Shell {
                 .into_iter()
                 .map(|service| self.service_fields(service, seeded, cx))
                 .collect();
-            if let Some(editor) = &mut self.project_terminals.editor {
+            if let Some(editor) = self.project_terminals.editor.open_mut() {
                 editor.services = fields;
                 editor.databases = databases;
                 editor.selected = editor.services.first().map(|service| service.id.clone());
@@ -774,8 +778,15 @@ impl Shell {
                     Ok(snapshot) => {
                         shell.project_terminals.handoff_error = None;
                         if method == methods::SAVE_PROJECT_TERMINALS {
-                            shell.project_terminals.editor = None;
-                            shell.project_terminals.discard = None;
+                            if let Some(editor) = shell.project_terminals.editor.open_mut() {
+                                editor.closed_by_save = true;
+                            }
+                            popover::close_popup(shell, cx, |this| {
+                                &mut this.project_terminals.editor
+                            });
+                            popover::close_popup(shell, cx, |this| {
+                                &mut this.project_terminals.discard
+                            });
                             // Project settings, if open underneath, lists them.
                             shell.refresh_worktree_settings(cx);
                         }
@@ -795,7 +806,7 @@ impl Shell {
     }
 
     fn save_project_terminal_settings(&mut self, cx: &mut Context<Self>) {
-        let Some(editor) = &mut self.project_terminals.editor else {
+        let Some(editor) = self.project_terminals.editor.open_mut() else {
             return;
         };
         if let Some(missing) = editor
@@ -1630,12 +1641,13 @@ impl Shell {
     pub(super) fn render_project_terminal_editor(
         &mut self,
         viewport: gpui::Size<Pixels>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let editor = self.project_terminals.editor.as_ref()?;
+        let editor = self.project_terminals.editor.get()?;
         let theme = Theme::of(cx).for_popup();
         let compact = viewport.width < px(640.0);
-        let busy = self.project_terminals.busy;
+        let busy = self.project_terminals.busy || editor.closed_by_save;
         let initialized = editor.initialized;
         let selected_database = editor
             .databases
@@ -1695,7 +1707,7 @@ impl Shell {
                         .role(gpui::Role::Button)
                         .aria_label(format!("Show {} database", database.name))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            if let Some(editor) = &mut this.project_terminals.editor {
+                            if let Some(editor) = this.project_terminals.editor.open_mut() {
                                 editor.selected = Some(id.clone());
                             }
                             cx.notify();
@@ -1756,7 +1768,7 @@ impl Shell {
                         if name.is_empty() { "Unnamed" } else { &name }
                     ))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(editor) = &mut this.project_terminals.editor {
+                        if let Some(editor) = this.project_terminals.editor.open_mut() {
                             editor.selected = Some(id.clone());
                             editor.scroll.set_offset(gpui::point(px(0.0), px(0.0)));
                         }
@@ -1807,7 +1819,7 @@ impl Shell {
                         false,
                         cx,
                     );
-                    if let Some(editor) = &mut this.project_terminals.editor {
+                    if let Some(editor) = this.project_terminals.editor.open_mut() {
                         editor.selected = Some(fields.id.clone());
                         editor.services.push(fields);
                         editor.scroll.set_offset(gpui::point(px(0.0), px(0.0)));
@@ -1881,12 +1893,13 @@ impl Shell {
                         ))),
                 )
                 .child(div().flex().child(
-                    crate::settings::widgets::text_action(
+                    crate::settings::widgets::action(
                         &theme,
                         crate::settings::widgets::ActionTone::Outlined,
-                        "Edit in Project settings",
+                        "database-worktree-settings",
+                        window,
                     )
-                    .id("database-worktree-settings")
+                    .child("Edit in Project settings")
                     .role(gpui::Role::Button)
                     .aria_label("Edit in Project settings")
                     .mt(px(16.0))
@@ -1899,7 +1912,9 @@ impl Shell {
                     })
                     .when(can_open, |button| {
                         button.on_click(cx.listener(move |this, _, _, cx| {
-                            this.project_terminals.editor = None;
+                            popover::close_popup(this, cx, |this| {
+                                &mut this.project_terminals.editor
+                            });
                             this.show_project_database_settings(space.clone(), cx);
                         }))
                     }),
@@ -1928,7 +1943,7 @@ impl Shell {
                             .text_color(theme.danger)
                             .on_click(cx.listener(
                                 move |this, _, _, cx| {
-                                    if let Some(editor) = &mut this.project_terminals.editor {
+                                    if let Some(editor) = this.project_terminals.editor.open_mut() {
                                         let index = editor
                                             .services
                                             .iter()
@@ -2025,7 +2040,7 @@ impl Shell {
                             .on_click(cx.listener(
                                 move |this, _, _, cx| {
                                     if let Some(service) =
-                                        this.project_terminals.editor.as_mut().and_then(|editor| {
+                                        this.project_terminals.editor.open_mut().and_then(|editor| {
                                             editor.services.iter_mut().find(|s| s.id == restart_id)
                                         })
                                     {
@@ -2132,7 +2147,7 @@ impl Shell {
                             })),
                     )
                     .child(
-                        popover::btn_primary(&theme, if busy { "Saving…" } else { "Save" })
+                        popover::btn_primary(&theme, if busy { "Saving…" } else { "Save" }, "save-project-services")
                             .id("save-project-services")
                             .role(gpui::Role::Button)
                             .aria_label("Save services")
@@ -2173,17 +2188,18 @@ impl Shell {
             "project-terminal-settings",
             viewport,
             card.into_any_element(),
+            self.project_terminals.editor.closing_since(),
         ))
     }
 
     fn discard_prompt(&self, form: UnsavedForm) -> Option<&DiscardPrompt> {
         match form {
-            UnsavedForm::Services => self.project_terminals.discard.as_ref(),
-            UnsavedForm::WorktreeSettings => self.worktree_settings.discard.as_ref(),
+            UnsavedForm::Services => self.project_terminals.discard.as_open(),
+            UnsavedForm::WorktreeSettings => self.worktree_settings.discard.as_open(),
         }
     }
 
-    fn discard_prompt_slot(&mut self, form: UnsavedForm) -> &mut Option<DiscardPrompt> {
+    fn discard_prompt_slot(&mut self, form: UnsavedForm) -> &mut popover::Popup<DiscardPrompt> {
         match form {
             UnsavedForm::Services => &mut self.project_terminals.discard,
             UnsavedForm::WorktreeSettings => &mut self.worktree_settings.discard,
@@ -2195,7 +2211,7 @@ impl Shell {
             UnsavedForm::Services => self
                 .project_terminals
                 .editor
-                .as_ref()
+                .as_open()
                 .is_some_and(|editor| editor.is_dirty(cx)),
             UnsavedForm::WorktreeSettings => self.worktree_settings_dirty(cx),
         }
@@ -2212,7 +2228,7 @@ impl Shell {
             self.discard_form(form, window, cx);
             return;
         }
-        if self.discard_prompt_slot(form).is_none() {
+        if !self.discard_prompt_slot(form).is_open() {
             let shell = cx.weak_entity();
             let owner = window.window_handle();
             let interceptor = cx.intercept_keystrokes(move |event, window, cx| {
@@ -2228,7 +2244,7 @@ impl Shell {
             let buttons = std::array::from_fn(|_| cx.focus_handle().tab_stop(true));
             let previous_focus = window.focused(cx);
             window.focus(&buttons[0], cx);
-            *self.discard_prompt_slot(form) = Some(DiscardPrompt {
+            self.discard_prompt_slot(form).open(DiscardPrompt {
                 buttons,
                 previous_focus,
                 focus_pending: true,
@@ -2244,11 +2260,14 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.discard_prompt_slot(form).take().is_some() {
+        if self.discard_prompt_slot(form).is_open() {
+            popover::close_popup(self, cx, move |this| this.discard_prompt_slot(form));
             window.focus(&self.shortcut_focus, cx);
         }
         match form {
-            UnsavedForm::Services => self.project_terminals.editor = None,
+            UnsavedForm::Services => {
+                popover::close_popup(self, cx, |this| &mut this.project_terminals.editor)
+            }
             UnsavedForm::WorktreeSettings => self.close_worktree_settings(cx),
         }
         cx.notify();
@@ -2262,13 +2281,14 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(prompt) = self.discard_prompt_slot(form).take() else {
+        let Some(prompt) = self.discard_prompt(form) else {
             return false;
         };
-        if let Some(focus) = prompt.previous_focus {
+        let focus = prompt.previous_focus.clone();
+        popover::close_popup(self, cx, move |this| this.discard_prompt_slot(form));
+        if let Some(focus) = focus {
             window.focus(&focus, cx);
         }
-        cx.notify();
         true
     }
 
@@ -2326,11 +2346,14 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let prompt = self.discard_prompt_slot(form).as_mut()?;
-        if std::mem::take(&mut prompt.focus_pending) {
+        let popup = self.discard_prompt_slot(form);
+        if let Some(prompt) = popup.open_mut()
+            && std::mem::take(&mut prompt.focus_pending)
+        {
             window.focus(&prompt.buttons[0], cx);
         }
-        let prompt = self.discard_prompt(form)?;
+        let closing = popup.closing_since();
+        let prompt = popup.get()?;
         let theme = Theme::of(cx).for_popup();
         let (id, body) = match form {
             UnsavedForm::Services => (
@@ -2368,7 +2391,7 @@ impl Shell {
                             })),
                     )
                     .child(
-                        popover::btn_danger(&theme, "Discard changes")
+                        popover::btn_danger(&theme, "Discard changes", SharedString::from(format!("{id}-confirm")))
                             .id(SharedString::from(format!("{id}-confirm")))
                             .role(gpui::Role::Button)
                             .track_focus(&prompt.buttons[1])
@@ -2380,7 +2403,7 @@ impl Shell {
                             })),
                     ),
             );
-        Some(popover::modal(id, viewport, card.into_any_element()))
+        Some(popover::modal(id, viewport, card.into_any_element(), closing))
     }
 }
 
@@ -2852,7 +2875,7 @@ mod tests {
             .update(cx, |shell, _, cx| {
                 let project = test_project(dir.path());
                 shell.project_terminals.context = Some(project.clone());
-                shell.project_terminals.editor = Some(Editor::new(project.clone()));
+                shell.project_terminals.editor.open(Editor::new(project.clone()));
                 let snapshot = |db: &str| ProjectTerminalsSnapshot {
                     checkout: None,
                     config: ProjectTerminalConfig {
@@ -2861,7 +2884,7 @@ mod tests {
                     runs: vec![],
                 };
                 shell.accept_project_terminal_snapshot(snapshot("Databases"), cx);
-                let editor = shell.project_terminals.editor.as_ref().unwrap();
+                let editor = shell.project_terminals.editor.as_open().unwrap();
                 assert_eq!(editor.services.len(), 1, "databases are not editable here");
                 assert_eq!(editor.services[0].id, "backend");
                 assert_eq!(editor.databases, vec![database_service("Databases")]);
@@ -2872,7 +2895,7 @@ mod tests {
                 // A poll after the database was renamed in Project settings
                 // refreshes the read-only list but keeps the unsaved edit.
                 shell.accept_project_terminal_snapshot(snapshot("Postgres"), cx);
-                let editor = shell.project_terminals.editor.as_ref().unwrap();
+                let editor = shell.project_terminals.editor.as_open().unwrap();
                 assert_eq!(editor.databases[0].name, "Postgres");
                 assert_eq!(editor.services[0].command.entity_id(), command.entity_id());
                 assert_eq!(editor.config(cx)[0].command, "bun run dev:api");
@@ -2888,7 +2911,7 @@ mod tests {
 
                 // A project with only a database still suggests app services,
                 // and untouched suggestions are never saved.
-                shell.project_terminals.editor = Some(Editor::new(project));
+                shell.project_terminals.editor.open(Editor::new(project));
                 shell.accept_project_terminal_snapshot(
                     ProjectTerminalsSnapshot {
                         checkout: None,
@@ -2899,7 +2922,7 @@ mod tests {
                     },
                     cx,
                 );
-                let editor = shell.project_terminals.editor.as_ref().unwrap();
+                let editor = shell.project_terminals.editor.as_open().unwrap();
                 let names: Vec<_> = editor
                     .services
                     .iter()
@@ -2981,7 +3004,7 @@ mod tests {
                     checkout_override: None,
                 };
                 shell.project_terminals.context = Some(project.clone());
-                shell.project_terminals.editor = Some(Editor::new(project));
+                shell.project_terminals.editor.open(Editor::new(project));
                 let snapshot = ProjectTerminalsSnapshot {
                     checkout: None,
                     config: ProjectTerminalConfig {
@@ -2997,11 +3020,11 @@ mod tests {
                     runs: Vec::new(),
                 };
                 shell.accept_project_terminal_snapshot(snapshot.clone(), cx);
-                let editor = shell.project_terminals.editor.as_ref().unwrap();
+                let editor = shell.project_terminals.editor.as_open().unwrap();
                 let input = editor.services[0].command.clone();
                 input.update(cx, |input, cx| input.set_text("bun run dev:server", cx));
                 shell.accept_project_terminal_snapshot(snapshot, cx);
-                let editor = shell.project_terminals.editor.as_ref().unwrap();
+                let editor = shell.project_terminals.editor.as_open().unwrap();
                 assert_eq!(editor.services[0].command.entity_id(), input.entity_id());
                 assert_eq!(input.read(cx).text(), "bun run dev:server");
                 assert_eq!(editor.selected.as_deref(), Some("backend"));
@@ -3284,9 +3307,9 @@ mod tests {
             shell.update(cx, |shell, cx| {
                 let project = test_project(dir.path());
                 shell.project_terminals.context = Some(project.clone());
-                shell.project_terminals.editor = Some(Editor::new(project));
+                shell.project_terminals.editor.open(Editor::new(project));
                 shell.accept_project_terminal_snapshot(empty_snapshot(), cx);
-                shell.project_terminals.editor.as_ref().unwrap().services[0]
+                shell.project_terminals.editor.as_open().unwrap().services[0]
                     .command
                     .update(cx, |input, cx| input.set_text("run dev", cx));
                 shell.request_close_form(UnsavedForm::Services, window, cx);
@@ -3307,7 +3330,7 @@ mod tests {
                         .read(cx)
                         .project_terminals
                         .discard
-                        .as_ref()
+                        .as_open()
                         .unwrap()
                         .buttons[button]
                         .is_focused(window)
@@ -3318,8 +3341,8 @@ mod tests {
         cx.run_until_parked();
         host.read_with(cx, |host, cx| {
             let shell = host.shell.read(cx);
-            assert!(shell.project_terminals.discard.is_none());
-            assert!(shell.project_terminals.editor.is_some());
+            assert!(!shell.project_terminals.discard.is_open());
+            assert!(shell.project_terminals.editor.is_open());
         });
     }
 
@@ -3384,9 +3407,9 @@ mod tests {
             .update(cx, |shell, window, cx| {
                 let project = test_project(dir.path());
                 shell.project_terminals.context = Some(project.clone());
-                shell.project_terminals.editor = Some(Editor::new(project.clone()));
+                shell.project_terminals.editor.open(Editor::new(project.clone()));
                 shell.accept_project_terminal_snapshot(empty_snapshot(), cx);
-                let editor = shell.project_terminals.editor.as_ref().unwrap();
+                let editor = shell.project_terminals.editor.as_open().unwrap();
                 assert_eq!(editor.services.len(), 3, "a new project suggests services");
                 assert!(
                     editor.config(cx).is_empty(),
@@ -3394,19 +3417,19 @@ mod tests {
                 );
                 assert!(!editor.is_dirty(cx));
                 shell.request_close_form(UnsavedForm::Services, window, cx);
-                assert!(shell.project_terminals.editor.is_none());
-                assert!(shell.project_terminals.discard.is_none());
+                assert!(!shell.project_terminals.editor.is_open());
+                assert!(!shell.project_terminals.discard.is_open());
 
-                shell.project_terminals.editor = Some(Editor::new(project));
+                shell.project_terminals.editor.open(Editor::new(project));
                 shell.accept_project_terminal_snapshot(empty_snapshot(), cx);
-                let editor = shell.project_terminals.editor.as_ref().unwrap();
+                let editor = shell.project_terminals.editor.as_open().unwrap();
                 let frontend = editor.services[1].id.clone();
                 editor.services[1]
                     .name
                     .update(cx, |input, cx| input.set_text("Web", cx));
                 assert!(editor.is_dirty(cx));
                 shell.save_project_terminal_settings(cx);
-                let editor = shell.project_terminals.editor.as_ref().unwrap();
+                let editor = shell.project_terminals.editor.as_open().unwrap();
                 assert!(
                     editor.show_missing,
                     "an edited service without a command is flagged"
@@ -3418,18 +3441,18 @@ mod tests {
                 );
 
                 shell.request_close_form(UnsavedForm::Services, window, cx);
-                assert!(shell.project_terminals.discard.is_some());
-                assert!(shell.project_terminals.editor.is_some());
+                assert!(shell.project_terminals.discard.is_open());
+                assert!(shell.project_terminals.editor.is_open());
                 assert!(shell.capture_escape_surface(window, cx));
-                assert!(shell.project_terminals.discard.is_none());
+                assert!(!shell.project_terminals.discard.is_open());
                 assert!(
-                    shell.project_terminals.editor.is_some(),
+                    shell.project_terminals.editor.is_open(),
                     "Escape keeps editing"
                 );
                 shell.request_close_form(UnsavedForm::Services, window, cx);
                 shell.discard_form(UnsavedForm::Services, window, cx);
-                assert!(shell.project_terminals.discard.is_none());
-                assert!(shell.project_terminals.editor.is_none());
+                assert!(!shell.project_terminals.discard.is_open());
+                assert!(!shell.project_terminals.editor.is_open());
             })
             .unwrap();
     }
@@ -3525,7 +3548,7 @@ impl Shell {
             "serviceOutput": self.project_terminals.panel.as_ref().map(text).unwrap_or_default(),
             "panelOpen": self.terminal_open(cx), "shellSessions": self.terminal.as_ref().map(|panel| panel.read(cx).fixture_session_ids(cx)).unwrap_or_default(),
             "shellTabs": self.terminal.as_ref().map(|panel| panel.read(cx).tab_summaries(cx)).unwrap_or_default(),
-            "error": self.project_terminals.operation_error.as_ref().or(self.project_terminals.error.as_ref()), "mode": if self.project_terminals.mode == TerminalMode::Services { "services" } else { "shells" }, "editor": self.project_terminals.editor.is_some(),
+            "error": self.project_terminals.operation_error.as_ref().or(self.project_terminals.error.as_ref()), "mode": if self.project_terminals.mode == TerminalMode::Services { "services" } else { "shells" }, "editor": self.project_terminals.editor.is_open(),
             "drawer": self.project_terminals.drawer, "handoff": self.project_terminals.handoff.is_some(),
             "handoffError": self.project_terminals.handoff_error })
     }

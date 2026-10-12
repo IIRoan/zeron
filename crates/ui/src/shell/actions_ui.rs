@@ -169,7 +169,7 @@ impl Shell {
             &command,
             |_: &mut Shell, _, _: &crate::composer::ComposerInputEvent, cx| cx.notify(),
         );
-        self.project_actions.editor = Some(ProjectActionEditor {
+        self.project_actions.editor.open(ProjectActionEditor {
             key,
             action_id,
             name,
@@ -188,13 +188,13 @@ impl Shell {
 
     fn save_project_action(&mut self, cx: &mut Context<Self>) {
         let Some(context) = self.project_action_context(cx) else {
-            if let Some(editor) = self.project_actions.editor.as_mut() {
+            if let Some(editor) = self.project_actions.editor.open_mut() {
                 editor.error = Some("Project action is no longer available".into());
                 cx.notify();
             }
             return;
         };
-        let Some(editor) = self.project_actions.editor.as_mut() else {
+        let Some(editor) = self.project_actions.editor.open_mut() else {
             return;
         };
         if editor.saving {
@@ -273,10 +273,10 @@ impl Shell {
                         if shell
                             .project_actions
                             .editor
-                            .as_ref()
+                            .as_open()
                             .is_some_and(|editor| editor.key == key && editor.saving)
                         {
-                            shell.project_actions.editor = None;
+                            popover::close_popup(shell, cx, |this| &mut this.project_actions.editor);
                         }
                     }
                     Err(err) => {
@@ -287,7 +287,7 @@ impl Shell {
                         if let Some(editor) = shell
                             .project_actions
                             .editor
-                            .as_mut()
+                            .open_mut()
                             .filter(|editor| editor.key == key && editor.saving)
                         {
                             editor.saving = false;
@@ -306,12 +306,11 @@ impl Shell {
         let Some(context) = self.project_action_context(cx) else {
             return;
         };
-        let Some(editor) = self.project_actions.editor.as_mut() else {
+        let Some(editor) = self.project_actions.editor.open_mut() else {
             return;
         };
         let Some(action_id) = editor.action_id.clone() else {
-            self.project_actions.editor = None;
-            cx.notify();
+            popover::close_popup(self, cx, |this| &mut this.project_actions.editor);
             return;
         };
         if editor.saving {
@@ -363,10 +362,10 @@ impl Shell {
                         if shell
                             .project_actions
                             .editor
-                            .as_ref()
+                            .as_open()
                             .is_some_and(|editor| editor.key == key && editor.saving)
                         {
-                            shell.project_actions.editor = None;
+                            popover::close_popup(shell, cx, |this| &mut this.project_actions.editor);
                         }
                     }
                     Err(err) => {
@@ -377,7 +376,7 @@ impl Shell {
                         if let Some(editor) = shell
                             .project_actions
                             .editor
-                            .as_mut()
+                            .open_mut()
                             .filter(|editor| editor.key == key && editor.saving)
                         {
                             editor.saving = false;
@@ -515,10 +514,13 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let editor = self.project_actions.editor.as_mut()?;
-        if std::mem::take(&mut editor.focus_pending) {
+        if let Some(editor) = self.project_actions.editor.open_mut()
+            && std::mem::take(&mut editor.focus_pending)
+        {
             window.focus(&editor.name.focus_handle(cx), cx);
         }
+        let closing = self.project_actions.editor.closing_since();
+        let editor = self.project_actions.editor.get()?;
         let theme = Theme::of(cx).clone();
         if editor.confirm_delete {
             let name = editor.name.read(cx).text().trim().to_string();
@@ -538,14 +540,14 @@ impl Shell {
                             popover::btn_ghost(&theme, "Cancel", "action-delete-cancel")
                                 .id("action-delete-cancel")
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(editor) = this.project_actions.editor.as_mut() {
+                                    if let Some(editor) = this.project_actions.editor.open_mut() {
                                         editor.confirm_delete = false;
                                     }
                                     cx.notify();
                                 })),
                         )
                         .child(
-                            popover::btn_danger(&theme, "Delete")
+                            popover::btn_danger(&theme, "Delete", "action-delete-confirm")
                                 .id("action-delete-confirm")
                                 .on_click(
                                     cx.listener(|this, _, _, cx| this.delete_project_action(cx)),
@@ -553,7 +555,7 @@ impl Shell {
                         ),
                 )
                 .into_any_element();
-            return Some(popover::modal("project-action-delete", viewport, card));
+            return Some(popover::modal("project-action-delete", viewport, card, closing));
         }
 
         let name = editor.name.clone();
@@ -568,8 +570,7 @@ impl Shell {
             .w(px(440.0))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                 if event.keystroke.key == "escape" {
-                    this.project_actions.editor = None;
-                    cx.notify();
+                    popover::close_popup(this, cx, |this| &mut this.project_actions.editor);
                 }
             }))
             .child(popover::dialog_title(&theme, title))
@@ -610,7 +611,7 @@ impl Shell {
                     })
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(editor) = this.project_actions.editor.as_mut() {
+                        if let Some(editor) = this.project_actions.editor.open_mut() {
                             editor.icon = kind;
                         }
                         cx.notify();
@@ -633,7 +634,7 @@ impl Shell {
                     .gap(px(9.0))
                     .cursor_pointer()
                     .on_click(cx.listener(|this, _, _, cx| {
-                        if let Some(editor) = this.project_actions.editor.as_mut() {
+                        if let Some(editor) = this.project_actions.editor.open_mut() {
                             editor.run_on_worktree_create = !editor.run_on_worktree_create;
                         }
                         cx.notify();
@@ -678,7 +679,7 @@ impl Shell {
                                 .id("action-delete")
                                 .text_color(theme.danger)
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(editor) = this.project_actions.editor.as_mut() {
+                                    if let Some(editor) = this.project_actions.editor.open_mut() {
                                         editor.confirm_delete = true;
                                     }
                                     cx.notify();
@@ -693,14 +694,13 @@ impl Shell {
                                 popover::btn_ghost(&theme, "Cancel", "action-cancel")
                                     .id("action-cancel")
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.project_actions.editor = None;
-                                        cx.notify();
+                                        popover::close_popup(this, cx, |this| &mut this.project_actions.editor);
                                     })),
                             )
                             .child(
                                 popover::btn_primary(
                                     &theme,
-                                    if saving { "Saving…" } else { "Save action" },
+                                    if saving { "Saving…" } else { "Save action" }, "action-save",
                                 )
                                 .id("action-save")
                                 .when(!saving, |button| {
@@ -715,6 +715,7 @@ impl Shell {
             "project-action-editor",
             viewport,
             card.into_any_element(),
+            closing,
         ))
     }
 }

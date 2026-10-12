@@ -1,5 +1,5 @@
 use super::{BrowserEvent, BrowserSurface};
-use crate::{icons, surface_chrome, theme::Theme};
+use crate::{icons, motion::HoverFade as _, surface_chrome, theme::Theme};
 use gpui::{
     AnyElement, Context, Focusable, IntoElement, KeyDownEvent, MouseButton, Render, Window, div,
     prelude::*, px,
@@ -101,7 +101,12 @@ impl BrowserSurface {
         cx.stop_propagation();
     }
 
-    fn preview_body(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn preview_body(
+        &self,
+        theme: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let snapshot = &self.previews;
         let available = snapshot.error.is_none();
         let subtitle = if snapshot.remote {
@@ -150,11 +155,15 @@ impl BrowserSurface {
                     .items_center()
                     .gap(px(10.0))
                     .when(available, |el| {
+                        let hover_key = format!("preview-row-hover-{}", service.id);
                         el.cursor_pointer()
-                            .hover(move |style| {
-                                style
-                                    .bg(crate::theme::ink(0.05))
-                                    .border_color(border_strong)
+                            .hover_fade(hover_key, window, |el, t| {
+                                el.bg(crate::motion::mix(
+                                    crate::theme::ink(0.02),
+                                    crate::theme::ink(0.05),
+                                    t,
+                                ))
+                                .border_color(crate::motion::mix(theme.border, border_strong, t))
                             })
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.navigate(&row_url, window, cx)
@@ -216,7 +225,12 @@ impl BrowserSurface {
                             .aria_label(format!("Open {} preview", service.name))
                             .when(available, |el| {
                                 el.cursor_pointer()
-                                    .hover(|style| style.bg(crate::theme::ink(0.05)))
+                                    .hover_bg(
+                                        format!("open-preview-hover-{}", service.id),
+                                        window,
+                                        gpui::transparent_black(),
+                                        crate::theme::ink(0.05),
+                                    )
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         cx.stop_propagation();
                                         this.navigate(&url, window, cx)
@@ -280,9 +294,9 @@ impl BrowserSurface {
             .into_any_element()
     }
 
-    fn empty_body(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn empty_body(&self, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         if self.page.url.is_none() && self.previews_task.is_some() {
-            return self.preview_body(theme, cx);
+            return self.preview_body(theme, window, cx);
         }
         let external = !cfg!(any(target_os = "macos", target_os = "linux", windows));
         let has_error = self.page.error.is_some();
@@ -355,7 +369,6 @@ impl BrowserSurface {
                             .rounded(px(6.0))
                             .border_1()
                             .border_color(theme.border)
-                            .bg(theme.surface_raised)
                             .cursor_pointer()
                             .role(gpui::Role::Button)
                             .aria_label(if has_error {
@@ -363,7 +376,12 @@ impl BrowserSurface {
                             } else {
                                 "Enter an address"
                             })
-                            .hover(|style| style.bg(crate::theme::wash(0.10)))
+                            .hover_bg(
+                                "browser-empty-action-hover",
+                                window,
+                                theme.surface_raised,
+                                crate::theme::wash(0.10),
+                            )
                             .flex()
                             .items_center()
                             .gap(px(8.0))
@@ -610,7 +628,12 @@ impl Render for BrowserSurface {
                         .cursor_pointer()
                         .role(gpui::Role::Button)
                         .aria_label("Go to address")
-                        .hover(|s| s.bg(crate::theme::wash(0.10)))
+                        .hover_bg(
+                            "browser-go-hover",
+                            window,
+                            gpui::transparent_black(),
+                            crate::theme::wash(0.10),
+                        )
                         .on_mouse_down(MouseButton::Left, |_, w, _| w.prevent_default())
                         .on_click(cx.listener(|this, _, w, cx| this.submit(w, cx)))
                         .tooltip(crate::settings::widgets::text_tooltip("Go to address"))
@@ -649,7 +672,7 @@ impl Render for BrowserSurface {
         #[cfg(target_os = "macos")]
         let body = if let Some(native) = &self.native {
             if self.page.error.is_some() {
-                body.child(self.empty_body(&theme, cx))
+                body.child(self.empty_body(&theme, window, cx))
             } else {
                 let native = native.handle();
                 let resize_inset = self.resize_inset;
@@ -678,12 +701,12 @@ impl Render for BrowserSurface {
                 )
             }
         } else {
-            body.child(self.empty_body(&theme, cx))
+            body.child(self.empty_body(&theme, window, cx))
         };
         #[cfg(target_os = "linux")]
         let body = if let Some(native) = &self.native {
             if self.page.error.is_some() {
-                body.child(self.empty_body(&theme, cx))
+                body.child(self.empty_body(&theme, window, cx))
             } else {
                 let image = native.image.clone();
                 let image_scale = native.image_scale;
@@ -740,20 +763,20 @@ impl Render for BrowserSurface {
                 }))
             }
         } else {
-            body.child(self.empty_body(&theme, cx))
+            body.child(self.empty_body(&theme, window, cx))
         };
         #[cfg(windows)]
         let body = if let Some(native) = &self.native {
             if self.page.error.is_some() {
-                body.child(self.empty_body(&theme, cx))
+                body.child(self.empty_body(&theme, window, cx))
             } else {
                 self.windows_page(body, native.handle(), cx)
             }
         } else {
-            body.child(self.empty_body(&theme, cx))
+            body.child(self.empty_body(&theme, window, cx))
         };
         #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-        let body = body.child(self.empty_body(&theme, cx));
+        let body = body.child(self.empty_body(&theme, window, cx));
 
         #[cfg(target_os = "linux")]
         let body = body.when_some(self.linux_menu(&theme, cx), |el, menu| el.child(menu));

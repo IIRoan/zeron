@@ -17,7 +17,8 @@ use super::{
 };
 use crate::{
     file_icons::{self, FileIconIdentity},
-    icons::{self, icon},
+    icons,
+    motion::HoverFade as _,
     theme::Theme,
 };
 
@@ -598,7 +599,7 @@ impl FilesSurface {
     fn render_search_row(
         &mut self,
         index: usize,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let Some(row) = self.search_state.tree.rows().get(index).cloned() else {
@@ -632,7 +633,12 @@ impl FilesSurface {
             .cursor_pointer()
             .when(selected, |element| element.bg(crate::theme::wash(0.1)))
             .when(!selected, |element| {
-                element.hover(|style| style.bg(crate::theme::wash(0.055)))
+                element.hover_bg(
+                    ("files-search-row-wash", index),
+                    window,
+                    gpui::transparent_black(),
+                    crate::theme::wash(0.055),
+                )
             })
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.search_state.active = index;
@@ -651,11 +657,12 @@ impl FilesSurface {
                     .justify_center()
                     .when(row.has_children, |element| {
                         element.child(
-                            icon(if expanded {
-                                icons::ALT_ARROW_DOWN
-                            } else {
-                                icons::ALT_ARROW_RIGHT
-                            })
+                            icons::disclosure_chevron(
+                                SharedString::from(format!("search-chevron-{}", row.path)),
+                                expanded,
+                                window,
+                                cx,
+                            )
                             .size(px(11.0))
                             .text_color(theme.text_faint),
                         )
@@ -690,6 +697,7 @@ impl FilesSurface {
             )
             .into_any_element();
         super::tree::with_indent_guides(content, row.depth, SEARCH_ROW_HEIGHT, &theme)
+            .into_any_element()
     }
 }
 

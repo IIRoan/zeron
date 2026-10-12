@@ -279,7 +279,9 @@ fn modal_and_picker_block_navigation_in_both_panes(cx: &mut TestAppContext) {
                     &shell.navigation_focus.main
                 };
                 window.focus(focus, cx);
-                shell.delete_confirm = Some("parent".into());
+                shell
+                    .delete_confirm
+                    .open(("parent".into(), "Parent".into()));
             })
         });
         press(cx, true);
@@ -290,7 +292,7 @@ fn modal_and_picker_block_navigation_in_both_panes(cx: &mut TestAppContext) {
                 Some("parent")
             );
             assert_eq!(shell.resolved_right_active(cx), RightSurface::Subagent(2));
-            shell.delete_confirm = None;
+            shell.delete_confirm = popover::Popup::default();
         });
     }
     cx.update(|window, cx| {

@@ -302,7 +302,7 @@ impl VoiceCard {
     }
 }
 impl Render for VoiceCard {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).for_settings_surface();
         let saved_voice = settings::current(cx).codex_voice;
         let mut voice_ids: Vec<Option<String>> = std::iter::once(None)
@@ -578,8 +578,7 @@ impl Render for VoiceCard {
                             )),
                     )
                     .child(
-                        widgets::action_button(&theme, widgets::ActionTone::Quiet)
-                            .id("voice-remove")
+                        widgets::action(&theme, widgets::ActionTone::Quiet, "voice-remove", window)
                             .role(gpui::Role::Button)
                             .aria_label("Remove speech model")
                             .tab_index(0)

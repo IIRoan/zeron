@@ -2212,9 +2212,9 @@ pub(super) struct SidebarViewMenu {
 struct SidebarViewOptionsTooltip;
 
 impl Render for SidebarViewOptionsTooltip {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx);
-        div()
+        let card = div()
             .px(px(8.0))
             .py(px(6.0))
             .rounded(px(6.0))
@@ -2224,7 +2224,8 @@ impl Render for SidebarViewOptionsTooltip {
             .shadow_md()
             .text_size(crate::typography::ui_rems(11.0))
             .text_color(theme.text)
-            .child("Sidebar view options")
+            .child("Sidebar view options");
+        crate::popover::tooltip_surface(card, None, window, cx)
     }
 }
 
@@ -2512,9 +2513,9 @@ fn request_home_folders(
                 .update(cx, |shell, cx| {
                     let selected = shell
                         .add_space
-                        .as_ref()
+                        .get()
                         .and_then(|flow| shell.add_space_folder_rows(cx).get(flow.active).cloned());
-                    let Some(search) = shell.add_space.as_mut().map(|flow| &mut flow.home_search)
+                    let Some(search) = shell.add_space.open_mut().map(|flow| &mut flow.home_search)
                     else {
                         return false;
                     };
@@ -2551,7 +2552,7 @@ fn request_home_folders(
                             .add_space_folder_rows(cx)
                             .iter()
                             .position(|row| row == &selected)
-                        && let Some(flow) = shell.add_space.as_mut()
+                        && let Some(flow) = shell.add_space.open_mut()
                     {
                         flow.active = active;
                     }
@@ -2569,7 +2570,7 @@ fn request_home_folders(
             let current = this
                 .update(cx, |shell, _| {
                     shell.add_space_in_home()
-                        && shell.add_space.as_ref().is_some_and(|flow| {
+                        && shell.add_space.get().is_some_and(|flow| {
                             generation == Some(flow.home_search.generation)
                                 && !flow.home_search.unsupported
                         })
@@ -4642,9 +4643,13 @@ impl Shell {
             .bg(if view_open {
                 theme.glass_hover()
             } else {
-                theme.glass_hover().opacity(0.0)
+                motion::hover_blend(
+                    "sidebar-view-options",
+                    theme.glass_hover().opacity(0.0),
+                    theme.glass_hover(),
+                )
             })
-            .hover(|el| el.bg(theme.glass_hover()))
+            .on_hover(motion::hover_listener("sidebar-view-options"))
             // Over the titlebar's drag strip: block it, as the other titlebar
             // controls do, so a click never starts a window drag.
             .occlude()
@@ -4823,6 +4828,7 @@ impl Shell {
                             }))
                             .when_some(menu_space, |el, space_id| {
                                 let context_id = space_id.clone();
+                                let settings_key = format!("project-settings-{space_id}");
                                 el.on_mouse_down(
                                     MouseButton::Right,
                                     cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -4832,7 +4838,7 @@ impl Shell {
                                 )
                                 .child(
                                     div()
-                                        .id(SharedString::from(format!("project-settings-{space_id}")))
+                                        .id(SharedString::from(settings_key.clone()))
                                         .size(px(24.0))
                                         .flex_none()
                                         .flex()
@@ -4843,7 +4849,12 @@ impl Shell {
                                         .role(gpui::Role::Button)
                                         .aria_label("Project settings")
                                         .tooltip(crate::settings::widgets::text_tooltip("Project settings"))
-                                        .hover(|el| el.bg(theme.element_hover))
+                                        .bg(motion::hover_blend(
+                                            &settings_key,
+                                            gpui::transparent_black(),
+                                            theme.element_hover,
+                                        ))
+                                        .on_hover(motion::hover_listener(settings_key.clone()))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             cx.stop_propagation();
                                             this.close_spaces_menu(cx);
@@ -5696,10 +5707,9 @@ impl Shell {
                 })
                 .flatten();
             let new_chat_button = group_space.map(|project| {
+                let key = format!("sidebar-group-new-chat-{collapse_key}");
                 div()
-                    .id(SharedString::from(format!(
-                        "sidebar-group-new-chat-{collapse_key}"
-                    )))
+                    .id(SharedString::from(key.clone()))
                     .size(px(20.0))
                     .flex_none()
                     .flex()
@@ -5711,7 +5721,8 @@ impl Shell {
                     .aria_label("New chat in project")
                     .opacity(0.0)
                     .group_hover(group_name.clone(), |style| style.opacity(1.0))
-                    .hover(|el| el.bg(theme.glass_hover()))
+                    .bg(motion::hover_blend(&key, gpui::transparent_black(), theme.glass_hover()))
+                    .on_hover(motion::hover_listener(key))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
                         this.open_new_session(Some(project.clone()), cx);
@@ -6188,9 +6199,18 @@ impl Shell {
                         .px(px(Theme::SPACE_SM))
                         .rounded(px(6.0))
                         .text_size(crate::typography::ui_rems(13.0))
-                        .text_color(theme.text_muted.opacity(0.55))
+                        .text_color(motion::hover_blend(
+                            "archived-more",
+                            theme.text_muted.opacity(0.55),
+                            theme.text,
+                        ))
+                        .bg(motion::hover_blend(
+                            "archived-more",
+                            gpui::transparent_black(),
+                            theme.glass_hover(),
+                        ))
+                        .on_hover(motion::hover_listener("archived-more"))
                         .cursor_pointer()
-                        .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.archived_shown = this.archived_shown.max(INITIAL) + PAGE;
                             cx.notify();
@@ -6229,7 +6249,7 @@ impl Shell {
 
     pub(super) fn open_add_space(&mut self, cx: &mut Context<Self>) {
         self.release_home_folder_search(cx);
-        self.command_palette = None;
+        self.dismiss_command_palette(cx);
         self.project_crumb_menu = popover::Popup::default();
         // "PaletteSearch" context: navigation keys stay unbound so ↑↓/←/→/⏎
         // bubble to the palette frame (`add_space_key`) instead of moving the
@@ -6245,7 +6265,7 @@ impl Shell {
                 if this.add_space_slash_descend(cx) {
                     return;
                 }
-                if let Some(flow) = this.add_space.as_mut() {
+                if let Some(flow) = this.add_space.open_mut() {
                     flow.active = 0;
                     flow.list_scroll.set_offset(gpui::Point::default());
                 }
@@ -6253,7 +6273,7 @@ impl Shell {
                 cx.notify();
             }
         });
-        self.add_space = Some(AddSpaceFlow {
+        self.add_space.open(AddSpaceFlow {
             step: ProjectStep::Devices,
             location: None,
             device: None,
@@ -6283,14 +6303,13 @@ impl Shell {
     /// Close the new-project picker, releasing the host's home index.
     pub(super) fn close_add_space(&mut self, cx: &mut Context<Self>) {
         self.release_home_folder_search(cx);
-        self.add_space = None;
-        cx.notify();
+        popover::close_popup(self, cx, |this| &mut this.add_space);
     }
 
     /// Whether the picker browses the Home location, where the query also
     /// searches every folder under home.
     fn add_space_in_home(&self) -> bool {
-        self.add_space.as_ref().is_some_and(|flow| {
+        self.add_space.get().is_some_and(|flow| {
             flow.step == ProjectStep::Folders
                 && flow
                     .location
@@ -6305,7 +6324,7 @@ impl Shell {
         let in_home = self.add_space_in_home();
         let engine = self.state.read(cx).engine().cloned();
         let local = self.state.read(cx).local_device_id.clone();
-        let Some(flow) = self.add_space.as_mut() else {
+        let Some(flow) = self.add_space.open_mut() else {
             return;
         };
         let query = flow.search.read(cx).text().trim().to_owned();
@@ -6348,7 +6367,7 @@ impl Shell {
     fn release_home_folder_search(&mut self, cx: &mut Context<Self>) {
         let engine = self.state.read(cx).engine().cloned();
         let local = self.state.read(cx).local_device_id.clone();
-        let Some(flow) = self.add_space.as_mut() else {
+        let Some(flow) = self.add_space.open_mut() else {
             return;
         };
         let search = std::mem::take(&mut flow.home_search);
@@ -6379,7 +6398,7 @@ impl Shell {
 
     /// Selecting a device advances to its locations.
     fn add_space_pick_device(&mut self, device: Device, cx: &mut Context<Self>) {
-        let Some(flow) = self.add_space.as_mut() else {
+        let Some(flow) = self.add_space.open_mut() else {
             return;
         };
         flow.focus_pending = true;
@@ -6414,7 +6433,7 @@ impl Shell {
         if path.is_some() {
             self.release_home_folder_search(cx);
         }
-        let Some(flow) = self.add_space.as_mut() else {
+        let Some(flow) = self.add_space.open_mut() else {
             return;
         };
         flow.focus_pending = true;
@@ -6433,7 +6452,7 @@ impl Shell {
 
     fn add_space_back_to(&mut self, step: ProjectStep, cx: &mut Context<Self>) {
         self.release_home_folder_search(cx);
-        let Some(flow) = self.add_space.as_mut() else {
+        let Some(flow) = self.add_space.open_mut() else {
             return;
         };
         flow.focus_pending = true;
@@ -6468,7 +6487,7 @@ impl Shell {
     }
 
     fn add_space_devices(&self, cx: &App) -> Vec<Device> {
-        let Some(flow) = &self.add_space else {
+        let Some(flow) = self.add_space.get() else {
             return Vec::new();
         };
         let devices = &self.state.read(cx).devices;
@@ -6480,7 +6499,7 @@ impl Shell {
     }
 
     fn add_space_locations(&self, cx: &App) -> Vec<(String, Option<String>)> {
-        let Some(flow) = &self.add_space else {
+        let Some(flow) = self.add_space.get() else {
             return Vec::new();
         };
         let locations: Vec<_> = std::iter::once(("Home".to_string(), None))
@@ -6507,7 +6526,7 @@ impl Shell {
             return;
         };
         let local = self.state.read(cx).local_device_id.clone();
-        let Some(flow) = self.add_space.as_mut() else {
+        let Some(flow) = self.add_space.open_mut() else {
             return;
         };
         let device_id = flow.device.as_ref().map(|d| d.id.clone());
@@ -6528,7 +6547,7 @@ impl Shell {
                 .call(methods::LIST_DRIVES, serde_json::Value::Object(params))
                 .await;
             this.update(cx, |shell, cx| {
-                if let Some(flow) = shell.add_space.as_mut() {
+                if let Some(flow) = shell.add_space.open_mut() {
                     flow.drives = match result {
                         Ok(value) => match serde_json::from_value::<DriveListing>(value) {
                             Ok(listing) => Loadable::Ready(listing.drives),
@@ -6546,7 +6565,7 @@ impl Shell {
     /// The current listing's folder rows filtered by the search query
     /// (prefix matches first — `popover::filter_indices`).
     fn add_space_filtered(&self, cx: &App) -> Vec<zeron_proto::FolderEntry> {
-        let Some(flow) = self.add_space.as_ref() else {
+        let Some(flow) = self.add_space.get() else {
             return Vec::new();
         };
         if flow.step != ProjectStep::Folders {
@@ -6568,7 +6587,7 @@ impl Shell {
     /// matches from anywhere under home not already listed.
     fn add_space_folder_rows(&self, cx: &App) -> Vec<FolderRow> {
         let local = self.add_space_filtered(cx);
-        let Some(flow) = self.add_space.as_ref() else {
+        let Some(flow) = self.add_space.get() else {
             return Vec::new();
         };
         let open = flow.browser.ready().map(|listing| listing.path.as_str());
@@ -6604,7 +6623,7 @@ impl Shell {
     /// instead — `/disk2⏎` must work, not sit on "No folders match" (an
     /// absolute query can never match a folder name anyway).
     fn add_space_open_active(&mut self, cx: &mut Context<Self>) {
-        let Some(flow) = self.add_space.as_ref() else {
+        let Some(flow) = self.add_space.get() else {
             return;
         };
         match flow.step {
@@ -6623,7 +6642,7 @@ impl Shell {
             ProjectStep::Folders => {}
         }
         let rows = self.add_space_folder_rows(cx);
-        let Some(flow) = self.add_space.as_ref() else {
+        let Some(flow) = self.add_space.get() else {
             return;
         };
         if rows.is_empty() {
@@ -6648,7 +6667,7 @@ impl Shell {
         let full = crate::pickers::child_path(&listing.path, &entry.name);
         let is_repo = entry.is_repo;
         let search = flow.search.clone();
-        if let Some(flow) = self.add_space.as_mut() {
+        if let Some(flow) = self.add_space.open_mut() {
             flow.browser_repo = is_repo;
         }
         search.update(cx, |input, cx| input.set_text("", cx));
@@ -6664,7 +6683,7 @@ impl Shell {
     fn add_space_slash_descend(&mut self, cx: &mut Context<Self>) -> bool {
         if self
             .add_space
-            .as_ref()
+            .get()
             .is_none_or(|f| f.step != ProjectStep::Folders)
         {
             return false;
@@ -6675,7 +6694,7 @@ impl Shell {
         // Locations row. Same trailing-separator trigger as the folder-name
         // descend below.
         {
-            let Some(flow) = self.add_space.as_ref() else {
+            let Some(flow) = self.add_space.get() else {
                 return false;
             };
             let text = flow.search.read(cx).text().to_string();
@@ -6691,7 +6710,7 @@ impl Shell {
             }
         }
         let target = {
-            let Some(flow) = self.add_space.as_ref() else {
+            let Some(flow) = self.add_space.get() else {
                 return false;
             };
             let text = flow.search.read(cx).text().to_string();
@@ -6725,7 +6744,7 @@ impl Shell {
     /// `(full name, remaining suffix)`; `None` on an empty query or when the
     /// match is already complete.
     fn add_space_completion(&self, cx: &App) -> Option<(String, String)> {
-        let flow = self.add_space.as_ref()?;
+        let flow = self.add_space.get()?;
         let query = flow.search.read(cx).text().to_string();
         if query.is_empty() {
             return None;
@@ -6751,7 +6770,7 @@ impl Shell {
         let Some((name, _)) = self.add_space_completion(cx) else {
             return;
         };
-        if let Some(flow) = self.add_space.as_ref() {
+        if let Some(flow) = self.add_space.get() {
             let search = flow.search.clone();
             search.update(cx, |input, cx| input.set_text(name, cx));
         }
@@ -6759,7 +6778,7 @@ impl Shell {
 
     /// Descend into a specific folder row (mouse path); clears the query.
     fn add_space_descend(&mut self, full: String, is_repo: bool, cx: &mut Context<Self>) {
-        let Some(flow) = self.add_space.as_mut() else {
+        let Some(flow) = self.add_space.open_mut() else {
             return;
         };
         flow.browser_repo = is_repo;
@@ -6772,7 +6791,7 @@ impl Shell {
     pub(super) fn load_space_folders(&mut self, path: Option<String>, cx: &mut Context<Self>) {
         let engine = self.state.read(cx).engine().cloned();
         let local = self.state.read(cx).local_device_id.clone();
-        let Some(flow) = self.add_space.as_mut() else {
+        let Some(flow) = self.add_space.open_mut() else {
             return;
         };
         flow.focus_pending = true;
@@ -6806,7 +6825,7 @@ impl Shell {
                 .call(methods::LIST_FOLDERS, serde_json::Value::Object(params))
                 .await;
             this.update(cx, |shell, cx| {
-                if let Some(flow) = shell.add_space.as_mut() {
+                if let Some(flow) = shell.add_space.open_mut() {
                     flow.browser = match result {
                         Ok(value) => match serde_json::from_value::<FolderListing>(value) {
                             Ok(listing) => {
@@ -6834,7 +6853,7 @@ impl Shell {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        let Some(flow) = self.add_space.as_ref() else {
+        let Some(flow) = self.add_space.get() else {
             return;
         };
         if flow.submit_busy || flow.step != ProjectStep::Folders {
@@ -6863,7 +6882,7 @@ impl Shell {
             self.land_in_space(existing, cx);
             return;
         }
-        let Some(flow) = self.add_space.as_mut() else {
+        let Some(flow) = self.add_space.open_mut() else {
             return;
         };
         flow.submit_busy = true;
@@ -6910,7 +6929,7 @@ impl Shell {
                             s.spaces.retain(|space| space.id != submit_id);
                             cx.notify();
                         });
-                        if let Some(flow) = shell.add_space.as_mut() {
+                        if let Some(flow) = shell.add_space.open_mut() {
                             flow.submit_busy = false;
                             flow.error = Some(format!("{err}").into());
                         }
@@ -6920,7 +6939,7 @@ impl Shell {
             })
             .ok();
         });
-        if let Some(flow) = self.add_space.as_mut() {
+        if let Some(flow) = self.add_space.open_mut() {
             flow.submit_task = Some(task);
         }
         cx.notify();
@@ -6928,7 +6947,7 @@ impl Shell {
 
     /// Back traverses folders, then locations, then devices.
     fn add_space_go_up(&mut self, cx: &mut Context<Self>) {
-        let Some(flow) = &self.add_space else {
+        let Some(flow) = self.add_space.get() else {
             return;
         };
         match flow.step {
@@ -6990,13 +7009,13 @@ impl Shell {
                 cx.stop_propagation();
             }
             popover::MenuKey::Up | popover::MenuKey::Down => {
-                let count = match self.add_space.as_ref().map(|f| f.step) {
+                let count = match self.add_space.get().map(|f| f.step) {
                     Some(ProjectStep::Devices) => self.add_space_devices(cx).len(),
                     Some(ProjectStep::Locations) => self.add_space_locations(cx).len(),
                     _ => self.add_space_folder_rows(cx).len(),
                 };
                 let delta = if key == popover::MenuKey::Up { -1 } else { 1 };
-                if let Some(flow) = self.add_space.as_mut() {
+                if let Some(flow) = self.add_space.open_mut() {
                     flow.active = popover::menu_step(Some(flow.active), count, delta).unwrap_or(0);
                     // Keep the highlighted row in view as the cursor walks
                     // past the viewport (user-reported: the list didn't
@@ -7016,7 +7035,7 @@ impl Shell {
             popover::MenuKey::Backspace => {
                 let empty = self
                     .add_space
-                    .as_ref()
+                    .get()
                     .is_some_and(|f| f.search.read(cx).is_empty());
                 if empty {
                     self.add_space_go_up(cx);
@@ -7084,7 +7103,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let theme = Theme::of(cx).for_popup();
-        let flow = self.add_space.as_mut()?;
+        let flow = self.add_space.get_mut()?;
         if std::mem::take(&mut flow.focus_pending) {
             window.focus(&flow.search.focus_handle(cx), cx);
         }
@@ -7129,7 +7148,7 @@ impl Shell {
                 // never light two rows. Motion only: rows scrolling under a
                 // resting pointer must not steal the keyboard's place.
                 .on_mouse_move(cx.listener(move |this, _: &gpui::MouseMoveEvent, _, cx| {
-                    if let Some(flow) = this.add_space.as_mut()
+                    if let Some(flow) = this.add_space.open_mut()
                         && flow.active != ix
                     {
                         flow.active = ix;
@@ -7243,7 +7262,7 @@ impl Shell {
                 }
             }
         }
-        if let Some(flow) = self.add_space.as_mut() {
+        if let Some(flow) = self.add_space.get_mut() {
             flow.active = flow.active.min(rows.len().saturating_sub(1));
         }
         let count = rows.len();
@@ -7281,7 +7300,7 @@ impl Shell {
                     popover::btn_ghost(&theme, "Retry", "project-retry")
                         .id("project-retry")
                         .on_click(cx.listener(|this, _, _, cx| {
-                            let path = this.add_space.as_ref().and_then(|f| f.browser_path.clone());
+                            let path = this.add_space.get().and_then(|f| f.browser_path.clone());
                             this.load_space_folders(path, cx);
                         })),
                 ),
@@ -7421,9 +7440,13 @@ impl Shell {
                 theme.text_muted
             };
             let long = spec.name.chars().count() > 26;
+            let hovered_color = if spec.current {
+                color
+            } else {
+                motion::hover_blend(&group, color, theme.text)
+            };
             let mut el = div()
                 .id(group.clone())
-                .group(group.clone())
                 .relative()
                 .flex_none()
                 .h(px(24.0))
@@ -7432,7 +7455,7 @@ impl Shell {
                 .flex()
                 .items_center()
                 .gap(px(5.0))
-                .text_color(color)
+                .text_color(hovered_color)
                 .when(more, |el| el.min_w(px(24.0)).justify_center())
                 .when(more && menu_open, |el| el.bg(theme.element_hover))
                 .when_some(spec.glyph, |el, glyph| {
@@ -7440,8 +7463,7 @@ impl Shell {
                         icon(glyph)
                             .size(px(14.0))
                             .flex_none()
-                            .text_color(color)
-                            .group_hover(group.clone(), |s| s.text_color(theme.text)),
+                            .text_color(hovered_color),
                     )
                 })
                 .child(div().max_w(px(180.0)).truncate().child(spec.name.clone()))
@@ -7458,7 +7480,16 @@ impl Shell {
                     } else {
                         spec.name.clone()
                     })
-                    .hover(|s| s.bg(theme.element_hover).text_color(theme.text));
+                    .bg(motion::hover_blend(
+                        &group,
+                        if more && menu_open {
+                            theme.element_hover
+                        } else {
+                            gpui::transparent_black()
+                        },
+                        theme.element_hover,
+                    ))
+                    .on_hover(motion::hover_listener(group.clone()));
                 el = match spec.target {
                     CrumbTarget::Devices => el.on_click(cx.listener(|this, _, _, cx| {
                         this.add_space_back_to(ProjectStep::Devices, cx)
@@ -7497,7 +7528,7 @@ impl Shell {
             }
             trail.push(el.into_any_element());
         }
-        let crumb_scroll = self.add_space.as_mut().map(|flow| {
+        let crumb_scroll = self.add_space.get_mut().map(|flow| {
             // Reveal the open folder whenever the path changes; otherwise
             // leave the strip where the user scrolled it.
             if flow.crumb_key != crumb_key {
@@ -7538,7 +7569,6 @@ impl Shell {
             .child(
                 div()
                     .id("project-crumb-back")
-                    .group("project-crumb-back")
                     .size(px(24.0))
                     .flex_none()
                     .flex()
@@ -7549,9 +7579,14 @@ impl Shell {
                     .role(gpui::Role::Button)
                     .aria_label(back_label)
                     .tooltip(crate::settings::widgets::text_tooltip(back_label))
-                    .hover(|s| s.bg(theme.element_hover))
+                    .bg(motion::hover_blend(
+                        "project-crumb-back",
+                        gpui::transparent_black(),
+                        theme.element_hover,
+                    ))
+                    .on_hover(motion::hover_listener("project-crumb-back"))
                     .on_click(cx.listener(|this, _, window, cx| {
-                        if this.add_space.as_ref().map(|f| f.step) == Some(ProjectStep::Devices) {
+                        if this.add_space.get().map(|f| f.step) == Some(ProjectStep::Devices) {
                             this.close_add_space(cx);
                             this.toggle_command_palette(window, cx);
                         } else {
@@ -7561,8 +7596,11 @@ impl Shell {
                     .child(
                         icon(icons::ARROW_LEFT)
                             .size(px(16.0))
-                            .text_color(theme.text_muted)
-                            .group_hover("project-crumb-back", |s| s.text_color(theme.text)),
+                            .text_color(motion::hover_blend(
+                                "project-crumb-back",
+                                theme.text_muted,
+                                theme.text,
+                            )),
                     ),
             )
             .child(
@@ -7614,7 +7652,12 @@ impl Shell {
                         .aria_label("Add project")
                         .when(can_add, |el| {
                             el.cursor_pointer()
-                                .hover(|s| s.bg(crate::theme::card_selected_bg()))
+                                .bg(motion::hover_blend(
+                                    "project-add",
+                                    gpui::transparent_black(),
+                                    crate::theme::card_selected_bg(),
+                                ))
+                                .on_hover(motion::hover_listener("project-add"))
                                 .active(|s| s.opacity(0.8))
                                 .on_click(cx.listener(|this, _, _, cx| this.submit_add_space(cx)))
                         })
@@ -7663,7 +7706,12 @@ impl Shell {
                     )
                 })
                 .child(footer);
-        Some(command_palette::palette_overlay(viewport, card))
+        Some(command_palette::palette_overlay(
+            "add-space-palette",
+            viewport,
+            card,
+            self.add_space.closing_since(),
+        ))
     }
 
     // ---- space context menu / rename / delete overlays ----
@@ -7690,7 +7738,7 @@ impl Shell {
                 this.submit_rename_space(cx);
             }
         });
-        self.rename_space_dialog = Some(RenameSpaceDialog {
+        self.rename_space_dialog.open(RenameSpaceDialog {
             space_id,
             input,
             focus_pending: true,
@@ -7700,21 +7748,50 @@ impl Shell {
     }
 
     pub(super) fn submit_rename_space(&mut self, cx: &mut Context<Self>) {
-        let Some(dialog) = self.rename_space_dialog.take() else {
+        let Some(dialog) = self.rename_space_dialog.as_open() else {
             return;
         };
+        let space_id = dialog.space_id.clone();
         let name = dialog.input.read(cx).text().trim().to_string();
+        popover::close_popup(self, cx, |this| &mut this.rename_space_dialog);
         if !name.is_empty() {
             self.mutate(
-                serde_json::json!({ "op": "renameSpace", "spaceId": dialog.space_id, "name": name }),
+                serde_json::json!({ "op": "renameSpace", "spaceId": space_id, "name": name }),
                 cx,
             );
         }
+    }
+
+    fn open_delete_space_confirm(&mut self, space_id: String, cx: &mut Context<Self>) {
+        let (name, device, count) = {
+            let state = self.state.read(cx);
+            let space = state.space_row(&space_id);
+            (
+                space
+                    .map(|s| s.display_name().to_string())
+                    .unwrap_or_else(|| "this project".into()),
+                space
+                    .and_then(|s| state.device_name(&s.device_id))
+                    .unwrap_or("its device")
+                    .to_string(),
+                state.chats_in_space(&space_id).len(),
+            )
+        };
+        let copy = if count == 1 {
+            format!(
+                "Removing “{name}” permanently deletes its 1 session on {device}. This can’t be undone."
+            )
+        } else {
+            format!(
+                "Removing “{name}” permanently deletes its {count} sessions on {device}. This can’t be undone."
+            )
+        };
+        self.delete_space_confirm.open((space_id, copy.into()));
         cx.notify();
     }
 
     pub(super) fn delete_space(&mut self, space_id: String, cx: &mut Context<Self>) {
-        self.delete_space_confirm = None;
+        popover::close_popup(self, cx, |this| &mut this.delete_space_confirm);
         self.mutate(
             serde_json::json!({ "op": "deleteSpace", "spaceId": space_id }),
             cx,
@@ -7775,8 +7852,7 @@ impl Shell {
                         .text_color(theme.danger)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.close_space_menu(cx);
-                            this.delete_space_confirm = Some(delete_id.clone());
-                            cx.notify();
+                            this.open_delete_space_confirm(delete_id.clone(), cx);
                         }))
                         .child(
                             icon(icons::TRASH_BIN_MINIMALISTIC)
@@ -7794,16 +7870,17 @@ impl Shell {
             ));
         }
 
-        if let Some(dialog) = &mut self.rename_space_dialog {
-            if std::mem::take(&mut dialog.focus_pending) {
-                window.focus(&dialog.input.focus_handle(cx), cx);
-            }
+        if let Some(dialog) = self.rename_space_dialog.open_mut()
+            && std::mem::take(&mut dialog.focus_pending)
+        {
+            window.focus(&dialog.input.focus_handle(cx), cx);
+        }
+        if let Some(dialog) = self.rename_space_dialog.get() {
             let input = dialog.input.clone();
             let card = popover::dialog_card(&theme)
                 .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
                     if ev.keystroke.key == "escape" {
-                        this.rename_space_dialog = None;
-                        cx.notify();
+                        popover::close_popup(this, cx, |this| &mut this.rename_space_dialog);
                         cx.stop_propagation();
                     }
                 }))
@@ -7824,12 +7901,11 @@ impl Shell {
                             popover::btn_ghost(&theme, "Cancel", "rename-space-cancel")
                                 .id("rename-space-cancel")
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.rename_space_dialog = None;
-                                    cx.notify();
+                                    popover::close_popup(this, cx, |this| &mut this.rename_space_dialog);
                                 })),
                         )
                         .child(
-                            popover::btn_primary(&theme, "Rename")
+                            popover::btn_primary(&theme, "Rename", "rename-space-save")
                                 .id("rename-space-save")
                                 .on_click(
                                     cx.listener(|this, _, _, cx| this.submit_rename_space(cx)),
@@ -7837,33 +7913,15 @@ impl Shell {
                         ),
                 )
                 .into_any_element();
-            overlays.push(popover::modal("rename-space-dialog", viewport, card));
+            overlays.push(popover::modal(
+                "rename-space-dialog",
+                viewport,
+                card,
+                self.rename_space_dialog.closing_since(),
+            ));
         }
 
-        if let Some(space_id) = self.delete_space_confirm.clone() {
-            let (name, device, count) = {
-                let state = self.state.read(cx);
-                let space = state.space_row(&space_id);
-                (
-                    space
-                        .map(|s| s.display_name().to_string())
-                        .unwrap_or_else(|| "this project".into()),
-                    space
-                        .and_then(|s| state.device_name(&s.device_id))
-                        .unwrap_or("its device")
-                        .to_string(),
-                    state.chats_in_space(&space_id).len(),
-                )
-            };
-            let copy = if count == 1 {
-                format!(
-                    "Removing “{name}” permanently deletes its 1 session on {device}. This can’t be undone."
-                )
-            } else {
-                format!(
-                    "Removing “{name}” permanently deletes its {count} sessions on {device}. This can’t be undone."
-                )
-            };
+        if let Some((space_id, copy)) = self.delete_space_confirm.get().cloned() {
             let card = popover::dialog_card(&theme)
                 .child(popover::dialog_title(&theme, "Remove project?"))
                 .child(div().mt(px(6.0)).child(popover::dialog_body(&theme, copy)))
@@ -7878,12 +7936,11 @@ impl Shell {
                             popover::btn_ghost(&theme, "Cancel", "delete-space-cancel")
                                 .id("delete-space-cancel")
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.delete_space_confirm = None;
-                                    cx.notify();
+                                    popover::close_popup(this, cx, |this| &mut this.delete_space_confirm);
                                 })),
                         )
                         .child(
-                            popover::btn_danger(&theme, "Remove")
+                            popover::btn_danger(&theme, "Remove", "delete-space-confirm")
                                 .id("delete-space-confirm")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.delete_space(space_id.clone(), cx)
@@ -7891,7 +7948,12 @@ impl Shell {
                         ),
                 )
                 .into_any_element();
-            overlays.push(popover::modal("delete-space-dialog", viewport, card));
+            overlays.push(popover::modal(
+                "delete-space-dialog",
+                viewport,
+                card,
+                self.delete_space_confirm.closing_since(),
+            ));
         }
 
         overlays
@@ -7979,7 +8041,7 @@ impl Shell {
                 .clone()
                 .update(cx, |pickers, cx| pickers.fixture_model_catalog(cx));
         }
-        let Some(flow) = self.add_space.as_mut() else {
+        let Some(flow) = self.add_space.open_mut() else {
             return;
         };
         if flow.device.is_some() && !matches!(flow.drives, Loadable::Ready(_)) {
@@ -8099,13 +8161,13 @@ mod project_flow_tests {
         });
         shell.update(cx, |shell, cx| {
             shell.open_add_space(cx);
-            assert_eq!(shell.add_space.as_ref().unwrap().step, ProjectStep::Devices);
-            assert!(shell.add_space.as_ref().unwrap().device.is_none());
-            let search = shell.add_space.as_ref().unwrap().search.clone();
+            assert_eq!(shell.add_space.get().unwrap().step, ProjectStep::Devices);
+            assert!(shell.add_space.get().unwrap().device.is_none());
+            let search = shell.add_space.get().unwrap().search.clone();
             search.update(cx, |input, cx| input.set_text("server", cx));
             assert_eq!(shell.add_space_devices(cx).len(), 1);
             shell.add_space_open_active(cx);
-            let flow = shell.add_space.as_mut().unwrap();
+            let flow = shell.add_space.open_mut().unwrap();
             assert_eq!(flow.step, ProjectStep::Locations);
             assert_eq!(flow.device.as_ref().unwrap().id, "remote");
             assert!(flow.search.read(cx).is_empty());
@@ -8115,7 +8177,7 @@ mod project_flow_tests {
             }]);
             search.update(cx, |input, cx| input.set_text("projects", cx));
             shell.add_space_open_active(cx);
-            let flow = shell.add_space.as_mut().unwrap();
+            let flow = shell.add_space.open_mut().unwrap();
             assert_eq!(flow.step, ProjectStep::Folders);
             assert_eq!(flow.browser_path.as_deref(), Some("/projects"));
             flow.browser = Loadable::Ready(FolderListing {
@@ -8125,12 +8187,12 @@ mod project_flow_tests {
             });
             shell.add_space_go_up(cx);
             assert_eq!(
-                shell.add_space.as_ref().unwrap().step,
+                shell.add_space.get().unwrap().step,
                 ProjectStep::Locations
             );
-            assert!(shell.add_space.as_ref().unwrap().browser.ready().is_none());
+            assert!(shell.add_space.get().unwrap().browser.ready().is_none());
             shell.add_space_go_up(cx);
-            let flow = shell.add_space.as_ref().unwrap();
+            let flow = shell.add_space.get().unwrap();
             assert_eq!(flow.step, ProjectStep::Devices);
             assert!(flow.device.is_none());
             assert!(flow.drives.ready().is_none());
@@ -8279,7 +8341,7 @@ mod home_folder_search_tests {
     fn type_query(window: gpui::WindowHandle<Shell>, query: &str, cx: &mut TestAppContext) {
         window
             .update(cx, |shell, _, cx| {
-                let search = shell.add_space.as_ref().unwrap().search.clone();
+                let search = shell.add_space.get().unwrap().search.clone();
                 search.update(cx, |input, cx| input.set_text(query, cx));
             })
             .unwrap();
@@ -8364,7 +8426,7 @@ mod home_folder_search_tests {
             cx.run_until_parked();
             window
                 .read_with(cx, |shell, cx| {
-                    let flow = shell.add_space.as_ref().unwrap();
+                    let flow = shell.add_space.get().unwrap();
                     assert_eq!(flow.home_search.indexing, round < 3);
                     assert!(!flow.home_search.loading);
                     // The original selected folder survives result reordering.
@@ -8419,7 +8481,7 @@ mod home_folder_search_tests {
                     assert!(
                         !shell
                             .add_space
-                            .as_ref()
+                            .get()
                             .is_some_and(|flow| flow.home_search.indexing)
                     );
                 })
@@ -8491,7 +8553,7 @@ mod home_folder_search_tests {
             cx.run_until_parked();
             window
                 .read_with(cx, |shell, _| {
-                    let search = &shell.add_space.as_ref().unwrap().home_search;
+                    let search = &shell.add_space.get().unwrap().home_search;
                     assert!(!search.indexing);
                     assert!(!search.loading);
                 })
@@ -8582,7 +8644,7 @@ mod home_folder_search_tests {
             assert!(matches!(&listed[0], FolderRow::Local(entry) if entry.name == "code"));
             window
                 .update(cx, |shell, _, cx| {
-                    shell.add_space.as_mut().unwrap().active = 1;
+                    shell.add_space.open_mut().unwrap().active = 1;
                     shell.add_space_open_active(cx);
                 })
                 .unwrap();
@@ -8625,7 +8687,7 @@ mod home_folder_search_tests {
                     })).unwrap());
                 });
                 shell.submit_add_space(cx);
-                assert!(shell.add_space.is_none());
+                assert!(!shell.add_space.is_open());
                 assert_eq!(shell.state.read(cx).selected_space.as_deref(), Some("existing"));
                 assert_eq!(shell.state.read(cx).spaces.len(), 1);
             }).unwrap();
@@ -8655,7 +8717,7 @@ mod home_folder_search_tests {
         assert_eq!(browse[0]["params"]["path"], "/home/me/dev/comet");
         window
             .read_with(cx, |shell, _| {
-                let flow = shell.add_space.as_ref().unwrap();
+                let flow = shell.add_space.get().unwrap();
                 assert!(flow.browser_repo);
             })
             .unwrap();

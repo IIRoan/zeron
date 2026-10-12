@@ -284,7 +284,7 @@ impl SourceControl {
         } else {
             let entity = cx.entity();
             let theme = theme.clone();
-            uniform_list("git-stash-picker-list", count, move |range, _, cx| {
+            uniform_list("git-stash-picker-list", count, move |range, window, cx| {
                 entity.update(cx, |this, cx| {
                     range
                         .filter_map(|i| {
@@ -304,8 +304,16 @@ impl SourceControl {
                                     .text_size(px(13.0))
                                     .text_color(theme.text)
                                     .cursor_pointer()
-                                    .when(i == active, |row| row.bg(theme.accent.opacity(0.15)))
-                                    .hover(|row| row.bg(theme.glass_hover()))
+                                    .hover_bg(
+                                        ("git-stash-choice-wash", i),
+                                        window,
+                                        if i == active {
+                                            theme.accent.opacity(0.15)
+                                        } else {
+                                            gpui::transparent_black()
+                                        },
+                                        theme.glass_hover(),
+                                    )
                                     .child(
                                         div()
                                             .flex_none()

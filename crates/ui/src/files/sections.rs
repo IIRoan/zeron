@@ -19,7 +19,7 @@ use std::hash::{Hash, Hasher};
 use chrono::{DateTime, Utc};
 use gpui::{
     Animation, AnimationExt as _, AnyElement, Context, Entity, EntityId, MouseButton, ScrollHandle,
-    SharedString, div, prelude::*, px,
+    SharedString, Window, div, prelude::*, px,
 };
 use zeron_doc::{MessagePart, SubagentStatus};
 use zeron_proto::{Chat, ChatIndicator};
@@ -28,7 +28,10 @@ use crate::composer::ComposerInput;
 use crate::icons::{self, icon};
 use crate::state::AppState;
 use crate::theme::Theme;
-use crate::{loaders, motion};
+use crate::{
+    loaders,
+    motion::{self, HoverFade as _},
+};
 
 use super::subagents::{Group, GroupState, SubagentPlan};
 use super::{FilesEvent, FilesSurface};
@@ -493,7 +496,12 @@ impl FilesSurface {
         }
     }
 
-    pub(super) fn render_sections(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_sections(
+        &mut self,
+        theme: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let now = Utc::now();
         let (subagents, chats) = {
             let state = self.state.read(cx);
@@ -519,7 +527,7 @@ impl FilesSurface {
         let budget = FOOTER_HEIGHT - chrome_height();
         let heights = body_budget(budget, wants, open);
         let view = cx.entity_id();
-        let subagent_body = self.render_subagent_rows(&plan, view, theme, cx);
+        let subagent_body = self.render_subagent_rows(&plan, view, theme, window, cx);
         let subagent_badge = (plan.running() > 0).then(|| {
             crate::running_pill::running_pill(
                 "files-subagents-header",
@@ -527,8 +535,8 @@ impl FilesSurface {
                 theme,
             )
         });
-        let chat_body = self.render_chat_rows(&chats, theme, cx);
-        let chats_actions = self.render_chats_header_actions(theme, cx);
+        let chat_body = self.render_chat_rows(&chats, theme, window, cx);
+        let chats_actions = self.render_chats_header_actions(theme, window, cx);
         div()
             .id("files-sections")
             .relative()
@@ -566,7 +574,12 @@ impl FilesSurface {
 
     /// "+" and fork beside the Chats caret: a fresh side chat of the active
     /// chat, or a fork of it through its latest completed response.
-    fn render_chats_header_actions(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn render_chats_header_actions(
+        &self,
+        theme: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         // Hidden until the header is hovered, like the sidebar's row menus:
         // the caret is the resting state, the actions appear on approach.
         div()
@@ -583,6 +596,7 @@ impl FilesSurface {
                     icons::PLUS,
                     "New side chat",
                     theme,
+                    window,
                 )
                 .on_click(cx.listener(|_, _, _, cx| {
                     cx.stop_propagation();
@@ -595,6 +609,7 @@ impl FilesSurface {
                     icons::FORK,
                     "Fork this chat",
                     theme,
+                    window,
                 )
                 .on_click(cx.listener(|_, _, _, cx| {
                     cx.stop_propagation();
@@ -775,6 +790,7 @@ impl FilesSurface {
         section: Section,
         remaining: usize,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         show_more_row(
@@ -782,6 +798,7 @@ impl FilesSurface {
             remaining,
             0.0,
             theme,
+            window,
         )
         .on_click(cx.listener(move |this, _, _, cx| {
             cx.stop_propagation();
@@ -797,6 +814,7 @@ impl FilesSurface {
         plan: &SubagentPlan,
         view: EntityId,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if plan.total() == 0 {
@@ -810,7 +828,7 @@ impl FilesSurface {
         let scroll = self.sections.scroll(Section::Subagents);
         let mut list = row_list("files-subagent-rows", &scroll);
         for row in &plan.active {
-            list = list.child(self.render_subagent_row(row, 0.0, now, view, theme, cx));
+            list = list.child(self.render_subagent_row(row, 0.0, now, view, theme, window, cx));
         }
         if plan.finished() > 0 {
             list = list.child(self.render_group_header(
@@ -818,6 +836,7 @@ impl FilesSurface {
                 plan.finished(),
                 0.0,
                 theme,
+                window,
                 cx,
             ));
             if self.sections.groups.is_open(Group::Finished) {
@@ -831,6 +850,7 @@ impl FilesSurface {
                         rows.len(),
                         GROUP_INDENT,
                         theme,
+                        window,
                         cx,
                     ));
                     if !self.sections.groups.is_open(group) {
@@ -844,6 +864,7 @@ impl FilesSurface {
                             now,
                             view,
                             theme,
+                            window,
                             cx,
                         ));
                     }
@@ -853,6 +874,7 @@ impl FilesSurface {
                             rows.len() - shown,
                             2.0 * GROUP_INDENT,
                             theme,
+                            window,
                             cx,
                         ));
                     }
@@ -870,6 +892,7 @@ impl FilesSurface {
         now: DateTime<Utc>,
         view: EntityId,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let glyph = status_glyph(
@@ -880,7 +903,7 @@ impl FilesSurface {
             cx,
         );
         let open = row.clone();
-        compact_row(format!("files-subagent-{}", row.doc_id), theme)
+        compact_row(format!("files-subagent-{}", row.doc_id), theme, window)
             .pl(px(Theme::SPACE_SM + indent))
             .aria_label(SharedString::from(format!("Open subagent {}", row.title)))
             .on_click(cx.listener(move |_, _, _, cx| {
@@ -911,17 +934,18 @@ impl FilesSurface {
         count: usize,
         indent: f32,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let open = self.sections.groups.is_open(group);
-        let chevron = icon(icons::ALT_ARROW_RIGHT)
-            .size(px(12.0))
-            .text_color(theme.text_muted.opacity(0.5))
-            .with_transformation(gpui::Transformation::rotate(gpui::percentage(if open {
-                0.25
-            } else {
-                0.0
-            })));
+        let chevron = icons::disclosure_chevron(
+            SharedString::from(format!("files-subagent-group-chevron-{}", group.key())),
+            open,
+            window,
+            cx,
+        )
+        .size(px(12.0))
+        .text_color(theme.text_muted.opacity(0.5));
         div()
             .id(SharedString::from(format!(
                 "files-subagent-group-{}",
@@ -943,7 +967,12 @@ impl FilesSurface {
             .pl(px(Theme::SPACE_SM + indent - 4.0))
             .pr(px(4.0))
             .cursor_pointer()
-            .hover(|s| s.bg(theme.glass_hover()))
+            .hover_bg(
+                SharedString::from(format!("files-subagent-group-wash-{}", group.key())),
+                window,
+                gpui::transparent_black(),
+                theme.glass_hover(),
+            )
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.sections.groups.toggle(group);
                 cx.notify();
@@ -977,6 +1006,7 @@ impl FilesSurface {
         remaining: usize,
         indent: f32,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         show_more_row(
@@ -984,6 +1014,7 @@ impl FilesSurface {
             remaining,
             indent,
             theme,
+            window,
         )
         .on_click(cx.listener(move |this, _, _, cx| {
             cx.stop_propagation();
@@ -997,6 +1028,7 @@ impl FilesSurface {
         &self,
         rows: &[ChildChatRow],
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if rows.is_empty() {
@@ -1012,6 +1044,7 @@ impl FilesSurface {
                         icons::FORK,
                         "Fork",
                         theme,
+                        window,
                     )
                     .on_click(cx.listener(|_, _, _, cx| {
                         cx.stop_propagation();
@@ -1024,6 +1057,7 @@ impl FilesSurface {
                         icons::PLUS,
                         "New side chat",
                         theme,
+                        window,
                     )
                     .on_click(cx.listener(|_, _, _, cx| {
                         cx.stop_propagation();
@@ -1070,7 +1104,7 @@ impl FilesSurface {
                 .into_any_element(),
             };
             list = list.child(
-                compact_row(format!("files-chat-{}", row.chat_id), theme)
+                compact_row(format!("files-chat-{}", row.chat_id), theme, window)
                     .aria_label(SharedString::from(format!("Open side chat {}", row.title)))
                     .on_click(cx.listener(move |_, event: &gpui::ClickEvent, _, cx| {
                         cx.stop_propagation();
@@ -1107,7 +1141,13 @@ impl FilesSurface {
             );
         }
         if rows.len() > shown {
-            list = list.child(self.render_show_more(Section::Chats, rows.len() - shown, theme, cx));
+            list = list.child(self.render_show_more(
+                Section::Chats,
+                rows.len() - shown,
+                theme,
+                window,
+                cx,
+            ));
         }
         faded_list(list, &scroll)
     }
@@ -1123,6 +1163,7 @@ fn header_action(
     icon_path: &'static str,
     label: &'static str,
     theme: &Theme,
+    window: &mut Window,
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
@@ -1135,7 +1176,12 @@ fn header_action(
         .items_center()
         .justify_center()
         .cursor_pointer()
-        .hover(|s| s.bg(crate::theme::wash(0.09)))
+        .hover_bg(
+            SharedString::from(format!("{id}-wash")),
+            window,
+            gpui::transparent_black(),
+            crate::theme::wash(0.09),
+        )
         .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
         .tooltip(crate::settings::widgets::text_tooltip(label))
         // Icons take their color on the element itself, never inherited.
@@ -1153,7 +1199,9 @@ fn show_more_row(
     remaining: usize,
     indent: f32,
     theme: &Theme,
+    window: &mut Window,
 ) -> gpui::Stateful<gpui::Div> {
+    let wash = SharedString::from(format!("{id}-wash"));
     div()
         .id(SharedString::from(id))
         .role(gpui::Role::Button)
@@ -1166,8 +1214,18 @@ fn show_more_row(
         .rounded(px(8.0))
         .cursor_pointer()
         .text_size(crate::typography::ui_rems(12.0))
-        .text_color(theme.text_muted.opacity(0.7))
-        .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text_muted))
+        .hover_fade(wash, window, |row, t| {
+            row.bg(motion::mix(
+                gpui::transparent_black(),
+                theme.glass_hover(),
+                t,
+            ))
+            .text_color(motion::mix(
+                theme.text_muted.opacity(0.7),
+                theme.text_muted,
+                t,
+            ))
+        })
         .child(format!("Show {} more", remaining.min(PAGE_ROWS)))
 }
 
@@ -1177,6 +1235,7 @@ fn pill_button(
     icon_path: &'static str,
     label: &'static str,
     theme: &Theme,
+    window: &mut Window,
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
@@ -1187,8 +1246,12 @@ fn pill_button(
         .rounded(px(7.0))
         .border_1()
         .border_color(theme.border)
-        .bg(crate::theme::wash(0.04))
-        .hover(|style| style.bg(crate::theme::wash(0.09)))
+        .hover_bg(
+            SharedString::from(format!("{id}-wash")),
+            window,
+            crate::theme::wash(0.04),
+            crate::theme::wash(0.09),
+        )
         .cursor_pointer()
         .flex()
         .flex_row()
@@ -1255,7 +1318,8 @@ fn empty_state(copy: &'static str, actions: Option<AnyElement>, theme: &Theme) -
 
 /// The sidebar's compact session row, stripped to status + title (+ time):
 /// 29px, 8px radius, the glass hover wash, 13px title on a 17px line.
-fn compact_row(id: String, theme: &Theme) -> gpui::Stateful<gpui::Div> {
+fn compact_row(id: String, theme: &Theme, window: &mut Window) -> gpui::Stateful<gpui::Div> {
+    let wash = SharedString::from(format!("{id}-wash"));
     div()
         .id(SharedString::from(id))
         .role(gpui::Role::Button)
@@ -1268,8 +1332,14 @@ fn compact_row(id: String, theme: &Theme) -> gpui::Stateful<gpui::Div> {
         .rounded(px(8.0))
         .px(px(Theme::SPACE_SM))
         .cursor_pointer()
-        .text_color(theme.text.opacity(0.8))
-        .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
+        .hover_fade(wash, window, |row, t| {
+            row.bg(motion::mix(
+                gpui::transparent_black(),
+                theme.glass_hover(),
+                t,
+            ))
+            .text_color(motion::mix(theme.text.opacity(0.8), theme.text, t))
+        })
 }
 
 /// The compact row's trailing time, 11px in the faded subline color.

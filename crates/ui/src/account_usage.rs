@@ -411,7 +411,7 @@ impl FooterCard {
 /// The footer's ring cluster: account usage (accent arc, so the two read
 /// apart), then context occupancy. Each opens its popover on click.
 impl Render for AccountUsage {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
         let context = self.state.read(cx).context_usage;
         let account = self.fraction(cx).map(|fraction| {
@@ -427,6 +427,7 @@ impl Render for AccountUsage {
                 format!("{}%", (fraction * 100.0).round() as u32),
                 self.popup.get() == Some(&FooterCard::Accounts),
                 &theme,
+                window,
             );
             self.trigger(
                 chip,
@@ -440,6 +441,7 @@ impl Render for AccountUsage {
                 context,
                 self.popup.get() == Some(&FooterCard::Context),
                 &theme,
+                window,
             );
             self.trigger(
                 chip,

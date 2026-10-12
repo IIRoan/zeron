@@ -10,7 +10,8 @@ use super::{
 };
 use crate::{
     file_icons::{self, FileIconIdentity},
-    icons::{self, icon},
+    icons,
+    motion::{self, HoverFade as _},
     popover,
     theme::Theme,
 };
@@ -28,7 +29,7 @@ pub(super) fn with_indent_guides(
     depth: usize,
     height: f32,
     theme: &Theme,
-) -> AnyElement {
+) -> gpui::Div {
     div()
         .relative()
         .h(px(height))
@@ -45,7 +46,6 @@ pub(super) fn with_indent_guides(
                 .bg(theme.border)
         }))
         .child(row)
-        .into_any_element()
 }
 
 /// Keep the viewport attached to a path rather than an index when rows move.
@@ -242,6 +242,26 @@ impl FilesSurface {
         };
         let theme = Theme::of(cx).clone();
         let padding = 8.0 + row.depth as f32 * TREE_INDENT;
+        // Rows under a folder that just expanded fade in; rows that scroll
+        // into view later never do.
+        let reveal = self
+            .tree_revealed
+            .as_ref()
+            .filter(|(parent, at)| {
+                at.elapsed() < motion::FADE_QUICK.total()
+                    && row
+                        .path
+                        .strip_prefix(parent.as_str())
+                        .is_some_and(|rest| rest.starts_with(['/', '\0']))
+            })
+            .map(|_| {
+                motion::entrance(
+                    window,
+                    gpui::SharedString::from(format!("tree-reveal-{}", row.path)),
+                    motion::FADE_QUICK,
+                    motion::reduced_motion(cx),
+                )
+            });
         let drop_key = row.path.clone();
         let drop_target = match &row.kind {
             VisibleRowKind::Entry => Some(row.path.clone()),
@@ -318,7 +338,12 @@ impl FilesSurface {
                         element.bg(crate::theme::wash(if focused { 0.12 } else { 0.08 }))
                     })
                     .when(!selected, |element| {
-                        element.hover(|style| style.bg(crate::theme::wash(0.055)))
+                        element.hover_bg(
+                            gpui::SharedString::from(format!("tree-row-wash-{}", row.path)),
+                            window,
+                            gpui::transparent_black(),
+                            crate::theme::wash(0.055),
+                        )
                     })
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.tree_focus.focus(window, cx);
@@ -354,11 +379,15 @@ impl FilesSurface {
                             .justify_center()
                             .when(is_directory, |element| {
                                 element.child(
-                                    icon(if expanded {
-                                        icons::ALT_ARROW_DOWN
-                                    } else {
-                                        icons::ALT_ARROW_RIGHT
-                                    })
+                                    icons::disclosure_chevron(
+                                        gpui::SharedString::from(format!(
+                                            "tree-chevron-{}",
+                                            row.path
+                                        )),
+                                        expanded,
+                                        window,
+                                        cx,
+                                    )
                                     .size(px(11.0))
                                     .text_color(theme.text_faint),
                                 )
@@ -406,7 +435,12 @@ impl FilesSurface {
                 .items_center()
                 .gap(px(6.0))
                 .cursor_pointer()
-                .hover(|style| style.bg(crate::theme::wash(0.055)))
+                .hover_bg(
+                    ("files-tree-error-wash", index),
+                    window,
+                    gpui::transparent_black(),
+                    crate::theme::wash(0.055),
+                )
                 .on_click(cx.listener(move |this, _, _, cx| {
                     let cursor = this
                         .tree
@@ -436,7 +470,12 @@ impl FilesSurface {
                 .flex()
                 .items_center()
                 .cursor_pointer()
-                .hover(|style| style.bg(crate::theme::wash(0.055)))
+                .hover_bg(
+                    ("files-tree-more-wash", index),
+                    window,
+                    gpui::transparent_black(),
+                    crate::theme::wash(0.055),
+                )
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.load_directory(directory.clone(), Some(cursor.clone()), cx);
                 }))
@@ -452,7 +491,9 @@ impl FilesSurface {
             drop_key,
             drop_target,
             TREE_ROW_HEIGHT,
-            with_indent_guides(content, row.depth, TREE_ROW_HEIGHT, &theme),
+            with_indent_guides(content, row.depth, TREE_ROW_HEIGHT, &theme)
+                .when_some(reveal, |element, t| element.opacity(t))
+                .into_any_element(),
         )
     }
 
@@ -474,6 +515,9 @@ impl FilesSurface {
     fn toggle_tree_directory(&mut self, path: String, cx: &mut Context<Self>) {
         if !self.tree.toggle_expanded(&path) {
             return;
+        }
+        if self.tree.is_expanded(&path) {
+            self.tree_revealed = Some((path.clone(), std::time::Instant::now()));
         }
         self.sync_tree_list();
         let needs_load = self.tree.node(&path).is_some_and(|node| {

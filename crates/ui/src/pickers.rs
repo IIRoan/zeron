@@ -49,7 +49,7 @@ fn workspace_footer_row() -> gpui::Div {
 }
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
-use crate::motion;
+use crate::motion::{self, HoverFade as _};
 use crate::popover::{self, Loadable, MenuKey};
 use crate::settings::composer::ComposerDefaults;
 use crate::state::{AppState, EngineHandle};
@@ -3017,7 +3017,7 @@ impl Pickers {
     /// The project popover: search + one row per project across devices
     /// (check on the current pick), then "New project" and the opt-out rows.
     /// No per-row `@ device` tag — the device chip next door picks the host.
-    fn render_space_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_space_popover(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).for_popup();
         let rows = self.filtered_project_rows(cx);
         let mut settings_spaces = self.project_space_ids(cx);
@@ -3104,45 +3104,57 @@ impl Pickers {
                                 }))
                                 .child(popover::picker_icon_slot(art))
                                 .child(div().flex_1().min_w_0().truncate().child(label))
-                                .when_some(settings_space, |el, space_id| {
-                                    el.child(
-                                        div()
-                                            .id(SharedString::from(format!(
-                                                "canvas-project-settings-{space_id}"
-                                            )))
-                                            .debug_selector(|| "canvas-project-settings".into())
-                                            .size(px(24.0))
-                                            .flex_none()
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .rounded(px(6.0))
-                                            .cursor_pointer()
-                                            .role(gpui::Role::Button)
-                                            .aria_label(settings_label)
-                                            .tooltip(crate::settings::widgets::text_tooltip(
-                                                "Project settings",
-                                            ))
-                                            .hover(|el| el.bg(theme.element_hover))
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                cx.stop_propagation();
-                                                this.dismiss(cx);
-                                                window.dispatch_action(
-                                                    Box::new(crate::shell::OpenProjectSettings(
-                                                        space_id.clone(),
-                                                    )),
-                                                    cx,
-                                                );
-                                            }))
-                                            .child(
-                                                crate::icons::icon(
-                                                    crate::icons::SETTINGS_MINIMALISTIC,
+                                .when_some(
+                                    settings_space,
+                                    |el, space_id| {
+                                        el.child(
+                                            div()
+                                                .id(SharedString::from(format!(
+                                                    "canvas-project-settings-{space_id}"
+                                                )))
+                                                .debug_selector(|| "canvas-project-settings".into())
+                                                .size(px(24.0))
+                                                .flex_none()
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .rounded(px(6.0))
+                                                .cursor_pointer()
+                                                .role(gpui::Role::Button)
+                                                .aria_label(settings_label)
+                                                .tooltip(crate::settings::widgets::text_tooltip(
+                                                    "Project settings",
+                                                ))
+                                                .hover_bg(
+                                                    ("space-settings-hover", ix),
+                                                    window,
+                                                    gpui::transparent_black(),
+                                                    theme.element_hover,
                                                 )
-                                                .size(px(14.0))
-                                                .text_color(theme.text_muted),
-                                            ),
-                                    )
-                                })
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        cx.stop_propagation();
+                                                        this.dismiss(cx);
+                                                        window.dispatch_action(
+                                                            Box::new(
+                                                                crate::shell::OpenProjectSettings(
+                                                                    space_id.clone(),
+                                                                ),
+                                                            ),
+                                                            cx,
+                                                        );
+                                                    },
+                                                ))
+                                                .child(
+                                                    crate::icons::icon(
+                                                        crate::icons::SETTINGS_MINIMALISTIC,
+                                                    )
+                                                    .size(px(14.0))
+                                                    .text_color(theme.text_muted),
+                                                ),
+                                        )
+                                    },
+                                )
                             },
                         )),
                 ))
@@ -3769,12 +3781,16 @@ impl Pickers {
     }
 
     /// New-session navigation and destination controls above the composer.
-    pub fn render_new_thread_target_selectors(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    pub fn render_new_thread_target_selectors(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let closing = (self.open.closing_since(), self.menu_geometry().below);
         let mut overlay: Option<(PickerKind, AnyElement)> = match self.mounted_kind() {
             Some(PickerKind::Space) => {
-                let content = self.render_space_popover(cx);
+                let content = self.render_space_popover(window, cx);
                 Some((PickerKind::Space, self.popover_frame(280.0, content, cx)))
             }
             Some(PickerKind::Device) => {
@@ -3876,6 +3892,7 @@ impl Pickers {
     /// chip-only cluster floating below the composer's leading edge.
     pub fn render_new_thread_git_selectors(
         &mut self,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let git = self
@@ -3899,7 +3916,7 @@ impl Pickers {
         let closing = (self.open.closing_since(), self.menu_geometry().below);
         let mut overlay: Option<(PickerKind, AnyElement)> = match self.mounted_kind() {
             Some(PickerKind::Branch) => {
-                let content = self.render_branch_popover(cx);
+                let content = self.render_branch_popover(window, cx);
                 Some((PickerKind::Branch, self.popover_frame(320.0, content, cx)))
             }
             Some(PickerKind::Checkout) => {
@@ -3957,7 +3974,11 @@ impl Pickers {
     /// The composer footer row: checkout-kind + ref, LEFT-aligned, only when
     /// the picked (or session's) project has git. New sessions use the floating
     /// chip clusters; sessions name their target in the titlebar.
-    pub fn render_footer(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub fn render_footer(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let theme = Theme::of(cx).clone();
         // A selected chat whose workspace row hasn't synced yet (the moment
         // right after send mints it) still renders the DRAFT footer — the
@@ -4060,7 +4081,7 @@ impl Pickers {
         let closing = (self.open.closing_since(), self.menu_geometry().below);
         let mut overlay: Option<(PickerKind, AnyElement)> = match self.mounted_kind() {
             Some(PickerKind::Branch) => {
-                let content = self.render_branch_popover(cx);
+                let content = self.render_branch_popover(window, cx);
                 Some((PickerKind::Branch, self.popover_frame(320.0, content, cx)))
             }
             Some(PickerKind::Checkout) => {
@@ -4220,6 +4241,7 @@ impl Pickers {
         message: &str,
         kind: PickerKind,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         popover::error_row(theme, message)
@@ -4233,7 +4255,12 @@ impl Pickers {
                     .border_color(theme.border)
                     .text_color(theme.text)
                     .cursor_pointer()
-                    .hover(|s| s.bg(theme.element_hover))
+                    .hover_bg(
+                        format!("{id}-hover"),
+                        window,
+                        gpui::transparent_black(),
+                        theme.element_hover,
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| match kind {
                         PickerKind::Branch | PickerKind::Checkout => this.ensure_refs(true, cx),
                         PickerKind::HarnessModel => {
@@ -4289,7 +4316,7 @@ impl Pickers {
     /// The ref picker (t3code BranchToolbarBranchSelector): search on top,
     /// rows with right-aligned muted `current`/`worktree` tags, and a
     /// "Showing X of Y refs" footer when the list is capped.
-    fn render_branch_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_branch_popover(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).for_popup();
         if self.state.read(cx).selected_space_row().is_none() {
             return div()
@@ -4318,7 +4345,14 @@ impl Pickers {
             }
             Loadable::Error(message) => {
                 let message = message.clone();
-                self.retry_row("branch-retry", &message, PickerKind::Branch, &theme, cx)
+                self.retry_row(
+                    "branch-retry",
+                    &message,
+                    PickerKind::Branch,
+                    &theme,
+                    window,
+                    cx,
+                )
             }
             Loadable::Ready(_) if rows.is_empty() => div()
                 .p(px(Theme::SPACE_SM))
@@ -4521,7 +4555,11 @@ impl Pickers {
 
     /// Model picker with favorites and harness tabs above a scoped search.
     /// Existing chats show only their own harness tab and models.
-    fn render_harness_model_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_harness_model_popover(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let compact = self.compact_model_picker(cx);
         let height = self.menu_geometry().height.min(self.open_model_height);
         let (list_height, tray_height) = model_menu_budgets(height, self.setting_groups(cx).len());
@@ -4560,6 +4598,7 @@ impl Pickers {
                         &message,
                         PickerKind::HarnessModel,
                         &theme,
+                        window,
                         cx,
                     ))
                     .into_any_element();
@@ -4636,7 +4675,12 @@ impl Pickers {
                 .justify_center()
                 .cursor_pointer()
                 .when(!favorites_view, |el| {
-                    el.hover(|s| s.bg(crate::theme::ink(0.06)))
+                    el.hover_bg(
+                        "model-tab-favorites-hover",
+                        window,
+                        gpui::transparent_black(),
+                        crate::theme::ink(0.06),
+                    )
                 })
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.setting_menu = None;
@@ -4676,7 +4720,14 @@ impl Pickers {
                         .items_center()
                         .justify_center()
                         .cursor_pointer()
-                        .when(!is_viewed, |el| el.hover(|s| s.bg(crate::theme::ink(0.06))))
+                        .when(!is_viewed, |el| {
+                            el.hover_bg(
+                                ("harness-tab-hover", ix),
+                                window,
+                                gpui::transparent_black(),
+                                crate::theme::ink(0.06),
+                            )
+                        })
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.setting_menu = None;
                             this.model_rail = ModelRail::Harness;
@@ -4695,7 +4746,7 @@ impl Pickers {
         }
 
         if compact {
-            tabs = self.compact_model_back_header(cx);
+            tabs = self.compact_model_back_header(window, cx);
         }
 
         // ── search row: icon + borderless input over a full-bleed hairline.
@@ -4737,13 +4788,13 @@ impl Pickers {
                 gpui::uniform_list(
                     "model-menu-scroll",
                     rows.len(),
-                    move |range, _window, app| {
+                    move |range, window, app| {
                         entity.update(app, |this, cx| {
                             range
                                 .filter_map(|ix| {
                                     row_data
                                         .get(ix)
-                                        .map(|row| this.render_model_row(ix, row, cx))
+                                        .map(|row| this.render_model_row(ix, row, window, cx))
                                 })
                                 .collect::<Vec<AnyElement>>()
                         })
@@ -4775,6 +4826,7 @@ impl Pickers {
                         &message,
                         PickerKind::HarnessModel,
                         &theme,
+                        window,
                         cx,
                     )]
                 }
@@ -4798,6 +4850,7 @@ impl Pickers {
                     &message,
                     PickerKind::HarnessModel,
                     &theme,
+                    window,
                     cx,
                 )
             });
@@ -4876,10 +4929,11 @@ impl Pickers {
         &mut self,
         ix: usize,
         row: &ModelRowData,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if self.compact_model_picker(cx) {
-            return self.render_compact_model_row(ix, row, cx);
+            return self.render_compact_model_row(ix, row, window, cx);
         }
         let theme = Theme::of(cx).for_popup();
         let effective = self.effective_harness(cx);
@@ -5124,7 +5178,12 @@ impl Pickers {
                 .items_center()
                 .justify_center()
                 .cursor_pointer()
-                .hover(|s| s.bg(crate::theme::ink(0.08)))
+                .hover_bg(
+                    ("model-star-hover", ix),
+                    window,
+                    gpui::transparent_black(),
+                    crate::theme::ink(0.08),
+                )
                 .on_click(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
                     this.toggle_model_favorite(harness, &star_model, cx);
@@ -6591,7 +6650,7 @@ impl Render for Pickers {
                 let menu = if self.compact_model_picker(cx) {
                     self.render_compact_menu(window, cx)
                 } else {
-                    let content = self.render_harness_model_popover(cx);
+                    let content = self.render_harness_model_popover(window, cx);
                     self.popover_frame_flush(304.0, content, cx)
                 };
                 Some((PickerKind::HarnessModel, menu))
@@ -7350,10 +7409,10 @@ mod tests {
             bounds: Rc<Cell<gpui::Bounds<gpui::Pixels>>>,
         }
         impl Render for Fixture {
-            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
                 let measured = self.bounds.clone();
                 let menu = self.pickers.update(cx, |pickers, cx| {
-                    let content = pickers.render_harness_model_popover(cx);
+                    let content = pickers.render_harness_model_popover(window, cx);
                     pickers.popover_frame_flush(304.0, content, cx)
                 });
                 div().size_full().relative().child(
@@ -8264,10 +8323,10 @@ mod tests {
             bounds: Rc<Cell<gpui::Bounds<gpui::Pixels>>>,
         }
         impl Render for CardFixture {
-            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
                 let measured = self.bounds.clone();
                 let menu = self.pickers.update(cx, |pickers, cx| {
-                    let content = pickers.render_harness_model_popover(cx);
+                    let content = pickers.render_harness_model_popover(window, cx);
                     pickers.popover_frame_flush(304.0, content, cx)
                 });
                 div().size_full().relative().child(
@@ -8460,10 +8519,10 @@ mod tests {
             bounds: Rc<Cell<gpui::Bounds<gpui::Pixels>>>,
         }
         impl Render for MouseFixture {
-            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
                 let measured = self.bounds.clone();
                 let menu = self.pickers.update(cx, |pickers, cx| {
-                    let content = pickers.render_harness_model_popover(cx);
+                    let content = pickers.render_harness_model_popover(window, cx);
                     pickers.popover_frame_flush(304.0, content, cx)
                 });
                 div().size_full().relative().child(

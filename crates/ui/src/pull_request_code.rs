@@ -363,7 +363,7 @@ impl PullRequestDetailPage {
             _ => None,
         };
         match row {
-            StreamRow::File(file) => self.file_header(file, false, &theme, cx),
+            StreamRow::File(file) => self.file_header(file, false, &theme, window, cx),
             StreamRow::Row(ix) => {
                 let row = &rows[ix];
                 meta(row, &theme).unwrap_or_else(|| {
@@ -424,6 +424,7 @@ impl PullRequestDetailPage {
         file: usize,
         sticky: bool,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let path = self
@@ -475,7 +476,6 @@ impl PullRequestDetailPage {
             .items_center()
             .gap(px(8.0))
             .px(px(Theme::SPACE_MD))
-            .bg(rest)
             .when(!sticky && file > 0, |el| {
                 el.border_t_1().border_color(theme.border)
             })
@@ -485,15 +485,16 @@ impl PullRequestDetailPage {
             })
             .when(sticky, |el| el.block_mouse_except_scroll())
             .cursor_pointer()
-            .hover(move |style| style.bg(hover))
+            .hover_bg(format!("{prefix}-{file}-hover"), window, rest, hover)
             .focus_visible(|style| style.border_2().border_color(theme.accent))
             .on_click(cx.listener(move |page, _, _, cx| page.toggle_fold(file, cx)))
             .child(
-                crate::icons::icon(if collapsed {
-                    crate::icons::ALT_ARROW_RIGHT
-                } else {
-                    crate::icons::ALT_ARROW_DOWN
-                })
+                crate::icons::disclosure_chevron(
+                    format!("{prefix}-{file}-chevron"),
+                    !collapsed,
+                    window,
+                    cx,
+                )
                 .size(px(13.0))
                 .flex_none()
                 .text_color(theme.text_muted.opacity(0.7)),
@@ -537,7 +538,12 @@ impl PullRequestDetailPage {
 
     /// The current file's header, pinned over the stream while its body
     /// scrolls and pushed up by the next file's header.
-    fn sticky_header(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn sticky_header(
+        &self,
+        theme: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let top = self.review.list.logical_scroll_top();
         let file = file_at(&self.review.ranges, top.item_ix)?;
         let range = self.review.ranges.get(file)?;
@@ -550,7 +556,7 @@ impl PullRequestDetailPage {
             let bounds = self.review.list.bounds_for_item(next.start)?;
             Some((bounds.origin.y - self.review.list.viewport_bounds().origin.y).as_f32())
         });
-        let header = self.file_header(file, true, theme, cx);
+        let header = self.file_header(file, true, theme, window, cx);
         // A faint veil of the content plane melts the blurred glyphs beneath
         // without lifting the header above the rows' own tone.
         let header = if theme.is_frost() {
@@ -582,6 +588,7 @@ impl PullRequestDetailPage {
         active: Option<usize>,
         wide: bool,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let entries = tree(&self.parsed_diff().files, &self.file_query);
@@ -673,9 +680,17 @@ impl PullRequestDetailPage {
                         .rounded(px(6.0))
                         .text_size(px(12.0))
                         .text_color(if selected { theme.text } else { theme.text_dim })
-                        .when(selected, |el| el.bg(theme.glass_hover()))
                         .cursor_pointer()
-                        .hover(|style| style.bg(theme.glass_hover()))
+                        .hover_bg(
+                            format!("pr-file-{index}-hover"),
+                            window,
+                            if selected {
+                                theme.glass_hover()
+                            } else {
+                                gpui::transparent_black()
+                            },
+                            theme.glass_hover(),
+                        )
                         .child(
                             crate::file_icons::icon(
                                 crate::file_icons::FileIconIdentity::file(path),
@@ -754,7 +769,6 @@ impl PullRequestDetailPage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let _ = window;
         let wide = self.code_pane_width.is_some_and(|width| width >= WIDE_MIN);
         let loading = self.diff.is_none();
         let active = self.active_file();
@@ -893,7 +907,7 @@ impl PullRequestDetailPage {
                     .size_full()
                     .with_sizing_behavior(gpui::ListSizingBehavior::Auto),
                 )
-                .children(self.sticky_header(theme, cx))
+                .children(self.sticky_header(theme, window, cx))
             }
         });
         let editor = div()
@@ -940,6 +954,12 @@ impl PullRequestDetailPage {
                         .border_color(theme.border)
                         .bg(theme.surface_raised)
                         .shadow_lg()
+                        .opacity(crate::motion::entrance(
+                            window,
+                            "pr-file-picker-enter",
+                            crate::motion::FADE_QUICK,
+                            crate::motion::reduced_motion(cx),
+                        ))
                         .occlude()
                         .on_key_down(cx.listener(|page, event: &gpui::KeyDownEvent, window, cx| {
                             if event.keystroke.key == "escape" {
@@ -949,7 +969,7 @@ impl PullRequestDetailPage {
                                 cx.notify();
                             }
                         }))
-                        .child(self.file_tree(active, false, theme, cx)),
+                        .child(self.file_tree(active, false, theme, window, cx)),
                 )
             });
         div()
@@ -969,7 +989,7 @@ impl PullRequestDetailPage {
                         .flex_none()
                         .h_full()
                         .min_h_0()
-                        .child(self.file_tree(active, true, theme, cx)),
+                        .child(self.file_tree(active, true, theme, window, cx)),
                 )
             })
             .child(editor)

@@ -100,7 +100,7 @@ impl ThreadNamingCard {
 }
 
 impl Render for ThreadNamingCard {
-    fn render(&mut self, _: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::toast::take_error(&mut self.error, cx);
         let theme = Theme::of(cx).for_settings_surface();
         let follows_session = self
@@ -116,8 +116,13 @@ impl Render for ThreadNamingCard {
                 .gap(px(4.0))
                 .when(!follows_session, |row| {
                     row.child(
-                        widgets::text_action(&theme, widgets::ActionTone::Quiet, "Reset")
-                            .id("thread-naming-reset")
+                        widgets::action(
+                            &theme,
+                            widgets::ActionTone::Quiet,
+                            "thread-naming-reset",
+                            window,
+                        )
+                        .child("Reset")
                             .tab_index(0)
                             .role(gpui::Role::Button)
                             .aria_label("Name threads with the session agent")

@@ -24,7 +24,7 @@ use zeron_proto::{
 use zeron_rpc::methods;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
-use crate::motion::AnimationExt;
+use crate::motion::{self, AnimationExt, HoverFade as _};
 use crate::popover::{self, Popup};
 use crate::settings::{
     self, GitHistoryAuthorDisplay, GitHistoryColumn, GitHistoryColumnOrder, GitHistoryColumnWidths,
@@ -1207,7 +1207,7 @@ struct HistoryRefTooltip {
 }
 
 impl Render for HistoryRefTooltip {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx);
         let longest = self
             .descriptions
@@ -1216,7 +1216,7 @@ impl Render for HistoryRefTooltip {
             .max()
             .unwrap_or_default();
         let width = (longest as f32 * 6.4 + 16.0).clamp(72.0, 360.0);
-        div()
+        let card = div()
             .w(px(width))
             .px(px(8.0))
             .py(px(6.0))
@@ -1237,7 +1237,8 @@ impl Render for HistoryRefTooltip {
                     .whitespace_nowrap()
                     .font_family(theme.font_mono.clone())
                     .child(description)
-            }))
+            }));
+        crate::popover::tooltip_surface(card, None, window, cx)
     }
 }
 
@@ -1246,10 +1247,10 @@ struct HistoryAuthorTooltip {
 }
 
 impl Render for HistoryAuthorTooltip {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx);
         let width = (self.name.chars().count() as f32 * 6.2 + 16.0).clamp(72.0, 260.0);
-        div()
+        let card = div()
             .w(px(width))
             .px(px(8.0))
             .py(px(5.0))
@@ -1262,7 +1263,8 @@ impl Render for HistoryAuthorTooltip {
             .whitespace_nowrap()
             .text_size(px(11.0))
             .text_color(theme.text_muted)
-            .child(self.name.clone())
+            .child(self.name.clone());
+        crate::popover::tooltip_surface(card, None, window, cx)
     }
 }
 
@@ -1344,6 +1346,7 @@ pub struct GitHistory {
     hovered_path: Option<usize>,
     hovered_graph_path: Option<usize>,
     hovered_row_path: Option<usize>,
+    hovered_row: Option<usize>,
     graph_hover_active: bool,
     graph_hover_clear_task: Option<Task<()>>,
     column_drag_anchor: Option<HistoryColumnDragAnchor>,
@@ -1789,7 +1792,12 @@ impl Render for GitHistorySearchControl {
                     .justify_center()
                     .rounded(px(3.5))
                     .cursor_pointer()
-                    .hover(|style| style.bg(crate::theme::ink(0.08)))
+                    .hover_bg(
+                        "history-search-close-hover",
+                        window,
+                        gpui::transparent_black(),
+                        crate::theme::ink(0.08),
+                    )
                     .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
                         window.prevent_default()
                     })
@@ -1990,6 +1998,7 @@ impl GitHistory {
             hovered_path: None,
             hovered_graph_path: None,
             hovered_row_path: None,
+            hovered_row: None,
             graph_hover_active: false,
             graph_hover_clear_task: None,
             column_drag_anchor: None,
@@ -2048,6 +2057,7 @@ impl GitHistory {
             self.hovered_path = None;
             self.hovered_graph_path = None;
             self.hovered_row_path = None;
+            self.hovered_row = None;
             self.graph_hover_active = false;
             self.graph_hover_clear_task = None;
             self.avatar_images.clear();
@@ -2092,6 +2102,7 @@ impl GitHistory {
         self.hovered_path = None;
         self.hovered_graph_path = None;
         self.hovered_row_path = None;
+        self.hovered_row = None;
         self.graph_hover_active = false;
         self.graph_hover_clear_task = None;
         self.avatar_images.clear();
@@ -2247,6 +2258,7 @@ impl GitHistory {
         self.hovered_path = None;
         self.hovered_graph_path = None;
         self.hovered_row_path = None;
+        self.hovered_row = None;
         self.graph_hover_active = false;
         self.graph_hover_clear_task = None;
         cx.notify();
@@ -2412,6 +2424,7 @@ impl GitHistory {
         self.hovered_path = None;
         self.hovered_graph_path = None;
         self.hovered_row_path = None;
+        self.hovered_row = None;
         self.graph_hover_active = false;
         self.graph_hover_clear_task = None;
         cx.notify();
@@ -3006,6 +3019,7 @@ impl GitHistory {
         left: HistoryDataColumn,
         right: HistoryDataColumn,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let hover = theme.border_strong;
@@ -3019,7 +3033,12 @@ impl GitHistory {
             .bottom_0()
             .w(px(6.0))
             .cursor_col_resize()
-            .hover(move |style| style.bg(hover.opacity(0.7)))
+            .hover_bg(
+                format!("history-resize-hover-{left:?}-{right:?}"),
+                window,
+                gpui::transparent_black(),
+                hover.opacity(0.7),
+            )
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
@@ -3056,6 +3075,7 @@ impl GitHistory {
         drag: Option<HistoryColumnDragState>,
         widths: GitHistoryColumnWidths,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let data_column = history_data_column(column);
@@ -3067,7 +3087,7 @@ impl GitHistory {
             GitHistoryColumn::Date => "history-date-header",
             GitHistoryColumn::Sha => "history-sha-header",
         };
-        let resize = self.column_resize_handle(left, data_column, theme, cx);
+        let resize = self.column_resize_handle(left, data_column, theme, window, cx);
         let indicator = drag
             .filter(|state| state.over == index && state.from != state.over)
             .map(|state| {
@@ -3898,6 +3918,7 @@ impl GitHistory {
         copied: bool,
         opacity: f32,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let label = if copied {
@@ -3923,7 +3944,12 @@ impl GitHistory {
                     .items_center()
                     .rounded(px(4.0))
                     .cursor_pointer()
-                    .hover(|style| style.bg(crate::theme::ink(0.07)))
+                    .hover_bg(
+                        ("history-sha-hover", index),
+                        window,
+                        gpui::transparent_black(),
+                        crate::theme::ink(0.07),
+                    )
                     .font_family(theme.font_mono.clone())
                     .text_size(px(10.5))
                     .text_color(if copied {
@@ -3943,7 +3969,7 @@ impl GitHistory {
     fn render_row(
         &mut self,
         index: usize,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if index >= self.visible_commits.len() {
@@ -3987,11 +4013,19 @@ impl GitHistory {
                 .when(!pending, |element| {
                     element
                         .cursor_pointer()
-                        .hover(|style| {
-                            style
-                                .bg(theme.element_hover)
-                                .border_color(theme.border_strong.opacity(0.75))
-                                .text_color(theme.text)
+                        .hover_fade("history-load-older-hover", window, |element, t| {
+                            element
+                                .bg(motion::mix(
+                                    theme.surface_raised.opacity(0.72),
+                                    theme.element_hover,
+                                    t,
+                                ))
+                                .border_color(motion::mix(
+                                    theme.border.opacity(0.85),
+                                    theme.border_strong.opacity(0.75),
+                                    t,
+                                ))
+                                .text_color(motion::mix(theme.text_muted, theme.text, t))
                         })
                         .on_click(cx.listener(|this, _, _, cx| this.load_older(cx)))
                 })
@@ -4056,6 +4090,15 @@ impl GitHistory {
             .filter(|_| row_is_focused)
             .map(|focus| crate::theme::ink(0.018 * focus.amount));
         let row_hover_path = graph_row.node_color_id;
+        // The row's own hover listener tracks lanes, so the wash follows
+        // `hovered_row` instead of a second listener.
+        let row_hover = motion::transition(
+            window,
+            ("history-row-wash", index),
+            if self.hovered_row == Some(index) { 1.0 } else { 0.0 },
+            motion::HOVER_FADE,
+            motion::reduced_motion(cx),
+        );
         let optional_cells = visible_history_columns(&column_order, columns)
             .into_iter()
             .map(|column| match column {
@@ -4082,6 +4125,7 @@ impl GitHistory {
                     copied,
                     row_content_opacity,
                     &theme,
+                    window,
                     cx,
                 ),
             })
@@ -4097,9 +4141,18 @@ impl GitHistory {
             .items_center()
             .text_size(px(11.0))
             .cursor_pointer()
-            .when_some(focused_row_wash, |element, wash| element.bg(wash))
-            .hover(|style| style.bg(crate::theme::ink(0.025)))
+            .bg(motion::mix(
+                focused_row_wash.unwrap_or(gpui::transparent_black()),
+                crate::theme::ink(0.025),
+                row_hover,
+            ))
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                if *hovered {
+                    this.hovered_row = Some(index);
+                } else if this.hovered_row == Some(index) {
+                    this.hovered_row = None;
+                }
+                cx.notify();
                 this.set_row_hover((*hovered).then_some(row_hover_path), cx);
             }))
             // A commit row click opens the commit as its own diff tab (the
@@ -4184,7 +4237,7 @@ impl GitHistory {
 }
 
 impl Render for GitHistory {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_loaded(cx);
         if !cx.has_active_drag() {
             self.column_drag = None;
@@ -4210,6 +4263,7 @@ impl Render for GitHistory {
                 self.column_drag,
                 column_widths,
                 &theme,
+                window,
                 cx,
             ));
             previous = history_data_column(column);
@@ -4241,7 +4295,12 @@ impl Render for GitHistory {
             .opacity(0.0)
             .group_hover("history-column-header", |style| style.opacity(1.0))
             .when(self.column_menu.is_open(), |button| button.opacity(1.0))
-            .hover(|style| style.bg(crate::theme::ink(0.08)))
+            .hover_bg(
+                "history-columns-button-hover",
+                window,
+                gpui::transparent_black(),
+                crate::theme::ink(0.08),
+            )
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {

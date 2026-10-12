@@ -64,7 +64,7 @@ struct RenameDialog {
 pub struct DevicesPage {
     state: Entity<AppState>,
     scroll: widgets::PageScroll,
-    rename: Option<RenameDialog>,
+    rename: popover::Popup<RenameDialog>,
     /// Device id whose id-chip shows "Copied" right now.
     copied: Option<String>,
     error: Option<SharedString>,
@@ -79,7 +79,7 @@ impl DevicesPage {
         Self {
             state,
             scroll: widgets::PageScroll::default(),
-            rename: None,
+            rename: popover::Popup::default(),
             copied: None,
             error: None,
             task: None,
@@ -101,7 +101,7 @@ impl DevicesPage {
                 this.submit_rename(cx);
             }
         });
-        self.rename = Some(RenameDialog {
+        self.rename.open(RenameDialog {
             device_id,
             input,
             _events: events,
@@ -112,20 +112,21 @@ impl DevicesPage {
     /// Escape that reached Settings unclaimed closes the rename dialog first,
     /// so it never closes Settings under the dialog. Returns whether it did.
     pub(crate) fn dismiss_on_escape(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.rename.take().is_none() {
+        if !self.rename.is_open() {
             return false;
         }
-        cx.notify();
+        popover::close_popup(self, cx, |this| &mut this.rename);
         true
     }
 
     fn submit_rename(&mut self, cx: &mut Context<Self>) {
-        let Some(dialog) = self.rename.take() else {
+        let Some(dialog) = self.rename.as_open() else {
             return;
         };
+        let device_id = dialog.device_id.clone();
         let name = dialog.input.read(cx).text().trim().to_string();
+        popover::close_popup(self, cx, |this| &mut this.rename);
         if name.is_empty() {
-            cx.notify();
             return;
         }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
@@ -133,7 +134,7 @@ impl DevicesPage {
         };
         let params = serde_json::json!({
             "op": "renameDevice",
-            "deviceId": dialog.device_id,
+            "deviceId": device_id,
             "name": name,
         });
         self.task = Some(cx.spawn(async move |this, cx| {
@@ -167,11 +168,11 @@ impl DevicesPage {
 
     fn render_rename_dialog(
         &mut self,
-        viewport: gpui::Size<gpui::Pixels>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let theme = Theme::of(cx).for_popup();
-        let dialog = self.rename.as_ref()?;
+        let dialog = self.rename.get()?;
         let input = dialog.input.clone();
         let card = popover::dialog_card(&theme)
             .id("rename-device-card")
@@ -179,8 +180,7 @@ impl DevicesPage {
             .aria_label("Rename device")
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                 if event.keystroke.key == "escape" {
-                    this.rename = None;
-                    cx.notify();
+                    popover::close_popup(this, cx, |this| &mut this.rename);
                     cx.stop_propagation();
                 }
             }))
@@ -198,19 +198,23 @@ impl DevicesPage {
                     .justify_end()
                     .gap(px(8.0))
                     .child(
-                        widgets::text_action(&theme, widgets::ActionTone::Quiet, "Cancel")
-                            .id("rename-cancel")
-                            .tab_index(0)
-                            .role(gpui::Role::Button)
-                            .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.rename = None;
-                                cx.notify();
-                            })),
+                        widgets::action(
+                            &theme,
+                            widgets::ActionTone::Quiet,
+                            "rename-cancel",
+                            window,
+                        )
+                        .child("Cancel")
+                        .tab_index(0)
+                        .role(gpui::Role::Button)
+                        .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            popover::close_popup(this, cx, |this| &mut this.rename);
+                        })),
                     )
                     .child(
-                        widgets::text_action(&theme, widgets::ActionTone::Solid, "Rename")
-                            .id("rename-save")
+                        widgets::action(&theme, widgets::ActionTone::Solid, "rename-save", window)
+                            .child("Rename")
                             .tab_index(0)
                             .role(gpui::Role::Button)
                             .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
@@ -218,7 +222,12 @@ impl DevicesPage {
                     ),
             )
             .into_any_element();
-        Some(popover::modal("rename-device-dialog", viewport, card))
+        Some(popover::modal(
+            "rename-device-dialog",
+            window.viewport_size(),
+            card,
+            self.rename.closing_since(),
+        ))
     }
 
     fn on_scroll_hovered(&mut self, hovered: &bool, _: &mut Window, cx: &mut Context<Self>) {
@@ -274,14 +283,14 @@ impl Render for DevicesPage {
             )
         };
         let copied = self.copied.clone();
-        let dialog = self.render_rename_dialog(window.viewport_size(), cx);
+        let dialog = self.render_rename_dialog(window, cx);
         // Split into this device and the rest; each renders as rows in one
         // block, like every other settings page.
         let (local, others): (Vec<_>, Vec<_>) = devices
             .into_iter()
             .enumerate()
             .partition(|(_, device)| local_id.as_deref() == Some(device.id.as_str()));
-        let device_row = |ix: usize, device: zeron_proto::Device, first: bool| {
+        let mut device_row = |ix: usize, device: zeron_proto::Device, first: bool| {
             let online = device_online(device.last_seen_at, now);
             let is_local = local_id.as_deref() == Some(device.id.as_str());
             let id_copied = copied.as_deref() == Some(device.id.as_str());
@@ -333,12 +342,13 @@ impl Render for DevicesPage {
                         .items_center()
                         .gap(px(4.0))
                         .child(
-                            widgets::text_action(
+                            widgets::action(
                                 &theme,
                                 widgets::ActionTone::Quiet,
-                                if id_copied { "Copied" } else { "Copy ID" },
+                                ("device-id", ix),
+                                window,
                             )
-                            .id(("device-id", ix))
+                            .child(if id_copied { "Copied" } else { "Copy ID" })
                             .tab_index(0)
                             .role(gpui::Role::Button)
                             .aria_label(format!("Copy device ID {}", device.id))
@@ -350,15 +360,22 @@ impl Render for DevicesPage {
                             )),
                         )
                         .child(
-                            widgets::text_action(&theme, widgets::ActionTone::Filled, "Rename")
-                                .id(("device-rename", ix))
-                                .tab_index(0)
-                                .role(gpui::Role::Button)
-                                .aria_label(format!("Rename {}", device.name))
-                                .focus_visible(|s| s.border_2().border_color(theme.accent))
-                                .on_click(cx.listener(move |this, _, _, cx| {
+                            widgets::action(
+                                &theme,
+                                widgets::ActionTone::Filled,
+                                ("device-rename", ix),
+                                window,
+                            )
+                            .child("Rename")
+                            .tab_index(0)
+                            .role(gpui::Role::Button)
+                            .aria_label(format!("Rename {}", device.name))
+                            .focus_visible(|s| s.border_2().border_color(theme.accent))
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
                                     this.open_rename(rename_id.clone(), rename_name.clone(), cx);
-                                })),
+                                },
+                            )),
                         ),
                 )
                 .into_any_element()

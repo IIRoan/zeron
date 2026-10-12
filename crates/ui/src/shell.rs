@@ -35,7 +35,8 @@ use crate::files::{
 use crate::icons::{self, icon};
 use crate::loaders;
 use crate::motion::{
-    self, AnimationExt as _, MotionSpec, PANEL_RESIZE, RESIZE, SPLASH_OUT, TAB_SLIDE,
+    self, AnimationExt as _, HoverFade as _, MotionSpec, PANEL_RESIZE, RESIZE, SPLASH_OUT,
+    TAB_SLIDE,
 };
 use crate::popover::{self, Loadable};
 use crate::pull_requests::PullRequestsPage;
@@ -1304,7 +1305,7 @@ struct SurfaceTabTooltip {
 }
 
 impl Render for SurfaceTabTooltip {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx);
         let card = div()
             .max_w(px(380.0))
@@ -1317,7 +1318,7 @@ impl Render for SurfaceTabTooltip {
             .text_size(px(10.5))
             .text_color(theme.text_muted)
             .child(self.text.clone());
-        crate::frost::frosted(6.0, crate::frost::MENU_BLUR, card)
+        crate::popover::tooltip_surface(card, Some(6.0), window, cx)
     }
 }
 /// Drag marker for the terminal-panel height handle.
@@ -2036,7 +2037,7 @@ pub struct Shell {
     file_surface_seq: u64,
     pending_file_closes: std::collections::HashSet<RightSurface>,
     file_close_dialog: Option<FileCloseDialog>,
-    release_notes_dialog: Option<release_notes_ui::ReleaseNotesDialog>,
+    release_notes_dialog: popover::Popup<release_notes_ui::ReleaseNotesDialog>,
     _release_notes_observation: Option<Subscription>,
     pending_exit: Option<PendingExit>,
     /// Event hookups for [`Self::diffs`] (History rows opening commit tabs).
@@ -2106,29 +2107,31 @@ pub struct Shell {
     chat_copy_left: bool,
     /// The chat title being edited in place on its row.
     chat_rename: Option<ChatRename>,
-    /// Chat id awaiting delete confirmation.
-    delete_confirm: Option<String>,
+    /// Chat id awaiting delete confirmation, with the title it showed (the
+    /// exit animation outlives the deleted chat).
+    delete_confirm: popover::Popup<(String, SharedString)>,
     /// Global confirmation dialog for the Changes-pane trash action. The RPC
     /// task is retained separately so rerenders do not cancel it.
-    discard_working_tree: Option<DiscardWorkingTreeRequest>,
+    discard_working_tree: popover::Popup<DiscardWorkingTreeRequest>,
     discard_working_tree_task: Option<Task<()>>,
     /// Space-row context menu (dropdown rows): (space id, window position).
     space_menu: popover::Popup<(String, Point<Pixels>)>,
-    rename_space_dialog: Option<RenameSpaceDialog>,
+    rename_space_dialog: popover::Popup<RenameSpaceDialog>,
     sidebar_section_migration: Option<(String, crate::state::EngineHandle)>,
-    section_dialog: Option<sidebar_sections::SectionDialog>,
+    section_dialog: popover::Popup<sidebar_sections::SectionDialog>,
     section_menu: Option<(String, Point<Pixels>)>,
     section_header_hover: Option<String>,
     section_menu_focus: FocusHandle,
     section_menu_active: Option<usize>,
-    /// Space id awaiting delete confirmation (hard delete + session cascade).
-    delete_space_confirm: Option<String>,
+    /// Space id awaiting delete confirmation (hard delete + session cascade),
+    /// with the warning it showed (the exit animation outlives the space).
+    delete_space_confirm: popover::Popup<(String, SharedString)>,
     /// The add-space palette (device tabs + folder search), `Some`
     /// while open.
-    add_space: Option<AddSpaceFlow>,
+    add_space: popover::Popup<AddSpaceFlow>,
     /// The New project palette's collapsed-breadcrumbs (`…`) menu.
     project_crumb_menu: popover::Popup<()>,
-    command_palette: Option<command_palette::CommandPalette>,
+    command_palette: popover::Popup<command_palette::CommandPalette>,
     /// The focus whose workspace search index was last warmed (see `search_warm`).
     search_warm: Option<search_warm::SearchWarm>,
     /// Per chat, the files opened in editor tabs, most recent first.
@@ -2553,7 +2556,7 @@ impl Shell {
             files_subs: std::collections::HashMap::new(),
             file_surfaces: std::collections::HashMap::new(),
             file_close_dialog: None,
-            release_notes_dialog: None,
+            release_notes_dialog: popover::Popup::default(),
             _release_notes_observation: crate::release_notes::ReleaseNotes::global(cx)
                 .map(|notes| cx.observe(&notes, |_, _, cx| cx.notify())),
             file_surface_paths: std::collections::HashMap::new(),
@@ -2615,21 +2618,21 @@ impl Shell {
             chat_copy_bounds: None,
             chat_copy_left: false,
             chat_rename: None,
-            delete_confirm: None,
-            discard_working_tree: None,
+            delete_confirm: popover::Popup::default(),
+            discard_working_tree: popover::Popup::default(),
             discard_working_tree_task: None,
             space_menu: popover::Popup::default(),
-            rename_space_dialog: None,
+            rename_space_dialog: popover::Popup::default(),
             sidebar_section_migration: None,
-            section_dialog: None,
+            section_dialog: popover::Popup::default(),
             section_menu: None,
             section_header_hover: None,
             section_menu_focus: cx.focus_handle(),
             section_menu_active: None,
-            delete_space_confirm: None,
-            add_space: None,
+            delete_space_confirm: popover::Popup::default(),
+            add_space: popover::Popup::default(),
             project_crumb_menu: popover::Popup::default(),
-            command_palette: None,
+            command_palette: popover::Popup::default(),
             search_warm: None,
             recent_files: std::collections::HashMap::new(),
             pending_workspace_command: None,
@@ -2856,9 +2859,7 @@ impl Shell {
             self.debug_dialog = None;
             match which.as_str() {
                 "rename" => self.open_rename_chat(first, cx),
-                "delete" => {
-                    self.delete_confirm = Some(first);
-                }
+                "delete" => self.open_delete_confirm(first, cx),
                 _ => {}
             }
         }
@@ -4303,7 +4304,7 @@ impl Shell {
                     }
                     ChangesEvent::DiscardWorkingTree(request) => {
                         if this.discard_working_tree_task.is_none() {
-                            this.discard_working_tree = Some(request.clone());
+                            this.discard_working_tree.open(request.clone());
                             cx.notify();
                         }
                     }
@@ -5122,7 +5123,7 @@ impl Shell {
     // ---- routes / settings ----
 
     fn set_route(&mut self, route: Route, cx: &mut Context<Self>) {
-        self.command_palette = None;
+        self.dismiss_command_palette(cx);
         let was_pull_requests = matches!(self.route, Route::PullRequests);
         let will_show_pull_requests = matches!(route, Route::PullRequests);
         if was_pull_requests && !will_show_pull_requests {
@@ -5135,6 +5136,15 @@ impl Shell {
             if let Some(page) = self.pull_requests_page.as_ref().cloned() {
                 page.update(cx, |page, cx| page.on_visible(cx));
             }
+        }
+    }
+
+    /// What the main outlet shows, so a swap replays its entrance.
+    fn outlet_key(&self) -> u64 {
+        match (&self.route, &self.pull_request_detail) {
+            (Route::PullRequests, Some(detail)) => detail.entity_id().as_u64(),
+            (Route::PullRequests, None) => 1,
+            _ => 0,
         }
     }
 
@@ -5511,7 +5521,7 @@ impl Shell {
 
     pub(crate) fn open_settings(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
         let section = section.canonical();
-        self.command_palette = None;
+        self.dismiss_command_palette(cx);
         // Recreate per visit: the page's ListHarnesses load re-probes which
         // CLIs are installed, so installing one shows up on the next open.
         if section == SettingsSection::Harnesses {
@@ -6445,14 +6455,14 @@ impl Shell {
     /// is not one: navigating leaves it, and its shortcut recorder intercepts
     /// the keys it records before they can dispatch.
     pub(super) fn overlay_owns_keyboard(&self, cx: &App) -> bool {
-        self.worktree_settings.editor.is_some()
-            || self.project_terminals.editor.is_some()
+        self.worktree_settings.editor.is_open()
+            || self.project_terminals.editor.is_open()
             || self.project_terminals.actions_menu.is_open()
-            || self.command_palette.is_some()
+            || self.command_palette.is_open()
             || self.voice.read(cx).stage_open
-            || self.section_dialog.is_some()
+            || self.section_dialog.is_open()
             || self.section_menu.is_some()
-            || self.add_space.is_some()
+            || self.add_space.is_open()
             || self.composer.read(cx).pickers().read(cx).is_open()
             || self.open_side_chat_pickers(cx).is_some()
     }
@@ -6498,8 +6508,23 @@ impl Shell {
         }
     }
 
+    fn open_delete_confirm(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        let title = transcript::single_line(
+            &self
+                .state
+                .read(cx)
+                .chats
+                .iter()
+                .find(|c| c.id == chat_id)
+                .and_then(|c| c.title.clone())
+                .unwrap_or_else(|| "New session".into()),
+        );
+        self.delete_confirm.open((chat_id, title.into()));
+        cx.notify();
+    }
+
     fn delete_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
-        self.delete_confirm = None;
+        popover::close_popup(self, cx, |this| &mut this.delete_confirm);
         if let Some(tabs) = self.right_tabs.get(&chat_id) {
             for surface in tabs {
                 if let RightSurface::Browser(id) = surface {
@@ -6526,11 +6551,11 @@ impl Shell {
         if self.discard_working_tree_task.is_some() {
             return;
         }
-        let Some(request) = self.discard_working_tree.clone() else {
+        let Some(request) = self.discard_working_tree.as_open().cloned() else {
             return;
         };
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.discard_working_tree = None;
+            popover::close_popup(self, cx, |this| &mut this.discard_working_tree);
             self.toasts.update(cx, |toasts, cx| toasts.error("Source Control".into(), "Engine is not connected.".into(), cx));
             cx.notify();
             return;
@@ -6552,7 +6577,7 @@ impl Shell {
 
         // Dismiss the confirmation immediately. The task remains retained so
         // repeat clicks cannot issue a second destructive request.
-        self.discard_working_tree = None;
+        popover::close_popup(self, cx, |this| &mut this.discard_working_tree);
         let notification = crate::progress_toast::PendingToast::start(self.toasts.clone(), "Source Control".into(), "Discarding working tree changes…".into(), cx);
         self.discard_working_tree_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
@@ -8027,6 +8052,13 @@ impl Shell {
         let footer_theme = Theme::of(cx).clone();
         let footer = self.render_sidebar_footer_row(&footer_theme, cx);
         let outlet = self.settings_outlet(section, window, cx);
+        let swap = motion::swap_entrance(
+            window,
+            "settings-outlet",
+            section as u64,
+            motion::FADE_IN,
+            motion::reduced_motion(cx),
+        );
         div()
             .id("settings-page")
             .role(gpui::Role::Group)
@@ -8104,7 +8136,7 @@ impl Shell {
                     .flex()
                     .flex_col()
                     .opacity(self.voice_stage_underlay_opacity(cx))
-                    .child(div().flex_1().min_h_0().child(outlet)),
+                    .child(motion::rise(div().flex_1().min_h_0(), swap).child(outlet)),
             )
             .child(
                 div()
@@ -8440,7 +8472,9 @@ impl Shell {
                 .child(label)
                 .into_any_element()
         } else if corner_hovered {
+            let key = format!("chat-row-archive-{id}");
             div()
+                .id(SharedString::from(key.clone()))
                 .flex()
                 .flex_row()
                 .items_center()
@@ -8450,8 +8484,12 @@ impl Shell {
                     el.px(px(4.0))
                         .mr(px(-4.0))
                         .rounded(px(5.0))
-                        .bg(crate::theme::wash(0.10))
-                        .hover(|s| s.bg(crate::theme::wash(0.18)))
+                        .bg(motion::hover_blend(
+                            &key,
+                            crate::theme::wash(0.10),
+                            crate::theme::wash(0.18),
+                        ))
+                        .on_hover(motion::hover_listener(key.clone()))
                 })
                 .child(
                     icon(if archived {
@@ -9647,7 +9685,8 @@ impl Shell {
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(tone)
                 .cursor_pointer()
-                .hover(move |s| s.bg(chip_bg_hover))
+                .bg(motion::hover_blend("github-star-banner", theme.accent_wash, chip_bg_hover))
+                .on_hover(motion::hover_listener("github-star-banner"))
                 .on_click(cx.listener(|this, _, _, cx| {
                     cx.open_url(GITHUB_REPO_URL);
                     this.dismiss_github_star_banner(cx);
@@ -9673,7 +9712,12 @@ impl Shell {
                         .items_center()
                         .justify_center()
                         .cursor_pointer()
-                        .hover(move |s| s.bg(close_bg_hover))
+                        .bg(motion::hover_blend(
+                            "github-star-banner-dismiss",
+                            gpui::transparent_black(),
+                            close_bg_hover,
+                        ))
+                        .on_hover(motion::hover_listener("github-star-banner-dismiss"))
                         .on_click(cx.listener(|this, _, _, cx| {
                             cx.stop_propagation();
                             this.dismiss_github_star_banner(cx);
@@ -9732,7 +9776,8 @@ impl Shell {
         if action != crate::app_update::StripAction::None {
             strip = strip
                 .cursor_pointer()
-                .hover(move |s| s.bg(chip_bg_hover))
+                .bg(motion::hover_blend("update-strip", chip_bg, chip_bg_hover))
+                .on_hover(motion::hover_listener("update-strip"))
                 .on_click(
                     cx.listener(move |this, _, _, cx| this.on_update_strip_click(action, cx)),
                 );
@@ -9907,21 +9952,21 @@ impl Shell {
                             }
                         }))
                 }
-                UpdatePromptButton::CheckAgain => popover::btn_primary(&theme, "Try again")
+                UpdatePromptButton::CheckAgain => popover::btn_primary(&theme, "Try again", "update-prompt-check")
                     .id("update-prompt-check")
                     .on_click(cx.listener(|_, _, _, cx| {
                         if let Some(update) = crate::app_update::AppUpdate::global(cx) {
                             update.update(cx, |update, cx| update.check_for_updates(cx));
                         }
                     })),
-                UpdatePromptButton::Download => popover::btn_primary(&theme, "Download")
+                UpdatePromptButton::Download => popover::btn_primary(&theme, "Download", "update-prompt-download")
                     .id("update-prompt-download")
                     .on_click(cx.listener(|_, _, _, cx| {
                         if let Some(update) = crate::app_update::AppUpdate::global(cx) {
                             update.update(cx, |update, cx| update.start_download(cx));
                         }
                     })),
-                UpdatePromptButton::Restart => popover::btn_primary(&theme, "Restart to update")
+                UpdatePromptButton::Restart => popover::btn_primary(&theme, "Restart to update", "update-prompt-restart")
                     .id("update-prompt-restart")
                     .on_click(cx.listener(|this, _, _, cx| {
                         let Some(update) = crate::app_update::AppUpdate::global(cx) else {
@@ -9934,7 +9979,7 @@ impl Shell {
                         }
                     })),
                 UpdatePromptButton::OpenDownloads => {
-                    popover::btn_primary(&theme, "Open download page")
+                    popover::btn_primary(&theme, "Open download page", "update-prompt-downloads")
                         .id("update-prompt-downloads")
                         .on_click(cx.listener(|_, _, _, cx| {
                             cx.open_url(zeron_update::LATEST_RELEASE_PAGE);
@@ -9950,7 +9995,7 @@ impl Shell {
             .child(div().mt(px(6.0)).child(popover::dialog_body(&theme, body)))
             .child(row)
             .into_any_element();
-        Some(popover::modal("update-prompt-dialog", viewport, card))
+        Some(popover::modal("update-prompt-dialog", viewport, card, None))
     }
 
     /// The sidebar's bottom row: account menu on the left, settings toggle on
@@ -10388,7 +10433,7 @@ impl Shell {
                                 })),
                         )
                         .child(
-                            popover::btn_primary(&theme, "Open browser again")
+                            popover::btn_primary(&theme, "Open browser again", "sync-enable-open-browser")
                                 .id("sync-enable-open-browser")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.start_sign_in(cx)
@@ -10446,7 +10491,7 @@ impl Shell {
                                 })),
                         )
                         .child(
-                            popover::btn_primary(&theme, "Bring my work")
+                            popover::btn_primary(&theme, "Bring my work", "sync-switch-import")
                                 .id("sync-switch-import")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.start_synced_switch(true, cx)
@@ -10454,7 +10499,7 @@ impl Shell {
                         );
                 } else {
                     actions = actions.child(
-                        popover::btn_primary(&theme, "Switch now")
+                        popover::btn_primary(&theme, "Switch now", "sync-switch-now")
                             .id("sync-switch-now")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.start_synced_switch(false, cx)
@@ -10552,7 +10597,7 @@ impl Shell {
                             .flex_row()
                             .justify_end()
                             .child(
-                                popover::btn_primary(&theme, "Continue")
+                                popover::btn_primary(&theme, "Continue", "sync-switch-done")
                                     .id("sync-switch-done")
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.sync_flow = SyncFlow::Idle;
@@ -10593,7 +10638,7 @@ impl Shell {
                                 })),
                         )
                         .child(
-                            popover::btn_primary(&theme, "Retry import")
+                            popover::btn_primary(&theme, "Retry import", "import-failed-retry")
                                 .id("import-failed-retry")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.spawn_local_import(cx)
@@ -10641,7 +10686,7 @@ impl Shell {
                                 })),
                         )
                         .child(
-                            popover::btn_primary(&theme, runtime_change_label)
+                            popover::btn_primary(&theme, runtime_change_label, "sync-restart-quit")
                                 .id("sync-restart-quit")
                                 .when(self.runtime_change_task.is_some(), |button| {
                                     button.opacity(0.6)
@@ -10676,7 +10721,7 @@ impl Shell {
                                 })),
                         )
                         .child(
-                            popover::btn_danger(&theme, "Sign out")
+                            popover::btn_danger(&theme, "Sign out", "signout-confirm")
                                 .id("signout-confirm")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.confirm_sign_out(cx)
@@ -10700,7 +10745,7 @@ impl Shell {
             | SyncFlow::SignedOutRestartRequired => return None,
         };
 
-        Some(popover::modal("sync-lifecycle-dialog", viewport, card))
+        Some(popover::modal("sync-lifecycle-dialog", viewport, card, None))
     }
 
     fn active_changes(&self, cx: &App) -> Option<Entity<Changes>> {
@@ -10728,11 +10773,11 @@ impl Shell {
             self.close_project_terminal_actions(cx);
             return true;
         }
-        if self.project_terminals.editor.is_some() {
+        if self.project_terminals.editor.is_open() {
             self.request_close_form(UnsavedForm::Services, window, cx);
             return true;
         }
-        if self.worktree_settings.editor.is_some() {
+        if self.worktree_settings.editor.is_open() {
             if self.dismiss_worktree_select(cx) {
                 return true;
             }
@@ -10743,8 +10788,8 @@ impl Shell {
         // their existing behavior: only surfaces that already have a Cancel
         // path close here; the others remain explicit blockers.
         if self.sync_flow.has_visible_overlay()
-            || self.delete_confirm.is_some()
-            || self.delete_space_confirm.is_some()
+            || self.delete_confirm.is_open()
+            || self.delete_space_confirm.is_open()
             || self.chat_menu.get().is_some()
             || self.space_menu.get().is_some()
             || self.user_menu.get().is_some()
@@ -10759,14 +10804,12 @@ impl Shell {
             self.finish_rename_chat(false, cx);
             return true;
         }
-        if self.rename_space_dialog.is_some() {
-            self.rename_space_dialog = None;
-            cx.notify();
+        if self.rename_space_dialog.is_open() {
+            popover::close_popup(self, cx, |this| &mut this.rename_space_dialog);
             return true;
         }
-        if self.discard_working_tree.is_some() {
-            self.discard_working_tree = None;
-            cx.notify();
+        if self.discard_working_tree.is_open() {
+            popover::close_popup(self, cx, |this| &mut this.discard_working_tree);
             return true;
         }
         if let Some(update) = crate::app_update::AppUpdate::global(cx)
@@ -10776,11 +10819,11 @@ impl Shell {
             return true;
         }
         // The folded-breadcrumbs menu floats over the palette; it closes first.
-        if self.add_space.is_some() && self.project_crumb_menu.is_open() {
+        if self.add_space.is_open() && self.project_crumb_menu.is_open() {
             self.close_project_crumb_menu(cx);
             return true;
         }
-        if self.add_space.is_some() {
+        if self.add_space.is_open() {
             self.close_add_space(cx);
             return true;
         }
@@ -10809,11 +10852,11 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.release_notes_dialog.is_some() {
+        if self.release_notes_dialog.is_open() {
             cx.stop_propagation();
             return;
         }
-        if self.project_terminals.discard.is_some() || self.worktree_settings.discard.is_some() {
+        if self.project_terminals.discard.is_open() || self.worktree_settings.discard.is_open() {
             cx.stop_propagation();
             return;
         }
@@ -10836,7 +10879,7 @@ impl Shell {
             cx.stop_propagation();
             return;
         }
-        if event.keystroke.key == "escape" && self.command_palette.is_some() {
+        if event.keystroke.key == "escape" && self.command_palette.is_open() {
             self.close_command_palette(window, cx);
             cx.stop_propagation();
             return;
@@ -11030,8 +11073,7 @@ impl Shell {
                     .text_color(theme.danger)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.close_chat_menu(cx);
-                        this.delete_confirm = Some(delete_id.clone());
-                        cx.notify();
+                        this.open_delete_confirm(delete_id.clone(), cx);
                     }))
                     .child(
                         icon(icons::TRASH_BIN_MINIMALISTIC)
@@ -11100,7 +11142,7 @@ impl Shell {
         if let Some(overlay) = self.render_project_action_overlay(viewport, window, cx) {
             overlays.push(overlay);
         }
-        if let Some(overlay) = self.render_worktree_settings(viewport, cx) {
+        if let Some(overlay) = self.render_worktree_settings(viewport, window, cx) {
             overlays.push(overlay);
         }
         if let Some(overlay) =
@@ -11108,7 +11150,7 @@ impl Shell {
         {
             overlays.push(overlay);
         }
-        if let Some(overlay) = self.render_project_terminal_editor(viewport, cx) {
+        if let Some(overlay) = self.render_project_terminal_editor(viewport, window, cx) {
             overlays.push(overlay);
         }
         if let Some(overlay) =
@@ -11120,17 +11162,7 @@ impl Shell {
             overlays.push(overlay);
         }
 
-        if let Some(chat_id) = self.delete_confirm.clone() {
-            let title = transcript::single_line(
-                &self
-                    .state
-                    .read(cx)
-                    .chats
-                    .iter()
-                    .find(|c| c.id == chat_id)
-                    .and_then(|c| c.title.clone())
-                    .unwrap_or_else(|| "New session".into()),
-            );
+        if let Some((chat_id, title)) = self.delete_confirm.get().cloned() {
             let card = popover::dialog_card(&theme)
                 .child(popover::dialog_title(&theme, "Delete session?"))
                 .child(div().mt(px(6.0)).child(popover::dialog_body(
@@ -11148,12 +11180,11 @@ impl Shell {
                             popover::btn_ghost(&theme, "Cancel", "delete-chat-cancel")
                                 .id("delete-chat-cancel")
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.delete_confirm = None;
-                                    cx.notify();
+                                    popover::close_popup(this, cx, |this| &mut this.delete_confirm);
                                 })),
                         )
                         .child(
-                            popover::btn_danger(&theme, "Delete")
+                            popover::btn_danger(&theme, "Delete", "delete-chat-confirm")
                                 .id("delete-chat-confirm")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.delete_chat(chat_id.clone(), cx)
@@ -11161,10 +11192,15 @@ impl Shell {
                         ),
                 )
                 .into_any_element();
-            overlays.push(popover::modal("delete-chat-dialog", viewport, card));
+            overlays.push(popover::modal(
+                "delete-chat-dialog",
+                viewport,
+                card,
+                self.delete_confirm.closing_since(),
+            ));
         }
 
-        if self.discard_working_tree.is_some() {
+        if self.discard_working_tree.get().is_some() {
             let card = popover::dialog_card(&theme)
                 .child(popover::dialog_title(
                     &theme,
@@ -11185,12 +11221,11 @@ impl Shell {
                             popover::btn_ghost(&theme, "Cancel", "discard-working-tree-cancel")
                                 .id("discard-working-tree-cancel")
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.discard_working_tree = None;
-                                    cx.notify();
+                                    popover::close_popup(this, cx, |this| &mut this.discard_working_tree);
                                 })),
                         )
                         .child(
-                            popover::btn_danger(&theme, "Discard changes")
+                            popover::btn_danger(&theme, "Discard changes", "discard-working-tree-confirm")
                                 .id("discard-working-tree-confirm")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.confirm_discard_working_tree(cx)
@@ -11202,6 +11237,7 @@ impl Shell {
                 "discard-working-tree-dialog",
                 viewport,
                 card,
+                self.discard_working_tree.closing_since(),
             ));
         }
 
@@ -11387,7 +11423,12 @@ impl Shell {
                                 .items_center()
                                 .justify_center()
                                 .cursor_pointer()
-                                .hover(|s| s.bg(theme.glass_hover()))
+                                .hover_bg(
+                                    "close-main-file-diff-wash",
+                                    window,
+                                    gpui::transparent_black(),
+                                    theme.glass_hover(),
+                                )
                                 .tooltip(crate::settings::widgets::text_tooltip(
                                     "Close diff and return to conversation",
                                 ))
@@ -11644,7 +11685,7 @@ impl Shell {
                                 )),
                         )
                         .child(
-                            popover::btn_primary(&theme_owned, "Add a project")
+                            popover::btn_primary(&theme_owned, "Add a project", "onboarding-add-space")
                                 .id("onboarding-add-space")
                                 .mt(px(20.0))
                                 .on_click(cx.listener(|this, _, _, cx| this.open_add_space(cx))),
@@ -12416,13 +12457,14 @@ impl Shell {
                 .rounded(px(10.0))
                 .border_1()
                 .border_color(border)
-                .bg(crate::theme::ink(0.02))
+                .bg(motion::hover_blend(id, crate::theme::ink(0.02), crate::theme::ink(0.05)))
+                .border_color(motion::hover_blend(id, border, border_strong))
+                .on_hover(motion::hover_listener(id))
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap(px(10.0))
                 .cursor_pointer()
-                .hover(move |s| s.bg(crate::theme::ink(0.05)).border_color(border_strong))
                 .child(icon(icon_path).size(px(15.0)).flex_none().text_color(muted))
                 .child(
                     div()
@@ -12541,7 +12583,7 @@ impl Shell {
                 )
             })
             .child(
-                popover::btn_primary(&theme, runtime_change_label)
+                popover::btn_primary(&theme, runtime_change_label, "signed-out-quit")
                     .id("signed-out-quit")
                     .when(self.runtime_change_task.is_some(), |button| {
                         button.opacity(0.6)
@@ -12715,6 +12757,7 @@ impl Shell {
             // (same slot, no width jump) — the ✕ only shows while the tab is
             // hovered (user request).
             let group: SharedString = format!("right-surface-tab-{ix}").into();
+            let close_key = format!("right-surface-close-{ix}");
             let ghost_title = title.clone();
             let workspace_path = self.workspace_path_for_surface(surface, cx);
             let accessible_name = detail.as_ref().unwrap_or(&title);
@@ -12891,7 +12934,12 @@ impl Shell {
                         .role(gpui::Role::Button)
                         .aria_label("Close tab")
                         .tooltip(crate::settings::widgets::text_tooltip("Close tab"))
-                        .hover(|s| s.bg(crate::theme::wash(0.12)))
+                        .bg(motion::hover_blend(
+                            &close_key,
+                            gpui::transparent_black(),
+                            crate::theme::wash(0.12),
+                        ))
+                        .on_hover(motion::hover_listener(close_key.clone()))
                         // The tab owns a drag payload. Claim the close press
                         // before it reaches that parent or GPUI starts a tab
                         // drag instead of delivering the close click.
@@ -13212,7 +13260,12 @@ impl Shell {
                         .text_size(crate::typography::ui_rems(13.0))
                         .text_color(theme.text)
                         .cursor_pointer()
-                        .hover(|s| s.bg(theme.glass_hover()))
+                        .bg(motion::hover_blend(
+                            "retry-engine",
+                            gpui::transparent_black(),
+                            theme.glass_hover(),
+                        ))
+                        .on_hover(motion::hover_listener("retry-engine"))
                         .on_click(cx.listener(|this, _, _, cx| this.retry_engine(cx)))
                         .child(SharedString::from("Retry")),
                 )
@@ -13271,7 +13324,8 @@ impl Shell {
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(theme.on_solid)
                         .cursor_pointer()
-                        .hover(|s| s.opacity(0.9))
+                        .opacity(1.0 - 0.1 * motion::hover_t("sign-in"))
+                        .on_hover(motion::hover_listener("sign-in"))
                         .on_click(cx.listener(|this, _, _, cx| this.start_sign_in(cx)))
                         .child(SharedString::from("Log in")),
                 )
@@ -13348,7 +13402,12 @@ impl Shell {
                                 .border_color(theme.border)
                                 .text_color(theme.text)
                                 .cursor_pointer()
-                                .hover(|s| s.bg(theme.glass_hover()))
+                                .bg(motion::hover_blend(
+                                    "orgs-retry",
+                                    gpui::transparent_black(),
+                                    theme.glass_hover(),
+                                ))
+                                .on_hover(motion::hover_listener("orgs-retry"))
                                 .on_click(cx.listener(|this, _, _, cx| this.load_orgs(cx)))
                                 .child(SharedString::from("Retry")),
                         ),
@@ -13372,6 +13431,7 @@ impl Shell {
                     .child(div().flex().flex_col().gap(px(4.0)).children(
                         rows.iter().enumerate().map(|(ix, row)| {
                             let org_id = row.organization_id.clone();
+                            let row_key = format!("org-row-{ix}");
                             div()
                                 .id(("org-row", ix))
                                 .px(px(12.0))
@@ -13379,12 +13439,12 @@ impl Shell {
                                 .rounded(px(8.0))
                                 .border_1()
                                 .border_color(theme.border)
-                                .bg(theme.bg)
+                                .bg(motion::hover_blend(&row_key, theme.bg, crate::theme::wash(0.11)))
+                                .on_hover(motion::hover_listener(row_key.clone()))
                                 .text_size(crate::typography::ui_rems(13.0))
                                 .text_color(theme.text)
                                 .when(submitting, |el| el.opacity(0.5))
                                 .cursor_pointer()
-                                .hover(|s| s.bg(crate::theme::wash(0.11)))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.select_org(org_id.clone(), cx);
                                 }))
@@ -13473,9 +13533,10 @@ impl Shell {
                             .text_size(crate::typography::ui_rems(14.0))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.on_solid)
+                            .opacity(1.0 - 0.1 * motion::hover_t("create-org"))
+                            .on_hover(motion::hover_listener("create-org"))
                             .when(submitting, |el| el.opacity(0.5))
                             .cursor_pointer()
-                            .hover(|s| s.opacity(0.9))
                             .on_click(cx.listener(|this, _, _, cx| this.create_org(cx)))
                             .child(SharedString::from(if submitting {
                                 "Creating…"
@@ -13500,9 +13561,13 @@ impl Shell {
                     div()
                         .id("org-signout")
                         .text_size(crate::typography::ui_rems(12.0))
-                        .text_color(theme.text_muted.opacity(0.6))
+                        .text_color(motion::hover_blend(
+                            "org-signout",
+                            theme.text_muted.opacity(0.6),
+                            theme.text,
+                        ))
+                        .on_hover(motion::hover_listener("org-signout"))
                         .cursor_pointer()
-                        .hover(|s| s.text_color(theme.text))
                         .on_click(cx.listener(|this, _, _, cx| this.cancel_auth_setup(cx)))
                         .child(SharedString::from(if local_setup {
                             "Cancel sync setup"
@@ -13732,8 +13797,9 @@ fn windows_caption_button(
         .items_center()
         .justify_center()
         .text_size(crate::typography::ui_rems(10.0))
-        .text_color(theme.text)
-        .hover(move |style| style.bg(hover_bg).text_color(hover_fg))
+        .text_color(motion::hover_blend(id, theme.text, hover_fg))
+        .bg(motion::hover_blend(id, gpui::transparent_black(), hover_bg))
+        .on_hover(motion::hover_listener(id))
         .active(move |style| style.bg(active_bg).text_color(active_fg))
         .occlude()
         .window_control_area(area)
@@ -13761,9 +13827,6 @@ fn linux_caption_button(
     };
     div()
         .id(id)
-        // gpui svgs don't inherit the div's text color — recolor the glyph
-        // on hover through the group instead (zed's WindowControl idiom).
-        .group("linux-caption-button")
         .size(px(24.0))
         .flex_none()
         .flex()
@@ -13771,7 +13834,8 @@ fn linux_caption_button(
         .justify_center()
         .rounded(px(6.0))
         .cursor_pointer()
-        .hover(move |style| style.bg(hover_bg))
+        .bg(motion::hover_blend(id, gpui::transparent_black(), hover_bg))
+        .on_hover(motion::hover_listener(id))
         .occlude()
         .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
         .on_click(move |event, window, cx| {
@@ -13781,10 +13845,7 @@ fn linux_caption_button(
         .child(
             icon(icon_path)
                 .size(px(16.0))
-                .text_color(muted)
-                .group_hover("linux-caption-button", move |style| {
-                    style.text_color(hover_fg)
-                }),
+                .text_color(motion::hover_blend(id, muted, hover_fg)),
         )
 }
 
@@ -14388,7 +14449,7 @@ impl Render for Shell {
                 if matches!(this.route, Route::Settings(_)) {
                     return;
                 }
-                if this.add_space.is_some() {
+                if this.add_space.is_open() {
                     this.close_add_space(cx);
                 } else {
                     this.open_add_space(cx);
@@ -14478,9 +14539,15 @@ impl Render for Shell {
                         .children(voice_stage)
                         .child(drag)
                         .children(overlays);
+                    let entrance = motion::entrance(
+                        window,
+                        ("phase-app", 1usize),
+                        motion::FADE_IN,
+                        motion::reduced_motion(cx),
+                    );
                     break 'ready root
                         .child(sidebar_tone)
-                        .child(motion::fade_in("phase-app", page));
+                        .child(motion::rise(page, entrance));
                 }
                 let right_target_width = if on_chat {
                     self.right_visible_width(cx)
@@ -14553,6 +14620,16 @@ impl Render for Shell {
                     )
                 });
                 let main = self.render_main(window, main_content_width, transcript_width, cx);
+                let swap = motion::swap_entrance(
+                    window,
+                    "main-outlet",
+                    self.outlet_key(),
+                    motion::FADE_IN,
+                    motion::reduced_motion(cx),
+                );
+                let main = motion::rise(div().flex_1().min_w_0().h_full().flex(), swap)
+                    .child(main)
+                    .into_any_element();
                 // The Changes pane is chat-scoped chrome: the Settings route
                 // never renders it (zeron __root.tsx `!isSettings && activeChat`
                 // around the diff column) — the per-session open flags stay
@@ -14616,8 +14693,8 @@ impl Render for Shell {
                     .into_any_element();
                 // The whole app page is one keyed `animate-in` entrance (zeron
                 // App.tsx `<div key={phase} className="animate-in h-full">`):
-                // arriving from the splash or any gate fades the page in; the
-                // splash-out crossfades over it on boot.
+                // arriving from the splash, any gate or Settings fades the page
+                // in; the splash-out crossfades over it on boot.
                 // The sidebar resize handle FLOATS over the sidebar/card seam
                 // (zero layout width, same idiom as the changes-pane grabber)
                 // so the sidebar's right gutter stays exactly as wide as its
@@ -14731,8 +14808,14 @@ impl Render for Shell {
                     .child(self.toasts.clone())
                     .children(self.render_sidebar_options_titlebar(cx))
                     .children(overlays);
+                let entrance = motion::entrance(
+                    window,
+                    ("phase-app", 0usize),
+                    motion::FADE_IN,
+                    motion::reduced_motion(cx),
+                );
                 root.child(sidebar_tone)
-                    .child(motion::fade_in("phase-app", page))
+                    .child(motion::rise(page, entrance))
             }
             GatePhase::Loading => root, // splash overlay covers boot
             GatePhase::OrgGate => {
@@ -16836,7 +16919,7 @@ mod exit_regressions {
                             assert!(matches!(shell.route, Route::Chat));
                             assert!(shell.state.read(cx).selected_chat.is_none());
                         }
-                        WorkspaceCommand::Resume => assert!(shell.command_palette.is_some()),
+                        WorkspaceCommand::Resume => assert!(shell.command_palette.is_open()),
                         WorkspaceCommand::Model => {
                             assert!(shell.composer.read(cx).pickers().read(cx).is_open());
                         }
@@ -18403,7 +18486,7 @@ impl Shell {
         serde_json::json!({
             "sessionVisible": self.session_workspace_visible(cx),
             "selectedChat": self.state.read(cx).selected_chat,
-            "recentChatsOpen": self.command_palette.as_ref().is_some_and(|palette| palette.chats_only),
+            "recentChatsOpen": self.command_palette.as_open().is_some_and(|palette| palette.chats_only),
             "setupPending": self.state.read(cx).selected_chat.as_deref().is_some_and(|chat| self.state.read(cx).worktree_setup_pending(chat)),
             "terminalHeight": self.terminal_geometry.get().height,
             "toast": self.toasts.read(cx).fixture_state(),
@@ -18589,7 +18672,7 @@ mod right_tab_mouse_regressions {
                     window.draw(cx).clear();
                 });
                 let scroll = shell.read_with(cx, |shell, _| {
-                    shell.release_notes_dialog.as_ref().unwrap().scroll.clone()
+                    shell.release_notes_dialog.as_open().unwrap().scroll.clone()
                 });
                 if selected == 0 {
                     assert!(scroll.max_offset().y > px(0.));
@@ -18633,7 +18716,7 @@ mod right_tab_mouse_regressions {
         assert!(scroll.size.height > px(100.0));
         assert!(close.bottom() <= card.bottom());
         cx.simulate_keystrokes("ctrl-s");
-        assert!(shell.read_with(cx, |shell, _| shell.release_notes_dialog.is_some()));
+        assert!(shell.read_with(cx, |shell, _| shell.release_notes_dialog.is_open()));
         let background = cx.debug_bounds("right-surface-tab-0").unwrap().center();
         cx.simulate_click(background, gpui::Modifiers::default());
         shell.read_with(cx, |shell, cx| {
@@ -18641,16 +18724,16 @@ mod right_tab_mouse_regressions {
         });
         let previous = cx.debug_bounds("release-notes-tab-1").unwrap().center();
         cx.simulate_click(previous, gpui::Modifiers::default());
-        assert_eq!(shell.read_with(cx, |shell, _| shell.release_notes_dialog.as_ref().unwrap().selected), 1);
+        assert_eq!(shell.read_with(cx, |shell, _| shell.release_notes_dialog.as_open().unwrap().selected), 1);
         // Restore the primary button then exercise the focus loop and opt out.
         cx.update(|window, cx| {
-            let focus = shell.read(cx).release_notes_dialog.as_ref().unwrap().buttons[4].clone();
+            let focus = shell.read(cx).release_notes_dialog.as_open().unwrap().buttons[4].clone();
             window.focus(&focus, cx);
         });
         for (keys, selected) in [("tab", 0), ("tab", 1), ("tab", 2), ("shift-tab", 1)] {
             cx.simulate_keystrokes(keys);
             cx.update(|window, cx| {
-                assert!(shell.read(cx).release_notes_dialog.as_ref().unwrap().buttons[selected].is_focused(window));
+                assert!(shell.read(cx).release_notes_dialog.as_open().unwrap().buttons[selected].is_focused(window));
             });
         }
         cx.simulate_keystrokes("tab space");
@@ -18666,14 +18749,14 @@ mod right_tab_mouse_regressions {
         assert_eq!(saved["seen_version"], zeron_update::current_version());
         assert_eq!(saved["show_after_updates"], false);
         cx.update(|window, cx| {
-            assert!(shell.read(cx).release_notes_dialog.is_none());
+            assert!(!shell.read(cx).release_notes_dialog.is_open());
             assert!(shell.read(cx).unfocused.is_focused(window));
             // Manual menu action is available even with automatic display off.
             cx.dispatch_action(&crate::app_menus::OpenReleaseNotes);
         });
         cx.run_until_parked();
         cx.update(|window, cx| window.draw(cx).clear());
-        assert!(shell.read_with(cx, |shell, _| shell.release_notes_dialog.is_some()));
+        assert!(shell.read_with(cx, |shell, _| shell.release_notes_dialog.is_open()));
     }
 
     #[cfg(target_os = "linux")]
@@ -19565,7 +19648,7 @@ mod settings_modal_regressions {
         cx.run_until_parked();
         cx.update(|window, cx| window.draw(cx).clear());
         shell.read_with(cx, |shell, cx| {
-            assert!(shell.worktree_settings.editor.is_some());
+            assert!(shell.worktree_settings.editor.is_open());
             assert!(!shell.composer.read(cx).pickers().read(cx).is_open());
             assert_eq!(shell.state.read(cx).selected_space.as_deref(), Some("project"));
             assert!(shell.state.read(cx).selected_chat.is_none());
