@@ -1093,6 +1093,8 @@ mod rendered_tests {
         ignore = "requires a native desktop; run with --ignored --test-threads=1"
     )]
     fn rendered_truncation_resizes_and_selects_the_original_url() {
+        // Selecting the link writes the process-global markdown selection.
+        let _selection = super::super::selection::test_state_lock();
         test_application().run(|cx| {
             cx.set_global(Theme::dark());
             let url = format!("https://example.com/{}", "long-segment-🙂/".repeat(20));

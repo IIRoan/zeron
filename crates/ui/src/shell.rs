@@ -17197,6 +17197,8 @@ mod exit_regressions {
             let state = cx.new(|_| {
                 let mut state = AppState::new();
                 state.connection = zeron_proto::view::ConnectionStatus::Ready;
+                // Linux shows session chrome only for a selected chat.
+                state.selected_chat = Some("chat".into());
                 state
             });
             Shell::new(
@@ -17269,8 +17271,12 @@ mod exit_regressions {
                     cx.run_until_parked();
                     let new_session = cx.debug_bounds("titlebar-new-session").unwrap();
                     let title = cx.debug_bounds("pr-detail-title").unwrap();
+                    // The New session control leads the titlebar on macOS
+                    // and trails it in the Linux cluster.
+                    let apart = title.left() >= new_session.right() + px(8.0)
+                        || title.right() + px(8.0) <= new_session.left();
                     assert!(
-                        title.left() >= new_session.right() + px(8.0),
+                        apart,
                         "PR header overlaps New session: width={width}, collapsed={collapsed}, fullscreen={fullscreen}, title={title:?}, new_session={new_session:?}"
                     );
                     let external = cx.debug_bounds("pr-external").unwrap();
@@ -18658,7 +18664,20 @@ mod right_tab_mouse_regressions {
     fn release_notes_scroll_reaches_the_last_line(cx: &mut TestAppContext) {
         let (shell, cx) = setup(cx);
         let root = tempfile::tempdir().unwrap();
-        cx.update(|_, cx| crate::release_notes::ReleaseNotes::init(root.path().into(), cx));
+        // Notes long enough to scroll at every size, whatever upstream ships.
+        let notes = std::iter::once("## What's Changed".to_string())
+            .chain((1..=60).map(|line| {
+                format!("* Change {line}: a release note long enough to wrap in a narrow dialog")
+            }))
+            .collect::<Vec<_>>()
+            .join("\n");
+        cx.update(|_, cx| {
+            crate::release_notes::ReleaseNotes::init_fixture_with_notes(
+                root.path().into(),
+                &notes,
+                cx,
+            );
+        });
         cx.run_until_parked();
         for size in [
             gpui::size(px(1000.), px(900.)),
@@ -19894,10 +19913,12 @@ mod settings_modal_regressions {
         cx.update(|window, cx| window.draw(cx).clear());
         let row = cx.debug_bounds("chat-older").expect("sidebar row");
         let from = row.center();
+        // The conversation lies right of the sidebar, or left of it on Linux.
+        let toward = if cfg!(target_os = "linux") { -1.0 } else { 1.0 };
         cx.simulate_mouse_down(from, MouseButton::Left, gpui::Modifiers::default());
         // Several frames of dragging, inside the sidebar and then out of it.
         for step in 1..=6 {
-            let x = from.x + px(4.0 + 120.0 * step as f32);
+            let x = from.x + px(toward * (4.0 + 120.0 * step as f32));
             cx.simulate_mouse_move(
                 gpui::point(x, from.y + px(40.0)),
                 Some(MouseButton::Left),
@@ -19912,10 +19933,15 @@ mod settings_modal_regressions {
             let transfer = shell.sidebar_session_transfer.as_ref().expect("still dragging");
             let left = transfer.slide_x.to;
             let expected = f32::from(transfer.pointer.x - transfer.cursor_offset.x);
-            assert!(left > sidebar_width, "outside the sidebar the row follows the pointer");
+            let outside = if cfg!(target_os = "linux") {
+                left + f32::from(row.size.width) < 1200.0 - sidebar_width
+            } else {
+                left > sidebar_width
+            };
+            assert!(outside, "outside the sidebar the row follows the pointer");
             assert!((left - expected).abs() < 0.5);
         });
-        let drop = gpui::point(from.x + px(724.0), from.y + px(40.0));
+        let drop = gpui::point(from.x + px(toward * 724.0), from.y + px(40.0));
         cx.simulate_mouse_up(drop, MouseButton::Left, gpui::Modifiers::default());
         cx.run_until_parked();
         cx.update(|window, cx| window.draw(cx).clear());

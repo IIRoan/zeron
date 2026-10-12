@@ -232,8 +232,34 @@ impl ReleaseNotes {
 
     #[cfg(test)]
     pub(crate) fn init_fixture(data_dir: PathBuf, cx: &mut App) -> Entity<Self> {
+        Self::init_with_catalog(data_dir, Catalog::parse(BUNDLED).unwrap(), cx)
+    }
+
+    /// [`Self::init_fixture`] with the current release's upstream notes
+    /// replaced, for layout tests that must not depend on how long the
+    /// bundled notes happen to be.
+    #[cfg(test)]
+    pub(crate) fn init_fixture_with_notes(
+        data_dir: PathBuf,
+        upstream_notes: &str,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        let mut source: serde_json::Value = serde_json::from_str(BUNDLED).unwrap();
+        let current = zeron_update::current_version();
+        let release = source["releases"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|release| release["version"] == current)
+            .expect("the bundled catalog lists the current release");
+        release["upstream_notes"] = upstream_notes.into();
+        Self::init_with_catalog(data_dir, Catalog::parse(&source.to_string()).unwrap(), cx)
+    }
+
+    #[cfg(test)]
+    fn init_with_catalog(data_dir: PathBuf, catalog: Catalog, cx: &mut App) -> Entity<Self> {
         let entity = cx.new(|_| Self {
-            catalog: Some(Arc::new(Catalog::parse(BUNDLED).unwrap())),
+            catalog: Some(Arc::new(catalog)),
             loaded: true,
             state: LaunchState::default(),
             data_dir,
