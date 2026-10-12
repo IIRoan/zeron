@@ -194,7 +194,7 @@ impl Shell {
         editor.busy = true;
         editor.error = None;
         let epoch = self.worktree_settings.epoch;
-        let toast = crate::toast::PendingToast::start(
+        let toast = crate::progress_toast::PendingToast::start(
             self.toasts.clone(),
             "Removing worktree…".into(),
             name.clone().into(),

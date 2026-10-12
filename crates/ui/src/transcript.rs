@@ -3224,6 +3224,9 @@ pub struct Transcript {
     /// identity, so the virtual list must explicitly discard cached heights.
     typography_generation: u32,
     content_width: f32,
+    /// Width held free at the column's right for a docked side card; the
+    /// reading column centers in what remains.
+    right_reserve: f32,
     /// Last global code-fence layout generation applied to this transcript.
     /// Each instance owns separate scroll handles and list measurements, so
     /// every one must reset itself after a global Fit-mode transition.
@@ -3456,6 +3459,13 @@ impl Transcript {
             .linked_tree(tree, roots, ui.source_local)
     }
 
+    /// File badges on tool chips open through the same workspace-link route
+    /// as Markdown file links, so only chats with a link handler get
+    /// clickable badges.
+    fn tool_file_opener(&mut self, cx: &mut Context<Self>) -> Option<ToolFileOpener> {
+        self.link_ui(cx).map(|link| ToolFileOpener { link })
+    }
+
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         Self::build(state, None, true, cx)
     }
@@ -3578,6 +3588,7 @@ impl Transcript {
             rendered_rows: HashSet::new(),
             typography_generation: crate::typography::generation(cx),
             content_width: crate::settings::transcript_width(cx),
+            right_reserve: 0.0,
             code_fences_generation: crate::settings::code_fences_generation(cx),
             compact_mode: crate::settings::transcript_compact_mode(cx),
             compact_live_entries: HashSet::new(),
@@ -3637,6 +3648,21 @@ impl Transcript {
     // ---- rail plumbing (rendering lives in crate::rail) ----
 
     /// Shell-driven width gate: the rail hides below 48rem of container width.
+    /// Shell-driven: hold `reserve` px free on the right of the reading
+    /// column (a docked side card), so the column and card center together.
+    pub fn set_right_reserve(&mut self, reserve: f32, cx: &mut Context<Self>) {
+        let reserve = reserve.max(0.0);
+        if (self.right_reserve - reserve).abs() > 0.25 {
+            self.right_reserve = reserve;
+            // Rows rewrap at the new width, including virtual ones offscreen.
+            self.list.remeasure();
+            if self.pinned {
+                self.wake_spring();
+            }
+            cx.notify();
+        }
+    }
+
     pub fn set_rail_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
         if self.rail_enabled != enabled {
             self.rail_enabled = enabled;
@@ -7554,8 +7580,10 @@ impl Transcript {
             .justify_center()
             .pt(px(top_gap))
             .pb(px(bottom_pad))
-            // Keep side gutters as the configurable column shrinks to fit.
-            .px(px(48.0))
+            // Keep side gutters as the configurable column shrinks to fit;
+            // a docked side card's room comes off the right.
+            .pl(px(48.0))
+            .pr(px(48.0 + self.right_reserve))
             .child(
                 div()
                     .w_full()
@@ -7805,6 +7833,7 @@ impl Transcript {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let mut fold = self.folds.get(row_id).copied().unwrap_or_default();
+        let file_opener = self.tool_file_opener(cx);
         // Agent/spawn chips never fold: they are their own row, always open,
         // no "Called N tools" header — a running subagent stays visible.
         // Compact mode is the exception: EVERYTHING sits under the one work
@@ -8130,6 +8159,13 @@ impl Transcript {
             tool_disclosure_progress(open, fold, now)
         };
 
+        // The summary rolls as the group grows ("Thought 2 times" → "Thought
+        // 3 times · Ran 1 command"), like the working indicator's word.
+        let rolled_summary = crate::roll_text::rolling(
+            format!("tool-group-title-{row_id}"),
+            summary.clone(),
+            reduce_motion,
+        );
         let toggle_id = row_id.clone();
         // A quiet summary sits above the activity rail; its chevron occupies
         // the same gutter as the rounded task-tree elbows below it.
@@ -8191,7 +8227,9 @@ impl Transcript {
                             shimmer_phase,
                             theme,
                         ),
-                        None => tool_group_title(summary.clone(), shimmer_phase, theme),
+                        None => rolled_summary.unwrap_or_else(|| {
+                            tool_group_title(summary.clone(), shimmer_phase, theme)
+                        }),
                     }),
             );
 
@@ -8278,6 +8316,7 @@ impl Transcript {
                             content_reveal,
                             connector_reveal,
                             continuation_reveal,
+                            file_opener.as_ref(),
                             theme,
                             cx.entity_id(),
                             cx,
@@ -8335,7 +8374,14 @@ impl Transcript {
                                 entry.toggled_at = Some(Instant::now());
                                 cx.notify();
                             }))
-                            .child(chip_header(tool, open, theme, cx.entity_id(), cx)),
+                            .child(chip_header(
+                                tool,
+                                open,
+                                file_opener.as_ref(),
+                                theme,
+                                cx.entity_id(),
+                                cx,
+                            )),
                     );
                 // The body stays mounted while the close tween shrinks over it.
                 // Invocation first (what was asked), then output/diff (what
@@ -9274,6 +9320,32 @@ enum ChipTrail {
     OpenArrow,
 }
 
+/// Opens a tool chip's file in the files panel through the transcript's
+/// workspace-link handler.
+#[derive(Clone)]
+struct ToolFileOpener {
+    link: render::LinkUi,
+}
+
+impl ToolFileOpener {
+    /// Only paths the link handler resolves — inside one of the chat's roots,
+    /// or an absolute host file it opens read-only — get a clickable badge;
+    /// the rest stay inert instead of looking clickable and doing nothing.
+    fn opens(&self, path: &str) -> bool {
+        self.link.file_link(path).is_some()
+    }
+
+    fn open(&self, path: &str, window: &mut Window, cx: &mut gpui::App) {
+        render::activate_link(
+            render::LinkTarget::new(file_badge_name(path), path),
+            render::LinkAction::Primary,
+            Some(&self.link),
+            window,
+            cx,
+        );
+    }
+}
+
 /// The chip's content row: icon tile + label + detail line (+ trailing tile
 /// when the chip expands or links out). Shared between the plain chip, the
 /// header of an expandable chip card, and the spawn link chip.
@@ -9286,6 +9358,7 @@ enum ChipTrail {
 fn chip_header_row(
     tool: &ToolItem,
     trail: Option<ChipTrail>,
+    file_opener: Option<&ToolFileOpener>,
     theme: &Theme,
     view: gpui::EntityId,
     cx: &mut gpui::App,
@@ -9303,6 +9376,10 @@ fn chip_header_row(
         | ToolCall::ApplyPatch { path: Some(path) } => Some(path.as_str()),
         _ => None,
     };
+    let open_file = file_path
+        .zip(file_opener)
+        .filter(|(path, opener)| opener.opens(path))
+        .map(|(path, opener)| (path.to_owned(), opener.clone()));
     let running = tool.subagent_ref.is_some()
         && matches!(tool.subagent_status, Some(SubagentStatus::Running));
     let failed = tool.is_error
@@ -9438,16 +9515,32 @@ fn chip_header_row(
                                 .child(SharedString::from(file_badge_name(path).to_owned())),
                         )
                         .map(|badge| {
-                            if hover_text {
-                                badge
-                                    .id("tool-file-badge")
-                                    .group_hover("tool-header", |style| {
+                            if !hover_text && open_file.is_none() {
+                                return badge.into_any_element();
+                            }
+                            badge
+                                .id("tool-file-badge")
+                                .when(hover_text, |badge| {
+                                    badge.group_hover("tool-header", |style| {
                                         style.text_color(theme.text)
                                     })
-                                    .into_any_element()
-                            } else {
-                                badge.into_any_element()
-                            }
+                                })
+                                // The badge is its own target: opening the
+                                // file must not also toggle the chip's
+                                // accordion underneath it.
+                                .when_some(open_file, |badge, (path, opener)| {
+                                    badge
+                                        .debug_selector(|| "tool-file-badge".into())
+                                        .cursor_pointer()
+                                        .hover(|style| {
+                                            style.bg(theme.ink(0.1)).text_color(theme.text)
+                                        })
+                                        .on_click(move |_, window, cx| {
+                                            cx.stop_propagation();
+                                            opener.open(&path, window, cx);
+                                        })
+                                })
+                                .into_any_element()
                         });
                     crate::frost::frosted(5.0, 16.0, badge).into_any_element()
                 } else {
@@ -9551,11 +9644,19 @@ fn chip_header_row(
 fn chip_header(
     tool: &ToolItem,
     open: bool,
+    file_opener: Option<&ToolFileOpener>,
     theme: &Theme,
     view: gpui::EntityId,
     cx: &mut gpui::App,
 ) -> gpui::Div {
-    chip_header_row(tool, Some(ChipTrail::Chevron { open }), theme, view, cx)
+    chip_header_row(
+        tool,
+        Some(ChipTrail::Chevron { open }),
+        file_opener,
+        theme,
+        view,
+        cx,
+    )
 }
 
 /// Max chars a subagent tab title keeps. The strip chip is fixed-width and
@@ -9747,6 +9848,7 @@ fn tool_chip(
     content_reveal: f32,
     connector_reveal: f32,
     continuation_reveal: f32,
+    file_opener: Option<&ToolFileOpener>,
     theme: &Theme,
     view: gpui::EntityId,
     cx: &mut gpui::App,
@@ -9794,7 +9896,7 @@ fn tool_chip(
                         .top(px(4.0 * (1.0 - content_reveal)))
                         .opacity(content_reveal)
                 })
-                .child(chip_header_row(tool, None, theme, view, cx)),
+                .child(chip_header_row(tool, None, file_opener, theme, view, cx)),
         )
         .into_any_element()
 }
@@ -9850,6 +9952,7 @@ fn subagent_chip(
                 .child(chip_header_row(
                     tool,
                     Some(ChipTrail::OpenArrow),
+                    None,
                     theme,
                     view,
                     cx,
@@ -9997,7 +10100,8 @@ impl Render for Transcript {
             let mut released = diagrams.begin_frame(crate::theme::style_generation());
             let list_width = f32::from(self.list.viewport_bounds().size.width);
             let column = if list_width > 0.0 {
-                self.content_width.min(list_width)
+                self.content_width
+                    .min((list_width - self.right_reserve).max(1.0))
             } else {
                 self.content_width
             };
@@ -13501,6 +13605,7 @@ mod tests {
                     this.state.update(cx, |state, _| {
                         state.sessions.push(zeron_proto::Session {
                             last_completed_turn: None,
+                            running_subagents: 0,
                             chat_id: "chat".into(),
                             device_id: "test".into(),
                             status: zeron_proto::SessionStatus::Working,
@@ -15485,6 +15590,131 @@ mod tests {
         assert_eq!(file_badge_name("src/components/"), "components");
         assert_eq!(file_badge_name("main.rs"), "main.rs");
         assert_eq!(file_badge_name(""), "");
+    }
+
+    #[gpui::test]
+    fn tool_file_badge_opens_linkable_files_without_toggling_the_chip(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::Modifiers;
+
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+        });
+        let opened: Rc<RefCell<Vec<render::LinkActivation>>> = Rc::default();
+        let recorded = opened.clone();
+        let opener = ToolFileOpener {
+            link: render::LinkUi {
+                source_session: Some("chat".into()),
+                source_local: true,
+                file_roots: Some(Rc::new(vec![crate::workspace_links::FileLinkRoot {
+                    chat: Some("chat".into()),
+                    root: "/work/app".into(),
+                    local: true,
+                }])),
+                handler: Rc::new(move |activation, _, _| {
+                    recorded.borrow_mut().push(activation.clone());
+                    render::LinkOutcome::Internal
+                }),
+            },
+        };
+        assert!(opener.opens("/work/app/src/guard.rs"));
+        assert!(opener.opens("src/guard.rs"));
+        // An absolute file outside every root still opens, read-only.
+        assert!(opener.opens("/tmp/report.md"));
+        assert!(!opener.opens("/work/app/../secret.rs"));
+        assert!(!opener.opens("../secret.rs"));
+
+        let read = |path: &str| ToolItem {
+            part_id: "fixture".into(),
+            images: Default::default(),
+            call: ToolCall::ReadFile { path: path.into() },
+            is_error: false,
+            resolved: true,
+            detail: None,
+            invocation: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+            kind: ToolItemKind::Call,
+        };
+        // The chip header inside a clickable parent, standing in for the
+        // accordion toggle that wraps it in `render_tool_group`.
+        struct ChipFixture {
+            tool: ToolItem,
+            opener: ToolFileOpener,
+            toggles: Rc<Cell<usize>>,
+        }
+        impl Render for ChipFixture {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let theme = Theme::of(cx).clone();
+                let toggles = self.toggles.clone();
+                div().w(px(600.0)).child(
+                    div()
+                        .id("chip-toggle")
+                        .debug_selector(|| "chip-toggle".into())
+                        .on_click(move |_, _, _| toggles.set(toggles.get() + 1))
+                        .child(chip_header(
+                            &self.tool,
+                            false,
+                            Some(&self.opener),
+                            &theme,
+                            cx.entity_id(),
+                            cx,
+                        )),
+                )
+            }
+        }
+
+        let toggles = Rc::new(Cell::new(0));
+        let (_inside, window) = cx.add_window_view(|_, _| ChipFixture {
+            tool: read("/work/app/src/guard.rs"),
+            opener: opener.clone(),
+            toggles: toggles.clone(),
+        });
+        window.update(|window, cx| window.draw(cx).clear());
+        let badge = window
+            .debug_bounds("tool-file-badge")
+            .expect("a workspace file badge is clickable");
+        window.simulate_click(badge.center(), Modifiers::default());
+        {
+            let opened = opened.borrow();
+            assert_eq!(opened.len(), 1);
+            assert_eq!(opened[0].target.original, "/work/app/src/guard.rs");
+            assert_eq!(opened[0].action, render::LinkAction::Primary);
+            assert_eq!(opened[0].source_session.as_deref(), Some("chat"));
+        }
+        assert_eq!(
+            toggles.get(),
+            0,
+            "opening the file must not toggle the chip"
+        );
+        // The rest of the header still toggles the accordion.
+        let row = window.debug_bounds("chip-toggle").unwrap();
+        window.simulate_click(
+            gpui::point(row.left() + px(2.0), row.center().y),
+            Modifiers::default(),
+        );
+        assert_eq!(toggles.get(), 1);
+        assert_eq!(opened.borrow().len(), 1);
+
+        let unlinkable_toggles = Rc::new(Cell::new(0));
+        let (_unlinkable, window) = cx.add_window_view(|_, _| ChipFixture {
+            tool: read("../secret.rs"),
+            opener: opener.clone(),
+            toggles: unlinkable_toggles.clone(),
+        });
+        window.update(|window, cx| window.draw(cx).clear());
+        assert!(
+            window.debug_bounds("tool-file-badge").is_none(),
+            "paths the link handler cannot open keep an inert badge"
+        );
     }
 
     #[test]

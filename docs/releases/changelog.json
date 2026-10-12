@@ -4,6 +4,28 @@
   "fork_repository": "IIRoan/zeron",
   "releases": [
     {
+      "version": "0.2.111",
+      "upstream_commit": "40091d469aa8a3f1ab1ec7cb404957b742940278",
+      "upstream_url": "https://github.com/zeronsh/zeron/releases/tag/v0.2.111",
+      "published_at": "2026-10-10T22:42:03Z",
+      "notes_source": "github_release",
+      "upstream_notes": "## What's Changed\n* Unified workspace search on fff, content search, and a tabbed cmd+K palette by @jsgrrchg in https://github.com/zeronsh/zeron/pull/856\n\n\n**Full Changelog**: https://github.com/zeronsh/zeron/compare/v0.2.110...v0.2.111",
+      "fork_changes": [
+        "Keep shared databases and app services in one saved list"
+      ],
+      "fork_through_commit": "5805868044d65dc07d501bb35eec4055cfa5ec1d"
+    },
+    {
+      "version": "0.2.110",
+      "upstream_commit": "ec28627ce2e28304d01751d3462302ce7fd3d57a",
+      "upstream_url": "https://github.com/zeronsh/zeron/releases/tag/v0.2.110",
+      "published_at": "2026-10-10T19:33:13Z",
+      "notes_source": "github_release",
+      "upstream_notes": "## What's Changed\n* Panels: content columns share the width, continuous transitions by @gaelcado in https://github.com/zeronsh/zeron/pull/677\n* Engine: fall back to the fetch URL when a remote's push URL is disabled by @katulevskiy in https://github.com/zeronsh/zeron/pull/863\n\n\n**Full Changelog**: https://github.com/zeronsh/zeron/compare/v0.2.109...v0.2.110",
+      "fork_changes": [],
+      "fork_through_commit": "5805868044d65dc07d501bb35eec4055cfa5ec1d"
+    },
+    {
       "version": "0.2.107",
       "upstream_commit": "565b49c527fb738704f217b897f9ba3aee575285",
       "upstream_url": "https://github.com/zeronsh/zeron/releases/tag/v0.2.107",

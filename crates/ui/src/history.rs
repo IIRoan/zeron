@@ -1301,7 +1301,7 @@ fn decode_history_avatar(encoded: &str) -> Option<Arc<Image>> {
 }
 
 pub struct GitHistory {
-    notifications: Option<Entity<crate::toast::Toasts>>,
+    notifications: Option<Entity<crate::progress_toast::Toasts>>,
     state: Entity<AppState>,
     started: bool,
     target_key: Option<String>,
@@ -2106,7 +2106,7 @@ impl GitHistory {
         self.fetch_page(key, cwd, target, 0, true, cx);
     }
 
-    pub(crate) fn set_notifications(&mut self, notifications: Entity<crate::toast::Toasts>) {
+    pub(crate) fn set_notifications(&mut self, notifications: Entity<crate::progress_toast::Toasts>) {
         self.notifications = Some(notifications);
     }
 
@@ -2133,7 +2133,7 @@ impl GitHistory {
         self.fetch_error = None;
         let notification = self.notifications.as_ref().map(|toasts| {
             let name = std::path::Path::new(&cwd).file_name().and_then(|name| name.to_str()).unwrap_or("repository");
-            crate::toast::PendingToast::start(toasts.clone(), format!("Source Control · {name}").into(), "Fetching changes from all remotes…".into(), cx)
+            crate::progress_toast::PendingToast::start(toasts.clone(), format!("Source Control · {name}").into(), "Fetching changes from all remotes…".into(), cx)
         });
         cx.notify();
         cx.spawn(async move |this, cx| {

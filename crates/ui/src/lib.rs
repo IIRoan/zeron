@@ -18,6 +18,7 @@ pub mod app_update;
 pub mod release_notes;
 pub mod appearance;
 pub mod appshots;
+mod asset_http;
 pub mod attachments;
 pub mod badges;
 pub mod browser;
@@ -31,6 +32,7 @@ mod composer_markdown;
 mod context_usage;
 mod dictation;
 pub mod edge_fade;
+pub mod rounded_clip;
 pub mod file_icons;
 pub mod files;
 pub mod frost;
@@ -48,15 +50,22 @@ mod new_thread_background_effects;
 mod new_thread_background_image;
 mod new_thread_background_mask;
 mod notice;
-mod toast;
+mod progress_toast;
 pub mod notify;
 pub mod orb;
 pub mod pickers;
 pub mod popover;
 pub mod project_actions;
+pub mod pull_request_detail;
+mod pull_request_media;
+mod pull_request_skeleton;
+#[cfg(test)]
+mod pull_request_test_support;
+pub mod pull_requests;
 pub mod queue;
 pub mod rail;
 mod roll_text;
+pub mod running_pill;
 pub mod settings;
 pub mod shell;
 pub mod sound;
@@ -69,6 +78,7 @@ mod todo_panel;
 pub(crate) mod tool_images;
 pub mod theme;
 pub mod theme_library;
+pub mod toast;
 pub mod transcript;
 pub mod typography;
 pub mod voice;
@@ -136,7 +146,9 @@ pub fn run_app(config: UiConfig) {
     // default runtime has only two workers, insufficient for a desktop engine.
     let runtime = tokio::runtime::Runtime::new().expect("desktop Tokio runtime");
     let runtime_handle = runtime.handle().clone();
-    let app = gpui_platform::application().with_assets(icons::Assets);
+    let app = gpui_platform::application()
+        .with_assets(icons::Assets)
+        .with_http_client(asset_http::AssetHttpClient::new(runtime_handle.clone()));
     let (url_tx, url_rx) = futures::channel::mpsc::unbounded::<String>();
     let callback_tx = url_tx.clone();
     app.on_open_urls(move |urls| {
