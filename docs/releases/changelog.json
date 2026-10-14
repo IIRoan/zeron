@@ -4,6 +4,19 @@
   "fork_repository": "IIRoan/zeron",
   "releases": [
     {
+      "version": "0.2.112",
+      "upstream_commit": "b40ac5ee31b59e98f283fc10d1132895afdae566",
+      "upstream_url": "https://github.com/zeronsh/zeron/releases/tag/v0.2.112",
+      "published_at": "2026-10-11T20:52:52Z",
+      "notes_source": "github_release",
+      "upstream_notes": "## What's Changed\n* Docs: add Spanish README by @jsgrrchg in https://github.com/zeronsh/zeron/pull/870\n* Mouse back/forward buttons navigate like the titlebar arrows by @jsgrrchg in https://github.com/zeronsh/zeron/pull/872\n* iOS: Group by Project setting for the Sessions page by @wingleeio in https://github.com/zeronsh/zeron/pull/875\n* Projectless chats get their own folder; home is never indexed by fff by @wingleeio in https://github.com/zeronsh/zeron/pull/876\n* Run the MCP bridge on two worker threads instead of one per core by @neo773 in https://github.com/zeronsh/zeron/pull/843\n* Opt out of macOS one-time-code AutoFill by @neo773 in https://github.com/zeronsh/zeron/pull/842\n* Let dropped files from any folder attach on macOS by @neo773 in https://github.com/zeronsh/zeron/pull/812\n\n\n**Full Changelog**: https://github.com/zeronsh/zeron/compare/v0.2.111...v0.2.112",
+      "fork_changes": [
+        "Fix Linux session drag-out and the tests the v0.2.111 merge broke",
+        "Make transitions and hover feedback consistent across the app"
+      ],
+      "fork_through_commit": "e293fb4e5f61b122a12f69802cbefd5733f912db"
+    },
+    {
       "version": "0.2.111",
       "upstream_commit": "40091d469aa8a3f1ab1ec7cb404957b742940278",
       "upstream_url": "https://github.com/zeronsh/zeron/releases/tag/v0.2.111",
