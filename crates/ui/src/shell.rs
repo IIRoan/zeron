@@ -18,8 +18,8 @@ use chrono::{DateTime, Utc};
 use gpui::{
     Action, AnyElement, App, ClipboardItem, Context, Empty, Entity, FocusHandle, Focusable as _,
     IntoElement, KeyBinding, Keystroke, ModifiersChangedEvent, MouseButton, MouseDownEvent,
-    MouseUpEvent, Pixels, Point, Render, SharedString, Subscription, Task, Window,
-    WindowControlArea, actions, div, prelude::*, px,
+    MouseUpEvent, NavigationDirection, Pixels, Point, Render, SharedString, Subscription, Task,
+    Window, WindowControlArea, actions, div, prelude::*, px,
 };
 
 use gpui_tokio::Tokio;
@@ -11864,7 +11864,6 @@ impl Shell {
                                 div()
                                     .id("persistent-composer")
                                     .relative()
-                                    .left(px(-session_reserve / 2.0))
                                     .w(px(composer_width))
                                     .opacity(composer_opacity)
                                     .mx_auto()
@@ -11879,6 +11878,9 @@ impl Shell {
                                 self.reduced_motion,
                                 frame_time,
                             )
+                            // Centered on the transcript, which keeps the
+                            // session card's room free on its right.
+                            .shift_x(-session_reserve / 2.0)
                             .reserve_terminal(terminal_geometry.clone()),
                         )
                     })
@@ -14243,6 +14245,16 @@ impl Render for Shell {
                         cx.notify();
                     }
                 }),
+            )
+            // Mouse side buttons walk the same history as the titlebar
+            // back/forward arrows (the browser surface keeps them to itself).
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Back),
+                cx.listener(|this, _, _, cx| this.navigate_back(cx)),
+            )
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Forward),
+                cx.listener(|this, _, _, cx| this.navigate_forward(cx)),
             )
             .capture_key_down(cx.listener(Self::on_key_down_capture))
             .on_key_down(cx.listener(Self::on_key_down))

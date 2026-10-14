@@ -18,6 +18,9 @@ pub mod capabilities {
     /// Shared databases are saved separately from app services, so either
     /// editor preserves the other's settings.
     pub const PROJECT_DATABASES_V1: &str = "project-databases-v1";
+    /// The host creates a projectless chat's scratch folder
+    /// (`crate::projectless`) when it runs; older hosts only know `~`.
+    pub const PROJECTLESS_SCRATCH_V1: &str = "projectless-scratch-v1";
 
     pub const CURRENT: &[&str] = &[
         COMPOSER_REFERENCES_V1,
@@ -28,6 +31,7 @@ pub mod capabilities {
         MESSAGE_QUEUE_EDIT_LEASE_V1,
         HARNESS_UPDATES_V1,
         PROJECT_DATABASES_V1,
+        PROJECTLESS_SCRATCH_V1,
         crate::voice::remote::CAPABILITY,
     ];
 
@@ -110,6 +114,7 @@ mod tests {
                     "message-queue-edit-lease-v1",
                     "harness-updates-v1",
                     "project-databases-v1",
+                    "projectless-scratch-v1",
                     "voice-client-media-v1"
                 ],
             })
