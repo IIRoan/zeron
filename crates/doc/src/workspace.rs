@@ -488,6 +488,10 @@ impl WorkspaceDoc {
         set_opt_ms(&row, "startedAt", session.started_at)?;
         row.insert("updatedAt", session.updated_at.timestamp_millis())?;
         row.insert("runningSubagents", i64::from(session.running_subagents))?;
+        row.insert(
+            "runningBackgroundTasks",
+            i64::from(session.running_background_tasks),
+        )?;
         self.doc.commit();
         Ok(())
     }
@@ -782,6 +786,8 @@ pub(crate) struct RawSession {
     updated_at: i64,
     #[serde(default)]
     running_subagents: u32,
+    #[serde(default)]
+    running_background_tasks: u32,
 }
 
 impl From<RawSession> for Session {
@@ -794,6 +800,7 @@ impl From<RawSession> for Session {
             started_at: raw.started_at.map(dt),
             updated_at: dt(raw.updated_at),
             running_subagents: raw.running_subagents,
+            running_background_tasks: raw.running_background_tasks,
         }
     }
 }
@@ -902,6 +909,7 @@ mod tests {
             started_at: Some(ts(3_000)),
             updated_at: ts(3_500),
             running_subagents: 0,
+            running_background_tasks: 0,
         }
     }
 
@@ -916,6 +924,27 @@ mod tests {
             .expect("export b");
         b.doc().import(&a_update).expect("import into b");
         a.doc().import(&b_update).expect("import into a");
+    }
+
+    #[test]
+    fn background_tasks_survive_workspace_sync_and_clear_when_drained() {
+        let host = WorkspaceDoc::new();
+        let peer = WorkspaceDoc::new();
+        let mut parked = session("chat", "host", SessionStatus::Idle);
+        parked.running_background_tasks = 2;
+        host.upsert_session(&parked).unwrap();
+        cross_sync(&host, &peer);
+        assert_eq!(peer.read_sessions().unwrap(), [parked.clone()]);
+        parked.running_background_tasks = 0;
+        host.upsert_session(&parked).unwrap();
+        cross_sync(&host, &peer);
+        assert_eq!(peer.read_sessions().unwrap(), [parked]);
+
+        // Workspace rows from an older engine do not have this key.
+        let legacy = peer.row("sessions", "chat").unwrap();
+        legacy.delete("runningBackgroundTasks").unwrap();
+        peer.doc.commit();
+        assert_eq!(peer.read_sessions().unwrap()[0].running_background_tasks, 0);
     }
 
     #[test]

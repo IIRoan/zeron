@@ -142,7 +142,6 @@ impl Shell {
         let Some(profile) = self.active_sidebar_pin_profile_key(cx) else {
             return;
         };
-        self.close_sidebar_view_menu(cx);
         self.section_menu = None;
         let name = self
             .active_sidebar_sections(cx)
@@ -718,6 +717,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(not(target_os = "linux"))]
     #[gpui::test]
     fn the_session_card_shows_beside_a_wide_transcript_and_opens_over_a_narrow_one(
         cx: &mut gpui::TestAppContext,

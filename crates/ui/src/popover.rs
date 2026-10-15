@@ -2581,6 +2581,19 @@ pub(crate) fn search_highlight_ranges(
             },
         )
     }));
+    search_highlight_underlay(styled, badges, theme)
+}
+
+/// Paint search washes beneath already styled source text, preserving syntax
+/// colors. Callers supply ranges validated against that same text revision.
+pub(crate) fn search_highlight_underlay(
+    styled: gpui::StyledText,
+    badges: Vec<std::ops::Range<usize>>,
+    theme: &Theme,
+) -> AnyElement {
+    if badges.is_empty() {
+        return styled.into_any_element();
+    }
     let layout = styled.layout().clone();
     let wash = theme.code_wash;
     // As in the composer, paint rounded backgrounds beneath shaped glyphs.

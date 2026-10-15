@@ -1643,6 +1643,7 @@ fn forwardable(method: &str) -> bool {
             | methods::COMMIT_CHECKOUT_STAGED
             | methods::GET_CHECKOUT_GIT_DETAILS
             | methods::GET_CHECKOUT_STASHES
+            | methods::GET_CHECKOUT_BRANCHES
             | methods::RUN_CHECKOUT_GIT_ACTION
             | methods::PREVIEW_CHECKOUT_DISCARD
             | methods::DISCARD_CHECKOUT_CHANGES
@@ -2844,6 +2845,7 @@ impl RpcService for EngineRpc {
             | methods::COMMIT_CHECKOUT_STAGED
             | methods::GET_CHECKOUT_GIT_DETAILS
             | methods::GET_CHECKOUT_STASHES
+            | methods::GET_CHECKOUT_BRANCHES
             | methods::RUN_CHECKOUT_GIT_ACTION
             | methods::PREVIEW_CHECKOUT_DISCARD
             | methods::DISCARD_CHECKOUT_CHANGES
@@ -2878,6 +2880,9 @@ impl RpcService for EngineRpc {
                     }
                     if method == methods::GET_CHECKOUT_STASHES {
                         return RpcReply::value(&crate::checkout_git::stashes(&root).await.map_err(|e| RpcError::Failed(e.to_string()))?);
+                    }
+                    if method == methods::GET_CHECKOUT_BRANCHES {
+                        return RpcReply::value(&crate::checkout_git::branches(&root).await.map_err(|e| RpcError::Failed(e.to_string()))?);
                     }
                     if method == methods::RUN_CHECKOUT_GIT_ACTION {
                         if !matches!(params.get("action").and_then(|a| a.get("kind")).and_then(|k| k.as_str()), Some("fetch")) && params.get("expectedBranch").is_some() {
@@ -4833,6 +4838,7 @@ mod tests {
             methods::COMMIT_CHECKOUT_STAGED,
             methods::GET_CHECKOUT_GIT_DETAILS,
             methods::GET_CHECKOUT_STASHES,
+            methods::GET_CHECKOUT_BRANCHES,
             methods::RUN_CHECKOUT_GIT_ACTION,
             methods::PREVIEW_CHECKOUT_DISCARD,
             methods::DISCARD_CHECKOUT_CHANGES,

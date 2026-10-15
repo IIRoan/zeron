@@ -24,6 +24,10 @@ mod selection;
 mod interaction;
 mod conflicts;
 mod stash;
+mod branch;
+mod staging;
+mod commands;
+pub(crate) use commands::{GitCommand, GIT_COMMANDS};
 use git::{Confirmation, ConfirmationDialog, GitForm, GitPanel, UndoDiscard};
 use selection::FileKey;
 
@@ -50,6 +54,8 @@ enum Row {
 }
 
 pub enum SourceControlEvent {
+    /// Invalidate the cached Changes host when local row state changes.
+    Updated,
     Success { title: SharedString, message: SharedString },
     OpenDiff(CheckoutChangeSelection),
     OpenFile(String),
@@ -116,6 +122,10 @@ pub struct SourceControl {
     selected_row_bounds: selection::MenuBounds,
     sort_order: interaction::SortOrder,
     stash_picker: Option<stash::StashPicker>,
+    branch_picker: Option<branch::BranchPicker>,
+    git_palette: Option<commands::GitPalette>,
+    pending_git_command: Option<(Target, GitCommand)>,
+    staging_queue: Option<staging::StagingHandle>,
 }
 impl gpui::EventEmitter<SourceControlEvent> for SourceControl {}
 
@@ -320,6 +330,8 @@ impl SourceControl {
                 cx.subscribe(input, |this: &mut Self, _, event, cx| {
                     if matches!(event, ComposerInputEvent::Submitted) {
                         this.submit_form(cx);
+                    } else if matches!(event, ComposerInputEvent::Edited) {
+                        cx.notify();
                     }
                 })
             })
@@ -376,6 +388,10 @@ impl SourceControl {
             selected_row_bounds: Default::default(),
             sort_order: Default::default(),
             stash_picker: None,
+            branch_picker: None,
+            git_palette: None,
+            pending_git_command: None,
+            staging_queue: None,
         }
     }
 
@@ -401,6 +417,7 @@ impl SourceControl {
         self.refreshing = false;
         self.refresh_feedback = None;
         self.busy = false;
+        self.staging_queue = None;
         self.snapshot = None;
         self.rows.clear();
         self.file_menu = Default::default();
@@ -416,6 +433,8 @@ impl SourceControl {
         self.git_panel = None;
         self.git_form = None;
         self.stash_picker = None;
+        self.branch_picker = None;
+        self.git_palette = None;
         self.confirmation = None;
         self.undo_discard = None;
         self.operation_label = None;
@@ -564,73 +583,13 @@ impl SourceControl {
         staged: bool,
         cx: &mut Context<Self>,
     ) {
+        if !self.staging_enabled() { return; }
         if staged && self.snapshot.as_ref().is_some_and(|snapshot| snapshot.repositories.iter()
             .any(|repo| repo.path == repository && repo.files.iter().any(|file| file.is_conflicted() && paths.contains(&file.path)))) {
             self.check_conflicts_before_staging(repository, paths, cx);
             return;
         }
         self.set_staged_checked(repository, paths, staged, false, cx);
-    }
-
-    fn set_staged_checked(&mut self, repository: String, paths: Vec<String>, staged: bool, allow_conflict_markers: bool, cx: &mut Context<Self>) {
-        if self.is_busy() {
-            return;
-        }
-        let Some(target) = self.target.clone() else {
-            return;
-        };
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.notify_error(&repository, "Repository is unavailable", cx);
-            return;
-        };
-        let git = self.snapshot.as_ref().and_then(|snapshot| snapshot.repositories.iter().find(|repo| repo.path == repository)).and_then(|repo| repo.git.as_ref());
-        let head = git.and_then(|git| git.head.clone());
-        let branch = git.and_then(|git| git.branch.clone());
-        let conflicts: Vec<_> = self.snapshot.as_ref().into_iter().flat_map(|snapshot| &snapshot.repositories)
-            .filter(|repo| repo.path == repository).flat_map(|repo| &repo.files)
-            .filter(|file| staged && file.is_conflicted() && paths.contains(&file.path)).map(|file| file.path.clone()).collect();
-        self.busy = true;
-        self.error = None;
-        self.notice = None;
-        self.mutation_epoch += 1;
-        let epoch = self.mutation_epoch;
-        self.details_task = None;
-        self.details_key = None;
-        let selected_files = self.selected_files.clone();
-        let selection_anchor = self.selection_anchor.clone();
-        let notification = self.begin_notification(&repository, if staged { "Staging changes…" } else { "Unstaging changes…" }, cx);
-        let notified = notification.is_some();
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let response = engine.client().call_as::<CheckoutChanges>(methods::SET_CHECKOUT_STAGED, serde_json::json!({ "cwd": target.cwd, "targetDeviceId": target.device, "repository": repository, "paths": paths, "staged": staged, "allowConflictMarkers": allow_conflict_markers, "expectedHead": head, "expectedBranch": branch })).await;
-            let outcome = response.as_ref().map(|snapshot| {
-                let notice = staging_notice(snapshot, &repository, &paths, staged);
-                let resolved = snapshot.repositories.iter().find(|repo| repo.path == repository && repo.complete)
-                    .map_or(0, |repo| conflicts.iter().filter(|path| !repo.files.iter().any(|file| &file.path == *path && file.is_conflicted())).count());
-                if resolved == 0 { return notice; }
-                let resolved = format!("Resolved {resolved} merge conflict{}", if resolved == 1 { "" } else { "s" });
-                if notice == "No file changes staged" { resolved.into() } else { format!("{resolved}. {notice}").into() }
-            })
-                .map_err(|error| SharedString::from(format!("Unable to {} changes: {error}", if staged { "stage" } else { "unstage" })));
-            if let Some(notification) = notification { notification.finish(outcome.clone(), cx); }
-            this.update(cx, |view, cx| {
-                if view.target.as_ref() != Some(&target) || view.mutation_epoch != epoch { return; }
-                view.busy = false;
-                match &outcome {
-                    Ok(message) if notified => view.notice = Some(message.clone()),
-                    Ok(message) => view.notify_success(&repository, message.clone(), cx),
-                    Err(error) => view.error = Some(error.clone()),
-                }
-                if let Ok(snapshot) = response {
-                    let unchanged = view.selected_files == selected_files;
-                    view.apply_snapshot(snapshot, cx);
-                    if unchanged {
-                        view.follow_staging(&repository, &paths, staged, selected_files, selection_anchor);
-                    }
-                }
-                cx.notify();
-            }).ok();
-        }).detach();
     }
 
     fn is_busy(&self) -> bool {
@@ -669,6 +628,8 @@ impl SourceControl {
 
     fn select_repository(&mut self, path: String, cx: &mut Context<Self>) {
         self.stash_picker = None;
+        self.branch_picker = None;
+        self.git_palette = None;
         if self.is_busy() || self.confirmation.is_some() || self.active_repository == path {
             return;
         }
@@ -958,7 +919,7 @@ impl SourceControl {
         theme: &Theme,
         window: &mut Window,
     ) -> gpui::Stateful<gpui::Div> {
-        let enabled = enabled && !self.is_busy();
+        let enabled = enabled && self.staging_enabled();
         let opacity = if enabled { 1.0 } else { 0.35 };
         let verb = if staged { "Unstage" } else { "Stage" };
         let label = match selection_count {
@@ -1138,6 +1099,7 @@ impl SourceControl {
                 let collapsed = self.collapsed.contains(&key);
                 let chevron = SharedString::from(format!("sc-chevron-{key}"));
                 let enabled = repo.complete;
+                let stage_enabled = self.stage_paths_enabled(&repo_path, &self.group_paths(&repo_path, staged, conflicts, false), !staged);
                 let discard_repository = repo_path.clone();
                 let selected_repository = repo_path.clone();
                 base.pl(px(18.0))
@@ -1199,7 +1161,7 @@ impl SourceControl {
                         self.action(
                             if conflicts { format!("stage-group-{repository}-merge") } else { format!("stage-group-{repository}-{staged}") },
                             staged,
-                            enabled,
+                            stage_enabled,
                             row_group,
                             false,
                             None,
@@ -1209,7 +1171,7 @@ impl SourceControl {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             let paths = this.group_paths(&repo_path, staged, conflicts, false);
-                            if enabled && !paths.is_empty() {
+                            if stage_enabled && !paths.is_empty() {
                                 this.select_repository(repo_path.clone(), cx);
                                 this.set_staged(repo_path.clone(), paths, !staged, cx);
                             }
@@ -1252,6 +1214,8 @@ impl SourceControl {
                 let stage_key = key.clone();
                 let discard_key = key.clone();
                 let paths = self.staging_paths(&key);
+                let pending = self.staging_pending(&repo_path, &file.path);
+                let stage_enabled = self.stage_paths_enabled(&repo_path, &paths, !staged);
                 let path = file.path.clone();
                 let enabled = repo.complete;
                 let open_path = if repo.path.is_empty() {
@@ -1318,7 +1282,9 @@ impl SourceControl {
                         );
                         this.selected = Some(selection.clone());
                         this.list_focus.focus(window, cx);
-                        cx.emit(SourceControlEvent::OpenDiff(selection.clone()));
+                        if this.staging_pending(&selection.repository, &selection.path).is_none() {
+                            cx.emit(SourceControlEvent::OpenDiff(selection.clone()));
+                        }
                         cx.notify();
                     }))
                     .child(if submodule {
@@ -1408,7 +1374,7 @@ impl SourceControl {
                         self.action(
                             format!("stage-file-{row}"),
                             staged,
-                            enabled,
+                            stage_enabled,
                             row_group,
                             selected,
                             Some(paths.len()),
@@ -1417,13 +1383,15 @@ impl SourceControl {
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
-                            if enabled {
+                            if stage_enabled {
                                 let paths = this.staging_paths(&stage_key);
                                 this.select_repository(repo_path.clone(), cx);
                                 this.set_staged(repo_path.clone(), paths, !staged, cx);
                             }
                         })),
                     )
+                    .when_some(pending, |el, staged| el.child(div().flex_none().text_size(px(10.0)).text_color(theme.text_muted)
+                        .child(if staged { "Staging…" } else { "Unstaging…" })))
                     .child(
                         div()
                             .w(px(16.0))
@@ -1451,6 +1419,11 @@ impl Render for SourceControl {
         }
         self.ensure_loaded(cx);
         self.ensure_git_details(cx);
+        if self.git_enabled() && let Some((target, command)) = self.pending_git_command.take() {
+            if self.target.as_ref() == Some(&target) {
+                self.execute_git_command(command, window, cx);
+            }
+        }
         let theme = Theme::of(cx).clone();
         let empty = self.snapshot.as_ref().is_some_and(|s| {
             s.repositories
@@ -1461,6 +1434,8 @@ impl Render for SourceControl {
         let confirmation = self.render_confirmation(window, cx);
         let file_menu = self.render_file_menu(cx);
         let stash_picker = self.render_stash_picker(window, cx);
+        let branch_picker = self.render_branch_picker(window, cx);
+        let git_palette = self.render_git_palette(window, cx);
         div()
             .size_full()
             .flex()
@@ -1518,6 +1493,8 @@ impl Render for SourceControl {
             .child(self.render_git_status(window, cx))
             .children(file_menu)
             .child(stash_picker)
+            .child(branch_picker)
+            .child(git_palette)
             .child(confirmation)
     }
 }
@@ -1541,13 +1518,16 @@ impl SourceControl {
             "primaryAction": format!("{:?}", self.primary_action()), "canRequestCommit": self.can_request_commit(cx),
             "fileMenu": self.file_menu.is_open(), "sortOrder": format!("{:?}", self.sort_order),
             "stashPicker": self.stash_picker.as_ref().map(|picker| picker.fixture_state(cx)),
+            "branchPicker": self.branch_picker.as_ref().map(|picker| picker.fixture_state(cx)),
+            "gitPalette": self.fixture_git_palette(cx),
+            "pendingStaging": self.fixture_pending_staging(),
             "selectedFiles": self.selected_files.iter().map(|key| serde_json::json!({ "repository": key.repository, "path": key.path, "staged": key.staged })).collect::<Vec<_>>(),
         })
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use gpui::{AppContext, TestAppContext, VisualTestContext};
 
@@ -1579,7 +1559,7 @@ mod tests {
         }
     }
 
-    fn selection_setup(cx: &mut TestAppContext) -> (Entity<SourceControl>, &mut VisualTestContext) {
+    pub(in crate::source_control) fn selection_setup(cx: &mut TestAppContext) -> (Entity<SourceControl>, &mut VisualTestContext) {
         cx.update(|cx| {
             gpui_base::init(cx);
             cx.set_global(Theme::default());

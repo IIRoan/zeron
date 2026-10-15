@@ -1,5 +1,5 @@
 //! Exercise the explorer and editors against an isolated real workspace/RPC.
-//! Set ZERON_FILES_CAPTURES to a directory to run on X11 and capture the fixture.
+//! Set ZERON_FILES_CAPTURES and enable browser-fixture to capture native frames.
 use super::*;
 use crate::settings::{FILES_PANEL_DEFAULT, RIGHT_PANE_DEFAULT};
 use gpui::{AppContext, AsyncApp, WindowHandle};
@@ -29,6 +29,8 @@ async fn wait_for(
             .update(cx, |_, window, cx| {
                 window.refresh();
                 let _ = window.draw(cx);
+                #[cfg(feature = "browser-fixture")]
+                window.present_if_needed();
             })
             .unwrap();
         if window
@@ -53,16 +55,33 @@ async fn frame(window: WindowHandle<Shell>, cx: &mut AsyncApp, output: Option<&P
         .update(cx, |_, window, cx| {
             window.refresh();
             let _ = window.draw(cx);
+            #[cfg(feature = "browser-fixture")]
+            window.present_if_needed();
         })
         .unwrap();
     if let Some(output) = output {
         std::fs::create_dir_all(output).unwrap();
-        let status = std::process::Command::new("import")
-            .args(["-window", "Files panel fixture"])
-            .arg(output.join(format!("{name}.png")))
-            .status()
-            .unwrap();
-        assert!(status.success(), "fixture capture failed");
+        let path = output.canonicalize().unwrap().join(format!("{name}.png"));
+        let rendered = gpui::AnyWindowHandle::from(window).update(cx, |_, window, _| window.render_to_image()).unwrap();
+        if let Ok(image) = rendered {
+            image.save(&path).unwrap();
+        } else {
+            // Linux's platform renderer has no offscreen capture. Capture only
+            // this fixture's native window, preserving the user's clipboard.
+            assert!(std::env::var_os("NIRI_SOCKET").is_some(), "native captures require a renderer capture backend or Niri");
+            let windows = std::process::Command::new("niri").args(["msg", "-j", "windows"]).output().unwrap();
+            assert!(windows.status.success());
+            let windows: serde_json::Value = serde_json::from_slice(&windows.stdout).unwrap();
+            let id = windows.as_array().unwrap().iter().find(|window| window["pid"].as_u64() == Some(std::process::id() as u64)).expect("fixture window is missing")["id"].as_u64().unwrap();
+            let clipboard = cx.update(|cx| cx.read_from_clipboard());
+            let status = std::process::Command::new("niri").args(["msg", "action", "screenshot-window", "--id", &id.to_string(), "--path"]).arg(&path).status().unwrap();
+            for _ in 0..100 {
+                if path.is_file() { break; }
+                pause(cx).await;
+            }
+            cx.update(|cx| cx.write_to_clipboard(clipboard.unwrap_or_else(|| gpui::ClipboardItem::new_string(String::new()))));
+            assert!(status.success() && path.is_file(), "fixture capture failed");
+        }
     }
 }
 
@@ -70,6 +89,8 @@ async fn frame(window: WindowHandle<Shell>, cx: &mut AsyncApp, output: Option<&P
 fn files_panel_workspace_navigation_and_external_updates() {
     let directory = tempfile::tempdir().unwrap();
     let project = directory.path().join("project");
+    let outside = directory.path().join("outside.txt");
+    std::fs::write(&outside, "needle\nNeedle\n").unwrap();
     std::fs::create_dir_all(project.join("src/nested")).unwrap();
     std::fs::write(
         project.join("src/nested/main.rs"),
@@ -143,10 +164,15 @@ fn files_panel_workspace_navigation_and_external_updates() {
     }
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    let _ipc = runtime
-        .block_on(zeron_engine::serve_ipc(port, core.rpc_service()))
-        .unwrap();
+    listener.set_nonblocking(true).unwrap();
+    // Transfer the bound socket to the RPC server instead of releasing and
+    // re-binding the port while other local fixtures are starting servers.
+    let service = core.rpc_service();
+    let _ipc = {
+        let _runtime_context = runtime.enter();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        runtime.spawn(zeron_rpc::serve_ws_listener(listener, service))
+    };
     let output = std::env::var_os("ZERON_FILES_CAPTURES").map(PathBuf::from);
     let application = if output.is_some() {
         gpui_platform::application()
@@ -239,6 +265,88 @@ fn files_panel_workspace_navigation_and_external_updates() {
                 })
                 .await;
                 frame(window, cx, output.as_deref(), "01-chat-files").await;
+                // Search through the real shell/RPC/index and open the exact
+                // source line, then find text without modifying the buffer.
+                gpui::AnyWindowHandle::from(window).update(cx, |_, window, cx| {
+                    assert!(window.dispatch_keystroke(gpui::Keystroke::parse(if cfg!(target_os = "macos") { "cmd-shift-f" } else { "ctrl-shift-f" }).unwrap(), cx));
+                }).unwrap();
+                frame(window, cx, None, "search-focus").await;
+                window.update(cx, |shell, _, cx| {
+                    shell.files["first"].update(cx, |files, cx| files.test_repo_query("println", cx));
+                }).unwrap();
+                wait_for(window, cx, "repository code matches", |shell, cx| {
+                    shell.files["first"].read(cx).test_repo_matches().is_some_and(|matches| matches.iter().any(|found| found.path == "src/nested/main.rs" && found.line == 1 && found.column == 12))
+                }).await;
+                frame(window, cx, output.as_deref(), "01-search-code").await;
+                window.update(cx, |shell, window, cx| {
+                    shell.files["first"].update(cx, |files, cx| files.test_repo_scope("src", window, cx));
+                }).unwrap();
+                wait_for(window, cx, "scoped code matches", |shell, cx| {
+                    shell.files["first"].read(cx).test_repo_matches().is_some_and(|matches| matches.len() == 1 && matches[0].path == "src/nested/main.rs")
+                }).await;
+                frame(window, cx, output.as_deref(), "01-search-advanced").await;
+                if output.is_some() {
+                    for (mode, surface, name) in [
+                        (crate::appearance::AppearanceMode::Light, zeron_theme::SurfacePreference::Opaque, "01-search-light-opaque"),
+                        (crate::appearance::AppearanceMode::Light, zeron_theme::SurfacePreference::Frosted, "01-search-light-frosted"),
+                        (crate::appearance::AppearanceMode::Dark, zeron_theme::SurfacePreference::Frosted, "01-search-dark-frosted"),
+                        (crate::appearance::AppearanceMode::Dark, zeron_theme::SurfacePreference::Opaque, "01-search-dark-opaque"),
+                    ] {
+                        cx.update(|cx| {
+                            crate::appearance::set_mode(mode, cx);
+                            crate::appearance::set_surface(surface, cx);
+                        });
+                        frame(window, cx, output.as_deref(), name).await;
+                    }
+                }
+                window.update(cx, |shell, _, cx| {
+                    shell.files["first"].update(cx, |files, cx| files.test_open_first_code_match(cx));
+                }).unwrap();
+                wait_for(window, cx, "search opened editor", |shell, cx| {
+                    shell.file_surfaces.values().any(|file| file.read(cx).test_document_text("src/nested/main.rs").is_some())
+                }).await;
+                frame(window, cx, None, "search-editor-focus").await;
+                gpui::AnyWindowHandle::from(window).update(cx, |_, window, cx| {
+                    assert!(window.dispatch_keystroke(gpui::Keystroke::parse(if cfg!(target_os = "macos") { "cmd-f" } else { "ctrl-f" }).unwrap(), cx));
+                }).unwrap();
+                window.update(cx, |shell, _, cx| {
+                    let file = shell.file_surfaces.values().find(|file| file.read(cx).attachment_path() == Some("src/nested/main.rs")).unwrap().clone();
+                    file.update(cx, |file, cx| file.test_find_query("println", cx));
+                }).unwrap();
+                wait_for(window, cx, "file find matches", |shell, cx| {
+                    shell.file_surfaces.values().any(|file| file.read(cx).test_find_label(cx).as_deref() == Some("1/1"))
+                }).await;
+                frame(window, cx, output.as_deref(), "01-search-find").await;
+                gpui::AnyWindowHandle::from(window).update(cx, |_, window, cx| {
+                    window.dispatch_keystroke(gpui::Keystroke::parse("escape").unwrap(), cx);
+                }).unwrap();
+                window.update(cx, |shell, window, cx| {
+                    assert!(shell.file_surfaces.values().all(|file| !file.read(cx).has_unsaved_changes()));
+                    shell.files["first"].update(cx, |files, cx| files.test_reset_repo_search(cx));
+                    let id = *shell.file_surfaces.keys().next().unwrap();
+                    shell.close_right_surface(RightSurface::File(id), window, cx);
+                    shell.open_workbench_file(outside.to_string_lossy().into_owned(), window, cx);
+                }).unwrap();
+                wait_for(window, cx, "read-only source preview", |shell, cx| {
+                    shell.file_surfaces.values().any(|file| file.read(cx).test_document_text(&outside.to_string_lossy()).is_some())
+                }).await;
+                gpui::AnyWindowHandle::from(window).update(cx, |_, window, cx| {
+                    window.dispatch_keystroke(gpui::Keystroke::parse(if cfg!(target_os = "macos") { "cmd-f" } else { "ctrl-f" }).unwrap(), cx);
+                }).unwrap();
+                window.update(cx, |shell, _, cx| {
+                    let file = shell.file_surfaces.values().find(|file| file.read(cx).attachment_path() == Some(outside.to_string_lossy().as_ref())).unwrap().clone();
+                    file.update(cx, |file, cx| file.test_find_query("needle", cx));
+                }).unwrap();
+                wait_for(window, cx, "read-only find matches", |shell, cx| {
+                    shell.file_surfaces.values().any(|file| file.read(cx).test_find_label(cx).as_deref() == Some("1/2"))
+                }).await;
+                frame(window, cx, output.as_deref(), "01-search-readonly-find").await;
+                window.update(cx, |shell, window, cx| {
+                    let id = *shell.file_surfaces.keys().next().unwrap();
+                    shell.close_right_surface(RightSurface::File(id), window, cx);
+                    shell.close_right_surface(RightSurface::Explorer, window, cx);
+                    shell.add_files_surface(window, cx);
+                }).unwrap();
                 wait_for(
                     window,
                     cx,

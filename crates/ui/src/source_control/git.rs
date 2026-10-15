@@ -9,7 +9,7 @@ pub(super) use dialog::ConfirmationDialog;
 fn action_label(action: &Action) -> &'static str {
     match action {
         Action::Fetch => "Fetching changes…",
-        Action::Pull { .. } => "Pulling changes…",
+        Action::Pull { .. } | Action::PullFrom { .. } => "Pulling changes…",
         Action::Push => "Pushing commits…",
         Action::Publish { .. } => "Publishing branch…",
         Action::Sync => "Syncing changes…",
@@ -45,13 +45,13 @@ struct GitDropdown {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use gpui::{AppContext, TestAppContext, VisualTestContext};
 
     struct MenuHost(Entity<SourceControl>);
     impl Render for MenuHost {
-        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             div().size_full().child(
                 div()
                     .absolute()
@@ -60,11 +60,11 @@ mod tests {
                     .w(px(52.0))
                     .h(px(24.0))
                     .child(self.0.update(cx, |view, cx| view.render_header_actions(cx))),
-            )
+            ).child(self.0.update(cx, |view, cx| view.render_git_palette(window, cx)))
         }
     }
 
-    fn menu_setup(
+    pub(in crate::source_control) fn menu_setup(
         cx: &mut TestAppContext,
         height: f32,
     ) -> (Entity<SourceControl>, &mut VisualTestContext) {
@@ -178,6 +178,27 @@ mod tests {
     }
 
     #[gpui::test]
+    fn git_menu_exposes_checkout_and_pull_from_and_branch_menu_stays_compact(cx: &mut TestAppContext) {
+        let (view, cx) = menu_setup(cx, 900.0);
+        assert!(cx.debug_bounds("git-checkout-to").is_some());
+        let pull = cx.debug_bounds("git-pull-from").unwrap();
+        cx.simulate_click(pull.center(), gpui::Modifiers::default());
+        view.read_with(cx, |view, _| {
+            assert!(view.branch_picker.is_some());
+            assert!(!view.actions_menu.is_open());
+        });
+        view.update(cx, |view, cx| {
+            view.branch_picker = None;
+            view.open_git_panel(GitPanel::Branches, cx);
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(cx.debug_bounds("git-merge-branch").is_some());
+        assert!(cx.debug_bounds("git-rebase-branch").is_some());
+        assert!(cx.debug_bounds("git-delete-branch").is_some());
+        assert!(cx.debug_bounds("git-switch-0").is_none());
+    }
+
+    #[gpui::test]
     fn accepting_a_conflict_version_asks_first_and_names_the_rebase_sides(cx: &mut TestAppContext) {
         let (view, cx) = menu_setup(cx, 900.0);
         view.update(cx, |view, cx| {
@@ -282,17 +303,23 @@ impl RenderOnce for GitDropdown {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum GitPanel {
     Actions,
+    Commands,
     Branches,
     Stashes,
     Remotes,
-    History,
     CommitPublish,
-    Sort,
+    Publish,
+    RemoveRemote,
+    Incoming,
+    Outgoing,
+    Recent,
+    CherryPick,
+    Revert,
 }
-#[derive(Clone)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum GitForm {
     CreateBranch,
     RenameBranch,
@@ -323,7 +350,7 @@ pub(super) struct UndoDiscard {
     result: CheckoutDiscardResult,
 }
 
-fn button(
+pub(super) fn button(
     id: impl Into<String>,
     label: impl Into<SharedString>,
     enabled: bool,
@@ -455,6 +482,7 @@ impl SourceControl {
         self.notice = None;
         self.git_panel = None;
         let submitted_form = self.git_form.take();
+        let mut submitted_palette = self.git_palette.take();
         self.details_task = None;
         self.details_key = None;
         self.mutation_epoch += 1;
@@ -513,7 +541,10 @@ impl SourceControl {
                         if view.active_repository == repository {
                             view.git_form = submitted_form.clone();
                             if view.git_form.is_some() {
-                                view.actions_menu.open(());
+                                view.git_palette = submitted_palette.take();
+                                if let Some(palette) = &mut view.git_palette {
+                                    palette.focus_pending = true;
+                                }
                             }
                         }
                     }
@@ -752,12 +783,27 @@ impl SourceControl {
         if !self.git_enabled() {
             return;
         }
-        if matches!(panel, GitPanel::Branches | GitPanel::History | GitPanel::Remotes | GitPanel::CommitPublish) {
+        if matches!(panel, GitPanel::Remotes | GitPanel::CommitPublish | GitPanel::Publish | GitPanel::RemoveRemote | GitPanel::Incoming | GitPanel::Outgoing | GitPanel::Recent | GitPanel::CherryPick | GitPanel::Revert) {
             self.details_key = None;
         }
+        self.close_actions_menu(cx);
+        self.close_commit_menu(cx);
+        self.stash_picker = None;
+        self.branch_picker = None;
+        self.mount_git_palette(cx);
         self.git_panel = Some(panel);
-        self.actions_menu.open(());
         self.git_form = None;
+        if let Some(palette) = &mut self.git_palette {
+            palette.search.update(cx, |input, cx| input.set_text("", cx));
+            let placeholder = match panel {
+                GitPanel::Publish | GitPanel::CommitPublish | GitPanel::RemoveRemote => "Search remotes…",
+                GitPanel::Incoming | GitPanel::Outgoing | GitPanel::Recent | GitPanel::Revert | GitPanel::CherryPick => "Search commits by message or hash…",
+                _ => "Search Git commands…",
+            };
+            palette.search.update(cx, |input, cx| input.set_placeholder(placeholder, cx));
+            palette.active = 0;
+            palette.focus_pending = true;
+        }
         cx.notify();
     }
     pub(super) fn start_form(
@@ -769,6 +815,14 @@ impl SourceControl {
         if !self.git_enabled() {
             return;
         }
+        self.close_actions_menu(cx);
+        self.close_commit_menu(cx);
+        self.mount_git_palette(cx);
+        if let Some(palette) = &mut self.git_palette {
+            if palette.previous_focus.is_none() { palette.previous_focus = window.focused(cx); }
+        }
+        let placeholder = match form { GitForm::CreateBranch | GitForm::RenameBranch => "Branch name", GitForm::Stash(_) => "Stash message (optional)", GitForm::AddRemote => "Remote name" };
+        self.form_input.update(cx, |input, cx| input.set_placeholder(placeholder, cx));
         let text = if matches!(form, GitForm::RenameBranch) {
             self.git_state()
                 .and_then(|s| s.branch.clone())
@@ -784,23 +838,31 @@ impl SourceControl {
             .update(cx, |input, cx| input.set_text("", cx));
         self.git_form = Some(form);
         self.git_panel = None;
+        if let Some(palette) = &mut self.git_palette {
+            palette.focus_pending = true;
+        }
         window.focus(
             &gpui::Focusable::focus_handle(self.form_input.read(cx), cx),
             cx,
         );
-        // The form replaces a menu row. Focus it again once the input has
-        // joined the window's focus tree, so typing works immediately.
-        let input = self.form_input.clone();
-        window.on_next_frame(move |window, cx| {
-            window.focus(&gpui::Focusable::focus_handle(input.read(cx), cx), cx);
-        });
+        // The palette claims focus once the input has joined the dispatch tree.
         cx.notify();
     }
     pub(super) fn submit_form(&mut self, cx: &mut Context<Self>) {
         let Some(form) = self.git_form.clone() else {
             return;
         };
+        if !self.git_palette_current() {
+            self.notify_error(&self.active_repository.clone(), "The branch changed; reopen Git commands", cx);
+            return;
+        }
         let value = self.form_input.read(cx).text().trim().to_owned();
+        if !matches!(form, GitForm::Stash(_)) && value.is_empty() {
+            return;
+        }
+        if matches!(form, GitForm::AddRemote) && self.form_second.read(cx).text().trim().is_empty() {
+            return;
+        }
         let action = match form {
             GitForm::CreateBranch => Action::CreateBranch {
                 name: value,
@@ -1088,7 +1150,7 @@ impl SourceControl {
                     .truncate()
                     .tooltip(crate::settings::widgets::text_tooltip(context))
                     .cursor_pointer()
-                    .on_click(cx.listener(|this, _, _, cx| this.open_git_panel(GitPanel::Branches, cx)))
+                    .on_click(cx.listener(|this, _, window, cx| this.open_branch_picker(super::branch::BranchCommand::Checkout, window, cx)))
                     .child(SharedString::from(branch)),
             )
             .child(
@@ -1344,7 +1406,6 @@ impl SourceControl {
                 .child(button("git-commit-push", if self.git_state().is_some_and(|s| s.upstream.is_none()) { "Commit & Publish Branch" } else { "Commit & Push" }, can_commit, &theme).on_click(cx.listener(|this, _, _, cx| this.commit_with_followup(Some(Action::Push), cx))))
                 .child(button("git-commit-sync", "Commit & Sync", can_commit, &theme).on_click(cx.listener(|this, _, _, cx| this.commit_with_followup(Some(Action::Sync), cx))))
                 .child(div().my(px(4.0)).border_b_1().border_color(theme.border))
-                .child(button("git-amend", if self.amend { "Cancel Amend" } else { "Commit (Amend)…" }, enabled, &theme).on_click(cx.listener(|this, _, _, cx| { this.close_commit_menu(cx); this.toggle_amend(cx); })))
                 .child(button("git-undo-commit", "Undo Last Commit…", enabled, &theme).on_click(cx.listener(|this, _, _, cx| { this.close_commit_menu(cx); this.confirm_git(Action::UndoCommit, "Undo last local commit?".into(), "Your files will be kept and its message will return to the commit input.".into(), cx); })));
             trigger = trigger.child(GitDropdown {
                 id: "git-commit-options".into(),
@@ -1359,147 +1420,12 @@ impl SourceControl {
     }
 
     pub(super) fn render_git_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        if self.confirmation.is_some() {
+        if self.confirmation.is_some() || self.git_panel != Some(GitPanel::Actions) {
             return gpui::Empty.into_any_element();
         }
         let theme = Theme::of(cx).clone();
         let enabled = self.git_enabled();
-        if let Some(form) = &self.git_form {
-            let title = match form {
-                GitForm::CreateBranch => "Create Branch",
-                GitForm::RenameBranch => "Rename Branch",
-                GitForm::Stash(_) => "Stash Message (optional)",
-                GitForm::AddRemote => "Remote Name and URL",
-            };
-            return div()
-                .flex_none()
-                .p(px(10.0))
-                .flex()
-                .flex_col()
-                .gap(px(10.0))
-                .child(
-                    div()
-                        .text_size(px(12.0))
-                        .text_color(theme.text)
-                        .child(title),
-                )
-                .child(
-                    div()
-                        .p(px(8.0))
-                        .border_1()
-                        .border_color(theme.border_strong)
-                        .rounded(px(3.0))
-                        .bg(theme.input_glass_bg())
-                        .child(self.form_input.clone()),
-                )
-                .when(matches!(form, GitForm::AddRemote), |el| {
-                    el.child(
-                        div()
-                            .p(px(8.0))
-                            .border_1()
-                            .border_color(theme.border_strong)
-                            .rounded(px(3.0))
-                            .bg(theme.input_glass_bg())
-                            .child(self.form_second.clone()),
-                    )
-                })
-                .child(
-                    div()
-                        .flex()
-                        .gap(px(6.0))
-                        .child(button("git-form-cancel", "Cancel", true, &theme).on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.git_form = None;
-                                this.close_actions_menu(cx);
-                                cx.notify();
-                            }),
-                        ))
-                        .child(
-                            button("git-form-submit", "Save", enabled, &theme)
-                                .bg(theme.accent.opacity(0.15))
-                                .text_color(theme.accent)
-                                .on_click(cx.listener(|this, _, _, cx| this.submit_form(cx))),
-                        ),
-                )
-                .into_any_element();
-        }
-        let Some(panel) = self.git_panel.clone() else {
-            return gpui::Empty.into_any_element();
-        };
-        let mut body = div()
-            .id("git-actions-panel")
-            .flex_none()
-            .p(px(4.0))
-            .flex()
-            .flex_col()
-            .gap(px(3.0))
-            .when(panel != GitPanel::Actions, |el| {
-                el.child(
-                    button("git-panel-back", "← Git actions", true, &theme).on_click(cx.listener(
-                        |this, _, _, cx| {
-                            this.git_panel = Some(GitPanel::Actions);
-                            cx.notify();
-                        },
-                    )),
-                )
-            });
-        match panel {
-            GitPanel::Sort => {
-                for (id, label, order) in [("path", "Path", super::interaction::SortOrder::Path), ("name", "File Name", super::interaction::SortOrder::Name), ("status", "Status", super::interaction::SortOrder::Status)] {
-                    body = body.child(button(format!("git-sort-{id}"), format!("{}{}", if self.sort_order == order { "✓ " } else { "" }, label), enabled, &theme)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.sort_order = order;
-                            this.rebuild();
-                            this.close_actions_menu(cx);
-                            cx.notify();
-                        })));
-                }
-            }
-            GitPanel::CommitPublish => {
-                body = body.child(
-                    div()
-                        .p(px(8.0))
-                        .text_color(theme.text_muted)
-                        .child("Choose a remote to commit and publish this branch:"),
-                );
-                if let Some(details) = &self.git_details {
-                    let remotes = details
-                        .remotes
-                        .iter()
-                        .filter(|r| r.push_url.as_deref() != Some("DISABLED"))
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    if remotes.is_empty() {
-                        body = body.child(
-                            button("commit-publish-add-remote", "Add Remote…", enabled, &theme)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.start_form(GitForm::AddRemote, window, cx)
-                                })),
-                        );
-                    }
-                    for (index, remote) in remotes.into_iter().enumerate() {
-                        body = body.child(
-                            button(
-                                format!("commit-publish-{index}"),
-                                format!("Commit & Publish to {}", remote.name),
-                                self.can_request_commit(cx),
-                                &theme,
-                            )
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    this.commit_with_followup(
-                                        Some(Action::Publish {
-                                            remote: remote.name.clone(),
-                                        }),
-                                        cx,
-                                    )
-                                },
-                            )),
-                        );
-                    }
-                }
-            }
-            GitPanel::Actions => {
+        let mut body = div().id("git-actions-panel").flex_none().p(px(4.0)).flex().flex_col().gap(px(3.0));
                 for (id, label, action) in [
                     ("git-fetch", "Fetch", Action::Fetch),
                     ("git-pull", "Pull", Action::Pull { rebase: None }),
@@ -1509,8 +1435,18 @@ impl SourceControl {
                     body = body.child(button(id, label, enabled, &theme).on_click(
                         cx.listener(move |this, _, _, cx| this.run_git(action.clone(), cx)),
                     ));
+                    if id == "git-pull" {
+                        let command = super::branch::BranchCommand::Pull;
+                        body = body.child(button(command.id(), command.label(), enabled, &theme)
+                            .debug_selector(move || command.id().into())
+                            .on_click(cx.listener(move |this, _, window, cx| this.open_branch_picker(command, window, cx))));
+                    }
                 }
                 body = body.child(div().my(px(4.0)).border_b_1().border_color(theme.border));
+                let command = super::branch::BranchCommand::Checkout;
+                body = body.child(button(command.id(), command.label(), enabled, &theme)
+                    .debug_selector(move || command.id().into())
+                    .on_click(cx.listener(move |this, _, window, cx| this.open_branch_picker(command, window, cx))));
                 // A mixed selection offers each side's action separately, so
                 // the working-tree rows are never routed through Unstage.
                 for staged in [false, true] {
@@ -1629,207 +1565,19 @@ impl SourceControl {
                     }
                 }
                 for (id, label, panel) in [
-                    ("branches", "Branches…", GitPanel::Branches),
-                    (
-                        "history",
-                        "Incoming / Outgoing / Recent Commits…",
-                        GitPanel::History,
-                    ),
+                    ("commands", "Git Commands…", GitPanel::Commands),
+                    ("branches", "Branch…", GitPanel::Branches),
                     ("stashes", "Stashes…", GitPanel::Stashes),
                     ("remotes", "Remotes / Publish Branch…", GitPanel::Remotes),
-                    ("sort", "Sort Changes By…", GitPanel::Sort),
                 ] {
                     body = body.child(button(id, label, enabled, &theme).on_click(
                         cx.listener(move |this, _, _, cx| this.open_git_panel(panel.clone(), cx)),
                     ));
                 }
                 body = body
-                    .child(button("git-amend", "Amend Last Commit…", enabled, &theme).on_click(cx.listener(|this, _, _, cx| this.toggle_amend(cx))))
                     .child(button("git-undo-commit", "Undo Last Commit…", enabled, &theme).on_click(cx.listener(|this, _, _, cx| this.confirm_git(Action::UndoCommit, "Undo last local commit?".into(), "Your files will be kept and its message will return to the commit input. Git keeps a recovery reference.".into(), cx))))
-                    .child(button("git-pull-merge", "Pull (Merge)", enabled, &theme).on_click(cx.listener(|this, _, _, cx| this.run_git(Action::Pull { rebase: Some(false) }, cx))))
-                    .child(button("git-pull-rebase", "Pull (Rebase)", enabled, &theme).on_click(cx.listener(|this, _, _, cx| this.run_git(Action::Pull { rebase: Some(true) }, cx))))
                     .child(button("git-discard-everything", "Discard Staged and Unstaged Changes…", enabled, &theme).text_color(theme.danger).on_click(cx.listener(|this, _, _, cx| { if this.git_enabled() { this.discard_all(true, cx); } })))
                     .child(button("git-refresh", "Refresh", enabled, &theme).debug_selector(|| "git-menu-refresh".into()).on_click(cx.listener(|this, _, _, cx| { this.git_panel = None; this.close_actions_menu(cx); this.refresh(cx); })));
-            }
-            GitPanel::Branches => {
-                body = body
-                    .child(
-                        button("git-create-branch", "＋ Create Branch…", enabled, &theme).on_click(
-                            cx.listener(|this, _, window, cx| {
-                                this.start_form(GitForm::CreateBranch, window, cx)
-                            }),
-                        ),
-                    )
-                    .child(
-                        button(
-                            "git-rename-branch",
-                            "Rename Current Branch…",
-                            enabled,
-                            &theme,
-                        )
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.start_form(GitForm::RenameBranch, window, cx)
-                        })),
-                    );
-                if let Some(details) = self.git_details.clone() {
-                    for (i, branch) in details.branches.into_iter().enumerate() {
-                        let name = branch.name.clone();
-                        let merge = name.clone();
-                        let rebase = name.clone();
-                        let delete = name.clone();
-                        body = body.child(div().flex().items_center()
-                            .child(button(format!("git-switch-{i}"), SharedString::from(format!("{}{}", if branch.current { "✓ " } else if branch.remote { "↗ " } else { "" }, name)), enabled && !branch.current, &theme).flex_1().min_w_0().truncate().on_click(cx.listener(move |this, _, _, cx| this.run_git(Action::SwitchBranch { branch: name.clone() }, cx))))
-                            .when(!branch.current, |el| el
-                                .child(button(format!("git-merge-{i}"), "Merge", enabled, &theme).on_click(cx.listener(move |this, _, _, cx| this.run_git(Action::Merge { branch: merge.clone() }, cx))))
-                                .child(button(format!("git-rebase-{i}"), "Rebase", enabled, &theme).on_click(cx.listener(move |this, _, _, cx| this.run_git(Action::Rebase { branch: rebase.clone() }, cx))))
-                                .when(!branch.remote, |el| el.child(button(format!("git-delete-{i}"), "×", enabled, &theme).tooltip(crate::settings::widgets::text_tooltip("Delete merged branch")).on_click(cx.listener(move |this, _, _, cx| this.confirm_git(Action::DeleteBranch { name: delete.clone() }, format!("Delete branch {delete}?"), "Only a fully merged local branch can be deleted.".into(), cx)))))));
-                    }
-                }
-            }
-            GitPanel::Stashes => {
-                body = body
-                    .child(
-                        button("git-stash", "Stash Tracked Changes…", enabled, &theme).on_click(
-                            cx.listener(|this, _, window, cx| {
-                                this.start_form(GitForm::Stash(false), window, cx)
-                            }),
-                        ),
-                    )
-                    .child(
-                        button(
-                            "git-stash-untracked",
-                            "Stash Including Untracked…",
-                            enabled,
-                            &theme,
-                        )
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.start_form(GitForm::Stash(true), window, cx)
-                        })),
-                    );
-                body = body.child(div().my(px(4.0)).border_b_1().border_color(theme.border));
-                for (id, label, command, latest) in [
-                    ("apply-latest", "Apply Latest Stash", super::stash::StashCommand::Apply, true),
-                    ("apply", "Apply Stash…", super::stash::StashCommand::Apply, false),
-                    ("pop-latest", "Pop Latest Stash", super::stash::StashCommand::Pop, true),
-                    ("pop", "Pop Stash…", super::stash::StashCommand::Pop, false),
-                    ("drop", "Drop Stash…", super::stash::StashCommand::Drop, false),
-                ] {
-                    body = body.child(button(format!("git-stash-{id}"), label, enabled, &theme)
-                        .debug_selector(move || format!("git-stash-{id}"))
-                        .on_click(cx.listener(move |this, _, window, cx| this.open_stash_picker(command, latest, window, cx))));
-                }
-                body = body.child(div().my(px(4.0)).border_b_1().border_color(theme.border))
-                    .child(button("git-stash-restore", "Apply Stash & Restore Staging…", enabled, &theme)
-                        .on_click(cx.listener(|this, _, window, cx| this.open_stash_picker(super::stash::StashCommand::Restore, false, window, cx))));
-            }
-            GitPanel::Remotes => {
-                body = body.child(
-                    button("git-add-remote", "＋ Add Remote…", enabled, &theme).on_click(
-                        cx.listener(|this, _, window, cx| {
-                            this.start_form(GitForm::AddRemote, window, cx)
-                        }),
-                    ),
-                );
-                if let Some(details) = self.git_details.clone() {
-                    if details.remotes.is_empty() {
-                        body = body.child(
-                            div()
-                                .p(px(8.0))
-                                .text_size(px(11.0))
-                                .text_color(theme.text_faint)
-                                .child("Add a remote to publish this branch"),
-                        );
-                    }
-                    for (i, remote) in details.remotes.into_iter().enumerate() {
-                        let name = remote.name.clone();
-                        let remove = name.clone();
-                        body = body.child(div().py(px(5.0)).border_b_1().border_color(theme.border).flex().flex_col()
-                            .child(div().text_size(px(12.0)).text_color(theme.text).child(SharedString::from(remote.name)))
-                            .child(div().text_size(px(10.0)).text_color(theme.text_faint).overflow_hidden().child(SharedString::from(remote.url)))
-                            .child(div().flex()
-                                .child(button(format!("git-publish-{i}"), "Publish Branch", enabled, &theme).on_click(cx.listener(move |this, _, _, cx| this.run_git(Action::Publish { remote: name.clone() }, cx))))
-                                .child(button(format!("git-remove-remote-{i}"), "Remove…", enabled, &theme).on_click(cx.listener(move |this, _, _, cx| this.confirm_git(Action::RemoveRemote { name: remove.clone() }, format!("Remove remote {remove}?"), "This removes its local configuration and tracking references. The remote repository is kept.".into(), cx))))));
-                    }
-                }
-            }
-            GitPanel::History => {
-                if let Some(details) = self.git_details.clone() {
-                    for (section, commits) in [
-                        ("Incoming", details.incoming),
-                        ("Outgoing", details.outgoing),
-                        ("Recent", details.recent),
-                    ] {
-                        body = body.child(
-                            div()
-                                .pt(px(10.0))
-                                .pb(px(5.0))
-                                .text_size(px(11.0))
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(theme.text_muted)
-                                .child(section),
-                        );
-                        if commits.is_empty() {
-                            body = body.child(
-                                div()
-                                    .text_size(px(11.0))
-                                    .text_color(theme.text_faint)
-                                    .child("No commits"),
-                            );
-                        }
-                        for (i, commit) in commits.into_iter().enumerate() {
-                            let sha = commit.sha.clone();
-                            let pick_sha = sha.clone();
-
-                            let label = format!(
-                                "{}  {}",
-                                &commit.sha[..7.min(commit.sha.len())],
-                                commit.subject
-                            );
-                            body = body.child(
-                                div().flex().items_center().child(button(
-                                    format!("git-history-{section}-{i}"),
-                                    SharedString::from(label),
-                                    enabled,
-                                    &theme,
-                                )
-                                .flex_1().min_w_0()
-                                .truncate()
-                                .on_click(cx.listener(
-                                    move |this, _, _, cx| {
-                                        if !this.git_enabled() {
-                                            return;
-                                        }
-                                        if let Some(target) = this.target.clone() {
-                                            this.close_actions_menu(cx);
-                                            cx.emit(SourceControlEvent::OpenCommit {
-                                                cwd: target.cwd.clone(),
-                                                repository: this.active_repository.clone(),
-                                                commit: commit.clone(),
-                                            });
-                                        }
-                                    },
-                                )))
-                                .when(section == "Recent", |el| el.child(button(format!("git-revert-commit-{i}"), "↶", enabled, &theme)
-                                    .tooltip(crate::settings::widgets::text_tooltip("Revert commit"))
-                                    .on_click(cx.listener(move |this, _, _, cx| this.confirm_git(Action::RevertCommit { sha: sha.clone() }, "Revert this commit?".into(), "Git will create a new commit that reverses this commit's changes. Existing history is kept.".into(), cx)))))
-                                .when(section == "Incoming", |el| el.child(button(format!("git-cherry-pick-{i}"), "＋", enabled, &theme)
-                                    .tooltip(crate::settings::widgets::text_tooltip("Cherry-pick commit"))
-                                    .on_click(cx.listener(move |this, _, _, cx| this.run_git(Action::CherryPick { sha: pick_sha.clone() }, cx))))),
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        if self.git_details.is_none() && matches!(panel, GitPanel::Branches | GitPanel::History | GitPanel::Remotes | GitPanel::CommitPublish) {
-            body = body.child(
-                div()
-                    .p(px(8.0))
-                    .text_size(px(11.0))
-                    .text_color(theme.text_faint)
-                    .child("Loading Git details…"),
-            );
-        }
         body.into_any_element()
     }
 

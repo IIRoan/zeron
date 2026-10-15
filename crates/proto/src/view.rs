@@ -72,11 +72,22 @@ pub fn running_subagents(session: Option<&Session>, now: DateTime<Utc>) -> u32 {
         .map_or(0, |s| s.running_subagents)
 }
 
+/// Provider-reported background tasks, using the session's liveness lease.
+pub fn running_background_tasks(session: Option<&Session>, now: DateTime<Utc>) -> u32 {
+    session
+        .filter(|s| now.signed_duration_since(s.updated_at).num_milliseconds() <= SESSION_STALE_MS)
+        .map_or(0, |s| s.running_background_tasks)
+}
+
 /// The full display status for a chat row / tab dot: live states win, then the
 /// synced seen marker decides completed-vs-idle. Staleness gating rides on
 /// [`effective_indicator`]; the derivation itself is [`crate::chat_indicator`].
 pub fn display_status(chat: &Chat, session: Option<&Session>, now: DateTime<Utc>) -> ChatIndicator {
-    let live = session.filter(|s| effective_indicator(Some(s), now) != Indicator::None);
+    let live = session.filter(|s| {
+        effective_indicator(Some(s), now) != Indicator::None
+            || running_subagents(Some(s), now) > 0
+            || running_background_tasks(Some(s), now) > 0
+    });
     crate::chat_indicator(chat, live)
 }
 
@@ -265,6 +276,7 @@ mod gate_tests {
             started_at: None,
             updated_at,
             running_subagents: running,
+            running_background_tasks: 0,
         }
     }
 
@@ -280,6 +292,61 @@ mod gate_tests {
         );
         assert_eq!(running_subagents(Some(&stale), now), 0);
         assert_eq!(running_subagents(None, now), 0);
+    }
+
+    #[test]
+    fn parked_chats_with_background_work_stay_active_until_it_finishes() {
+        let now = Utc::now();
+        let mut chat: Chat = serde_json::from_value(serde_json::json!({
+            "id": "chat", "deviceId": "dev", "archived": false,
+            "createdAt": now, "lastMessageAt": now,
+        }))
+        .unwrap();
+        for (subagents, background) in [(0, 2), (1, 0), (1, 2)] {
+            let mut wire = serde_json::to_value(running_session(subagents, now)).unwrap();
+            wire["status"] = "idle".into();
+            wire["runningBackgroundTasks"] = background.into();
+            let session: Session = serde_json::from_value(wire).unwrap();
+            chat.last_seen_at = None;
+            assert_eq!(
+                display_status(&chat, Some(&session), now),
+                ChatIndicator::Working
+            );
+            // The completed parent turn can still accept another message.
+            assert_eq!(effective_indicator(Some(&session), now), Indicator::None);
+            chat.last_seen_at = Some(now);
+            assert_eq!(
+                display_status(&chat, Some(&session), now),
+                ChatIndicator::Working
+            );
+            let stale = now + chrono::Duration::milliseconds(SESSION_STALE_MS + 1);
+            assert_eq!(
+                display_status(&chat, Some(&session), stale),
+                ChatIndicator::Idle
+            );
+        }
+        let mut drained = running_session(0, now);
+        drained.status = SessionStatus::Idle;
+        chat.last_seen_at = None;
+        assert_eq!(
+            display_status(&chat, Some(&drained), now),
+            ChatIndicator::Completed
+        );
+        chat.last_seen_at = Some(now);
+        assert_eq!(
+            display_status(&chat, Some(&drained), now),
+            ChatIndicator::Idle
+        );
+    }
+
+    #[test]
+    fn older_session_rows_default_to_no_background_tasks() {
+        let mut wire = serde_json::to_value(running_session(0, Utc::now())).unwrap();
+        wire.as_object_mut()
+            .unwrap()
+            .remove("runningBackgroundTasks");
+        let session: Session = serde_json::from_value(wire).unwrap();
+        assert_eq!(session.running_background_tasks, 0);
     }
 
     #[test]

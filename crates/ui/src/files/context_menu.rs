@@ -76,9 +76,17 @@ impl FilesSurface {
         match action {
             0 | 1 => true,
             2 => paths.len() == 1 && self.can_mutate_tree_entry(&paths[0], false, cx),
-            _ => paths
+            3 => paths
                 .iter()
                 .all(|path| self.can_mutate_tree_entry(path, true, cx)),
+            // Searching is read-only and has one directory scope.
+            4 => {
+                paths.len() == 1
+                    && self.tree.node(&paths[0]).is_some_and(|node| {
+                        node.entry.kind == zeron_proto::WorkspaceEntryKind::Directory
+                    })
+            }
+            _ => false,
         }
     }
 
@@ -106,11 +114,16 @@ impl FilesSurface {
             popover::MenuKey::Escape => self.close_tree_context_menu(cx),
             key @ (popover::MenuKey::Up | popover::MenuKey::Down) => {
                 if let Some(menu) = self.tree_context_menu.as_open() {
+                    let count = if self.tree_menu_enabled(&menu.paths, 4, cx) {
+                        5
+                    } else {
+                        4
+                    };
                     let mut next = menu.active;
-                    for _ in 0..4 {
+                    for _ in 0..count {
                         next = popover::menu_step(
                             Some(next),
-                            4,
+                            count,
                             if matches!(key, popover::MenuKey::Up) {
                                 -1
                             } else {
@@ -184,6 +197,7 @@ impl FilesSurface {
             }
             2 => self.begin_tree_rename(paths[0].clone(), window, cx),
             3 => self.begin_tree_delete(paths, window, cx),
+            4 => self.search_in_folder(paths[0].clone(), window, cx),
             _ => {}
         }
     }
@@ -215,11 +229,15 @@ impl FilesSurface {
             ),
             ("Rename…".to_string(), icons::PEN),
             (delete_label, icons::TRASH_BIN_MINIMALISTIC),
+            ("Find in Folder…".to_string(), icons::MAGNIFER),
         ]
         .into_iter()
         .enumerate()
         {
-            if index == 2 {
+            if index == 4 && !self.tree_menu_enabled(&menu.paths, index, cx) {
+                continue;
+            }
+            if index == 2 || index == 4 {
                 card = card.child(popover::menu_separator());
             }
             let enabled = self.tree_menu_enabled(&menu.paths, index, cx);
@@ -288,6 +306,25 @@ mod tests {
         ] {
             assert_eq!(absolute_workspace_path(root, "src/a.txt"), expected);
         }
+    }
+
+    #[gpui::test]
+    fn find_in_folder_works_without_mutation_permissions(cx: &mut TestAppContext) {
+        cx.update(|cx| crate::composer::init(cx, Default::default()));
+        let (files, cx) = super::super::test_support::setup(cx);
+        files.update_in(cx, |files, window, cx| {
+            files.mutation_capabilities = None;
+            files.open_tree_context_menu("folder".into(), gpui::point(px(20.0), px(50.0)), window, cx);
+            assert!(files.tree_menu_enabled(&["folder".into()], 4, cx));
+            assert!(!files.tree_menu_enabled(&["a.txt".into()], 4, cx));
+            files.dispatch_tree_menu(4, window, cx);
+        });
+        cx.run_until_parked();
+        files.read_with(cx, |files, _| {
+            assert_eq!(files.search_state.mode, super::super::search::SearchMode::Code);
+            assert_eq!(files.search_state.options.folder, "folder");
+            assert!(!files.tree_context_menu.is_open());
+        });
     }
 
     #[gpui::test]
@@ -393,6 +430,7 @@ mod tests {
             assert_eq!(paths, ["folder", "a.txt"]);
             assert!(!files.tree_menu_enabled(&paths, 2, cx));
             assert!(files.tree_menu_enabled(&paths, 3, cx));
+            assert!(!files.tree_menu_enabled(&paths, 4, cx));
             files.dispatch_tree_menu(1, window, cx);
             assert_eq!(
                 cx.read_from_clipboard().unwrap().text().as_deref(),

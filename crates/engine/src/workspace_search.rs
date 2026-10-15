@@ -30,6 +30,8 @@ use fff_search::{
 
 use crate::home_index::HomeIndex;
 
+mod content_walk;
+
 /// An index nobody searched or warmed for this long is dropped.
 pub const IDLE_EVICT: Duration = Duration::from_secs(15 * 60);
 /// Live indexes at once; creating one more evicts the least recently used.
@@ -67,6 +69,8 @@ pub(crate) fn normalize_name_query(query: &str) -> Cow<'_, str> {
 pub enum WorkspaceSearchError {
     #[error("workspace search is unavailable: {0}")]
     Unavailable(String),
+    #[error("{0}")]
+    InvalidQuery(String),
 }
 
 /// Whether a root's index has finished its initial scan.
@@ -319,12 +323,77 @@ impl WorkspaceSearch {
         limit: usize,
         per_file: usize,
     ) -> Result<ContentSearch, WorkspaceSearchError> {
+        self.search_content_with_options(root, query, limit, per_file, &Default::default())
+    }
+
+    pub fn search_content_with_options(
+        &self,
+        root: &Path,
+        query: &str,
+        limit: usize,
+        per_file: usize,
+        controls: &zeron_proto::WorkspaceContentSearchOptions,
+    ) -> Result<ContentSearch, WorkspaceSearchError> {
+        self.search_content_cancellable(
+            root,
+            query,
+            limit,
+            per_file,
+            controls,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+    }
+
+    pub(crate) fn search_content_cancellable(
+        &self,
+        root: &Path,
+        query: &str,
+        limit: usize,
+        per_file: usize,
+        controls: &zeron_proto::WorkspaceContentSearchOptions,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<ContentSearch, WorkspaceSearchError> {
         if self.is_home(root) {
             // Home's index holds names only (see the module docs).
             return Ok(ContentSearch::default());
         }
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(ContentSearch {
+                truncated: true,
+                ..Default::default()
+            });
+        }
+        let pattern = content_pattern(query, controls)?;
+        if controls.include_ignored {
+            return content_walk::search(root, query, &pattern, limit, per_file, controls, cancel);
+        }
+        let include = content_glob(&controls.include)?;
+        let exclude = content_glob(&controls.exclude)?;
+        let folder = content_folder(&controls.folder)?;
+        let folder_glob = folder
+            .as_ref()
+            .map(|folder| format!("{}/**", globset::escape(folder)));
+        let mut constraints = Vec::new();
+        if let Some(folder) = &folder_glob {
+            constraints.push(fff_search::Constraint::Glob(folder));
+        }
+        if let Some(include) = &include {
+            constraints.push(fff_search::Constraint::Glob(include));
+        }
+        if let Some(exclude) = &exclude {
+            constraints.push(fff_search::Constraint::Not(Box::new(
+                fff_search::Constraint::Glob(exclude),
+            )));
+        }
         let picker = self.acquire(root, false)?;
         let indexing = !picker.wait_for_scan(SCAN_WAIT);
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(ContentSearch {
+                indexing,
+                truncated: true,
+                ..Default::default()
+            });
+        }
         if limit == 0 || per_file == 0 || query.trim().is_empty() {
             return Ok(ContentSearch {
                 indexing,
@@ -341,18 +410,51 @@ impl WorkspaceSearch {
         };
         let options = GrepSearchOptions {
             max_matches_per_file: per_file,
-            casing: Some(Casing::Smart),
+            casing: Some(match controls.match_case {
+                Some(true) => Casing::Sensitive,
+                Some(false) => Casing::Insensitive,
+                None => {
+                    if query.chars().any(char::is_uppercase) {
+                        Casing::Sensitive
+                    } else {
+                        Casing::Insensitive
+                    }
+                }
+            }),
             page_limit: limit,
-            mode: GrepMode::PlainText,
+            mode: if controls.use_regex || controls.whole_word {
+                GrepMode::Regex
+            } else {
+                GrepMode::PlainText
+            },
             time_budget_ms: CONTENT_TIME_BUDGET.as_millis() as u64,
             enforce_time_budget: true,
+            abort_signal: Some(cancel),
             ..Default::default()
         };
-        // The raw-pattern API preserves whitespace, constraint-like tokens
-        // and backslashes. `grep` parses filters and interprets escapes even
-        // in PlainText mode, so use one literal pattern with no constraints.
-        let result = fff.multi_grep(&[query], &[], &options);
-        let mut truncated = result.next_file_offset != 0 || result.matches.len() > limit;
+        // multi_grep is always literal, regardless of GrepMode. Construct a
+        // regex query directly so neither the text nor explicit filters pass
+        // through fff's heuristic parser. An empty raw_query disables its
+        // fallback that would otherwise broaden a zero-result filtered search.
+        let result = if controls.use_regex || controls.whole_word {
+            fff.grep(
+                &fff_search::FFFQuery {
+                    raw_query: "",
+                    constraints,
+                    fuzzy_query: fff_search::FuzzyQuery::Text(&pattern),
+                    location: None,
+                },
+                &options,
+            )
+        } else {
+            fff.multi_grep(&[query], &constraints, &options)
+        };
+        if let Some(error) = result.regex_fallback_error {
+            return Err(WorkspaceSearchError::InvalidQuery(format!(
+                "Invalid regular expression: {error}"
+            )));
+        }
+        let mut truncated = result.next_file_offset != 0 || result.matches.len() >= limit;
         let mut matches = Vec::with_capacity(result.matches.len().min(limit));
         for found in result.matches {
             if matches.len() == limit {
@@ -581,6 +683,112 @@ fn build_home(inner: Weak<Inner>, root: PathBuf, cancel: Arc<AtomicBool>) {
     home.index = Some(Arc::new(index));
     home.building = None;
     inner.home_built.notify_all();
+}
+
+fn content_pattern(
+    query: &str,
+    controls: &zeron_proto::WorkspaceContentSearchOptions,
+) -> Result<String, WorkspaceSearchError> {
+    let mut pattern = if controls.use_regex {
+        query.to_owned()
+    } else if controls.whole_word {
+        regex::escape(query)
+    } else {
+        return Ok(query.to_owned());
+    };
+    if controls.whole_word {
+        pattern = format!(r"\b(?:{pattern})\b");
+    }
+    regex::RegexBuilder::new(&pattern)
+        .size_limit(2 * 1024 * 1024)
+        .build()
+        .map_err(|error| {
+            WorkspaceSearchError::InvalidQuery(format!("Invalid regular expression: {error}"))
+        })?;
+    Ok(pattern)
+}
+
+/// Search-view patterns implicitly match at any depth; ./ anchors to the
+/// workspace root. A matching folder also includes its descendants.
+fn content_glob(input: &str) -> Result<Option<String>, WorkspaceSearchError> {
+    if input.len() > 4096 {
+        return Err(WorkspaceSearchError::InvalidQuery(
+            "File filter is too long".into(),
+        ));
+    }
+    let mut depth = 0usize;
+    let mut character_class = false;
+    let mut start = 0;
+    let mut parts = Vec::new();
+    for (offset, character) in input.char_indices() {
+        match character {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            '[' => character_class = true,
+            ']' => character_class = false,
+            ',' if depth == 0 && !character_class => {
+                parts.push(&input[start..offset]);
+                start = offset + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&input[start..]);
+    let mut patterns = Vec::new();
+    for part in parts
+        .into_iter()
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        let anchored = part.starts_with("./");
+        let part = part
+            .strip_prefix("./")
+            .unwrap_or(part)
+            .trim_end_matches('/');
+        if part.is_empty() {
+            continue;
+        }
+        let normalized = if anchored || part.starts_with("**/") {
+            part.to_owned()
+        } else {
+            format!("**/{part}")
+        };
+        globset::GlobBuilder::new(&normalized)
+            .literal_separator(true)
+            .build()
+            .map_err(|error| {
+                WorkspaceSearchError::InvalidQuery(format!("Invalid file filter: {error}"))
+            })?;
+        patterns.push(format!("{normalized}/**"));
+        patterns.push(normalized);
+    }
+    Ok(match patterns.len() {
+        0 => None,
+        1 => patterns.pop(),
+        _ => Some(format!("{{{}}}", patterns.join(","))),
+    })
+}
+
+fn content_folder(input: &str) -> Result<Option<String>, WorkspaceSearchError> {
+    let input = normalize_name_query(input.trim());
+    if input.len() > 4096 || input.contains('\0') {
+        return Err(WorkspaceSearchError::InvalidQuery(
+            "Invalid search folder".into(),
+        ));
+    }
+    let mut parts = Vec::new();
+    for component in Path::new(input.as_ref()).components() {
+        match component {
+            std::path::Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+            std::path::Component::CurDir => {}
+            _ => {
+                return Err(WorkspaceSearchError::InvalidQuery(
+                    "Search folder must be inside the workspace".into(),
+                ));
+            }
+        }
+    }
+    Ok((!parts.is_empty()).then(|| parts.join("/")))
 }
 
 fn reap(inner: Weak<Inner>) {
@@ -1004,6 +1212,20 @@ mod tests {
                 .matches
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn cancelled_content_request_does_not_cancel_other_queries_of_the_same_index() {
+        let (_dir, root) = folder(&[("a.txt", b"needle\n")]);
+        let search = WorkspaceSearch::new();
+        ready(&search, &root);
+        let canceled = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let found = search
+            .search_content_cancellable(&root, "needle", 20, 20, &Default::default(), canceled)
+            .unwrap();
+        assert!(found.matches.is_empty());
+        let live = search.search_content(&root, "needle", 20, 20).unwrap();
+        assert_eq!(live.matches.len(), 1);
     }
 }
 

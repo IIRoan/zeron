@@ -1486,6 +1486,31 @@ impl Inner {
         }
     }
 
+    /// Keep background activity visible without changing whether the parent
+    /// turn can accept another message. The driver's live task set owns this count.
+    fn set_running_background_tasks(&self, chat_id: &str, running: usize) {
+        let running = u32::try_from(running).unwrap_or(u32::MAX);
+        let session = {
+            let mut statuses = lock(&self.statuses);
+            let Some(entry) = statuses.get_mut(chat_id) else {
+                return;
+            };
+            if entry.running_background_tasks == running {
+                return;
+            }
+            entry.running_background_tasks = running;
+            entry.updated_at = Utc::now();
+            let session = entry.clone();
+            let mut list: Vec<Session> = statuses.values().cloned().collect();
+            list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
+            self.sessions_tx.send_replace(list);
+            session
+        };
+        if let Some(ws) = self.workspace() {
+            ws.record_session(&session);
+        }
+    }
+
     fn has_pending_steers(&self, chat_id: &str, run_id: &str) -> bool {
         lock(&self.runs)
             .get(chat_id)
@@ -1515,6 +1540,7 @@ impl Inner {
                     started_at: None,
                     updated_at: now,
                     running_subagents: 0,
+                    running_background_tasks: 0,
                 });
             // `started_at` is the elapsed-timer base and must only ever mean
             // "this turn". Entering Working from a settled state always
@@ -2497,7 +2523,10 @@ async fn drive_run(
     // into Streaming. Only a steer (UserMessage) legitimately REOPENS a
     // settled subagent: it announces more work is coming.
     let mut settled_subagents: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // Live subagent sinks, parent tool-use id → transcript doc state.
+    // Child lifecycle is independent of transcript storage: a quiet child or
+    // a failed document open still represents work in progress.
+    let mut live_subagents: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Open subagent sinks, parent tool-use id → transcript doc state.
     let mut subagents: std::collections::HashMap<String, SubagentSink> =
         std::collections::HashMap::new();
     // Last tagged subagent event. A background subagent outlives the turn that
@@ -2532,6 +2561,10 @@ async fn drive_run(
                     inner.touch_session(&chat_id);
                     continue;
                 }
+                _ = turn.background_changed() => {
+                    inner.set_running_background_tasks(&chat_id, turn.background_tasks());
+                    continue;
+                }
                 // A hang-up restarts the idle window, however long the call.
                 _ = resume_state.voice_active.ended.notified() => {
                     if idle_since.is_some() {
@@ -2548,7 +2581,7 @@ async fn drive_run(
                         && !resume_state.voice_active.live()
                         && inner.registry.update_pending(harness_id)
                         && !turn.background_live()
-                        && (subagents.is_empty()
+                        && (live_subagents.is_empty()
                             || last_subagent_activity.is_none_or(|at| at.elapsed() >= subagent_silence)) =>
                 {
                     if let Some(token) = lock(&inner.runs)
@@ -2565,10 +2598,10 @@ async fn drive_run(
                 // was finalized at Done, so this end is clean — no aborted stamp.
                 // A live background subagent is somebody still using the child:
                 // the window counts from its last activity, and stretches to
-                // `subagent_silence` while its sink is open.
+                // `subagent_silence` while the child is active.
                 _ = tokio::time::sleep_until(
                     {
-                        let window = if subagents.is_empty() { session_idle } else { subagent_silence };
+                        let window = if live_subagents.is_empty() { session_idle } else { subagent_silence };
                         let base = idle_since
                             .map(|at| at.max(last_subagent_activity.unwrap_or(at)) + window);
                         match (base, reap_deferred_until) {
@@ -2598,7 +2631,7 @@ async fn drive_run(
                     }
                     tracing::info!(
                         chat = %chat_id,
-                        live_subagents = subagents.len(),
+                        live_subagents = live_subagents.len(),
                         "reaping idle persistent session"
                     );
                     if let Some(token) = lock(&inner.runs)
@@ -2762,7 +2795,7 @@ async fn drive_run(
             // Background subagents can outlive the turn and be the only
             // traffic for minutes: keep the row (and its count) inside the
             // UI's staleness window while any is live.
-            if !subagents.is_empty() {
+            if !live_subagents.is_empty() {
                 inner.touch_session(&chat_id);
             }
             let is_steer = matches!(
@@ -2778,6 +2811,14 @@ async fn drive_run(
                 // pre-viz behavior), never a reopened doc.
                 continue;
             }
+            let done = matches!(sub_event.as_ref(), AgentEvent::Done { .. });
+            if done {
+                live_subagents.remove(parent_tool_use_id);
+            } else {
+                live_subagents.insert(parent_tool_use_id.clone());
+            }
+            inner.set_running_subagents(&chat_id, live_subagents.len());
+            let activity_only = matches!(sub_event.as_ref(), AgentEvent::Steered { .. });
             let sub_id = subagent_doc_id(&chat_id, parent_tool_use_id);
             let chip_streaming = folded
                 .iter()
@@ -2790,7 +2831,7 @@ async fn drive_run(
             // on click).
             let done_only = !sink_known && matches!(sub_event.as_ref(), AgentEvent::Done { .. });
             if chip_streaming {
-                if !sink_known && !done_only {
+                if !sink_known && !done_only && !activity_only {
                     for p in folded.iter_mut() {
                         if let MessagePart::Tool {
                             id,
@@ -2816,6 +2857,17 @@ async fn drive_run(
                         + std::time::Duration::from_millis(STREAM_COMMIT_MS);
                 }
             }
+            if activity_only {
+                if !chip_streaming {
+                    let _ = doc_ref.update_subagent_chip(
+                        parent_tool_use_id,
+                        None,
+                        Some("running"),
+                        None,
+                    );
+                }
+                continue;
+            }
             // Open the sink lazily; an open failure degrades to chip-only.
             if !sink_known && !done_only {
                 let opened = inner.doc_host().and_then(|host| match host.open(&sub_id) {
@@ -2839,7 +2891,6 @@ async fn drive_run(
                             dirty: false,
                         },
                     );
-                    inner.set_running_subagents(&chat_id, subagents.len());
                     if !chip_streaming {
                         let _ = doc_ref.update_subagent_chip(
                             parent_tool_use_id,
@@ -2850,7 +2901,6 @@ async fn drive_run(
                     }
                 }
             }
-            let done = matches!(sub_event.as_ref(), AgentEvent::Done { .. });
             if done {
                 settled_subagents.insert(parent_tool_use_id.clone());
                 if !chip_streaming {
@@ -2897,7 +2947,6 @@ async fn drive_run(
                         _ => MessageStatus::Complete,
                     };
                     let sink = subagents.remove(parent_tool_use_id).expect("checked");
-                    inner.set_running_subagents(&chat_id, subagents.len());
                     let doc_id = sink.doc_id.clone();
                     // FREEZE: the finished transcript uploads as a static R2
                     // blob (`blob/{chatId}/{subDocId}`) so viewers of
@@ -3355,11 +3404,13 @@ async fn drive_run(
         }
     };
 
+    for parent_id in live_subagents.drain() {
+        let _ = doc_ref.update_subagent_chip(&parent_id, None, Some("failed"), None);
+    }
     // Any subagent still streaming when the run ends freezes as-is: the
     // parent process is gone, so nothing more can arrive on this stream.
-    for (parent_id, sink) in subagents.drain() {
+    for (_, sink) in subagents.drain() {
         let doc_id = sink.doc_id.clone();
-        let _ = doc_ref.update_subagent_chip(&parent_id, None, Some("failed"), None);
         if let Some(json) = sink.finish(&device_id, MessageStatus::Aborted)
             && let Some(host) = inner.doc_host()
         {
@@ -3374,6 +3425,7 @@ async fn drive_run(
         }
     }
     inner.set_running_subagents(&chat_id, 0);
+    inner.set_running_background_tasks(&chat_id, 0);
 
     // Claim any accepted-but-unconfirmed steers BEFORE the handle goes away:
     // a routed send that raced this exit either finds its entry gone (we own

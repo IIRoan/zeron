@@ -32,7 +32,7 @@ send. The paperclip and ordinary image intake remain unchanged.
 - `crates/ui/src/attachments.rs`: construct a staged PNG from native bytes and
   keep existing upload/path behavior authoritative.
 - `crates/ui/Cargo.toml`: macOS framework/FFI dependencies only where needed.
-- `docs/research/appshots.md` and `docs/toolcraft/agent-worklog.md`: record any
+- `docs/research/appshots.md`: record any
   implementation decisions that differ from the exploration.
 
 No schema migration, timeline, layers, renderer replacement, or export path is

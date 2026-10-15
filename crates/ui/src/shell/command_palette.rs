@@ -17,7 +17,7 @@ const THREADS_TAB_LIMIT: usize = 50;
 const FILES_TAB_LIMIT: usize = 50;
 const CONTENT_TAB_LIMIT: usize = 100;
 const CONTENT_MATCHES_PER_FILE: usize = 3;
-/// Shorter workspace queries match nearly everything; they are not sent.
+/// Shorter content queries match nearly everything; they are not sent.
 const MIN_WORKSPACE_QUERY_CHARS: usize = 2;
 /// Content search waits for typing to pause; name search does not.
 const CONTENT_DEBOUNCE: Duration = Duration::from_millis(80);
@@ -258,6 +258,7 @@ impl Section {
 
 #[derive(Clone, Debug, PartialEq)]
 enum Command {
+    Git(crate::source_control::GitCommand),
     NewChat,
     NewChatSameCheckout,
     NewProject,
@@ -270,6 +271,7 @@ enum Command {
 impl Command {
     fn label(&self) -> &'static str {
         match self {
+            Self::Git(command) => command.label(),
             Self::NewChat => "New chat",
             Self::NewChatSameCheckout => "New chat in this checkout",
             Self::NewProject => "New project",
@@ -284,6 +286,7 @@ impl Command {
 
     fn icon(&self) -> &'static str {
         match self {
+            Self::Git(_) => icons::GIT_BRANCH,
             Self::NewChat | Self::NewChatSameCheckout => icons::PEN_NEW_SQUARE,
             Self::NewProject => icons::FOLDER,
             Self::Settings => icons::SETTINGS,
@@ -566,11 +569,9 @@ impl Shell {
             return;
         };
         let query = palette.search.read(cx).text().trim().to_owned();
-        // An empty query lists the workspace's recent files (the default
-        // Files list); a single character is too broad to search.
-        let Some(client) =
-            workspace.filter(|_| query.is_empty() || query.chars().count() >= MIN_WORKSPACE_QUERY_CHARS)
-        else {
+        // Name search accepts every keystroke, including a single character.
+        // An empty query lists the workspace's recent files.
+        let Some(client) = workspace else {
             palette.files.clear();
             palette.content.clear();
             return;
@@ -640,7 +641,7 @@ impl Shell {
             }
         }));
 
-        if query.is_empty() {
+        if query.chars().count() < MIN_WORKSPACE_QUERY_CHARS {
             palette.content.clear();
             return;
         }
@@ -650,6 +651,7 @@ impl Shell {
             query,
             limit: Some(CONTENT_TAB_LIMIT as u16),
             per_file_limit: Some(CONTENT_MATCHES_PER_FILE as u16),
+            options: None,
         };
         palette.content.task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(CONTENT_DEBOUNCE).await;
@@ -696,6 +698,8 @@ impl Shell {
             .selected_chat
             .as_deref()
             .is_some_and(|chat| self.can_reuse_chat_checkout(chat, cx));
+        let has_git_workspace = palette_workspace(self, cx).is_some()
+            && self.state.read(cx).chats.iter().any(|chat| chat.id == self.active_chat && chat.cwd.is_some());
         let commands = |section| {
             PaletteSection::new(
                 section,
@@ -706,6 +710,12 @@ impl Shell {
                     same_checkout,
                 )
                 .into_iter()
+                .chain(
+                    std::iter::once(crate::source_control::GitCommand::Commands)
+                        .chain(crate::source_control::GIT_COMMANDS.iter().copied().filter(|_| palette.tab == Tab::Commands || !query.is_empty()))
+                        .filter(|command| has_git_workspace && matches_query(&query, command.label()))
+                        .map(Command::Git),
+                )
                 .map(RowKind::Command),
             )
         };
@@ -936,6 +946,15 @@ impl Shell {
         }
         self.close_command_palette(window, cx);
         match row.kind {
+            RowKind::Command(Command::Git(command)) => {
+                self.set_surfaces_open(true, cx);
+                if self.active_changes(cx).is_none() {
+                    self.add_diff_surface(window, cx);
+                }
+                if let Some(changes) = self.active_changes(cx) {
+                    changes.update(cx, |changes, cx| changes.open_git_command(command, cx));
+                }
+            }
             RowKind::Command(Command::NewChat) => self.open_new_session(None, cx),
             RowKind::Command(Command::NewChatSameCheckout) => {
                 self.new_chat_in_current_checkout(cx)
@@ -994,7 +1013,7 @@ impl Shell {
             Command::NewProject => ShortcutId::NewProject,
             Command::Settings => return Some(crate::settings::badge_combo("mod-,")),
             Command::ArchiveThread => ShortcutId::ArchiveSession,
-            Command::Theme(_) | Command::NewChatSameCheckout | Command::ReleaseNotes => {
+            Command::Theme(_) | Command::NewChatSameCheckout | Command::ReleaseNotes | Command::Git(_) => {
                 return None;
             }
         };
@@ -1532,6 +1551,23 @@ mod tests {
     use super::*;
     use crate::appearance::AppearanceMode;
     use gpui::{AppContext, TestAppContext};
+
+    #[gpui::test]
+    fn git_commands_are_searchable_only_with_a_checkout(cx: &mut TestAppContext) {
+        let (window, _dir, _engine) = file_search_palette(cx);
+        window.update(cx, |shell, _, cx| {
+            shell.select_palette_tab(Tab::Commands, cx);
+            assert!(!shell.palette_sections(cx).iter().flat_map(|section| &section.rows).any(|row| matches!(row.kind, RowKind::Command(Command::Git(_)))));
+            shell.state.update(cx, |state, _| {
+                state.chats.iter_mut().find(|chat| chat.id == "focused").unwrap().cwd = Some("/checkout".into());
+            });
+            let git_count = shell.palette_sections(cx).iter().flat_map(|section| &section.rows).filter(|row| matches!(row.kind, RowKind::Command(Command::Git(_)))).count();
+            assert_eq!(git_count, crate::source_control::GIT_COMMANDS.len() + 1);
+            shell.command_palette.as_open().unwrap().search.update(cx, |input, cx| input.set_text("git pull rebase", cx));
+            let rows: Vec<_> = shell.palette_sections(cx).into_iter().flat_map(|section| section.rows).map(|row| row.kind).collect();
+            assert_eq!(rows, [RowKind::Command(Command::Git(crate::source_control::GitCommand::PullRebase))]);
+        }).unwrap();
+    }
 
     fn palette_window(cx: &mut TestAppContext) -> (gpui::WindowHandle<Shell>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -2090,6 +2126,16 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_single_character_searches_file_names_without_starting_content_search(cx: &mut TestAppContext) {
+        let (window, _dir, mut engine) = file_search_palette(cx);
+        type_query(window, "n", cx);
+        assert_eq!(answer_all(&mut engine, "ready", cx), [methods::WARM_WORKSPACE_SEARCH, methods::SEARCH_WORKSPACE_FILES]);
+        window.read_with(cx, |shell, _| {
+            assert!(shell.command_palette.as_open().unwrap().content.task.is_none());
+        }).unwrap();
+    }
+
+    #[gpui::test]
     fn a_ready_index_skips_the_probe_until_the_palette_reopens(cx: &mut TestAppContext) {
         let (window, _dir, mut engine) = file_search_palette(cx);
         let probed = [
@@ -2305,7 +2351,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn file_names_need_a_focused_chat_and_two_characters(cx: &mut TestAppContext) {
+    fn file_names_need_a_focused_chat_and_accept_a_single_character(cx: &mut TestAppContext) {
         let (window, _dir, mut engine) = engine_palette(cx, false);
         type_query(window, "co", cx);
         assert!(engine.take(methods::SEARCH_WORKSPACE_FILES, cx).is_empty());
@@ -2313,12 +2359,10 @@ mod tests {
 
         let (window, _dir, mut engine) = engine_palette(cx, true);
         type_query(window, "c", cx);
-        assert!(engine.take(methods::SEARCH_WORKSPACE_FILES, cx).is_empty());
-        type_query(window, "co", cx);
         let requests = engine.take(methods::SEARCH_WORKSPACE_FILES, cx);
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0]["params"]["chatId"], "focused");
-        assert_eq!(requests[0]["params"]["query"], "co");
+        assert_eq!(requests[0]["params"]["query"], "c");
         let searching = palette_section(window, Section::Files, cx).unwrap();
         assert!(searching.rows.is_empty());
         assert_eq!(searching.status.as_deref(), Some("Searching…"));

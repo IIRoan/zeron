@@ -7,8 +7,8 @@ use std::{
 };
 
 use gpui::{
-    Context, Entity, EventEmitter, FocusHandle, ListAlignment, ListState, Pixels, Point, Render,
-    SharedString, Subscription, Task, Window, div, prelude::*, px,
+    Context, Entity, EventEmitter, FocusHandle, Focusable as _, ListAlignment, ListState, Pixels,
+    Point, Render, SharedString, Subscription, Task, Window, div, prelude::*, px,
 };
 use zeron_proto::ListWorkspaceDirectoryRequest;
 
@@ -24,6 +24,7 @@ pub mod document;
 mod drag;
 pub mod editor;
 pub mod editor_adapter;
+mod find;
 mod git_status;
 mod image_preview;
 pub(crate) mod markdown_media;
@@ -32,6 +33,7 @@ pub mod model;
 pub mod mutations;
 pub mod preview;
 mod rename;
+mod repo_search;
 pub mod search;
 mod sections;
 mod subagents;
@@ -249,6 +251,11 @@ pub enum FilesEvent {
     /// A multi-entry move or delete, applied in order.
     MutateMany(Vec<mutations::MutationIntent>),
     OpenFile(String),
+    OpenFileAt {
+        path: String,
+        line: u32,
+        column: u64,
+    },
     RevealFile(String),
     OpenWebLink(crate::markdown::render::LinkActivation),
     TitleChanged,
@@ -348,6 +355,7 @@ pub struct FilesSurface {
     search: Entity<ComposerInput>,
     search_restore_tree_focus: bool,
     search_state: FileSearchState,
+    search_filters: repo_search::SearchFilters,
     search_list: ListState,
     git_status: Option<Entity<git_status::GitStatusSource>>,
     git_status_subscription: Option<Subscription>,
@@ -355,6 +363,7 @@ pub struct FilesSurface {
     watch_sequence: Option<u64>,
     watch_error: Option<SharedString>,
     preview: FilePreviewState,
+    find: find::FileFind,
     tree_context_menu: crate::popover::Popup<context_menu::TreeContextMenu>,
     pending_line_navigation: Option<(u32, Option<FileColumn>)>,
     line_navigation_generation: u64,
@@ -397,10 +406,14 @@ impl Render for FilesSurface {
         } else {
             self.render_explorer(&theme, window, cx).into_any_element()
         };
+        let find_bar = is_editor
+            .then(|| self.render_file_find(&theme, cx))
+            .flatten();
+        let repo_controls = (!is_editor).then(|| self.render_repo_controls(&theme, cx));
         let editor_context_menu = self.render_editor_context_menu(&theme, cx);
-        // The explorer docks its Subagents / Chats sections under the tree;
-        // an editor surface has no footer.
-        let sections = (!is_editor).then(|| self.render_sections(&theme, window, cx));
+        // Chat navigation belongs to the right sidebar in the Linux workbench.
+        let sections = (!is_editor && !cfg!(target_os = "linux"))
+            .then(|| self.render_sections(&theme, window, cx));
         div()
             .id(SharedString::from(format!(
                 "files-surface-{}",
@@ -413,12 +426,47 @@ impl Render for FilesSurface {
             .flex()
             .bg(crate::theme::ink(0.0))
             .flex_col()
-            .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+            .when(is_editor, |el| el.track_focus(&self.tree_focus))
+            // The editor resolves Ctrl+F as a Search action before raw key
+            // listeners run. Claim it on the owning surface's capture path.
+            .capture_action(cx.listener(|this, _: &gpui_base::input::Search, window, cx| {
+                if this.open_file_find(window, cx) { cx.stop_propagation(); } else { cx.propagate(); }
+            }))
+            .capture_action(cx.listener(|this, _: &gpui_base::input::Escape, window, cx| {
+                if this.find.open { this.close_file_find(window, cx); cx.stop_propagation(); } else { cx.propagate(); }
+            }))
+            .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                let key = &event.keystroke;
+                let modifier = key.modifiers.control || key.modifiers.platform;
+                if modifier && key.modifiers.shift && !key.modifiers.alt && key.key == "j"
+                    && !this.presentation.is_editor() && this.search_state.mode == search::SearchMode::Code {
+                    this.toggle_search_details(cx);
+                    cx.stop_propagation();
+                    window.prevent_default();
+                } else if modifier && !key.modifiers.shift && !key.modifiers.alt && key.key == "f" {
+                    if this.open_file_find(window, cx) {
+                        cx.stop_propagation();
+                        window.prevent_default();
+                    }
+                } else if this.find.open && key.key == "escape" {
+                    this.close_file_find(window, cx);
+                    cx.stop_propagation();
+                } else if this.find.open
+                    && (key.key == "f3"
+                        || (key.key == "enter"
+                            && this.find.input.focus_handle(cx).is_focused(window)))
+                {
+                    this.step_file_find(!key.modifiers.shift, cx);
+                    cx.stop_propagation();
+                    window.prevent_default();
+                }
                 if event.keystroke.key == "escape" && this.cancel_close_confirmation(cx) {
                     cx.stop_propagation();
                 }
             }))
             .children(header)
+            .children(find_bar)
+            .children(repo_controls)
             .child(div().flex_1().min_h_0().w_full().child(body))
             .children(
                 self.mutation_error
@@ -461,6 +509,17 @@ impl FilesSurface {
         let phase = self.tree.node("").map(|root| root.load.clone());
         let content = if !self.search_state.query.is_empty() {
             self.render_search_results(cx)
+        } else if self.search_state.mode == search::SearchMode::Code {
+            div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .px(px(16.0))
+                .text_size(px(11.0))
+                .text_color(theme.text_faint)
+                .child("Search code in this workspace")
+                .into_any_element()
         } else if let Some(error) = self.error.clone().filter(|_| !self.tree_has_content()) {
             div()
                 .flex_1()
@@ -710,7 +769,7 @@ impl FilesSurface {
                 this.ensure_loaded(cx);
             }
             this.sync_active_markdown_comments(cx);
-            if !this.presentation.is_editor() {
+            if !this.presentation.is_editor() && !cfg!(target_os = "linux") {
                 this.refresh_sections(cx);
             }
         });
@@ -757,6 +816,7 @@ impl FilesSurface {
             search,
             search_restore_tree_focus: false,
             search_state: FileSearchState::default(),
+            search_filters: repo_search::SearchFilters::new(cx),
             search_list: ListState::new(0, ListAlignment::Top, px(420.0)),
             git_status: None,
             git_status_subscription: None,
@@ -769,6 +829,7 @@ impl FilesSurface {
                 word_wrap,
                 editor_font_size,
             ),
+            find: find::FileFind::new(cx),
             tree_context_menu: crate::popover::Popup::default(),
             pending_line_navigation: None,
             line_navigation_generation: 0,
@@ -1245,6 +1306,7 @@ impl FilesSurface {
         self.tree_context_menu = crate::popover::Popup::default();
         self.editor_context_menu = crate::popover::Popup::default();
         self.preview.reset();
+        self.find.clear_document();
         self.pending_line_navigation = None;
         self.line_navigation_generation = self.line_navigation_generation.wrapping_add(1);
         self.tree.reset();
@@ -1295,6 +1357,8 @@ impl FilesSurface {
     /// to the tree.
     fn close_search(&mut self, cx: &mut Context<Self>) {
         self.clear_search(cx);
+        self.search_state.mode = search::SearchMode::Files;
+        self.search.update(cx, |search, cx| search.set_placeholder("Search files", cx));
         self.search_restore_tree_focus = true;
         cx.notify();
     }
@@ -1350,36 +1414,41 @@ impl FilesSurface {
                             .child(self.search.clone()),
                     ),
             )
-            .child(
-                toolbar_button(
-                    "files-toggle-ignored",
-                    if include_ignored {
-                        "Hide hidden and ignored files"
-                    } else {
-                        "Show all files (even hidden)"
-                    },
-                )
-                .debug_selector(|| "files-toggle-ignored".into())
-                .when(include_ignored, |element| {
-                    element.bg(crate::theme::wash(0.1))
-                })
-                .on_click(cx.listener(|this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.toggle_ignored(cx);
-                }))
-                .child(
-                    crate::icons::icon(if include_ignored {
-                        crate::icons::EYE
-                    } else {
-                        crate::icons::EYE_CLOSED
-                    })
-                    .size(px(crate::surface_chrome::ICON_SIZE))
-                    .text_color(if include_ignored {
-                        theme.text
-                    } else {
-                        theme.text_muted
-                    }),
-                ),
+            .when(
+                self.search_state.mode == search::SearchMode::Files,
+                |element| {
+                    element.child(
+                        toolbar_button(
+                            "files-toggle-ignored",
+                            if include_ignored {
+                                "Hide hidden and ignored files"
+                            } else {
+                                "Show all files (even hidden)"
+                            },
+                        )
+                        .debug_selector(|| "files-toggle-ignored".into())
+                        .when(include_ignored, |element| {
+                            element.bg(crate::theme::wash(0.1))
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle_ignored(cx);
+                        }))
+                        .child(
+                            crate::icons::icon(if include_ignored {
+                                crate::icons::EYE
+                            } else {
+                                crate::icons::EYE_CLOSED
+                            })
+                            .size(px(crate::surface_chrome::ICON_SIZE))
+                            .text_color(if include_ignored {
+                                theme.text
+                            } else {
+                                theme.text_muted
+                            }),
+                        ),
+                    )
+                },
             )
             .into_any_element()
     }

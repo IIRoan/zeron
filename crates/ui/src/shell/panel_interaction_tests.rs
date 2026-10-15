@@ -230,6 +230,120 @@ fn select(shell: &mut Shell, chat: Option<&str>, cx: &mut Context<Shell>) {
     shell.on_state_changed(&state, cx);
 }
 
+#[cfg(target_os = "linux")]
+#[gpui::test]
+fn workbench_never_shows_the_session_card_or_reserves_its_space(cx: &mut TestAppContext) {
+    let (dir, shell, cx) = setup(cx);
+    for width in [1600.0, 1200.0, 900.0, 700.0, 1600.0] {
+        cx.simulate_resize(window(width));
+        change(&shell, cx, |shell, _, cx| {
+            shell.settings.session_info_hidden = true;
+            shell.session_info_overlay = false;
+            shell.schedule_save(cx);
+        });
+        let baseline = settled(&shell, cx);
+
+        // A preference written by an earlier release and an open overlay
+        // must both leave the workbench's conversation unobstructed.
+        change(&shell, cx, |shell, _, cx| {
+            shell.settings.session_info_hidden = false;
+            shell.session_info_overlay = true;
+            shell.schedule_save(cx);
+        });
+        cx.update(|_, cx| settings::flush(cx));
+        assert!(!UiSettings::load(dir.path()).session_info_hidden);
+        let frame = settled(&shell, cx);
+        assert!(cx.debug_bounds("session-info").is_none(), "width={width}");
+        expect(frame, baseline.widths);
+        near(
+            f32::from(frame.composer.size.width),
+            f32::from(baseline.composer.size.width),
+        );
+        near(
+            f32::from(frame.composer.left()),
+            conversation_left(&frame)
+                + (frame.widths[3] - f32::from(frame.composer.size.width)) / 2.0,
+        );
+        shell.update(cx, |shell, cx| {
+            let (_, reveal, transcript_reserve) = shell.session_info_frame(true, cx);
+            assert_eq!(reveal, 0.0);
+            assert_eq!(transcript_reserve, 0.0);
+        });
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[gpui::test]
+fn workbench_width_survives_restart_toggles_and_window_resize(cx: &mut TestAppContext) {
+    let (dir, shell, cx) = setup(cx);
+    change(&shell, cx, |s, window, cx| s.open_explorer(window, cx));
+    let open = settled(&shell, cx);
+    let (seam_x, widen) = surface_seam(&open);
+    let seam = gpui::point(px(seam_x), px(400.0));
+    let dragged = gpui::point(px(seam_x + (430.0 - open.widths[2]) * widen), px(400.0));
+    cx.simulate_mouse_down(seam, MouseButton::Left, Default::default());
+    for _ in 0..2 {
+        cx.simulate_mouse_move(dragged, Some(MouseButton::Left), Default::default());
+    }
+    cx.simulate_mouse_up(dragged, MouseButton::Left, Default::default());
+    near(settled(&shell, cx).widths[2], 430.0);
+    cx.update(|_, cx| settings::flush(cx));
+    let loaded = UiSettings::load(dir.path());
+    near(loaded.right_pane_width, 430.0);
+
+    // Rebuild the shell from disk, as a fresh process does, with the same chat.
+    let state = shell.read_with(cx, |s, _| s.state.clone());
+    drop(shell);
+    let shell = cx.update(|window, cx| {
+        settings::init(loaded, dir.path(), cx);
+        window.replace_root(cx, |_, cx| {
+            let mut shell = Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: String::new(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            );
+            shell.debug_gate = Some(GatePhase::Ready);
+            shell.splash = SplashPhase::Gone;
+            shell.active_chat = "a".into();
+            shell.sidebar_opened_at = 1;
+            shell.panel_open_sequence = 1;
+            shell.test_time = Some(std::time::Instant::now());
+            shell
+        })
+    });
+    settled(&shell, cx);
+    change(&shell, cx, |s, window, cx| s.open_explorer(window, cx));
+    near(settled(&shell, cx).widths[2], 430.0);
+    change(&shell, cx, |s, _, cx| s.toggle_right_pane(cx));
+    near(settled(&shell, cx).widths[2], 0.0);
+    change(&shell, cx, |s, window, cx| s.open_explorer(window, cx));
+    near(settled(&shell, cx).widths[2], 430.0);
+
+    for panel in [Panel::Files, Panel::Files, Panel::Sidebar, Panel::Sidebar] {
+        change(&shell, cx, |s, window, cx| panel.toggle(s, window, cx));
+        near(settled(&shell, cx).widths[2], 430.0);
+    }
+    // A narrow window constrains only the painted width, retaining the choice.
+    cx.simulate_resize(window(1000.0));
+    near(settled(&shell, cx).widths[2], 400.0);
+    near(
+        shell.read_with(cx, |s, _| s.settings.right_pane_width),
+        430.0,
+    );
+    cx.simulate_resize(window(1600.0));
+    near(settled(&shell, cx).widths[2], 430.0);
+    cx.update(|_, cx| settings::flush(cx));
+    near(UiSettings::load(dir.path()).right_pane_width, 430.0);
+}
+
 #[gpui::test]
 fn panels_share_space_and_keep_rendered_geometry_through_their_lifecycle(cx: &mut TestAppContext) {
     let (_dir, shell, cx) = setup(cx);
@@ -239,7 +353,15 @@ fn panels_share_space_and_keep_rendered_geometry_through_their_lifecycle(cx: &mu
     // Each column responds gently, with no click jump or overshoot. Measure
     // the rendered widths, not a second implementation of the easing curve.
     for (panel, column, target) in [
-        (Panel::Right, 2, 650.0),
+        (
+            Panel::Right,
+            2,
+            if cfg!(target_os = "linux") {
+                520.0
+            } else {
+                650.0
+            },
+        ),
         (Panel::Files, 1, 377.0),
         (Panel::Sidebar, 0, 0.0),
     ] {
@@ -278,7 +400,14 @@ fn panels_share_space_and_keep_rendered_geometry_through_their_lifecycle(cx: &mu
         near(previous, target);
     }
     let wide = settled(&shell, cx);
-    expect(wide, [0.0, 377.0, 611.5, 611.5]);
+    expect(
+        wide,
+        if cfg!(target_os = "linux") {
+            [0.0, 377.0, 520.0, 703.0]
+        } else {
+            [0.0, 377.0, 611.5, 611.5]
+        },
+    );
     strip_follows_surface(&wide);
     // A collapsed sidebar leaves the left edge to the window's own resize.
     let edge = from_sidebar_edge;
@@ -298,12 +427,19 @@ fn panels_share_space_and_keep_rendered_geometry_through_their_lifecycle(cx: &mu
     change(&shell, cx, |s, _, cx| s.toggle_sidebar(cx));
     continuous(reopening, draw(&shell, cx, 0));
     let shared = settled(&shell, cx);
-    expect(shared, [300.0, 377.0, 461.5, 461.5]);
+    expect(
+        shared,
+        if cfg!(target_os = "linux") {
+            [300.0, 377.0, 520.0, 403.0]
+        } else {
+            [300.0, 377.0, 461.5, 461.5]
+        },
+    );
 
-    // A drag holds until a toggle; a seam reset restores the allocation.
+    // An explicit seam reset restores the shared allocation after a drag.
     let (seam_x, widen) = surface_seam(&shared);
     let seam = gpui::point(px(seam_x), px(400.0));
-    let dragged = gpui::point(px(seam_x + 38.5 * widen), px(400.0));
+    let dragged = gpui::point(px(seam_x + (500.0 - shared.widths[2]) * widen), px(400.0));
     cx.simulate_mouse_down(seam, MouseButton::Left, Default::default());
     for _ in 0..2 {
         cx.simulate_mouse_move(dragged, Some(MouseButton::Left), Default::default());
@@ -335,12 +471,17 @@ fn panels_share_space_and_keep_rendered_geometry_through_their_lifecycle(cx: &mu
     // for it promotes it; closing a neighbour makes room for its return.
     cx.simulate_resize(window(1000.0));
     let narrow = draw(&shell, cx, 0);
-    expect(narrow, [300.0, 0.0, 360.0, 340.0]);
+    let narrow_widths = if cfg!(target_os = "linux") {
+        [300.0, 0.0, 400.0, 300.0]
+    } else {
+        [300.0, 0.0, 360.0, 340.0]
+    };
+    expect(narrow, narrow_widths);
     assert!(shell.read_with(cx, |s, cx| s.files_panel_open(cx)));
     change(&shell, cx, |s, window, cx| s.toggle_files_panel(window, cx));
     expect(settled(&shell, cx), [300.0, 286.0, 0.0, 414.0]);
     change(&shell, cx, |s, window, cx| s.toggle_files_panel(window, cx));
-    expect(settled(&shell, cx), [300.0, 0.0, 360.0, 340.0]);
+    expect(settled(&shell, cx), narrow_widths);
     cx.simulate_resize(window(1600.0));
     change(&shell, cx, |s, window, cx| s.toggle_files_panel(window, cx));
     let ordinary = settled(&shell, cx);

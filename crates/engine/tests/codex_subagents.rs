@@ -236,3 +236,112 @@ async fn v2_followup_appends_to_the_original_document_and_updates_the_original_c
     )
     .await;
 }
+
+async fn check_quiet_children(scenario: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let (core, _) = assemble(dir.path());
+    let chat: zeron_proto::Chat = serde_json::from_value(serde_json::json!({
+        "id": CHAT, "deviceId": "test-device", "archived": false,
+        "createdAt": chrono::Utc::now(),
+    }))
+    .unwrap();
+    let mut request = RunRequest {
+        mcp: None,
+        prompt: format!("scenario:{scenario}"),
+        harness: None,
+        model: None,
+        reasoning: None,
+        model_options: Default::default(),
+        cwd: dir.path().display().to_string(),
+        sandbox: SandboxLevel::ReadOnly,
+        auto_approve: true,
+        attachments: vec![],
+        worktree: None,
+        resume: None,
+    };
+    for (turn, prompt, expected) in [
+        (1, None, 3),
+        (2, Some("keep-running"), 3),
+        (3, Some("finish-1"), 2),
+        (4, Some("finish-2"), 1),
+        (5, Some("finish-3"), 0),
+        (6, Some("restart-1"), 1),
+    ] {
+        if let Some(prompt) = prompt {
+            request.prompt = prompt.into();
+        }
+        core.sessions
+            .dispatch(CHAT, HarnessId::Codex, request.clone(), None)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if core
+                    .sessions
+                    .session_status(CHAT)
+                    .is_some_and(|session| session.status == SessionStatus::Idle)
+                    && text(&entries(&core, CHAT), MessageRole::Assistant)
+                        .contains(&format!("parent-{turn}"))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("parent reply finishes while the same runtime remains available");
+        let session = core.sessions.session_status(CHAT).unwrap();
+        assert_eq!(
+            session.running_subagents, expected,
+            "quiet children remain active after parent turn {turn}"
+        );
+        let now = chrono::Utc::now();
+        assert_eq!(
+            zeron_proto::view::effective_indicator(Some(&session), now),
+            zeron_proto::view::Indicator::None,
+            "parent composer is ready for another message"
+        );
+        assert_eq!(
+            zeron_proto::view::display_status(&chat, Some(&session), now),
+            if expected > 0 {
+                zeron_proto::ChatIndicator::Working
+            } else {
+                zeron_proto::ChatIndicator::Idle
+            },
+            "sidebar stays working while quiet child assignments are active"
+        );
+        // Activity alone must not create empty linked child transcripts.
+        assert!(
+            entries(&core, CHAT)
+                .iter()
+                .flat_map(|entry| &entry.parts)
+                .all(|part| {
+                    !matches!(
+                        part,
+                        MessagePart::Tool {
+                            subagent_ref: Some(_),
+                            ..
+                        }
+                    )
+                })
+        );
+    }
+    core.shutdown().await;
+    assert_eq!(
+        core.sessions
+            .session_status(CHAT)
+            .unwrap()
+            .running_subagents,
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn v1_quiet_children_stay_active_between_parent_replies() {
+    check_quiet_children("silent-v1").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn v2_quiet_children_stay_active_between_parent_replies() {
+    check_quiet_children("silent-v2").await;
+}

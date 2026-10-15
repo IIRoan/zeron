@@ -522,14 +522,53 @@ pub async fn stashes(root: &Path) -> Result<Vec<RepositoryGitStash>, EngineError
     Ok(stashes)
 }
 
-pub async fn details(root: &Path) -> Result<RepositoryGitDetails, EngineError> {
-    let state = state(root).await?;
+/// Branch-only metadata for quick pickers, without stash/history/remote scans.
+pub async fn branches(root: &Path) -> Result<Vec<RepositoryGitBranch>, EngineError> {
+    // HEAD's reflog is worktree-local and includes checkouts made outside Zeron.
+    // Missing reflogs (unborn repositories or core.logAllRefUpdates=false) are fine.
+    let reflog = text(
+        root,
+        &[
+            "reflog",
+            "show",
+            "-2048",
+            "--format=%gs%x00%gD",
+            "--date=unix",
+            "HEAD",
+        ],
+    )
+    .await
+    .unwrap_or_default();
+    let mut used = std::collections::HashMap::new();
+    for line in reflog.lines() {
+        let Some((message, selector)) = line.split_once('\0') else {
+            continue;
+        };
+        let Some(timestamp) = selector
+            .strip_prefix("HEAD@{")
+            .and_then(|s| s.strip_suffix('}'))
+            .and_then(|s| s.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let Some((from, to)) = message
+            .strip_prefix("checkout: moving from ")
+            .and_then(|s| s.split_once(" to "))
+        else {
+            continue;
+        };
+        for name in [from, to] {
+            used.entry(name.to_owned())
+                .and_modify(|value: &mut u64| *value = (*value).max(timestamp))
+                .or_insert(timestamp);
+        }
+    }
     let refs = text(
         root,
         &[
             "for-each-ref",
-            "--count=512",
-            "--format=%(refname)%00%(symref)%00%(HEAD)",
+            "--sort=-committerdate",
+            "--format=%(refname)%00%(symref)%00%(HEAD)%00%(committerdate:unix)",
             "refs/heads",
             "refs/remotes",
         ],
@@ -538,7 +577,7 @@ pub async fn details(root: &Path) -> Result<RepositoryGitDetails, EngineError> {
     let mut branches = Vec::new();
     for line in refs.lines() {
         let fields: Vec<_> = line.split('\0').collect();
-        if fields.len() != 3 || !fields[1].is_empty() {
+        if fields.len() != 4 || !fields[1].is_empty() {
             continue;
         }
         let (name, remote) = if let Some(name) = fields[0].strip_prefix("refs/heads/") {
@@ -552,8 +591,28 @@ pub async fn details(root: &Path) -> Result<RepositoryGitDetails, EngineError> {
             name: name.into(),
             remote,
             current: fields[2] == "*",
+            last_used_at: if remote {
+                None
+            } else {
+                used.get(name).copied()
+            },
+            commit_time: fields[3].parse().ok(),
         });
     }
+    branches.sort_by(|a, b| {
+        b.current
+            .cmp(&a.current)
+            .then_with(|| b.last_used_at.cmp(&a.last_used_at))
+            .then_with(|| b.commit_time.cmp(&a.commit_time))
+            .then_with(|| a.remote.cmp(&b.remote))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    Ok(branches)
+}
+
+pub async fn details(root: &Path) -> Result<RepositoryGitDetails, EngineError> {
+    let state = state(root).await?;
+    let branches = branches(root).await?;
     let mut remotes = Vec::new();
     for name in text(root, &["remote"]).await?.lines() {
         // A remote without a usable URL must not hide every other remote.
@@ -624,6 +683,15 @@ async fn branch_name(root: &Path, name: &str) -> Result<(), EngineError> {
 }
 
 async fn known_branch(root: &Path, name: &str) -> Result<RepositoryGitBranch, EngineError> {
+    // Pickers send a full ref to distinguish a local branch named origin/main
+    // from the remote branch origin/main. Legacy callers still send short names.
+    let (name, namespace) = if let Some(name) = name.strip_prefix("refs/heads/") {
+        (name, Some(false))
+    } else if let Some(name) = name.strip_prefix("refs/remotes/") {
+        (name, Some(true))
+    } else {
+        (name, None)
+    };
     let local = format!("refs/heads/{name}");
     let remote = format!("refs/remotes/{name}");
     let refs = text(
@@ -651,10 +719,15 @@ async fn known_branch(root: &Path, name: &str) -> Result<RepositoryGitBranch, En
         } else {
             continue;
         };
+        if namespace.is_some_and(|remote| remote != is_remote) {
+            continue;
+        }
         found = Some(RepositoryGitBranch {
             name: name.into(),
             remote: is_remote,
             current: fields[2] == "*",
+            last_used_at: None,
+            commit_time: None,
         });
         if !is_remote {
             break;
@@ -887,6 +960,37 @@ async fn perform_inner(
             pull(root, rebase).await?;
             "Incoming commits pulled"
         }
+        Action::PullFrom { branch } => {
+            let selected = known_branch(root, &branch).await?;
+            if !selected.remote {
+                return Err(fail("Select a remote branch to pull from"));
+            }
+            if before.branch.is_none() {
+                return Err(fail("Switch to a branch before pulling"));
+            }
+            // Remote names can contain slashes. Match the longest registered
+            // prefix instead of guessing the remote from the first slash.
+            let remotes = text(root, &["remote"]).await?;
+            let (remote, name) = remotes
+                .lines()
+                .filter_map(|remote| {
+                    selected
+                        .name
+                        .strip_prefix(remote)
+                        .and_then(|s| s.strip_prefix('/'))
+                        .map(|name| (remote, name))
+                })
+                .max_by_key(|(remote, _)| remote.len())
+                .ok_or_else(|| fail("The branch's remote is unavailable; fetch and try again"))?;
+            let reference = format!("refs/heads/{name}");
+            run(
+                root,
+                &["pull", "--no-rebase", "--no-edit", "--", remote, &reference],
+                None,
+            )
+            .await?;
+            "Selected remote branch pulled into the current branch"
+        }
         Action::Push => {
             push(root).await?;
             "Commits pushed"
@@ -909,6 +1013,8 @@ async fn perform_inner(
         }
         Action::SwitchBranch { branch } => {
             let selected = known_branch(root, &branch).await?;
+            let reference = branch_ref(&selected);
+            let branch = selected.name;
             if selected.remote {
                 let local = branch
                     .split_once('/')
@@ -918,15 +1024,22 @@ async fn perform_inner(
                     root,
                     &[
                         "for-each-ref",
-                        "--format=%(upstream:short)",
-                        &format!("refs/heads/{local}"),
+                        "--format=%(refname:strip=2)%00%(upstream)",
+                        "refs/heads",
                     ],
                 )
                 .await?;
-                if tracking == branch {
-                    run(root, &["switch", "--", local], None).await?;
+                let tracking = tracking
+                    .lines()
+                    .filter_map(|line| {
+                        let (name, upstream) = line.split_once('\0')?;
+                        (upstream == reference).then_some(name)
+                    })
+                    .min_by_key(|&name| (name != local, name));
+                if let Some(tracking) = tracking {
+                    run(root, &["switch", "--", tracking], None).await?;
                 } else {
-                    run(root, &["switch", "--track", "--", &branch], None).await?;
+                    run(root, &["switch", "--track", "--", &reference], None).await?;
                 }
             } else {
                 run(root, &["switch", "--", &branch], None).await?;
@@ -958,7 +1071,7 @@ async fn perform_inner(
                     "Select a local branch that is not currently checked out",
                 ));
             }
-            run(root, &["branch", "--delete", "--", &name], None).await?;
+            run(root, &["branch", "--delete", "--", &selected.name], None).await?;
             "Merged branch deleted"
         }
         Action::Merge { branch } => {
@@ -1213,6 +1326,216 @@ mod tests {
     async fn act(root: &Path, action: Action) -> Result<RepositoryGitActionResult, EngineError> {
         let head = state(root).await.unwrap().head;
         perform(root, action, head.as_deref()).await
+    }
+
+    #[tokio::test]
+    async fn checkout_branch_picker_reads_all_refs_and_recent_checkouts_of_old_tips() {
+        let dir = repo();
+        let root = dir.path();
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args([
+                "commit",
+                "--amend",
+                "--no-edit",
+                "--date=2000-01-01T00:00:00Z",
+            ])
+            .env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        // More than the old 512-ref cap, written in one process.
+        let head = git(root, &["rev-parse", "HEAD"]);
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["update-ref", "--stdin"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            use std::io::Write;
+            let mut input = child.stdin.take().unwrap();
+            for i in 0..600 {
+                writeln!(input, "create refs/heads/old/{i:04} {head}").unwrap();
+            }
+        }
+        assert!(child.wait().unwrap().success());
+        git(root, &["switch", "-c", "recently-used"]);
+        git(root, &["switch", "main"]);
+        git(root, &["update-ref", "refs/remotes/origin/main", &head]);
+        git(
+            root,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        let entries = branches(root).await.unwrap();
+        assert_eq!(entries.len(), 603);
+        assert!(entries[0].current);
+        assert_eq!(entries[1].name, "recently-used");
+        assert!(entries[1].last_used_at.unwrap() >= unix_now() - 60);
+        assert!(entries[1].commit_time.unwrap() < 1_000_000_000);
+        let old = entries
+            .iter()
+            .find(|entry| entry.name == "old/0599")
+            .unwrap();
+        assert_eq!(old.last_used_at, None);
+        assert!(old.commit_time.unwrap() < 1_000_000_000);
+        assert!(!entries.iter().any(|entry| entry.name == "origin/HEAD"));
+        let unborn = tempfile::tempdir().unwrap();
+        git(unborn.path(), &["init", "-q", "-b", "main"]);
+        assert!(branches(unborn.path()).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn checkout_pull_from_fetches_selected_remote_branch_without_changing_checkout_or_upstream()
+     {
+        let dir = repo();
+        let root = dir.path();
+        let remote = tempfile::tempdir().unwrap();
+        git(remote.path(), &["init", "-q", "--bare", "-b", "main"]);
+        git(
+            root,
+            &[
+                "remote",
+                "add",
+                "team/origin",
+                remote.path().to_str().unwrap(),
+            ],
+        );
+        git(root, &["push", "-qu", "team/origin", "main"]);
+        let source = tempfile::tempdir().unwrap();
+        git(
+            source.path(),
+            &["clone", "-q", remote.path().to_str().unwrap(), "."],
+        );
+        git(source.path(), &["config", "user.name", "Fixture"]);
+        git(
+            source.path(),
+            &["config", "user.email", "fixture@example.com"],
+        );
+        git(source.path(), &["config", "commit.gpgsign", "false"]);
+        git(source.path(), &["switch", "-c", "feature/remote"]);
+        git(source.path(), &["push", "-q", "origin", "HEAD"]);
+        git(root, &["fetch", "-q", "team/origin"]);
+        // A same-named local branch must never shadow the selected remote ref.
+        git(root, &["branch", "team/origin/feature/remote"]);
+        assert!(
+            act(
+                root,
+                Action::PullFrom {
+                    branch: "team/origin/feature/remote".into()
+                }
+            )
+            .await
+            .is_err()
+        );
+        std::fs::write(source.path().join("incoming.txt"), "selected branch\n").unwrap();
+        git(source.path(), &["add", "incoming.txt"]);
+        git(source.path(), &["commit", "-qm", "Incoming branch change"]);
+        git(source.path(), &["push", "-q", "origin", "HEAD"]);
+        std::fs::write(root.join("local.txt"), "local branch commit\n").unwrap();
+        git(root, &["add", "local.txt"]);
+        git(root, &["commit", "-qm", "Local branch change"]);
+        let local_head = git(root, &["rev-parse", "HEAD"]);
+        git(root, &["config", "pull.rebase", "true"]);
+        let upstream = state(root).await.unwrap().upstream;
+        act(
+            root,
+            Action::PullFrom {
+                branch: "refs/remotes/team/origin/feature/remote".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(git(root, &["branch", "--show-current"]), "main");
+        assert_eq!(state(root).await.unwrap().upstream, upstream);
+        assert_eq!(git(root, &["rev-parse", "HEAD^1"]), local_head);
+        assert_eq!(
+            git(root, &["rev-parse", "HEAD^2"]),
+            git(source.path(), &["rev-parse", "HEAD"])
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("incoming.txt")).unwrap(),
+            "selected branch\n"
+        );
+        // This operation also works on a branch without a configured upstream.
+        git(root, &["switch", "-c", "unpublished"]);
+        act(
+            root,
+            Action::PullFrom {
+                branch: "refs/remotes/team/origin/feature/remote".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(state(root).await.unwrap().upstream, None);
+        assert!(
+            act(
+                root,
+                Action::PullFrom {
+                    branch: "refs/heads/main".into()
+                }
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn checkout_full_remote_ref_switches_to_tracking_branch_and_preserves_local_work() {
+        let dir = repo();
+        let root = dir.path();
+        git(root, &["remote", "add", "origin", "/unused-local-remote"]);
+        git(root, &["update-ref", "refs/remotes/origin/topic", "HEAD"]);
+        git(root, &["branch", "origin/topic"]);
+        std::fs::write(root.join("file.txt"), "local work\n").unwrap();
+        act(
+            root,
+            Action::SwitchBranch {
+                branch: "refs/remotes/origin/topic".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(git(root, &["branch", "--show-current"]), "topic");
+        assert_eq!(git(root, &["rev-parse", "--symbolic-full-name", "@{upstream}"]), "refs/remotes/origin/topic");
+        assert_eq!(
+            std::fs::read_to_string(root.join("file.txt")).unwrap(),
+            "local work\n"
+        );
+        git(root, &["branch", "--move", "custom-topic"]);
+        act(
+            root,
+            Action::SwitchBranch {
+                branch: "refs/heads/origin/topic".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(git(root, &["branch", "--show-current"]), "origin/topic");
+        act(
+            root,
+            Action::SwitchBranch {
+                branch: "refs/remotes/origin/topic".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(git(root, &["branch", "--show-current"]), "custom-topic");
+        act(
+            root,
+            Action::DeleteBranch {
+                name: "refs/heads/origin/topic".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(known_branch(root, "refs/heads/origin/topic").await.is_err());
     }
 
     #[test]

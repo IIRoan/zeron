@@ -227,6 +227,7 @@ pub mod methods {
     pub const COMMIT_CHECKOUT_STAGED: &str = "CommitCheckoutStaged";
     pub const GET_CHECKOUT_GIT_DETAILS: &str = "GetCheckoutGitDetails";
     pub const GET_CHECKOUT_STASHES: &str = "GetCheckoutStashes";
+    pub const GET_CHECKOUT_BRANCHES: &str = "GetCheckoutBranches";
     pub const RUN_CHECKOUT_GIT_ACTION: &str = "RunCheckoutGitAction";
     pub const PREVIEW_CHECKOUT_DISCARD: &str = "PreviewCheckoutDiscard";
     pub const DISCARD_CHECKOUT_CHANGES: &str = "DiscardCheckoutChanges";
