@@ -88,11 +88,16 @@ impl Shell {
     }
 
     pub(super) fn navigation_focus_fallback(&self, cx: &App) -> (FocusHandle, FocusHandle) {
+        let right_open = match self.route {
+            Route::Chat => self.right_pane_open(cx),
+            Route::PullRequests => self.pull_request_pane_open(),
+            Route::Settings(_) => false,
+        };
         if let Some(dialog) = self.release_notes_dialog.as_open() {
             (dialog.buttons[4].clone(), dialog.buttons[4].clone())
         } else if matches!(self.route, Route::Settings(_)) {
             (self.settings_focus.clone(), self.unfocused.clone())
-        } else if self.right_pane_open(cx) && self.navigation_focus.right_was_focused {
+        } else if right_open && self.navigation_focus.right_was_focused {
             (
                 self.navigation_focus.right.clone(),
                 self.navigation_focus.right.clone(),

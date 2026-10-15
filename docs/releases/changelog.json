@@ -4,6 +4,20 @@
   "fork_repository": "IIRoan/zeron",
   "releases": [
     {
+      "version": "0.2.113",
+      "upstream_commit": "6ac8859998909bc5afd55838afb0635c281f31c3",
+      "upstream_url": "https://github.com/zeronsh/zeron/releases/tag/v0.2.113",
+      "published_at": "2026-10-15T01:37:51Z",
+      "notes_source": "github_release",
+      "upstream_notes": "## What's Changed\n* Session card: show beside a roomy transcript, float over a tight one by @jsgrrchg in https://github.com/zeronsh/zeron/pull/867\n* Composer: show usage reset times on hover by @iamnishanth in https://github.com/zeronsh/zeron/pull/873\n* Persist embedded browser sessions across tabs and app restarts by @jsgrrchg in https://github.com/zeronsh/zeron/pull/573\n* Open pull requests in side panes beside the board and the chat by @jsgrrchg in https://github.com/zeronsh/zeron/pull/866\n* Overscroll bounce effect for the transcript, sidebar and file tree at their ends by @jsgrrchg in https://github.com/zeronsh/zeron/pull/821\n* Select several entries in the file tree by @jsgrrchg in https://github.com/zeronsh/zeron/pull/774\n* Add per-device custom worktree locations by @jsgrrchg in https://github.com/zeronsh/zeron/pull/530\n* Show harness icons in idle right sidebar chat tabs by @jsgrrchg in https://github.com/zeronsh/zeron/pull/725\n* Add sidebar toggle for Archived section by @wintergraham in https://github.com/zeronsh/zeron/pull/901\n* Cmd+K: fix Recent Files flicker by @Sushants-Git in https://github.com/zeronsh/zeron/pull/890\n* Settings: delete every archived session at once by @jdrly in https://github.com/zeronsh/zeron/pull/861\n* Native visuals: agents show interactive Luau visuals rendered by GPUI by @wingleeio in https://github.com/zeronsh/zeron/pull/900\n\n## New Contributors\n* @iamnishanth made their first contribution in https://github.com/zeronsh/zeron/pull/873\n* @Sushants-Git made their first contribution in https://github.com/zeronsh/zeron/pull/890\n* @jdrly made their first contribution in https://github.com/zeronsh/zeron/pull/861\n\n**Full Changelog**: https://github.com/zeronsh/zeron/compare/v0.2.112...v0.2.113",
+      "fork_changes": [
+        "Custom worktree locations retain project environment setup, lifecycle commands, and safe branch cleanup.",
+        "Persistent browser sessions use the Linux WebKitGTK helper with the system runtime libraries.",
+        "Keep the Linux workbench layout and menu hover feedback alongside upstream pull-request panes and file selection."
+      ],
+      "fork_through_commit": "c6941f292f5a887053bf5664ec2238e478d8177b"
+    },
+    {
       "version": "0.2.112",
       "upstream_commit": "b40ac5ee31b59e98f283fc10d1132895afdae566",
       "upstream_url": "https://github.com/zeronsh/zeron/releases/tag/v0.2.112",

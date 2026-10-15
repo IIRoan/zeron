@@ -1302,6 +1302,7 @@ impl Shell {
                         (viewport.height - px(Theme::TITLEBAR_HEIGHT + 16.0)).max(px(1.0)),
                     ),
                 ),
+                popover::MenuAlign::End,
             ));
         }
         actions.child(more).into_any_element()

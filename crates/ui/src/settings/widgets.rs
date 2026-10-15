@@ -75,6 +75,7 @@ fn dropdown_layer(
         closing,
         trigger_height,
         priority,
+        align: popover::MenuAlign::End,
     }
     .into_any_element()
 }
@@ -86,6 +87,7 @@ struct SettingsDropdown {
     closing: Option<std::time::Instant>,
     trigger_height: f32,
     priority: usize,
+    align: popover::MenuAlign,
 }
 
 impl RenderOnce for SettingsDropdown {
@@ -97,6 +99,7 @@ impl RenderOnce for SettingsDropdown {
             self.closing,
             self.trigger_height,
             limits,
+            self.align,
             self.priority,
         )
     }
@@ -1164,6 +1167,7 @@ pub fn select<V: 'static>(
         font: None,
         heading: None,
         menu_layer: 1,
+        align: popover::MenuAlign::End,
         reach: Rc::new(reach),
         on_select: None,
     }
@@ -1180,6 +1184,7 @@ pub struct Select<V: 'static> {
     font: Option<SharedString>,
     heading: Option<&'static str>,
     menu_layer: usize,
+    align: popover::MenuAlign,
     reach: SelectReach<V>,
     on_select: Option<SelectHandler<V>>,
 }
@@ -1255,6 +1260,13 @@ impl<V: 'static> Select<V> {
         self
     }
 
+    /// Open the menu rightward from the trigger's left edge, for triggers
+    /// that lead a row rather than end it.
+    pub fn open_rightward(mut self) -> Self {
+        self.align = popover::MenuAlign::Start;
+        self
+    }
+
     pub fn render(self, state: &SelectState, cx: &mut Context<V>) -> gpui::Stateful<gpui::Div> {
         let Self {
             id,
@@ -1267,6 +1279,7 @@ impl<V: 'static> Select<V> {
             font,
             heading,
             menu_layer,
+            align,
             reach,
             on_select,
         } = self;
@@ -1402,13 +1415,14 @@ impl<V: 'static> Select<V> {
                     SELECT_HEIGHT,
                     if heading.is_some() { 32.0 } else { 8.0 },
                 ));
-            trigger = trigger.child(dropdown_layer(
-                format!("{id}-menu"),
-                menu,
-                state.menu.closing_since(),
-                SELECT_HEIGHT,
-                menu_layer,
-            ));
+            trigger = trigger.child(SettingsDropdown {
+                id: format!("{id}-menu").into(),
+                content: menu,
+                closing: state.menu.closing_since(),
+                trigger_height: SELECT_HEIGHT,
+                align,
+                priority: menu_layer,
+            });
         }
         trigger
     }
@@ -1416,14 +1430,15 @@ impl<V: 'static> Select<V> {
 
 /// Settings actions share one size, corner radius, and hover language. Use
 /// outlined for selectors, quiet for secondary actions, filled for row
-/// actions on a block (the dropdown trigger's glass wash), and solid for
-/// commits.
+/// actions on a block (the dropdown trigger's glass wash), solid for
+/// commits, and danger for destructive actions behind a confirmation.
 #[derive(Clone, Copy)]
 pub enum ActionTone {
     Quiet,
     Outlined,
     Filled,
     Solid,
+    Danger,
 }
 
 fn action_rest(theme: &Theme, tone: ActionTone) -> gpui::Div {
@@ -1450,6 +1465,8 @@ fn action_rest(theme: &Theme, tone: ActionTone) -> gpui::Div {
             .bg(theme.solid)
             .font_weight(gpui::FontWeight::MEDIUM)
             .text_color(theme.on_solid),
+        // The dialogs' destructive fill (`popover::btn_danger`).
+        ActionTone::Danger => button.bg(theme.danger_strong).text_color(gpui::white()),
     }
 }
 
@@ -1499,7 +1516,7 @@ fn action_hover<E: Styled>(button: E, theme: &Theme, tone: ActionTone, t: f32) -
             select_fill(theme, true),
             t,
         )),
-        ActionTone::Solid => button.opacity(lerp(1.0, 0.9, t)),
+        ActionTone::Solid | ActionTone::Danger => button.opacity(lerp(1.0, 0.9, t)),
     }
 }
 
