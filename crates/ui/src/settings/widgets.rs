@@ -92,7 +92,7 @@ struct SettingsDropdown {
 
 impl RenderOnce for SettingsDropdown {
     fn render(self, window: &mut gpui::Window, cx: &mut gpui::App) -> impl IntoElement {
-        let limits = dropdown_limits(window.viewport_size(), sidebar_width(cx));
+        let limits = dropdown_limits(window.viewport_size(), sidebar_width(cx), self.priority);
         popover::contained_menu_layer(
             self.id,
             self.content,
@@ -105,8 +105,18 @@ impl RenderOnce for SettingsDropdown {
     }
 }
 
-fn dropdown_limits(viewport: gpui::Size<Pixels>, sidebar_width: f32) -> gpui::Bounds<Pixels> {
-    let pane = pane_bounds(viewport, sidebar_width);
+fn dropdown_limits(
+    viewport: gpui::Size<Pixels>,
+    sidebar_width: f32,
+    priority: usize,
+) -> gpui::Bounds<Pixels> {
+    // Priority-3 selects belong to a modal above the full window. The
+    // underlying Settings sidebar and titlebar do not bound that surface.
+    let pane = if priority >= 3 {
+        gpui::Bounds::new(gpui::point(px(0.0), px(0.0)), viewport)
+    } else {
+        pane_bounds(viewport, sidebar_width)
+    };
     gpui::Bounds::new(
         pane.origin + gpui::point(px(8.0), px(8.0)),
         gpui::size(
@@ -866,7 +876,7 @@ mod switch_tests {
         for (width, sidebar) in [(600.0, 224.0), (1200.0, 256.0), (1200.0, 400.0)] {
             let viewport = gpui::size(px(width), px(700.0));
             let pane = pane_bounds(viewport, sidebar);
-            let limits = dropdown_limits(viewport, sidebar);
+            let limits = dropdown_limits(viewport, sidebar, 1);
             assert_eq!(pane.size.width, px(width - sidebar));
             if cfg!(target_os = "linux") {
                 assert_eq!(pane.left(), px(0.0));
@@ -879,6 +889,21 @@ mod switch_tests {
             assert!(limits.right() <= pane.right());
             assert!(limits.top() >= px(Theme::TITLEBAR_HEIGHT));
             assert!(limits.bottom() <= pane.bottom());
+        }
+    }
+
+    #[test]
+    fn modal_dropdowns_use_the_window_instead_of_the_settings_pane() {
+        for width in [390.0, 600.0, 1200.0] {
+            let viewport = gpui::size(px(width), px(650.0));
+            for sidebar in [224.0, 256.0, 400.0] {
+                let limits = dropdown_limits(viewport, sidebar, 3);
+                assert_eq!(limits.left(), px(8.0));
+                assert_eq!(limits.top(), px(8.0));
+                assert_eq!(limits.right(), px(width - 8.0));
+                assert_eq!(limits.bottom(), px(642.0));
+                assert!(limits.size.width >= px(320.0));
+            }
         }
     }
 

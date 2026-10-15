@@ -384,6 +384,8 @@ impl Shell {
         space_id: &str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        use crate::settings::widgets::{self, ActionTone};
+
         let theme = Theme::of(cx).for_popup();
         let space = self.state.read(cx).space_row(space_id).cloned();
         let profile = self.active_sidebar_pin_profile_key(cx);
@@ -401,24 +403,22 @@ impl Shell {
         let reset_id = space_id.to_owned();
         let enabled = profile.is_some() && space.is_some();
         div()
-            .mt(px(12.0))
+            .w_full()
+            .min_w_0()
             .flex()
+            .flex_wrap()
             .items_center()
             .gap(px(10.0))
             .child(div().size(px(32.0)).flex_none().child(art))
             .child(
                 div()
                     .flex_1()
-                    .min_w_0()
+                    .min_w(px(100.0))
+                    .child(widgets::row_title(&theme, "Project icon"))
                     .child(
                         div()
-                            .text_size(px(12.0))
-                            .text_color(theme.text)
-                            .child("Project icon"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.0))
+                            .text_size(crate::typography::ui_rems(12.0))
+                            .line_height(crate::typography::ui_rems(16.0))
                             .text_color(theme.text_muted)
                             .truncate()
                             .child(
@@ -430,30 +430,41 @@ impl Shell {
                     ),
             )
             .child(
-                popover::btn_ghost(&theme, "Choose image…", "project-icon-choose")
-                    .id("project-icon-choose")
-                    .debug_selector(|| "project-icon-choose".into())
-                    .role(gpui::Role::Button)
-                    .aria_label("Choose project icon")
-                    .when(!enabled, |el| el.opacity(0.5).cursor_default())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if enabled {
-                            this.choose_project_icon(choose_id.clone(), cx);
-                        }
-                    })),
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(
+                        widgets::action_button(&theme, ActionTone::Quiet, "project-icon-choose")
+                            .min_h(px(28.0))
+                            .child("Choose image…")
+                            .id("project-icon-choose")
+                            .debug_selector(|| "project-icon-choose".into())
+                            .role(gpui::Role::Button)
+                            .aria_label("Choose project icon")
+                            .when(!enabled, |el| el.opacity(0.5).cursor_default())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if enabled {
+                                    this.choose_project_icon(choose_id.clone(), cx);
+                                }
+                            })),
+                    )
+                    .when(custom.is_some(), |el| {
+                        el.child(
+                            widgets::action_button(&theme, ActionTone::Quiet, "project-icon-reset")
+                                .min_h(px(28.0))
+                                .child("Reset icon")
+                                .id("project-icon-reset")
+                                .debug_selector(|| "project-icon-reset".into())
+                                .role(gpui::Role::Button)
+                                .aria_label("Reset project icon")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.reset_project_icon(&reset_id, cx)
+                                })),
+                        )
+                    }),
             )
-            .when(custom.is_some(), |el| {
-                el.child(
-                    popover::btn_ghost(&theme, "Reset icon", "project-icon-reset")
-                        .id("project-icon-reset")
-                        .debug_selector(|| "project-icon-reset".into())
-                        .role(gpui::Role::Button)
-                        .aria_label("Reset project icon")
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.reset_project_icon(&reset_id, cx)
-                        })),
-                )
-            })
             .into_any_element()
     }
 

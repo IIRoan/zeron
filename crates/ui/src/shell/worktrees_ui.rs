@@ -2,13 +2,55 @@
 use super::project_terminals_ui::{DiscardPrompt, ProjectContext, ServiceFields, UnsavedForm};
 use super::*;
 use crate::settings::widgets::{self, SelectOption, SelectState};
+use std::hash::{Hash as _, Hasher as _};
 use zeron_proto::{
     ProjectTerminalService, WorktreeDependencyMode as Deps, WorktreeEnvFile,
     WorktreeEnvMode as Env, WorktreeServiceMode as Services, WorktreeSettings,
     WorktreeSettingsSnapshot, WorktreeSetupPhase as Phase,
 };
 
+mod environment;
 mod removal;
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum SettingsPage {
+    #[default]
+    General,
+    Environment,
+    Workflow,
+    Services,
+    Advanced,
+}
+
+impl SettingsPage {
+    const ALL: [Self; 5] = [
+        Self::General,
+        Self::Environment,
+        Self::Workflow,
+        Self::Services,
+        Self::Advanced,
+    ];
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::General => "general",
+            Self::Environment => "environment",
+            Self::Workflow => "workflow",
+            Self::Services => "services",
+            Self::Advanced => "advanced",
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::General => "General",
+            Self::Environment => "Environment",
+            Self::Workflow => "Workflow",
+            Self::Services => "Services",
+            Self::Advanced => "Advanced",
+        }
+    }
+}
 
 #[derive(Default)]
 pub(super) struct WorktreeSettingsUi {
@@ -16,9 +58,13 @@ pub(super) struct WorktreeSettingsUi {
     poll: Option<Task<()>>,
     epoch: u64,
     dependencies: SelectState,
+    scope: SelectState,
     services: SelectState,
     directory: SelectState,
+    env_modes: std::collections::HashMap<String, SelectState>,
     lifecycle_visible: bool,
+    page: SettingsPage,
+    navigation_focus: Option<[gpui::FocusHandle; 5]>,
     removal: popover::Popup<removal::Removal>,
     pub(super) discard: popover::Popup<DiscardPrompt>,
 }
@@ -52,6 +98,18 @@ impl Editor {
             busy: false,
             output: None,
         }
+    }
+
+    fn page_identity(&self, page: SettingsPage) -> u64 {
+        let mut identity = std::hash::DefaultHasher::new();
+        (
+            &self.project.space,
+            &self.checkout,
+            page as u8,
+            self.fields.is_some(),
+        )
+            .hash(&mut identity);
+        identity.finish()
     }
 
     fn is_dirty(&self, cx: &App) -> bool {
@@ -183,13 +241,34 @@ impl Fields {
 
 impl Shell {
     fn reset_worktree_selects(&mut self) {
+        self.worktree_settings.env_modes.clear();
         self.worktree_settings.dependencies = SelectState::default();
+        self.worktree_settings.scope = SelectState::default();
         self.worktree_settings.services = SelectState::default();
         self.worktree_settings.directory = SelectState::default();
     }
 
     pub(super) fn dismiss_worktree_select(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.worktree_settings.dependencies.is_open() {
+        let env_mode = self
+            .worktree_settings
+            .env_modes
+            .iter()
+            .find(|(_, state)| state.is_open())
+            .map(|(path, _)| path.clone());
+        if let Some(path) = env_mode {
+            widgets::close_select(
+                self,
+                move |s| {
+                    s.worktree_settings
+                        .env_modes
+                        .entry(path.clone())
+                        .or_default()
+                },
+                cx,
+            );
+        } else if self.worktree_settings.scope.is_open() {
+            widgets::close_select(self, |s| &mut s.worktree_settings.scope, cx);
+        } else if self.worktree_settings.dependencies.is_open() {
             widgets::close_select(self, |s| &mut s.worktree_settings.dependencies, cx);
         } else if self.worktree_settings.services.is_open() {
             widgets::close_select(self, |s| &mut s.worktree_settings.services, cx);
@@ -208,6 +287,7 @@ impl Shell {
         self.worktree_settings.epoch += 1;
         self.reset_worktree_selects();
         self.worktree_settings.lifecycle_visible = false;
+        self.worktree_settings.page = SettingsPage::General;
         self.worktree_settings.removal = popover::Popup::default();
         self.worktree_settings.discard = popover::Popup::default();
         self.worktree_settings.editor.open(Editor::new(project));
@@ -224,9 +304,11 @@ impl Shell {
             .is_some_and(|e| e.project.space == space)
         {
             self.select_worktree_settings(None, cx);
+            self.select_worktree_settings_page(SettingsPage::Services, cx);
             cx.notify();
         } else {
             self.open_worktree_settings(space, cx);
+            self.select_worktree_settings_page(SettingsPage::Services, cx);
         }
     }
 
@@ -493,6 +575,38 @@ impl Shell {
         changed
     }
 
+    fn select_worktree_settings_page(&mut self, page: SettingsPage, cx: &mut Context<Self>) {
+        if !self.worktree_settings.editor.is_open() || self.worktree_settings.page == page {
+            return;
+        }
+        self.worktree_settings.page = page;
+        self.reset_worktree_selects();
+        if let Some(editor) = self.worktree_settings.editor.open_mut() {
+            editor.scroll.set_offset(gpui::point(px(0.0), px(0.0)));
+        }
+        cx.notify();
+    }
+
+    fn navigate_worktree_settings(
+        &mut self,
+        page: SettingsPage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let previous = self.worktree_settings.page;
+        self.select_worktree_settings_page(page, cx);
+        if let Some(focus) = &self.worktree_settings.navigation_focus {
+            window.focus(
+                &focus[if page == SettingsPage::General {
+                    previous as usize
+                } else {
+                    SettingsPage::General as usize
+                }],
+                cx,
+            );
+        }
+    }
+
     fn select_worktree_settings(&mut self, checkout: Option<String>, cx: &mut Context<Self>) {
         let Some(editor) = self.worktree_settings.editor.open_mut() else {
             return;
@@ -712,59 +826,38 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        self.worktree_settings.editor.get()?;
+        let navigation_focus = self
+            .worktree_settings
+            .navigation_focus
+            .get_or_insert_with(|| {
+                std::array::from_fn(|_| cx.focus_handle().tab_index(0).tab_stop(true))
+            })
+            .clone();
         let editor = self.worktree_settings.editor.get()?;
         let theme = Theme::of(cx).for_popup();
         let busy = editor.busy;
-        let title = editor
-            .checkout
-            .as_ref()
-            .map(|p| {
-                std::path::Path::new(p)
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .unwrap_or_else(|| "Project defaults".into());
-        let mut navigation = div()
-            .id("worktree-settings-list")
-            .w(px(190.0))
-            .flex_none()
-            .flex()
-            .flex_col()
-            .gap(px(4.0))
-            .p(px(12.0))
-            .border_r_1()
-            .border_color(theme.border)
-            .overflow_y_scroll();
-        navigation = navigation.child(
-            choice(
-                &theme,
-                "worktree-defaults",
-                "Project defaults",
-                editor.checkout.is_none(),
-                window,
-            )
-            .on_click(cx.listener(|this, _, _, cx| this.select_worktree_settings(None, cx))),
-        );
+        let has_scopes = editor.checkout.is_some()
+            || editor.snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot
+                    .worktrees
+                    .iter()
+                    .any(|tree| tree.path != editor.project.cwd)
+            });
+        let page = self.worktree_settings.page;
+        let compact = viewport.width < px(560.0);
+        let padding = px(if compact { 16.0 } else { 24.0 });
+        let card_width = px(680.0).min((viewport.width - px(32.0)).max(px(0.0)));
+        let mut scopes = vec![None];
+        let mut scope_options = vec![SelectOption::new("Project defaults")];
         if let Some(snapshot) = &editor.snapshot {
-            navigation = navigation.child(
-                div()
-                    .mt(px(12.0))
-                    .mb(px(4.0))
-                    .text_size(px(11.0))
-                    .text_color(theme.text_muted)
-                    .child("WORKTREES"),
-            );
             for tree in snapshot
                 .worktrees
                 .iter()
-                .filter(|t| t.path != editor.project.cwd)
+                .filter(|tree| tree.path != editor.project.cwd)
             {
-                let path = tree.path.clone();
-                let selected = editor.checkout.as_deref() == Some(&path);
                 let label = if tree.branch.is_empty() {
-                    std::path::Path::new(&path)
+                    std::path::Path::new(&tree.path)
                         .file_name()
                         .unwrap_or_default()
                         .to_string_lossy()
@@ -772,72 +865,94 @@ impl Shell {
                 } else {
                     tree.branch.clone()
                 };
-                navigation = navigation.child(
-                    choice(&theme, format!("worktree-choice-{path}"), "", selected, window)
-                        .aria_label(SharedString::from(label.clone()))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .child(SharedString::from(label)),
-                        )
-                        .when(tree.state.phase == Phase::Preparing, |row| row.child(
-                            loaders::mini_mono_spinner(format!("worktree-preparing-{path}"), 1.5, theme.text_muted, cx.entity_id(), cx),
-                        ))
-                        .child(
-                            div()
-                                .ml_auto()
-                                .text_size(px(10.0))
-                                .text_color(if tree.state.phase == Phase::Failed {
-                                    theme.danger
-                                } else {
-                                    theme.text_muted
-                                })
-                                .child(phase_label(tree.state.phase)),
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.select_worktree_settings(Some(path.clone()), cx)
-                        })),
-                );
+                scopes.push(Some(tree.path.clone()));
+                scope_options.push(SelectOption::new(label));
             }
         }
+        if let Some(checkout) = &editor.checkout
+            && !scopes.iter().any(|scope| scope.as_ref() == Some(checkout))
+        {
+            scopes.push(Some(checkout.clone()));
+            scope_options.push(SelectOption::new(
+                std::path::Path::new(checkout)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+            ));
+        }
+        let selected_scope = scopes
+            .iter()
+            .position(|scope| scope == &editor.checkout)
+            .unwrap_or(0);
+        let navigation = div()
+            .id("project-settings-navigation")
+            .debug_selector(|| "project-settings-navigation".into())
+            .min_w_0()
+            .max_w_full()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .justify_between()
+            .gap(px(8.0))
+            .child(widgets::row_title(&theme, "Settings for"))
+            .child(
+                widgets::select(
+                    "project-settings-scope",
+                    "Settings for",
+                    &theme,
+                    |shell: &mut Shell| &mut shell.worktree_settings.scope,
+                )
+                .menu_layer(3)
+                .options(scope_options, selected_scope)
+                .width(220.0)
+                .on_select(move |shell, index, _, cx| {
+                    if let Some(scope) = scopes.get(index) {
+                        shell.select_worktree_settings(scope.clone(), cx);
+                    }
+                })
+                .render(&self.worktree_settings.scope, cx),
+            );
         let mut content = div()
             .id("worktree-environment-scroll")
+            .debug_selector(|| "worktree-environment-scroll".into())
+            .w_full()
             .flex_1()
             .min_w_0()
             .min_h_0()
-            .p(px(20.0))
+            .px(padding)
+            .pt(px(4.0))
+            .pb(px(16.0))
             .overflow_y_scroll()
             .track_scroll(&editor.scroll)
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation());
         if let Some(snapshot) = &editor.snapshot {
-            content = content
-                .child(popover::dialog_title(&theme, &title))
-                .child(note(
-                    &theme,
-                    if editor.checkout.is_none() {
-                        "Applies to the main folder and every worktree that is not customized."
-                    } else if snapshot.has_overrides {
-                        "This worktree has its own settings. Saving changes only this worktree."
-                    } else {
-                        "Uses Project defaults. Saving here customizes only this worktree."
-                    },
-                ));
-            if let Some(path) = &editor.checkout
+            if page == SettingsPage::General
+                && let Some(path) = &editor.checkout
                 && let Some(tree) = snapshot.worktrees.iter().find(|t| &t.path == path)
             {
                 content = content.child(section(&theme, "Environment status"));
                 if tree.state.phase == Phase::Preparing {
                     content = content.child(loaders::worktree_setup_indicator(
-                        "worktree-environment-progress", &theme,
-                        if tree.state.step.is_empty() { "Preparing the environment" } else { &tree.state.step },
-                        cx.entity_id(), cx,
+                        "worktree-environment-progress",
+                        &theme,
+                        if tree.state.step.is_empty() {
+                            "Preparing the environment"
+                        } else {
+                            &tree.state.step
+                        },
+                        cx.entity_id(),
+                        cx,
                     ));
                 } else {
-                    content = content.child(note(&theme, if tree.state.step.is_empty() {
-                        "Not prepared yet"
-                    } else { &tree.state.step }));
+                    content = content.child(note(
+                        &theme,
+                        if tree.state.step.is_empty() {
+                            "Not prepared yet"
+                        } else {
+                            &tree.state.step
+                        },
+                    ));
                 }
                 if let Some(error) = &tree.state.error {
                     content = content.child(
@@ -849,7 +964,7 @@ impl Shell {
                     );
                 }
                 let preparing = tree.state.phase == Phase::Preparing;
-                let mut actions = div().flex().gap(px(8.0)).mt(px(10.0));
+                let mut actions = div().flex().flex_wrap().gap(px(8.0)).mt(px(10.0));
                 actions = actions.child(
                     popover::btn_ghost(
                         &theme,
@@ -918,252 +1033,295 @@ impl Shell {
             }
         }
         if let Some(fields) = &editor.fields {
-            content = content.child(section(&theme, "Branch names"));
-            if editor.checkout.is_none() {
-                content=content.child(label(&theme,"Prefix for new branches")).child(field(&theme,&fields.prefix)).child(note(&theme,"For example feature/ or iiroan/. Leave blank for no prefix. Existing branches keep their names."));
-            } else {
-                content=content.child(note(&theme,"The branch prefix is set in project defaults and applies when creating a worktree."));
-            }
-            content = content.child(
-                self.render_database_section(editor, fields, &theme, busy, window, cx),
-            );
-            content=content.child(section(&theme,"Environment files")).child(note(&theme,"Copy keeps edits separate. Link shares the project file. Follow carries the latest edits when you switch conversations. Skip leaves the file to your workflow."));
-            for (index, rule) in fields.settings.env_files.iter().enumerate() {
-                let path = rule.path.clone();
-                let mode = rule.mode;
-                content = content.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .mt(px(7.0))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(px(12.0))
-                                .child(SharedString::from(path)),
-                        )
-                        .child(
-                            choice(
+            let mut panel = div()
+                .id(SharedString::from(format!(
+                    "project-settings-page-{}",
+                    page.key()
+                )))
+                .debug_selector(move || format!("project-settings-page-{}", page.key()))
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(24.0));
+            if page == SettingsPage::General {
+                let branch = widgets::card_row(&theme, false)
+                    .id("project-settings-branch-row")
+                    .debug_selector(|| "project-settings-branch-row".into())
+                    .child(
+                        div()
+                            .min_w(px(160.0))
+                            .max_w_full()
+                            .flex_1()
+                            .child(widgets::row_title(&theme, "Branch prefix"))
+                            .child(note(
                                 &theme,
-                                format!("env-mode-{index}"),
-                                env_label(mode),
-                                false,
-                                window,
+                                if editor.checkout.is_none() {
+                                    "Added to new branches. Leave blank for none."
+                                } else {
+                                    "Set in project defaults for new worktrees."
+                                },
+                            )),
+                    )
+                    .when(editor.checkout.is_none(), |row| {
+                        row.child(field(&theme, &fields.prefix).w(px(200.0)).max_w_full())
+                    });
+                panel =
+                    panel.child(
+                        widgets::section_card(&theme)
+                            .mt_0()
+                            .id("project-settings-general-block")
+                            .debug_selector(|| "project-settings-general-block".into())
+                            .child(widgets::card_row(&theme, true).child(
+                                self.render_project_icon_controls(&editor.project.space, cx),
+                            ))
+                            .child(branch),
+                    );
+                let mut sections = widgets::section_card(&theme).mt_0();
+                for (index, destination) in SettingsPage::ALL.into_iter().skip(1).enumerate() {
+                    let id =
+                        SharedString::from(format!("project-settings-open-{}", destination.key()));
+                    let focus = navigation_focus[destination as usize].clone();
+                    let summary = settings_summary(destination, editor, fields, cx);
+                    sections = sections.child(
+                        widgets::card_row(&theme, index == 0).py_0().child(
+                            div()
+                                .id(id.clone())
+                                .debug_selector({
+                                    let id = id.clone();
+                                    move || id.to_string()
+                                })
+                                .track_focus(&focus)
+                                .tab_index(0)
+                                .role(gpui::Role::Button)
+                                .aria_label(format!("{} settings", destination.title()))
+                                .w_full()
+                                .min_w_0()
+                                .min_h(px(60.0))
+                                .py(px(10.0))
+                                .flex()
+                                .items_center()
+                                .gap(px(12.0))
+                                .cursor_pointer()
+                                .group(SharedString::from(format!("{id}-group")))
+                                .border_1()
+                                .border_color(gpui::transparent_black())
+                                .focus_visible(|s| s.rounded(px(6.0)).border_color(theme.accent))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(widgets::row_title(&theme, destination.title()))
+                                        .child(note(&theme, &summary).mt(px(2.0))),
+                                )
+                                .child(
+                                    icon(icons::ALT_ARROW_RIGHT)
+                                        .size(px(16.0))
+                                        .flex_none()
+                                        .text_color(theme.text_faint)
+                                        .group_hover(
+                                            SharedString::from(format!("{id}-group")),
+                                            |s| s.text_color(theme.text),
+                                        ),
+                                )
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.navigate_worktree_settings(destination, window, cx)
+                                }))
+                                .on_key_down(cx.listener(
+                                    move |this, event: &gpui::KeyDownEvent, window, cx| {
+                                        if !event.is_held
+                                            && matches!(
+                                                event.keystroke.key.as_str(),
+                                                "enter" | "space"
+                                            )
+                                        {
+                                            this.navigate_worktree_settings(
+                                                destination,
+                                                window,
+                                                cx,
+                                            );
+                                            cx.stop_propagation();
+                                        }
+                                    },
+                                )),
+                        ),
+                    );
+                }
+                panel = panel.child(sections);
+            }
+            if page == SettingsPage::Environment {
+                panel = panel.child(self.render_environment_settings(fields, &theme, window, cx));
+            }
+            if page == SettingsPage::Workflow {
+                if editor
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|s| s.detected_workflow.as_deref() == Some("muute"))
+                {
+                    panel = panel.child(widgets::section_card(&theme).mt_0().child(
+                        widgets::card_row(&theme, true)
+                            .child(div().flex_1().min_w_0()
+                                .child(widgets::row_title(&theme, "Muute workflow"))
+                                .child(note(&theme, "Prepare environment files, ports and databases with codex-sync.")))
+                            .child(widgets::action(&theme, widgets::ActionTone::Outlined, "muute-worktree-preset", window)
+                                .child("Apply preset").role(gpui::Role::Button).aria_label("Apply Muute worktree preset")
+                                .on_click(cx.listener(|this, _, _, cx| this.apply_muute_preset(cx))))));
+                }
+                let group = widgets::section_card(&theme)
+                    .mt_0()
+                    .child(command_row(
+                        &theme,
+                        true,
+                        "Setup",
+                        "After creation, before agents and services start",
+                        &fields.setup,
+                    ))
+                    .child(command_row(
+                        &theme,
+                        false,
+                        "Activation",
+                        "When switching to this worktree",
+                        &fields.activate,
+                    ))
+                    .child(command_row(
+                        &theme,
+                        false,
+                        "Cleanup",
+                        "Before removing this worktree",
+                        &fields.cleanup,
+                    ))
+                    .child(
+                        widgets::card_row(&theme, false)
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(130.0))
+                                    .child(widgets::row_title(&theme, "Run commands in")),
                             )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Some(f) = this
-                                    .worktree_settings
-                                    .editor
-                                    .open_mut()
-                                    .and_then(|e| e.fields.as_mut())
-                                    && let Some(rule) = f.settings.env_files.get_mut(index)
-                                {
-                                    rule.mode = match rule.mode {
-                                        Env::Copy => Env::Link,
-                                        Env::Link => Env::Follow,
-                                        Env::Follow => Env::Skip,
-                                        Env::Skip => Env::Copy,
-                                    };
-                                }
-                                cx.notify();
-                            })),
-                        )
-                        .child(
-                            choice(&theme, format!("remove-env-{index}"), "Remove", false, window)
-                                .on_click(cx.listener(move |this, _, _, cx| {
+                            .child(
+                                widgets::select(
+                                    "worktree-command-directory",
+                                    "Command folder",
+                                    &theme,
+                                    |s: &mut Shell| &mut s.worktree_settings.directory,
+                                )
+                                .menu_layer(3)
+                                .options(
+                                    [
+                                        SelectOption::new("Worktree folder"),
+                                        SelectOption::new("Main project folder"),
+                                    ],
+                                    usize::from(fields.settings.commands_in_project),
+                                )
+                                .width(220.0)
+                                .on_select(|this, index, _, cx| {
                                     if let Some(f) = this
                                         .worktree_settings
                                         .editor
                                         .open_mut()
                                         .and_then(|e| e.fields.as_mut())
-                                        && index < f.settings.env_files.len()
                                     {
-                                        f.settings.env_files.remove(index);
+                                        f.settings.commands_in_project = index == 1;
                                     }
                                     cx.notify();
-                                })),
-                        ),
-                );
-            }
-            content = content.child(
-                div()
-                    .flex()
-                    .gap(px(8.0))
-                    .mt(px(10.0))
-                    .child(field(&theme, &fields.new_file).flex_1())
-                    .child(
-                        choice(&theme, "add-env-file", "Add", false, window).on_click(cx.listener(
-                            |this, _, _, cx| {
-                                if let Some(f) = this
-                                    .worktree_settings
-                                    .editor
-                                    .open_mut()
-                                    .and_then(|e| e.fields.as_mut())
+                                })
+                                .render(&self.worktree_settings.directory, cx),
+                            ),
+                    );
+                panel = panel.child(group);
+                let expanded = self.worktree_settings.lifecycle_visible;
+                let mut custom = widgets::section_card(&theme).mt_0().child(
+                    widgets::card_row(&theme, true).py_0().child(
+                        choice(
+                            &theme,
+                            "worktree-lifecycle-options",
+                            "Custom Git commands",
+                            false,
+                            window,
+                        )
+                        .w_full()
+                        .min_h(px(48.0))
+                        .px_0()
+                        .justify_between()
+                        .aria_expanded(expanded)
+                        .child(
+                            icons::disclosure_chevron(
+                                "project-settings-git-chevron",
+                                expanded,
+                                window,
+                                cx,
+                            )
+                            .size(px(14.0))
+                            .text_color(theme.text_muted),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.worktree_settings.lifecycle_visible =
+                                !this.worktree_settings.lifecycle_visible;
+                            cx.notify();
+                        }))
+                        .on_key_down(cx.listener(
+                            |this, event: &gpui::KeyDownEvent, _, cx| {
+                                if !event.is_held
+                                    && matches!(event.keystroke.key.as_str(), "enter" | "space")
                                 {
-                                    let path = f.new_file.read(cx).text().trim().to_string();
-                                    if !path.is_empty()
-                                        && !f.settings.env_files.iter().any(|r| r.path == path)
-                                    {
-                                        f.settings.env_files.push(WorktreeEnvFile {
-                                            path,
-                                            mode: Env::Copy,
-                                        });
-                                        f.new_file.update(cx, |input, cx| input.set_text("", cx));
-                                    }
+                                    this.worktree_settings.lifecycle_visible =
+                                        !this.worktree_settings.lifecycle_visible;
+                                    cx.notify();
+                                    cx.stop_propagation();
                                 }
-                                cx.notify();
                             },
                         )),
                     ),
-            );
-            content = content.child(
-                choice(&theme, "detect-env-files", "Add detected env files", false, window)
-                    .mt(px(8.0))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if let Some(editor) = this.worktree_settings.editor.open_mut()
-                            && let (Some(snapshot), Some(fields)) =
-                                (&editor.snapshot, &mut editor.fields)
-                        {
-                            for path in &snapshot.detected_env_files {
-                                if !fields.settings.env_files.iter().any(|r| &r.path == path) {
-                                    fields.settings.env_files.push(WorktreeEnvFile {
-                                        path: path.clone(),
-                                        mode: Env::Copy,
-                                    });
-                                }
-                            }
-                        }
-                        cx.notify();
-                    })),
-            );
-            if fields
-                .settings
-                .env_files
-                .iter()
-                .any(|r| r.mode == Env::Follow)
-            {
-                content=content.child(label(&theme,"Follow profile")).child(field(&theme,&fields.profile)).child(note(&theme,"Worktrees using the same profile share the latest env edits. Different names keep profiles separate. Replaced files are backed up locally."));
-            }
-            content = content.child(section(&theme, "Dependencies"));
-            let dependency_modes = [Deps::Copy, Deps::Install, Deps::Link, Deps::Skip];
-            content = content
-                .child(
-                    widgets::select(
-                        "worktree-dependency-mode",
-                        "Dependencies",
-                        &theme,
-                        |s: &mut Shell| &mut s.worktree_settings.dependencies,
-                    )
-                    .menu_layer(3)
-                    .options(
-                        [
-                            SelectOption::new("Copy node_modules automatically"),
-                            SelectOption::new("Install dependencies per worktree"),
-                            SelectOption::new("Share node_modules with the project"),
-                            SelectOption::new("Let my setup command handle dependencies"),
-                        ],
-                        dependency_modes
-                            .iter()
-                            .position(|m| *m == fields.settings.dependencies)
-                            .unwrap_or(0),
-                    )
-                    .width(360.0)
-                    .on_select(move |this, index, _, cx| {
-                        if let Some(f) = this
-                            .worktree_settings
-                            .editor
-                            .open_mut()
-                            .and_then(|e| e.fields.as_mut())
-                        {
-                            f.settings.dependencies = dependency_modes[index];
-                        }
-                        cx.notify();
-                    })
-                    .render(&self.worktree_settings.dependencies, cx),
-                )
-                .child(note(&theme, dependency_help(fields.settings.dependencies)));
-            if fields.settings.dependencies == Deps::Install {
-                content = content
-                    .child(label(&theme, "Install command (optional override)"))
-                    .child(field(&theme, &fields.install));
-            }
-            if matches!(fields.settings.dependencies, Deps::Copy | Deps::Link) {
-                content = content
-                    .child(label(&theme, "Dependency folders, separated by commas"))
-                    .child(field(&theme, &fields.paths));
-            }
-            content = content.child(section(&theme, "Setup workflow"));
-            if editor
-                .snapshot
-                .as_ref()
-                .is_some_and(|s| s.detected_workflow.as_deref() == Some("muute"))
-            {
-                content=content.child(widgets::action(&theme, widgets::ActionTone::Outlined, "muute-worktree-preset", window).child("Use Muute worktree workflow").role(gpui::Role::Button).aria_label("Use Muute worktree workflow").on_click(cx.listener(|this,_,_,cx|this.apply_muute_preset(cx)))).child(note(&theme,"Zeron creates the checkout; Muute’s codex-sync prepares env files, ports, submodules and database resources, and installs dependencies independently. Cleanup removes its database schema. Apply this preset, then Save settings."));
-            }
-            content = content
-                .child(label(&theme, "Set up the worktree after creation"))
-                .child(field(&theme, &fields.setup))
-                .child(label(&theme, "Activate when switching to this worktree"))
-                .child(field(&theme, &fields.activate))
-                .child(label(
-                    &theme,
-                    "Clean up resources before removing the worktree",
-                ))
-                .child(field(&theme, &fields.cleanup));
-            let in_project = fields.settings.commands_in_project;
-            content = content.child(label(&theme, "Run setup, activation and cleanup commands in"))
-                .child(widgets::select("worktree-command-directory", "Command folder", &theme,
-                    |s: &mut Shell| &mut s.worktree_settings.directory)
-                    .menu_layer(3)
-                    .options([SelectOption::new("The worktree folder"), SelectOption::new("The main project folder")], usize::from(in_project))
-                    .width(300.0)
-                    .on_select(|this, index, _, cx| {
-                        if let Some(f) = this.worktree_settings.editor.open_mut().and_then(|e| e.fields.as_mut()) {
-                            f.settings.commands_in_project = index == 1;
-                        }
-                        cx.notify();
-                    })
-                    .render(&self.worktree_settings.directory, cx))
-                .child(note(&theme, "Setup finishes before agents or services start. Cleanup releases resources before the worktree is removed."))
-                .child(label(&theme, "Variables you can use in workflow commands"))
-                .child(note(&theme, "\"$branchname\" = Git branch · \"$worktreename\" = folder name · \"$worktreepath\" = full worktree path · \"$projectroot\" = main project path. Use double quotes around variables."))
-                .child(choice(&theme, "worktree-lifecycle-options", if self.worktree_settings.lifecycle_visible {"Hide custom creation and removal commands"} else {"Custom creation and removal commands…"}, false, window)
-                    .mt(px(12.0)).on_click(cx.listener(|this, _, _, cx| {
-                        this.worktree_settings.lifecycle_visible = !this.worktree_settings.lifecycle_visible;
-                        cx.notify();
-                    })));
-            if self.worktree_settings.lifecycle_visible {
-                if editor.checkout.is_none() {
-                    content = content.child(label(&theme, "Create the worktree (optional Git override)"))
-                        .child(field(&theme, &fields.create))
-                        .child(note(&theme, "Leave blank for Zeron’s Git creation. Your command must create a linked checkout at \"$worktreepath\" on \"$branchname\", starting from \"$basebranch\"."));
+                );
+                if expanded {
+                    if editor.checkout.is_none() {
+                        custom = custom.child(command_row(&theme, false, "Create worktree", "Leave blank to use Git. The command must create the linked checkout at \"$worktreepath\" on \"$branchname\" from \"$basebranch\".", &fields.create));
+                    }
+                    custom = custom.child(command_row(&theme, false, "Remove worktree", "Leave blank to use Git. Runs after cleanup, in the main project folder, and must remove \"$worktreepath\".", &fields.remove));
                 }
-                content = content.child(label(&theme, "Remove the worktree (optional Git override)"))
-                    .child(field(&theme, &fields.remove))
-                    .child(note(&theme, "Leave blank for Zeron’s Git removal. Runs after cleanup and must remove \"$worktreepath\". Creation and removal commands always run in the main project folder."));
+                panel = panel.child(custom).child(
+                    div().id("project-settings-command-variables").px(px(8.0)).child(note(&theme, "Command variables ⓘ"))
+                        .tooltip(widgets::text_tooltip("Use double quotes around variables: \"$branchname\" (Git branch), \"$worktreename\" (folder name), \"$worktreepath\" (worktree path), \"$projectroot\" (main project path).")));
             }
-            content =
-                content.child(self.render_app_service_section(editor, fields, &theme, busy, window, cx));
-            content = content
-                .child(section(&theme, "Advanced"))
-                .child(label(&theme, "Command timeout in seconds"))
-                .child(field(&theme, &fields.timeout))
-                .child(label(
-                    &theme,
-                    "Extra environment variables for commands, services, and worktree terminals",
-                ))
-                .child(field(&theme, &fields.variables))
-                .child(note(
-                    &theme,
-                    "NAME=value, one per line. These settings and env backups stay on this device.",
-                ));
+            if page == SettingsPage::Services {
+                panel = panel
+                    .child(
+                        widgets::section(
+                            &theme,
+                            "Shared databases",
+                            self.render_database_section(editor, fields, &theme, busy, window, cx),
+                        )
+                        .mt_0(),
+                    )
+                    .child(
+                        widgets::section(
+                            &theme,
+                            "App services",
+                            self.render_app_service_section(
+                                editor, fields, &theme, busy, window, cx,
+                            ),
+                        )
+                        .mt_0(),
+                    );
+            }
+            if page == SettingsPage::Advanced {
+                panel = panel.child(widgets::section_card(&theme).mt_0()
+                    .child(widgets::card_row(&theme, true)
+                        .child(div().flex_1().min_w(px(140.0))
+                            .child(widgets::row_title(&theme, "Command timeout"))
+                            .child(note(&theme, "Maximum time for each workflow command")))
+                        .child(div().flex().items_center().gap(px(8.0))
+                            .child(field(&theme, &fields.timeout).w(px(80.0)))
+                            .child(note(&theme, "seconds").mt_0())))
+                    .child(command_row(&theme, false, "Environment variables", "NAME=value, one per line. Available to commands, services and worktree terminals.", &fields.variables)))
+                    .child(note(&theme, "Settings and environment backups are stored on this device.").px(px(8.0)));
+            }
+            content = content.child(panel);
         } else {
             content = content.child(note(&theme, "Loading worktree settings…"));
         }
-        if let Some(output) = &editor.output {
+        if let Some(output) = &editor.output
+            && page == SettingsPage::General
+        {
             content = content.child(section(&theme, "Setup output")).child(
                 div()
                     .font_family("monospace")
@@ -1174,12 +1332,17 @@ impl Shell {
                     .child(SharedString::from(output.clone())),
             );
         }
-        let dirty = editor.is_dirty(cx);
+        let dirty = editor
+            .fields
+            .as_ref()
+            .is_some_and(|fields| fields.is_dirty(cx));
+        let other_dirty = editor.drafts.values().any(|fields| fields.is_dirty(cx));
         let mut footer = div()
+            .id("project-settings-footer")
+            .debug_selector(|| "project-settings-footer".into())
             .flex_none()
-            .p(px(16.0))
-            .border_t_1()
-            .border_color(theme.border);
+            .px(padding)
+            .py(px(16.0));
         if let Some(error) = editor.error.as_ref().or(editor.poll_error.as_ref()) {
             footer = footer.child(
                 div()
@@ -1192,73 +1355,210 @@ impl Shell {
         footer = footer.child(
             div()
                 .flex()
-                .items_center()
-                .gap(px(8.0))
+                .when(compact, |el| el.flex_col().items_end())
+                .when(!compact, |el| el.items_center())
+                .gap(px(12.0))
                 .child(
                     div()
-                        .flex_1()
+                        .id("project-settings-status")
+                        .debug_selector(|| "project-settings-status".into())
+                        .when(compact, |el| el.w_full())
+                        .when(!compact, |el| el.flex_1())
+                        .min_w_0()
                         .text_size(px(11.0))
                         .text_color(theme.text_muted)
                         .when(dirty && !busy, |el| el.text_color(theme.warning))
                         .child(if busy {
-                            "Saving… You can keep using the app."
-                        } else if !dirty {
-                            "All changes saved."
-                        } else if editor.checkout.is_none() {
-                            "Unsaved changes. Save settings applies them to Project defaults and shared databases."
+                            "Working…"
+                        } else if dirty {
+                            "Unsaved changes"
+                        } else if other_dirty {
+                            "Other settings have unsaved changes"
                         } else {
-                            "Unsaved changes. Save settings applies them to this worktree only."
+                            "Saved"
                         }),
                 )
                 .child(
-                    popover::btn_ghost(&theme, "Close", "close-worktree-settings")
-                        .id("close-worktree-settings")
-                        .role(gpui::Role::Button)
-                        .aria_label("Close")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.request_close_form(UnsavedForm::WorktreeSettings, window, cx);
-                        })),
-                )
-                .child(
-                    popover::btn_primary(&theme, if busy { "Working…" } else { "Save settings" }, "save-worktree-settings")
-                        .id("save-worktree-settings")
-                        .role(gpui::Role::Button)
-                        .aria_label("Save settings")
-                        .when(busy || editor.fields.is_none(), |b| {
-                            b.opacity(0.5).cursor_default()
-                        })
-                        .when(!busy && editor.fields.is_some(), |b| {
-                            b.on_click(cx.listener(|this, _, _, cx| {
-                                match this.worktree_save_payload(cx) {
-                                    Ok((settings, databases)) => this.worktree_request(
-                                        methods::SAVE_WORKTREE_SETTINGS,
-                                        Some(settings),
-                                        databases,
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(
+                            popover::btn_ghost(&theme, "Close", "close-worktree-settings")
+                                .id("close-worktree-settings")
+                                .debug_selector(|| "close-worktree-settings".into())
+                                .role(gpui::Role::Button)
+                                .aria_label("Close")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.request_close_form(
+                                        UnsavedForm::WorktreeSettings,
+                                        window,
                                         cx,
-                                    ),
-                                    Err(error) => {
-                                        if let Some(editor) = this.worktree_settings.editor.open_mut() {
-                                            editor.error = Some(error);
+                                    );
+                                })),
+                        )
+                        .child(
+                            popover::btn_primary(
+                                &theme,
+                                if busy { "Working…" } else { "Save settings" },
+                                "save-worktree-settings",
+                            )
+                            .id("save-worktree-settings")
+                            .debug_selector(|| "save-worktree-settings".into())
+                            .role(gpui::Role::Button)
+                            .aria_label("Save settings")
+                            .when(busy || !dirty || editor.fields.is_none(), |b| {
+                                b.opacity(0.5).cursor_default()
+                            })
+                            .when(
+                                !busy && dirty && editor.fields.is_some(),
+                                |b| {
+                                    b.on_click(cx.listener(|this, _, _, cx| {
+                                        match this.worktree_save_payload(cx) {
+                                            Ok((settings, databases)) => this.worktree_request(
+                                                methods::SAVE_WORKTREE_SETTINGS,
+                                                Some(settings),
+                                                databases,
+                                                cx,
+                                            ),
+                                            Err(error) => {
+                                                if let Some(editor) =
+                                                    this.worktree_settings.editor.open_mut()
+                                                {
+                                                    editor.error = Some(error);
+                                                }
+                                                cx.notify();
+                                            }
                                         }
-                                        cx.notify();
-                                    }
-                                }
-                            }))
-                        }),
+                                    }))
+                                },
+                            ),
+                        ),
                 ),
         );
+        let mut metadata = vec![
+            div()
+                .truncate()
+                .child(SharedString::from(editor.project.name.clone()))
+                .into_any_element(),
+        ];
+        if editor.checkout.is_some() {
+            metadata.push(
+                div()
+                    .child(
+                        if editor.snapshot.as_ref().is_some_and(|s| s.has_overrides) {
+                            "Customized"
+                        } else {
+                            "Using project defaults"
+                        },
+                    )
+                    .into_any_element(),
+            );
+        }
         let header = div()
+            .id("project-settings-header")
+            .debug_selector(|| "project-settings-header".into())
             .flex_none()
-            .p(px(20.0))
-            .border_b_1()
-            .border_color(theme.border)
-            .child(popover::dialog_title(&theme, "Project settings"))
-            .child(note(&theme, &editor.project.name))
-            .child(self.render_project_icon_controls(&editor.project.space, cx));
+            .px(padding)
+            .pt(px(24.0))
+            .pb(px(20.0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(12.0))
+                    .when(page != SettingsPage::General, |el| {
+                        el.child(
+                            widgets::action(
+                                &theme,
+                                widgets::ActionTone::Quiet,
+                                "project-settings-back",
+                                window,
+                            )
+                            .id("project-settings-back")
+                            .debug_selector(|| "project-settings-back".into())
+                            .track_focus(&navigation_focus[SettingsPage::General as usize])
+                            .tab_index(0)
+                            .role(gpui::Role::Button)
+                            .aria_label("Back to project settings")
+                            .size(px(32.0))
+                            .p_0()
+                            .justify_center()
+                            .focus_visible(|s| s.border_2().border_color(theme.accent))
+                            .child(
+                                icon(icons::ALT_ARROW_LEFT)
+                                    .size(px(18.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.navigate_worktree_settings(SettingsPage::General, window, cx)
+                            }))
+                            .on_key_down(cx.listener(
+                                |this, event: &gpui::KeyDownEvent, window, cx| {
+                                    if !event.is_held
+                                        && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                                    {
+                                        this.navigate_worktree_settings(
+                                            SettingsPage::General,
+                                            window,
+                                            cx,
+                                        );
+                                        cx.stop_propagation();
+                                    }
+                                },
+                            )),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                widgets::page_header(
+                                    &theme,
+                                    if page == SettingsPage::General {
+                                        "Project settings"
+                                    } else {
+                                        page.title()
+                                    },
+                                    None,
+                                )
+                                .px_0(),
+                            )
+                            .child(widgets::meta_line(&theme, metadata)),
+                    ),
+            )
+            .when(has_scopes, |el| {
+                el.child(div().mt(px(20.0)).child(navigation))
+            });
+        // Keep the modal entrance and exit on the shared deferred layer; only
+        // content replacements get a separate, first-frame-deferred fade.
+        let shown = editor.page_identity(page);
+        let t = motion::deferred_swap_entrance(
+            window,
+            "project-settings-page-transition",
+            shown,
+            motion::FADE_QUICK,
+            motion::reduced_motion(cx),
+        );
+        let outlet = div()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .opacity(t)
+            .child(
+                crate::edge_fade::edge_faded(16.0, true, true, content)
+                    .fade_overflow_y(&editor.scroll),
+            );
+        let height = px(640.0).min((viewport.height - px(48.0)).max(px(0.0)));
         let card = popover::dialog_card(&theme)
-            .w(px(840.0))
-            .max_w((viewport.width - px(40.0)).max(px(200.0)))
-            .h(px(680.0).min((viewport.height - px(64.0)).max(px(240.0))))
+            .id("project-settings-card")
+            .debug_selector(|| "project-settings-card".into())
+            .w(card_width)
+            .h(height)
             .p_0()
             .bg(theme.surface_dialog)
             .border_color(theme.border)
@@ -1266,16 +1566,17 @@ impl Shell {
             .child(header)
             .child(
                 div()
+                    .id("project-settings-body")
+                    .debug_selector(|| "project-settings-body".into())
                     .flex()
                     .flex_1()
+                    .min_w_0()
                     .min_h_0()
-                    .child(navigation)
-                    .child(motion::fade_quick(
-                        SharedString::from(format!("worktree-settings-content-{title}")),
-                        content,
-                    )),
+                    .flex_col()
+                    .child(outlet),
             )
             .child(footer);
+        motion::keyed_fade_frames(window);
         Some(popover::modal(
             "worktree-settings",
             viewport,
@@ -1297,9 +1598,9 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        let mut el = div().child(section(theme, "Shared databases")).child(note(
+        let mut el = form_block(theme).child(note(
             theme,
-            "Started in the main project folder and checked before worktree setup, migrations and app services. They keep running when you switch or remove worktrees.",
+            "Run in the main project folder. Ready checks finish before worktree setup; databases stay running across worktree switches.",
         ));
         if editor.checkout.is_some() {
             let databases = editor
@@ -1323,7 +1624,10 @@ impl Shell {
                     window,
                 )
                 .mt(px(6.0))
-                .on_click(cx.listener(|this, _, _, cx| this.select_worktree_settings(None, cx))),
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.select_worktree_settings(None, cx);
+                    this.select_worktree_settings_page(SettingsPage::Services, cx);
+                })),
             );
         }
         if !self.databases_supported(cx) {
@@ -1338,11 +1642,9 @@ impl Shell {
             el = el.child(
                 div()
                     .mt(px(12.0))
-                    .p(px(14.0))
-                    .rounded(px(10.0))
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.wash(0.02))
+                    .pt(px(12.0))
+                    .border_t_1()
+                    .border_color(widgets::row_divider(theme))
                     .child(
                         div()
                             .flex()
@@ -1394,18 +1696,37 @@ impl Shell {
                     .child(
                         div()
                             .flex()
+                            .flex_wrap()
                             .gap(px(12.0))
                             .child(
                                 div()
+                                    .id(SharedString::from(format!(
+                                        "project-settings-database-name-{}",
+                                        database.id
+                                    )))
+                                    .debug_selector({
+                                        let id = database.id.clone();
+                                        move || format!("project-settings-database-name-{id}")
+                                    })
                                     .flex_1()
-                                    .min_w_0()
+                                    .min_w(px(140.0))
+                                    .max_w_full()
                                     .child(label(theme, "Name"))
                                     .child(field(theme, &database.name)),
                             )
                             .child(
                                 div()
+                                    .id(SharedString::from(format!(
+                                        "project-settings-database-directory-{}",
+                                        database.id
+                                    )))
+                                    .debug_selector({
+                                        let id = database.id.clone();
+                                        move || format!("project-settings-database-directory-{id}")
+                                    })
                                     .w(px(170.0))
-                                    .flex_none()
+                                    .max_w_full()
+                                    .flex_shrink_0()
                                     .child(label(theme, "Run in folder"))
                                     .child(field(theme, &database.directory)),
                             ),
@@ -1424,7 +1745,7 @@ impl Shell {
                             .text_color(theme.text_muted)
                             .child("Wait up to")
                             .child(field(theme, &database.readiness_timeout).w(px(80.0)))
-                            .child("seconds, then report it as not ready."),
+                            .child("seconds"),
                     ),
             );
         }
@@ -1436,41 +1757,44 @@ impl Shell {
             < 12;
         el.child(
             div().flex().mt(px(10.0)).child(
-                widgets::action(theme, widgets::ActionTone::Outlined, "add-worktree-database", window)
-                    .child("Add database")
-                    .role(gpui::Role::Button)
-                    .aria_label("Add database")
-                    .when(!can_add || busy, |el| el.opacity(0.4).cursor_default())
-                    .when(can_add && !busy, |el| {
-                        el.on_click(cx.listener(|this, _, _, cx| {
-                            let database = this.service_fields(
-                                ProjectTerminalService {
-                                    id: uuid::Uuid::new_v4().to_string(),
-                                    name: "Databases".into(),
+                widgets::action(
+                    theme,
+                    widgets::ActionTone::Outlined,
+                    "add-worktree-database",
+                    window,
+                )
+                .child("Add database")
+                .role(gpui::Role::Button)
+                .aria_label("Add database")
+                .when(!can_add || busy, |el| el.opacity(0.4).cursor_default())
+                .when(can_add && !busy, |el| {
+                    el.on_click(cx.listener(|this, _, _, cx| {
+                        let database = this.service_fields(
+                            ProjectTerminalService {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                name: "Databases".into(),
+                                command: String::new(),
+                                directory: ".".into(),
+                                restart_on_failure: false,
+                                setup_prerequisite: Some(zeron_proto::ProjectServiceReadiness {
                                     command: String::new(),
-                                    directory: ".".into(),
-                                    restart_on_failure: false,
-                                    setup_prerequisite: Some(
-                                        zeron_proto::ProjectServiceReadiness {
-                                            command: String::new(),
-                                            timeout_seconds: 120,
-                                        },
-                                    ),
-                                },
-                                false,
-                                cx,
-                            );
-                            if let Some(f) = this
-                                .worktree_settings
-                                .editor
-                                .open_mut()
-                                .and_then(|e| e.fields.as_mut())
-                            {
-                                f.databases.push(database);
-                            }
-                            cx.notify();
-                        }))
-                    }),
+                                    timeout_seconds: 120,
+                                }),
+                            },
+                            false,
+                            cx,
+                        );
+                        if let Some(f) = this
+                            .worktree_settings
+                            .editor
+                            .open_mut()
+                            .and_then(|e| e.fields.as_mut())
+                        {
+                            f.databases.push(database);
+                        }
+                        cx.notify();
+                    }))
+                }),
             ),
         )
     }
@@ -1489,10 +1813,10 @@ impl Shell {
         let snapshot = editor.snapshot.as_ref();
         let own =
             editor.checkout.is_some() && snapshot.is_some_and(|s| s.settings.services.is_some());
-        let mut el = div().child(section(theme, "App services")).child(note(
+        let mut el = form_block(theme).child(note(
             theme,
             match (editor.checkout.is_some(), own) {
-                (false, _) => "Backend, frontend and other dev servers. They start after setup, in the active worktree.",
+                (false, _) => "Dev servers start after setup in the active worktree.",
                 (true, true) => "This worktree runs its own list of app services.",
                 (true, false) => "This worktree uses the project’s app services.",
             },
@@ -1519,32 +1843,42 @@ impl Shell {
             (true, true) => "Edit this worktree’s services…",
             (true, false) => "Customize for this worktree…",
         };
-        let mut actions = div().flex().gap(px(8.0)).mt(px(10.0)).child(
-            widgets::action(theme, widgets::ActionTone::Outlined, "worktree-service-settings", window)
-                .child(edit_label)
-                .role(gpui::Role::Button)
-                .aria_label(edit_label)
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if let Some(editor) = this.worktree_settings.editor.as_open() {
-                        let mut context = editor.project.clone();
-                        context.checkout_override = editor.checkout.clone();
-                        if let Some(cwd) = &editor.checkout {
-                            context.cwd = cwd.clone();
-                        }
-                        this.open_service_settings_context(context, cx);
+        let mut actions = div().flex().flex_wrap().gap(px(8.0)).mt(px(10.0)).child(
+            widgets::action(
+                theme,
+                widgets::ActionTone::Outlined,
+                "worktree-service-settings",
+                window,
+            )
+            .child(edit_label)
+            .role(gpui::Role::Button)
+            .aria_label(edit_label)
+            .on_click(cx.listener(|this, _, _, cx| {
+                if let Some(editor) = this.worktree_settings.editor.as_open() {
+                    let mut context = editor.project.clone();
+                    context.checkout_override = editor.checkout.clone();
+                    if let Some(cwd) = &editor.checkout {
+                        context.cwd = cwd.clone();
                     }
-                })),
+                    this.open_service_settings_context(context, cx);
+                }
+            })),
         );
         if own {
             actions = actions.child(
-                widgets::action(theme, widgets::ActionTone::Quiet, "inherit-worktree-services", window)
-                    .child("Use project services")
-                    .role(gpui::Role::Button)
-                    .aria_label("Use project services")
-                    .when(busy, |el| el.opacity(0.4).cursor_default())
-                    .when(!busy, |el| {
-                        el.on_click(cx.listener(|this, _, _, cx| this.use_project_services(cx)))
-                    }),
+                widgets::action(
+                    theme,
+                    widgets::ActionTone::Quiet,
+                    "inherit-worktree-services",
+                    window,
+                )
+                .child("Use project services")
+                .role(gpui::Role::Button)
+                .aria_label("Use project services")
+                .when(busy, |el| el.opacity(0.4).cursor_default())
+                .when(!busy, |el| {
+                    el.on_click(cx.listener(|this, _, _, cx| this.use_project_services(cx)))
+                }),
             );
         }
         el = el.child(actions);
@@ -1565,7 +1899,11 @@ impl Shell {
                     ],
                     usize::from(fields.settings.service_mode == Services::Parallel),
                 )
-                .width(360.0)
+                .width(
+                    360.0_f32
+                        .min(f32::from(window.viewport_size().width) - 98.0)
+                        .max(0.0),
+                )
                 .on_select(move |this, index, _, cx| {
                     if let Some(f) = this
                         .worktree_settings
@@ -1599,12 +1937,7 @@ fn summary_list(
     rows: impl Iterator<Item = gpui::Div>,
     empty: &'static str,
 ) -> gpui::Div {
-    let mut list = div()
-        .mt(px(10.0))
-        .px(px(12.0))
-        .py(px(6.0))
-        .rounded(px(8.0))
-        .bg(theme.wash(0.03));
+    let mut list = div().mt(px(10.0)).py(px(6.0));
     let mut any = false;
     for row in rows {
         any = true;
@@ -1655,6 +1988,97 @@ fn summary_row(theme: &Theme, glyph: &'static str, name: &str, detail: String) -
         )
 }
 
+fn command_row(
+    theme: &Theme,
+    first: bool,
+    title: &'static str,
+    detail: &'static str,
+    input: &Entity<ComposerInput>,
+) -> gpui::Div {
+    widgets::card_row(theme, first)
+        .flex_col()
+        .items_stretch()
+        .gap(px(8.0))
+        .child(
+            div()
+                .child(widgets::row_title(theme, title))
+                .child(note(theme, detail).mt(px(2.0))),
+        )
+        .child(field(theme, input))
+}
+
+fn settings_summary(page: SettingsPage, editor: &Editor, fields: &Fields, cx: &App) -> String {
+    match page {
+        SettingsPage::General => String::new(),
+        SettingsPage::Environment => {
+            let files = match fields.settings.env_files.len() {
+                0 => "No env files".to_string(),
+                1 => fields.settings.env_files[0].path.clone(),
+                count => format!("{count} env files"),
+            };
+            let dependencies = match fields.settings.dependencies {
+                Deps::Copy => "Copy dependencies",
+                Deps::Install => "Install dependencies",
+                Deps::Link => "Shared dependencies",
+                Deps::Skip => "Custom dependency setup",
+            };
+            format!("{files} · {dependencies}")
+        }
+        SettingsPage::Workflow => {
+            let mut commands = Vec::new();
+            for (input, name) in [
+                (&fields.setup, "Setup"),
+                (&fields.activate, "Activation"),
+                (&fields.cleanup, "Cleanup"),
+            ] {
+                if !input.read(cx).text().trim().is_empty() {
+                    commands.push(name);
+                }
+            }
+            if commands.is_empty() {
+                "No workflow commands".into()
+            } else {
+                commands.join(" · ")
+            }
+        }
+        SettingsPage::Services => {
+            let databases = if editor.checkout.is_none() {
+                fields.databases.len()
+            } else {
+                editor.snapshot.as_ref().map_or(0, |s| s.databases.len())
+            };
+            let services = editor.snapshot.as_ref().map_or(0, |s| s.app_services.len());
+            format!(
+                "{databases} {} · {services} app {}",
+                if databases == 1 {
+                    "database"
+                } else {
+                    "databases"
+                },
+                if services == 1 { "service" } else { "services" }
+            )
+        }
+        SettingsPage::Advanced => {
+            let variables = fields
+                .variables
+                .read(cx)
+                .text()
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count();
+            format!(
+                "{}s timeout · {variables} {}",
+                fields.timeout.read(cx).text(),
+                if variables == 1 {
+                    "variable"
+                } else {
+                    "variables"
+                }
+            )
+        }
+    }
+}
+
 fn choice(
     theme: &Theme,
     id: impl Into<SharedString>,
@@ -1666,6 +2090,8 @@ fn choice(
     let name = name.into();
     div()
         .id(id.clone())
+        .min_w_0()
+        .max_w_full()
         .flex()
         .items_center()
         .gap(px(7.0))
@@ -1695,18 +2121,21 @@ fn choice(
         .child(name)
 }
 fn section(theme: &Theme, text: &'static str) -> impl IntoElement {
-    div()
-        .mt(px(24.0))
-        .mb(px(10.0))
-        .text_size(px(13.0))
-        .font_weight(gpui::FontWeight::MEDIUM)
-        .text_color(theme.text)
-        .child(text)
+    widgets::section_label(theme, text).mt(px(24.0)).mb(px(8.0))
 }
+fn form_block(theme: &Theme) -> gpui::Div {
+    widgets::section_card(theme)
+        .mt_0()
+        .px(px(16.0))
+        .pt(px(4.0))
+        .pb(px(16.0))
+}
+
 fn note(theme: &Theme, text: &str) -> gpui::Div {
     div()
         .mt(px(6.0))
-        .text_size(px(12.0))
+        .text_size(crate::typography::ui_rems(12.0))
+        .line_height(crate::typography::ui_rems(16.0))
         .text_color(theme.text_muted)
         .child(SharedString::from(text.to_string()))
 }
@@ -1720,9 +2149,9 @@ fn label(theme: &Theme, text: &'static str) -> impl IntoElement {
 }
 fn field(theme: &Theme, input: &Entity<ComposerInput>) -> gpui::Div {
     popover::dialog_field(input.clone().into_any_element())
-        .bg(theme.wash(0.035))
-        .border_color(theme.border)
-        .rounded(px(6.0))
+        .bg(widgets::select_fill(theme, false))
+        .border_color(gpui::transparent_black())
+        .rounded(px(8.0))
 }
 fn env_label(mode: Env) -> &'static str {
     match mode {
@@ -1730,23 +2159,6 @@ fn env_label(mode: Env) -> &'static str {
         Env::Link => "Link",
         Env::Follow => "Follow",
         Env::Skip => "Skip",
-    }
-}
-
-fn dependency_help(mode: Deps) -> &'static str {
-    match mode {
-        Deps::Copy => {
-            "Zeron automatically copies the selected node_modules folders from the main project into each new worktree. Each worktree keeps its own copy; existing folders are never overwritten."
-        }
-        Deps::Install => {
-            "Zeron installs dependencies in each worktree using its lockfile. This creates independent node_modules; it does not copy the project’s existing folders."
-        }
-        Deps::Link => {
-            "Zeron links the selected node_modules folders to the main project. Every worktree uses the same dependencies, so installing or changing packages affects all of them."
-        }
-        Deps::Skip => {
-            "Zeron leaves node_modules alone. Your setup command must install, copy or link dependencies before agents and services use the worktree."
-        }
     }
 }
 
@@ -1758,15 +2170,6 @@ fn service_help(mode: Services) -> &'static str {
         Services::Parallel => {
             "Each worktree keeps its own app services running. Give each worktree different ports through env files or your setup command. Shared databases are still shared."
         }
-    }
-}
-fn phase_label(phase: Phase) -> &'static str {
-    match phase {
-        Phase::NotPrepared => "Not set up",
-        Phase::Preparing => "Setup…",
-        Phase::Ready => "Ready",
-        Phase::Failed => "Failed",
-        Phase::Interrupted => "Interrupted",
     }
 }
 
@@ -1796,6 +2199,9 @@ impl Shell {
             .unwrap_or(serde_json::Value::Null)
     }
 }
+
+#[cfg(test)]
+mod layout_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1990,7 +2396,10 @@ mod tests {
                     databases: vec![database("db", "Databases")],
                     app_services: vec![],
                 };
-                shell.worktree_settings.editor.open(Editor::new(test_project()));
+                shell
+                    .worktree_settings
+                    .editor
+                    .open(Editor::new(test_project()));
                 assert!(shell.accept_worktree_settings_poll(Ok(snapshot.clone()), cx));
                 let name = shell
                     .worktree_settings
@@ -2341,7 +2750,10 @@ mod tests {
                     databases: vec![],
                     app_services: vec![],
                 };
-                shell.worktree_settings.editor.open(Editor::new(test_project()));
+                shell
+                    .worktree_settings
+                    .editor
+                    .open(Editor::new(test_project()));
                 assert!(shell.accept_worktree_settings_poll(Ok(snapshot.clone()), cx));
                 assert!(
                     shell
@@ -2354,7 +2766,8 @@ mod tests {
                 );
                 assert!(!shell.accept_worktree_settings_poll(Ok(snapshot.clone()), cx));
 
-                shell.worktree_settings.editor.open_mut().unwrap().error = Some("Save failed".into());
+                shell.worktree_settings.editor.open_mut().unwrap().error =
+                    Some("Save failed".into());
                 assert!(shell.accept_worktree_settings_poll(Err("Engine offline".into()), cx));
                 assert!(!shell.accept_worktree_settings_poll(Err("Engine offline".into()), cx));
                 assert!(shell.accept_worktree_settings_poll(Ok(snapshot), cx));

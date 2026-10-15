@@ -2328,7 +2328,10 @@ impl Shell {
             UnsavedForm::Services => {
                 popover::close_popup(self, cx, |this| &mut this.project_terminals.editor)
             }
-            UnsavedForm::WorktreeSettings => self.close_worktree_settings(cx),
+            UnsavedForm::WorktreeSettings => {
+                self.close_worktree_settings(cx);
+                window.focus(&self.shortcut_focus, cx);
+            }
         }
         cx.notify();
     }
