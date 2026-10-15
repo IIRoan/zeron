@@ -160,6 +160,13 @@ pub(super) enum UnsavedForm {
     WorktreeSettings,
 }
 
+pub(super) struct ServiceMenu {
+    // Keep the clicked service and checkout even if the selected tab changes.
+    context: ProjectContext,
+    service: String,
+    position: gpui::Point<gpui::Pixels>,
+}
+
 #[derive(Default)]
 pub(super) struct ProjectTerminalUi {
     pub drawer: bool,
@@ -172,6 +179,7 @@ pub(super) struct ProjectTerminalUi {
     tabs: std::collections::HashMap<(String, String), (u64, Option<String>)>,
     selected: std::collections::HashMap<String, String>,
     pub actions_menu: popover::Popup<()>,
+    pub service_menu: popover::Popup<ServiceMenu>,
     bar_width: std::rc::Rc<std::cell::Cell<f32>>,
     output_height: std::rc::Rc<std::cell::Cell<f32>>,
     poll: Option<Task<()>>,
@@ -323,6 +331,7 @@ impl Shell {
         }
         self.project_terminals.mode = mode;
         self.project_terminals.actions_menu = popover::Popup::default();
+        self.project_terminals.service_menu = popover::Popup::default();
         self.project_terminals.drawer = mode == TerminalMode::Services;
         let key = self.panel_key(cx);
         self.panels
@@ -351,6 +360,7 @@ impl Shell {
 
     pub(super) fn hide_terminal_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.project_terminals.actions_menu = popover::Popup::default();
+        self.project_terminals.service_menu = popover::Popup::default();
         let from = self.terminal_geometry.get().height;
         self.project_terminals.drawer = false;
         let key = self.panel_key(cx);
@@ -416,6 +426,7 @@ impl Shell {
         context: ProjectContext,
         cx: &mut Context<Self>,
     ) {
+        self.project_terminals.service_menu = popover::Popup::default();
         self.project_terminals.editor.open(Editor::new(context));
         self.project_terminals.discard = popover::Popup::default();
         self.project_terminals.poll = None;
@@ -438,6 +449,7 @@ impl Shell {
             return;
         };
         if self.project_terminals.context.as_ref() != Some(&context) {
+            self.project_terminals.service_menu = popover::Popup::default();
             self.project_terminals.context = Some(context.clone());
             self.project_terminals.snapshot = None;
             self.project_terminals.error = None;
@@ -627,7 +639,13 @@ impl Shell {
             if let Some(editor) = self.project_terminals.editor.open_mut() {
                 editor.services = fields;
                 editor.databases = databases;
-                editor.selected = editor.services.first().map(|service| service.id.clone());
+                if !editor
+                    .services
+                    .iter()
+                    .any(|service| Some(&service.id) == editor.selected.as_ref())
+                {
+                    editor.selected = editor.services.first().map(|service| service.id.clone());
+                }
                 editor.initialized = true;
                 editor.saved = editor.config(cx);
             }
@@ -639,6 +657,12 @@ impl Shell {
             return changed;
         };
         let scope = context.scope();
+        if self.project_terminals.service_menu.get().is_some_and(|menu| {
+            menu.context != context || !snapshot.config.services.iter().any(|s| s.id == menu.service)
+        }) {
+            self.project_terminals.service_menu = popover::Popup::default();
+            changed = true;
+        }
         if let Some(panel) = self.project_terminals.panel.clone() {
             let removed = self
                 .project_terminals
@@ -1046,6 +1070,172 @@ impl Shell {
         }
     }
 
+    pub(super) fn close_service_menu(&mut self, cx: &mut Context<Self>) {
+        if self.project_terminals.service_menu.begin_close() {
+            popover::reap_popup(cx, |shell| &mut shell.project_terminals.service_menu);
+            cx.notify();
+        }
+    }
+
+    fn open_service_menu(
+        &mut self,
+        service: String,
+        position: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(context) = self.project_terminals.context.clone() else {
+            return;
+        };
+        if !self
+            .project_terminals
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.config.services.iter().any(|s| s.id == service))
+        {
+            return;
+        }
+        self.project_terminals.actions_menu = popover::Popup::default();
+        self.project_terminals.service_menu.open(ServiceMenu {
+            context,
+            service,
+            position,
+        });
+        cx.notify();
+    }
+
+    fn service_menu_target(&self) -> Option<(ProjectContext, ProjectTerminalService, Status)> {
+        let menu = self.project_terminals.service_menu.get()?;
+        if self.project_terminals.context.as_ref() != Some(&menu.context) {
+            return None;
+        }
+        let snapshot = self.project_terminals.snapshot.as_ref()?;
+        let service = snapshot
+            .config
+            .services
+            .iter()
+            .find(|s| s.id == menu.service)?
+            .clone();
+        let status = service_status(snapshot, &service.id);
+        Some((menu.context.clone(), service, status))
+    }
+
+    fn service_menu_action_enabled(&self, action: &str) -> bool {
+        let Some((_, service, status)) = self.service_menu_target() else {
+            return false;
+        };
+        match action {
+            "start" => {
+                !self.project_terminals.control_busy(Some(&service.id))
+                    && !service_is_active(status)
+            }
+            "stop" => {
+                !self.project_terminals.control_busy(Some(&service.id)) && service_is_active(status)
+            }
+            "restart" => !self.project_terminals.control_busy(Some(&service.id)),
+            "output" | "settings" => true,
+            _ => false,
+        }
+    }
+
+    fn dispatch_service_menu(&mut self, action: &'static str, cx: &mut Context<Self>) {
+        if !self.project_terminals.service_menu.is_open()
+            || !self.service_menu_action_enabled(action)
+        {
+            return;
+        }
+        let Some((context, service, _)) = self.service_menu_target() else {
+            return;
+        };
+        self.close_service_menu(cx);
+        match action {
+            "start" | "stop" | "restart" => {
+                self.control_project_terminal(Some(service.id), action, cx)
+            }
+            "output" => {
+                let scope = context.scope();
+                self.project_terminals
+                    .selected
+                    .insert(scope.clone(), service.id.clone());
+                self.project_terminals.content_started = Some(std::time::Instant::now());
+                if let Some(panel) = &self.project_terminals.panel
+                    && let Some((key, _)) = self.project_terminals.tabs.get(&(scope, service.id))
+                {
+                    panel.update(cx, |panel, cx| {
+                        panel.select_tab_by_key(*key, cx);
+                        panel.request_focus(cx);
+                    });
+                }
+                cx.notify();
+            }
+            "settings" if service.is_database() => {
+                self.show_project_database_settings(context.space, cx)
+            }
+            "settings" => {
+                self.open_service_settings_context(context, cx);
+                self.project_terminals.editor.open_mut().unwrap().selected = Some(service.id);
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn render_service_menu(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let menu = self.project_terminals.service_menu.get()?;
+        let position = menu.position;
+        let closing = self.project_terminals.service_menu.closing_since();
+        let (_, service, _) = self.service_menu_target()?;
+        let theme = Theme::of(cx).for_popup();
+        let mut card = popover::popover_card(&theme)
+            .id("service-context-menu")
+            .w(px(220.0))
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_service_menu(cx)))
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .child(popover::menu_heading(&theme, &service.name));
+        for (action, label, glyph) in [
+            ("start", "Start", icons::ACTION_PLAY),
+            ("stop", "Stop", icons::STOP),
+            ("restart", "Restart", icons::RESTART),
+            ("output", "Show output", icons::TERMINAL),
+            (
+                "settings",
+                if service.is_database() {
+                    "Database settings…"
+                } else {
+                    "Edit service…"
+                },
+                icons::SETTINGS_MINIMALISTIC,
+            ),
+        ] {
+            if action == "output" {
+                card = card.child(popover::menu_separator());
+            }
+            let enabled = closing.is_none() && self.service_menu_action_enabled(action);
+            card = card.child(
+                popover::menu_row(&theme, false, format!("service-context-{action}"))
+                    .id(SharedString::from(format!("service-context-{action}")))
+                    .debug_selector(move || format!("service-context-{action}"))
+                    .role(gpui::Role::Button)
+                    .aria_label(label)
+                    .child(icon(glyph).size(px(14.0)).text_color(theme.text_muted))
+                    .child(label)
+                    .when(!enabled, |el| el.opacity(0.4).cursor_default())
+                    .when(enabled, |el| {
+                        el.on_click(cx.listener(move |this, _, _, cx| {
+                            this.dispatch_service_menu(action, cx);
+                        }))
+                    }),
+            );
+        }
+        Some(popover::menu_at(
+            "service-context-popup",
+            position,
+            card.into_any_element(),
+            closing,
+        ))
+    }
+
     fn render_service_toolbar_actions(
         &mut self,
         window: &Window,
@@ -1161,6 +1351,7 @@ impl Shell {
                 if this.project_terminals.actions_menu.take_press_was_open() {
                     this.close_project_terminal_actions(cx);
                 } else {
+                    this.project_terminals.service_menu = popover::Popup::default();
                     this.project_terminals.actions_menu.open(());
                     cx.notify();
                 }
@@ -1403,6 +1594,7 @@ impl Shell {
                 previous_database = service.is_database();
                 let active = self.project_terminals.selected.get(&scope) == Some(&service.id);
                 let id = service.id.clone();
+                let menu_id = id.clone();
                 let tab_scope = scope.clone();
                 let key = format!("{}-service-tab-{id}", cx.entity_id());
                 let progress =
@@ -1410,6 +1602,10 @@ impl Shell {
                 tabs = tabs.child(
                     popover::btn_ghost(&theme, "", key.clone())
                         .id(SharedString::from(format!("service-tab-{id}")))
+                        .debug_selector({
+                            let id = id.clone();
+                            move || format!("service-tab-{id}")
+                        })
                         .flex()
                         .items_center()
                         .gap(px(6.0))
@@ -1452,6 +1648,14 @@ impl Shell {
                             )
                         })
                         .child(SharedString::from(service.name.clone()))
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                window.prevent_default();
+                                cx.stop_propagation();
+                                this.open_service_menu(menu_id.clone(), event.position, cx);
+                            }),
+                        )
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if this.project_terminals.selected.get(&tab_scope) != Some(&id) {
                                 this.project_terminals.content_started =
@@ -3595,6 +3799,174 @@ mod tests {
                     .child(shell.render_service_toolbar_actions(window, cx))
             })
         }
+    }
+
+    struct ServiceMenuHost {
+        shell: Entity<Shell>,
+        _observer: Subscription,
+    }
+
+    impl Render for ServiceMenuHost {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.shell.update(cx, |shell, cx| {
+                div()
+                    .size_full()
+                    .child(shell.render_project_terminal_content(cx))
+                    .children(shell.render_service_menu(cx))
+            })
+        }
+    }
+
+    #[gpui::test]
+    fn service_right_click_controls_the_clicked_tab_and_dismisses_outside(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let shell_window = test_shell(cx, dir.path());
+        let mut rpc = ServiceRpc::attach(shell_window, cx);
+        let shell = shell_window
+            .update(cx, |shell, _, cx| {
+                let scope = shell.project_terminals.context.as_ref().unwrap().scope();
+                shell
+                    .project_terminals
+                    .selected
+                    .insert(scope, "backend".into());
+                cx.entity()
+            })
+            .unwrap();
+        let (_, cx) = cx.add_window_view(|_, cx| ServiceMenuHost {
+            _observer: cx.observe(&shell, |_, _, cx| cx.notify()),
+            shell: shell.clone(),
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        let frontend = cx.debug_bounds("service-tab-frontend").unwrap().center();
+        cx.simulate_mouse_down(frontend, MouseButton::Right, gpui::Modifiers::default());
+        cx.simulate_mouse_up(frontend, MouseButton::Right, gpui::Modifiers::default());
+        shell.read_with(cx, |shell, _| {
+            let menu = shell.project_terminals.service_menu.as_open().unwrap();
+            assert_eq!(menu.service, "frontend");
+            assert_eq!(
+                shell.project_terminals.selected[&menu.context.scope()],
+                "backend"
+            );
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        let start = cx.debug_bounds("service-context-start").unwrap().center();
+        cx.simulate_click(start, gpui::Modifiers::default());
+        let requests = rpc.take(cx);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["method"], methods::CONTROL_PROJECT_TERMINALS);
+        assert_eq!(requests[0]["params"]["serviceId"], "frontend");
+        assert_eq!(requests[0]["params"]["action"], "start");
+        assert_eq!(requests[0]["params"]["spaceId"], "project");
+        shell.read_with(cx, |shell, _| {
+            assert!(!shell.project_terminals.service_menu.is_open())
+        });
+
+        // The closing popup still covers the pointer until its exit completes.
+        let exit = motion::MENU_OUT.total().mul_f32(motion::speed_scale());
+        std::thread::sleep(exit);
+        cx.executor().advance_clock(exit + Duration::from_millis(20));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+        cx.simulate_mouse_down(frontend, MouseButton::Right, gpui::Modifiers::default());
+        cx.simulate_mouse_up(frontend, MouseButton::Right, gpui::Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear());
+        cx.simulate_click(start, gpui::Modifiers::default());
+        assert!(
+            rpc.take(cx).is_empty(),
+            "pending service cannot be started twice"
+        );
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.project_terminals.service_menu.is_open())
+        });
+        cx.simulate_click(
+            gpui::point(px(600.0), px(400.0)),
+            gpui::Modifiers::default(),
+        );
+        shell.read_with(cx, |shell, _| {
+            assert!(!shell.project_terminals.service_menu.is_open())
+        });
+    }
+
+    #[gpui::test]
+    fn service_menu_rechecks_status_busy_scope_and_removal(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let shell = test_shell(cx, dir.path());
+        let mut rpc = ServiceRpc::attach(shell, cx);
+        shell
+            .update(cx, |shell, window, cx| {
+                let position = gpui::point(px(40.0), px(40.0));
+                shell.open_service_menu("frontend".into(), position, cx);
+                assert!(shell.service_menu_action_enabled("start"));
+                assert!(!shell.service_menu_action_enabled("stop"));
+                assert!(shell.service_menu_action_enabled("restart"));
+                let snapshot = shell.project_terminals.snapshot.as_mut().unwrap();
+                snapshot.runs.push(zeron_proto::ProjectTerminalRun {
+                    service_id: "frontend".into(),
+                    status: Status::Running,
+                    exit_code: None,
+                    restarts: 0,
+                    message: None,
+                    terminal: None,
+                    readiness: None,
+                });
+                assert!(!shell.service_menu_action_enabled("start"));
+                assert!(shell.service_menu_action_enabled("stop"));
+                let context = shell.project_terminals.context.clone().unwrap();
+                shell
+                    .project_terminals
+                    .service_actions
+                    .insert((context.scope(), "backend".into()), "start");
+                assert!(
+                    shell.service_menu_action_enabled("restart"),
+                    "other services remain independent"
+                );
+                shell
+                    .project_terminals
+                    .service_actions
+                    .insert((context.scope(), "frontend".into()), "stop");
+                assert!(!shell.service_menu_action_enabled("stop"));
+                assert!(!shell.service_menu_action_enabled("restart"));
+                assert!(shell.service_menu_action_enabled("output"));
+                shell.project_terminals.service_actions.clear();
+                assert!(shell.capture_escape_surface(window, cx));
+                assert!(!shell.project_terminals.service_menu.is_open());
+                shell.open_service_menu("frontend".into(), position, cx);
+                shell.project_terminals.context.as_mut().unwrap().cwd = "/another-checkout".into();
+                shell.dispatch_service_menu("restart", cx);
+                assert!(shell.service_menu_target().is_none());
+                shell.project_terminals.context = Some(context);
+                shell.accept_project_terminal_snapshot(empty_snapshot(), cx);
+                assert!(shell.project_terminals.service_menu.get().is_none());
+            })
+            .unwrap();
+        assert!(
+            rpc.take(cx).is_empty(),
+            "stale menus must never send a request"
+        );
+    }
+
+    #[gpui::test]
+    fn service_menu_opens_output_and_edits_the_clicked_service(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let shell = test_shell(cx, dir.path());
+        shell
+            .update(cx, |shell, _, cx| {
+                shell.project_terminals.context = Some(test_project(dir.path()));
+                let snapshot = service_snapshot("initial");
+                shell.project_terminals.snapshot = Some(snapshot.clone());
+                let position = gpui::point(px(40.0), px(40.0));
+                shell.open_service_menu("frontend".into(), position, cx);
+                shell.dispatch_service_menu("output", cx);
+                let scope = shell.project_terminals.context.as_ref().unwrap().scope();
+                assert_eq!(shell.project_terminals.selected[&scope], "frontend");
+                shell.open_service_menu("frontend".into(), position, cx);
+                shell.dispatch_service_menu("settings", cx);
+                shell.accept_project_terminal_snapshot(snapshot.clone(), cx);
+                let editor = shell.project_terminals.editor.as_open().unwrap();
+                assert_eq!(editor.selected.as_deref(), Some("frontend"));
+                assert_eq!(editor.config(cx), snapshot.config.services);
+            })
+            .unwrap();
     }
 
     #[gpui::test]

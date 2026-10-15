@@ -6538,6 +6538,7 @@ impl Shell {
         self.worktree_settings.editor.is_open()
             || self.project_terminals.editor.is_open()
             || self.project_terminals.actions_menu.is_open()
+            || self.project_terminals.service_menu.is_open()
             || self.command_palette.is_open()
             || self.active_changes(cx).is_some_and(|changes| changes.read(cx).git_picker_open(cx))
             || self.voice.read(cx).stage_open
@@ -10795,6 +10796,10 @@ impl Shell {
         if self.dismiss_worktree_removal(window, cx) {
             return true;
         }
+        if self.project_terminals.service_menu.is_open() {
+            self.close_service_menu(cx);
+            return true;
+        }
         if self.project_terminals.actions_menu.is_open() {
             self.close_project_terminal_actions(cx);
             return true;
@@ -11157,6 +11162,9 @@ impl Shell {
             ));
         }
         if let Some(menu) = self.render_pull_request_tab_menu(cx) {
+            overlays.push(menu);
+        }
+        if let Some(menu) = self.render_service_menu(cx) {
             overlays.push(menu);
         }
 
