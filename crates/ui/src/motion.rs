@@ -941,7 +941,11 @@ pub fn entrance(
     element_tween(
         window,
         key.into(),
-        |tween: Option<Tween>, now| tween.unwrap_or_else(|| from_zero(spec, reduced, now)),
+        |tween: Option<Tween>, now| {
+            let mut tween = tween.unwrap_or_else(|| from_zero(spec, reduced, now));
+            tween.retarget(1.0, reduced, now);
+            tween
+        },
         |tween| *tween,
     )
 }
@@ -959,13 +963,87 @@ pub fn swap_entrance(
     element_tween(
         window,
         key.into(),
-        |state: Option<(u64, Tween)>, now| match state {
-            Some((last, tween)) if last == shown => (last, tween),
-            Some(_) => (shown, from_zero(spec, reduced, now)),
-            None => (shown, Tween::at(1.0, spec, now)),
+        |state: Option<(u64, Tween)>, now| {
+            let mut tween = match state {
+                Some((last, tween)) if last == shown => tween,
+                Some(_) => from_zero(spec, reduced, now),
+                None => Tween::at(1.0, spec, now),
+            };
+            tween.retarget(1.0, reduced, now);
+            (shown, tween)
         },
         |(_, tween)| *tween,
     )
+}
+
+struct DeferredEntrance {
+    shown: u64,
+    /// A pending page has no clock until its first frame has finished. A new
+    /// page owns a fresh cell, so a queued callback cannot start its successor.
+    tween: Rc<Cell<Option<Tween>>>,
+}
+
+/// [`swap_entrance`] with a frame barrier before each replacement starts.
+/// New content first lays out and paints at zero progress, then starts its
+/// catalog tween on the next window frame. Repeated renders cannot consume
+/// the barrier, and only one callback is queued for each replacement. The
+/// first mount rests at 1 so a surrounding dialog can own its entrance.
+///
+/// The callback weakly references element state: replacing or unmounting the
+/// outlet retires its pending clock. Reduced motion settles immediately,
+/// including when enabled while a replacement is pending or animating.
+pub fn deferred_swap_entrance(
+    window: &mut Window,
+    key: impl Into<ElementId>,
+    shown: u64,
+    spec: MotionSpec,
+    reduced: bool,
+) -> f32 {
+    let now = Instant::now();
+    let (value, animating) = window.with_global_id(key.into(), |id, window| {
+        window.with_element_state(id, |state: Option<DeferredEntrance>, window| {
+            let (state, schedule) = match state {
+                Some(state) if state.shown == shown => (state, false),
+                state => {
+                    let pending = state.is_some() && !reduced;
+                    (
+                        DeferredEntrance {
+                            shown,
+                            tween: Rc::new(Cell::new(
+                                (!pending).then(|| Tween::at(1.0, spec, now)),
+                            )),
+                        },
+                        pending,
+                    )
+                }
+            };
+            if reduced {
+                state.tween.set(Some(Tween::at(1.0, spec, now)));
+            }
+            if schedule {
+                let pending = Rc::downgrade(&state.tween);
+                let owner = window.current_view();
+                window.on_next_frame(move |_, cx| {
+                    if let Some(tween) = pending.upgrade()
+                        && tween.get().is_none()
+                    {
+                        tween.set(Some(from_zero(spec, reduced_motion(cx), Instant::now())));
+                        cx.notify(owner);
+                    }
+                });
+            }
+            let sample = state
+                .tween
+                .get()
+                .map(|tween| (tween.value_at(now), tween.animating_at(now)))
+                .unwrap_or((0.0, false));
+            (sample, state)
+        })
+    });
+    if animating {
+        window.request_animation_frame();
+    }
+    value
 }
 
 /// The faded counterpart of gpui's `.hover(...)` — CSS `transition-colors`
@@ -1739,6 +1817,302 @@ mod tests {
         assert_eq!(seen.get(), 1.0);
         handle.update(cx, |_, window, _| window.refresh()).unwrap();
         assert_eq!(draw_frame(window, cx), 0, "the same content never replays");
+    }
+
+    struct DeferredOutlet {
+        shown: u64,
+        reduced: bool,
+        mounted: bool,
+        seen: Rc<Cell<f32>>,
+        renders: Rc<Cell<usize>>,
+    }
+
+    impl gpui::Render for DeferredOutlet {
+        fn render(&mut self, window: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+            use gpui::div;
+            self.renders.set(self.renders.get() + 1);
+            let t = if self.mounted {
+                deferred_swap_entrance(
+                    window,
+                    "deferred-outlet",
+                    self.shown,
+                    FADE_QUICK,
+                    self.reduced,
+                )
+            } else {
+                1.0
+            };
+            self.seen.set(t);
+            div().size_full().opacity(t)
+        }
+    }
+
+    struct DeferredHost(gpui::Entity<DeferredOutlet>);
+
+    impl gpui::Render for DeferredHost {
+        fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+            use gpui::{div, prelude::*};
+            div()
+                .size_full()
+                .child(self.0.clone().cached(gpui::StyleRefinement::default()))
+        }
+    }
+
+    fn deferred_outlet(
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        gpui::AnyWindowHandle,
+        gpui::Entity<DeferredOutlet>,
+        Rc<Cell<f32>>,
+        Rc<Cell<usize>>,
+    ) {
+        use gpui::AppContext as _;
+        let seen = Rc::new(Cell::new(0.0));
+        let renders = Rc::new(Cell::new(0));
+        let outlet = cx.new(|_| DeferredOutlet {
+            shown: 0,
+            reduced: false,
+            mounted: true,
+            seen: seen.clone(),
+            renders: renders.clone(),
+        });
+        let window = cx.add_window(|_, _| DeferredHost(outlet.clone())).into();
+        (window, outlet, seen, renders)
+    }
+
+    fn paint_without_callbacks(window: gpui::AnyWindowHandle, cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        cx.update_window(window, |_, window, cx| window.draw(cx).clear())
+            .unwrap();
+    }
+
+    fn deliver_frame_callbacks(
+        window: gpui::AnyWindowHandle,
+        cx: &mut gpui::TestAppContext,
+    ) -> usize {
+        use gpui::AppContext as _;
+        cx.update_window(window, |_, window, cx| window.simulate_next_frame(cx))
+            .unwrap()
+    }
+
+    #[gpui::test]
+    fn deferred_swap_waits_for_a_frame_and_repaints_its_cached_view(cx: &mut gpui::TestAppContext) {
+        let (window, outlet, seen, renders) = deferred_outlet(cx);
+        assert_eq!(draw_frame(window, cx), 0, "the first mount rests");
+        assert_eq!(seen.get(), 1.0);
+
+        outlet.update(cx, |outlet, cx| {
+            outlet.shown = 1;
+            cx.notify();
+        });
+        paint_without_callbacks(window, cx);
+        assert_eq!(seen.get(), 0.0, "a replacement first paints its start pose");
+
+        // Polls and other state updates can render the same page again before
+        // the platform delivers a frame; they must not start or re-arm it.
+        for _ in 0..3 {
+            outlet.update(cx, |_, cx| cx.notify());
+            paint_without_callbacks(window, cx);
+            assert_eq!(seen.get(), 0.0);
+        }
+        let painted = renders.get();
+        assert_eq!(
+            deliver_frame_callbacks(window, cx),
+            1,
+            "one page queues one frame barrier"
+        );
+        assert!(
+            draw_frame(window, cx) > 0,
+            "the delivered frame starts motion"
+        );
+        assert!(
+            renders.get() > painted,
+            "the barrier wakes the cached owner"
+        );
+        assert!(seen.get() < 1.0);
+
+        std::thread::sleep(FADE_QUICK.total() + Duration::from_millis(20));
+        // GPUI's test effect flush redraws the cached owner after the frame
+        // callback, which leaves its next ticket queued. Deliver that ticket
+        // before checking that the now-settled animation schedules nothing.
+        assert_eq!(deliver_frame_callbacks(window, cx), 1);
+        assert_eq!(seen.get(), 1.0);
+        assert_eq!(draw_frame(window, cx), 0, "the landed page stops its clock");
+        outlet.update(cx, |_, cx| cx.notify());
+        assert_eq!(draw_frame(window, cx), 0, "the same page never replays");
+    }
+
+    #[gpui::test]
+    fn deferred_swap_replaces_pending_pages_and_retires_unmounted_clocks(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, outlet, seen, renders) = deferred_outlet(cx);
+        draw_frame(window, cx);
+        for shown in 1..=2 {
+            outlet.update(cx, |outlet, cx| {
+                outlet.shown = shown;
+                cx.notify();
+            });
+            paint_without_callbacks(window, cx);
+            assert_eq!(seen.get(), 0.0);
+        }
+        assert_eq!(deliver_frame_callbacks(window, cx), 2);
+        assert!(draw_frame(window, cx) > 0);
+        assert!(seen.get() < 1.0, "the newest page owns a fresh clock");
+
+        // Retire the active page and drain its previously queued animation
+        // ticket before testing a pending barrier's weak ownership separately.
+        outlet.update(cx, |outlet, cx| {
+            outlet.mounted = false;
+            cx.notify();
+        });
+        assert_eq!(deliver_frame_callbacks(window, cx), 1);
+        assert_eq!(draw_frame(window, cx), 0);
+        outlet.update(cx, |outlet, cx| {
+            outlet.mounted = true;
+            cx.notify();
+        });
+        assert_eq!(draw_frame(window, cx), 0);
+        assert_eq!(seen.get(), 1.0);
+
+        outlet.update(cx, |outlet, cx| {
+            outlet.shown = 3;
+            cx.notify();
+        });
+        paint_without_callbacks(window, cx);
+        outlet.update(cx, |outlet, cx| {
+            outlet.mounted = false;
+            cx.notify();
+        });
+        paint_without_callbacks(window, cx);
+        let painted = renders.get();
+        assert_eq!(deliver_frame_callbacks(window, cx), 1);
+        paint_without_callbacks(window, cx);
+        assert_eq!(
+            renders.get(),
+            painted,
+            "a retired clock cannot wake its owner"
+        );
+        assert_eq!(deliver_frame_callbacks(window, cx), 0);
+
+        outlet.update(cx, |outlet, cx| {
+            outlet.mounted = true;
+            cx.notify();
+        });
+        assert_eq!(draw_frame(window, cx), 0, "remounting starts settled");
+        assert_eq!(seen.get(), 1.0);
+    }
+
+    #[gpui::test]
+    fn deferred_swap_reduced_motion_cancels_pending_and_running_pages(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, outlet, seen, _) = deferred_outlet(cx);
+        draw_frame(window, cx);
+        outlet.update(cx, |outlet, cx| {
+            outlet.shown = 1;
+            cx.notify();
+        });
+        paint_without_callbacks(window, cx);
+        outlet.update(cx, |outlet, cx| {
+            outlet.reduced = true;
+            cx.notify();
+        });
+        paint_without_callbacks(window, cx);
+        assert_eq!(
+            seen.get(),
+            1.0,
+            "reduced motion cancels the pending barrier"
+        );
+        deliver_frame_callbacks(window, cx);
+        assert_eq!(draw_frame(window, cx), 0);
+
+        outlet.update(cx, |outlet, cx| {
+            outlet.reduced = false;
+            outlet.shown = 2;
+            cx.notify();
+        });
+        assert!(draw_frame(window, cx) > 0);
+        assert!(draw_frame(window, cx) > 0);
+        assert!(seen.get() < 1.0);
+        outlet.update(cx, |outlet, cx| {
+            outlet.reduced = true;
+            cx.notify();
+        });
+        assert_eq!(seen.get(), 1.0, "running motion snaps immediately");
+        assert_eq!(deliver_frame_callbacks(window, cx), 1);
+        assert_eq!(
+            draw_frame(window, cx),
+            0,
+            "snapped motion schedules no further frames"
+        );
+        assert_eq!(seen.get(), 1.0);
+
+        outlet.update(cx, |outlet, cx| {
+            outlet.reduced = false;
+            outlet.shown = 3;
+            cx.notify();
+        });
+        paint_without_callbacks(window, cx);
+        cx.update(|cx| set_reduced_motion(cx, true));
+        deliver_frame_callbacks(window, cx);
+        assert_eq!(
+            draw_frame(window, cx),
+            0,
+            "the callback observes accessibility changes"
+        );
+        assert_eq!(seen.get(), 1.0);
+        cx.update(|cx| set_reduced_motion(cx, false));
+    }
+
+    #[gpui::test]
+    fn mounted_entrances_snap_when_reduced_motion_changes(cx: &mut gpui::TestAppContext) {
+        use gpui::{Context, Render, div};
+
+        struct Page {
+            shown: u64,
+            reduced: bool,
+            seen: Rc<Cell<(f32, f32)>>,
+        }
+        impl Render for Page {
+            fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let entrance = entrance(window, "page-entrance", FADE_QUICK, self.reduced);
+                let swap = swap_entrance(window, "page-swap", self.shown, FADE_QUICK, self.reduced);
+                self.seen.set((entrance, swap));
+                div().size_full().opacity(entrance * swap)
+            }
+        }
+
+        let seen = Rc::new(Cell::new((1.0, 1.0)));
+        let handle = cx.add_window(|_, _| Page {
+            shown: 0,
+            reduced: false,
+            seen: seen.clone(),
+        });
+        let window = handle.into();
+        assert!(draw_frame(window, cx) > 0);
+        assert!(seen.get().0 < 1.0);
+        handle
+            .update(cx, |page, _, cx| {
+                page.shown = 1;
+                cx.notify();
+            })
+            .unwrap();
+        assert!(draw_frame(window, cx) > 0);
+        assert!(seen.get().1 < 1.0);
+        handle
+            .update(cx, |page, _, cx| {
+                page.reduced = true;
+                cx.notify();
+            })
+            .unwrap();
+        assert_eq!(seen.get(), (1.0, 1.0));
+        assert_eq!(deliver_frame_callbacks(window, cx), 2);
+        assert_eq!(
+            draw_frame(window, cx),
+            0,
+            "snapped entrances stop their clocks"
+        );
     }
 
     #[test]
