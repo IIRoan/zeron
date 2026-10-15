@@ -121,6 +121,7 @@ impl SourceControl {
         let identity = search.entity_id();
         self.close_actions_menu(cx);
         self.close_commit_menu(cx);
+        self.branch_picker = None;
         self.stash_picker = Some(StashPicker {
             command,
             search: search.clone(),

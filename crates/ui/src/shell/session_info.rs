@@ -69,9 +69,13 @@ impl Shell {
         self.session_info_reserve(cx).is_some()
     }
 
-    /// Beside the transcript it shows unless hidden; over it, only while
-    /// opened.
+    /// Linux uses the workbench's controls without a session-card toggle.
+    /// Elsewhere it shows beside the transcript unless hidden, or floats
+    /// over it only while opened.
     pub(super) fn session_info_visible(&self, cx: &App) -> bool {
+        if cfg!(target_os = "linux") {
+            return false;
+        }
         if self.session_info_fits(cx) {
             !self.settings.session_info_hidden
         } else {

@@ -6,11 +6,11 @@ To remove a checkout, select it in the worktree list and choose **Remove worktre
 
 ## Branch names
 
-Set a branch prefix such as `iiroan/`, `feature/`, or an empty string. It applies to new worktree branches and their automatic title rename. Existing branches retain their names. Zeron records the branches it creates so deleting a worktree with a custom prefix does not delete an unrelated branch the user switched to.
+Set a branch prefix such as `feature/`, or leave it empty. It applies to new worktree branches and their automatic title rename. Existing branches retain their names. Zeron records the branches it creates so deleting a worktree with a custom prefix does not delete an unrelated branch the user switched to.
 
 ## Environment files
 
-Discovery inspects filenames in the main project, skips dependency and build folders, and never reads env values. Detected files default to **Follow**, as requested for this fork. Add more relative paths manually or use **Add detected env files**. Click a file's handling button to cycle through:
+Discovery inspects filenames in the main project, skips dependency and build folders, and never reads env values. Detected files default to **Follow**. Add more relative paths manually or use **Add detected env files**. Click a file's handling button to cycle through:
 
 - **Follow:** the latest edits from the previous active checkout go to the next checkout, including returning to the main project. Until a worktree is activated, the main project folder counts as the active checkout, so edits made there carry into the first worktree. If the file is missing or unreadable in the checkout being left, Zeron keeps the last saved copy and still switches. Files with the same profile name share that private environment; different profile names stay separate. A replaced destination gets a private backup with recovery metadata.
 - **Copy:** copy the main project's file only when the destination does not exist. Later source changes and retries never overwrite that checkout's edits.
@@ -65,19 +65,4 @@ Choose the concurrency policy in the **Service groups** dropdown in project defa
 
 Two conversations using the same checkout share its services. Only foreground selection or explicit Start/Restart activates an environment; status polling and opening settings do not move env files or services. Commands and crash-restart preferences can be overridden per checkout. Stop targets the selected checkout's services. Existing terminal crash detection and bounded restart backoff continue to apply.
 
-To use another agent in the same environment, click **New chat in this checkout** in the session header, or choose that command from the command palette. Select Codex, Claude Code, or another available agent in the model picker and send your first message. The new chat uses the exact same folder and device, with no copied history or provider session. The existing conversation stays available. The **Same checkout** label confirms that no new worktree or environment setup will run; services are shared by both conversations.
-
-## Muute preset
-
-When `tools/worktrees/src/commands/codex-sync.ts` is detected, **Use Muute worktree workflow** fills a preset. Save to enable it. Zeron still creates the linked checkout; the preset runs the existing project's workflow against that checkout:
-
-```sh
-bun run worktrees codex-sync --mode setup --source "$ZERON_PROJECT_ROOT" --worktree "$ZERON_CHECKOUT_ROOT"
-bun run worktrees codex-sync --mode cleanup --source "$ZERON_PROJECT_ROOT" --worktree "$ZERON_CHECKOUT_ROOT"
-```
-
-The preset disables built-in env/dependency copying and runs from the project root. Muute owns secret copying, submodules, port/schema allocation, installation, migrations, generation, and seeding. Its cleanup can remove the worktree's database schema. Inspect or edit these commands before saving; selecting the preset itself executes nothing. Zeron does not modify Muute's source or publish any env data.
-
-Configure database startup, ready check and timeout in **Project settings → Project defaults → Shared databases**, on the same page as the setup and cleanup workflow. Zeron starts and checks them before Muute setup, including worktree creation and setup retries, and they remain shared across checkouts. Worktree pages show them read-only. Muute's `start-db` omits Redis, which must be started separately or included in the same service command.
-
-Muute's `create` command chooses its own folder path, while Zeron allocates a specific destination. Use the `codex-sync` preset for this repository so both tools agree on the worktree path. The preset clears custom Git overrides and activation commands to avoid duplicate setup. It installs dependencies independently instead of copying `node_modules`.
+To use another agent in the same environment, choose **New chat in this checkout** from a chat's context menu or the command palette. Select Codex, Claude Code, or another available agent in the model picker and send your first message. The new chat uses the exact same folder and device, with no copied history or provider session. The existing conversation stays available. The **Same checkout** label confirms that no new worktree or environment setup will run; services are shared by both conversations.

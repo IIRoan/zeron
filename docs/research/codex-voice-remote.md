@@ -140,11 +140,10 @@ No binaries or credentials were copied into this repository.
 
 ## Remaining G0 evidence
 
-Remaining live acceptance (the user requested proceeding with implementation
-and will run these checks after it):
+Live acceptance requires:
 
-1. Supply the Fedora SSH alias, absolute Codex path and working directory, with
-   compatible subscription authentication already configured.
+1. Configure the execution host's SSH alias, absolute Codex path and working
+   directory, with compatible subscription authentication already configured.
 2. Run negotiation and an actual bidirectional conversation, with media on Mac
    and app-server on Fedora. Record sanitized versions/platforms and whether the
    devices are on different networks. Verify Fedora has no audio-device access.

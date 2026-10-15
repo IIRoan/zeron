@@ -1038,3 +1038,69 @@ async fn the_idle_reaper_spares_a_runtime_holding_background_work() {
     .await;
     rig.core.sessions.shutdown().await;
 }
+
+#[tokio::test]
+async fn background_task_changes_are_published_while_the_parent_turn_is_idle() {
+    let rig = rig();
+    rig.core
+        .sessions
+        .dispatch(
+            CHAT,
+            HarnessId::Mock,
+            request("launch background tests"),
+            None,
+        )
+        .await
+        .unwrap();
+    settle(&rig, 1).await;
+    let completed = rig
+        .core
+        .sessions
+        .session_status(CHAT)
+        .unwrap()
+        .last_completed_turn;
+    let turn = rig.ledger.turn.lock().unwrap().clone().unwrap();
+    turn.set_background(2);
+    wait_for(
+        || {
+            rig.core
+                .sessions
+                .session_status(CHAT)
+                .is_some_and(|s| s.running_background_tasks == 2)
+        },
+        "background activity to reach the session row without transcript output",
+    )
+    .await;
+    let session = rig.core.sessions.session_status(CHAT).unwrap();
+    assert_eq!(session.status, SessionStatus::Idle);
+    assert_eq!(session.last_completed_turn, completed);
+    let mut watch = rig.core.sessions.watch_sessions();
+    turn.set_background(0);
+    tokio::time::timeout(Duration::from_secs(2), watch.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(watch.borrow()[0].running_background_tasks, 0);
+    assert_eq!(status(&rig.core), Some(SessionStatus::Idle));
+
+    turn.set_background(1);
+    wait_for(
+        || {
+            rig.core
+                .sessions
+                .session_status(CHAT)
+                .is_some_and(|s| s.running_background_tasks == 1)
+        },
+        "new background activity to reach the session row",
+    )
+    .await;
+    rig.core.sessions.shutdown().await;
+    assert_eq!(
+        rig.core
+            .sessions
+            .session_status(CHAT)
+            .unwrap()
+            .running_background_tasks,
+        0
+    );
+}

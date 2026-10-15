@@ -241,6 +241,42 @@ case "$turnline" in
   emit '{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}'
   ;;
 
+*scenario:silent-v1*|*scenario:silent-v2*)
+  # Quiet children announce their lifecycle but never stream transcript content.
+  # Parent follow-ups control completion so the engine can inspect each count.
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  for child in 1 2 3; do
+    if has "$turnline" 'scenario:silent-v1'; then
+      emit "{\"method\":\"item/completed\",\"params\":{\"threadId\":\"th-1\",\"item\":{\"type\":\"collabAgentToolCall\",\"id\":\"spawn-$child\",\"tool\":\"spawnAgent\",\"status\":\"completed\",\"receiverThreadIds\":[\"child-$child\"]}}}"
+    else
+      emit "{\"method\":\"item/completed\",\"params\":{\"threadId\":\"th-1\",\"item\":{\"type\":\"subAgentActivity\",\"id\":\"spawn-$child\",\"kind\":\"started\",\"agentThreadId\":\"child-$child\",\"agentPath\":\"/root/idle-$child\"}}}"
+    fi
+  done
+  emit '{"method":"item/agentMessage/delta","params":{"threadId":"th-1","itemId":"parent-1","delta":"parent-1"}}'
+  emit '{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"t-1","status":"completed"}}}'
+  n=2
+  while read -r next; do
+    has "$next" '"method":"turn/start"' || exit 10
+    emit "{\"id\":$(rid "$next"),\"result\":{\"turn\":{\"id\":\"t-$n\"}}}"
+    case "$next" in
+      *finish-*)
+        child=$(printf '%s' "$next" | sed -n 's/.*finish-\([123]\).*/\1/p')
+        if has "$turnline" 'scenario:silent-v2'; then
+          # Parent summaries can precede the authoritative child terminal.
+          emit "{\"method\":\"item/completed\",\"params\":{\"threadId\":\"th-1\",\"item\":{\"type\":\"subAgentActivity\",\"id\":\"finished-$child\",\"kind\":\"completed\",\"agentThreadId\":\"child-$child\",\"agentPath\":\"/root/idle-$child\"}}}"
+        fi
+        emit "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"child-$child\",\"turn\":{\"id\":\"child-turn-$child\",\"status\":\"completed\"}}}"
+        ;;
+      *restart-1*)
+        emit '{"method":"turn/started","params":{"threadId":"child-1","turn":{"id":"child-restarted"}}}'
+        ;;
+    esac
+    emit "{\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"th-1\",\"itemId\":\"parent-$n\",\"delta\":\"parent-$n\"}}"
+    emit "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"th-1\",\"turn\":{\"id\":\"t-$n\",\"status\":\"completed\"}}}"
+    n=$((n + 1))
+  done
+  ;;
+
 *scenario:child-identity*)
   emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
   cat "$(dirname "$0")/codex/child-identity.jsonl"

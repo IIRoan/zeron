@@ -12,6 +12,37 @@ enum Tool {
 }
 
 impl Shell {
+    pub(super) fn open_search_file_at(
+        &mut self,
+        path: String,
+        line: u32,
+        column: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if cfg!(target_os = "linux") {
+            self.open_workbench_file(path.clone(), window, cx);
+            if let Some(id) = self
+                .file_surface_keys
+                .get(&(self.panel_key(cx), self.active_chat.clone(), path))
+                .copied()
+                && let Some(file) = self.file_surfaces.get(&id).cloned()
+            {
+                file.update(cx, |file, cx| {
+                    file.navigate_to_line(line, Some(FileColumn::Byte(column)), cx)
+                });
+            }
+        } else {
+            self.add_file_surface_at(
+                (self.active_chat.clone(), self.state.clone()),
+                path,
+                Some((line, Some(FileColumn::Byte(column)))),
+                window,
+                cx,
+            );
+        }
+    }
+
     fn select_tool(&mut self, tool: Tool, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_chat.is_empty() {
             return;

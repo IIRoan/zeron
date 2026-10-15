@@ -508,6 +508,7 @@ pub(super) struct ChildStream {
     streamed_text: std::collections::HashSet<String>,
     completed_items: std::collections::VecDeque<String>,
     completed_turns: std::collections::VecDeque<String>,
+    started_turns: std::collections::VecDeque<String>,
     settled: bool,
 }
 
@@ -532,17 +533,16 @@ impl ChildStream {
             if !id.is_empty() && self.completed_turns.contains(&id) {
                 return Vec::new();
             }
-            if self.settled {
-                self.settled = false;
-                // v2 followup_task starts a new child turn without echoing a
-                // userMessage. Reopen the existing document without inventing
-                // a user prompt or attributing an activity id as a new spawn.
-                return vec![AgentEvent::Steered {
-                    assistant_message_id: None,
-                    next_assistant_message_id: None,
-                }];
+            if !remember(&mut self.started_turns, id) {
+                return Vec::new();
             }
-            return Vec::new();
+            self.settled = false;
+            // Initial and follow-up assignments can run silently, including
+            // after a resume. Announce activity without inventing user text.
+            return vec![AgentEvent::Steered {
+                assistant_message_id: None,
+                next_assistant_message_id: None,
+            }];
         }
         if matches!(method, "item/started" | "item/completed") {
             let item = params.get("item").unwrap_or(&Value::Null);

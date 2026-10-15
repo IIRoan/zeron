@@ -326,6 +326,11 @@ impl Shell {
                             this.add_file_surface(path.clone(), window, cx);
                         }
                     }
+                    FilesEvent::OpenFileAt { path, line, column }
+                        if this.accepts_file_navigation(&owner, source, cx) =>
+                    {
+                        this.open_search_file_at(path.clone(), *line, *column, window, cx);
+                    }
                     FilesEvent::OpenWebLink(activation) => {
                         if let crate::markdown::render::LinkOutcome::External(url) =
                             this.activate_session_link(activation, window, cx)

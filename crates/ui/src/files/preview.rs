@@ -100,10 +100,10 @@ pub(super) struct FilePreviewState {
     images_visible: bool,
     pub(super) documents: HashMap<String, FileDocument>,
     document_recency: VecDeque<String>,
-    active: Option<String>,
+    pub(super) active: Option<String>,
     highlights: HashMap<String, HighlightedFile>,
     syntax_cache: SyntaxHighlightCache,
-    list: ListState,
+    pub(super) list: ListState,
     horizontal_scroll: ScrollHandle,
     word_wrap: bool,
     editor_font_size: f32,
@@ -116,6 +116,7 @@ pub(super) struct FilePreviewState {
     comment_draft: Option<EditorCommentDraft>,
     active_comment: Option<String>,
     typography_generation: u32,
+    focus_requested: bool,
 }
 
 impl FilePreviewState {
@@ -145,6 +146,7 @@ impl FilePreviewState {
             comment_draft: None,
             active_comment: None,
             typography_generation: 0,
+            focus_requested: false,
         }
     }
 
@@ -152,6 +154,7 @@ impl FilePreviewState {
         self.documents.clear();
         self.document_recency.clear();
         self.active = None;
+        self.focus_requested = false;
         self.highlights.clear();
         self.list.reset(0);
         self.reload_confirmation = None;
@@ -570,6 +573,23 @@ impl FilesSurface {
             .and_then(|path| self.preview.documents.get(path))
             .and_then(|document| document.editor.clone())
         else {
+            self.preview.focus_requested = !self.preview.close_requested;
+            // Claim the source preview while it loads, then re-check the
+            // lifecycle at the deferred handoff so dialogs keep their focus.
+            if self.preview.active.as_ref().filter(|path| !super::image_preview::is_image(path))
+                .and_then(|path| self.preview.documents.get(path)).is_some_and(|document|
+                    matches!(document.phase, DocumentPhase::Loading)
+                        || document.file.as_ref().is_some_and(|file| file.text.is_some())) {
+                let focus = self.tree_focus.clone();
+                let owner = cx.weak_entity();
+                window.defer(cx, move |window, cx| {
+                    let _ = owner.update(cx, |surface, cx| {
+                        if !surface.preview.close_requested && !surface.target_change_pending && !surface.find.open {
+                            focus.focus(window, cx);
+                        }
+                    });
+                });
+            }
             return;
         };
         let focus = editor.focus_handle(cx);
@@ -1680,6 +1700,7 @@ impl FilesSurface {
             self.preview.close_confirmation = true;
         }
         self.preview.close_requested = true;
+        self.preview.focus_requested = false;
         if self.preview.close_confirmation {
             cx.notify();
             return FilesCloseDisposition::Blocked;
@@ -2497,6 +2518,13 @@ impl FilesSurface {
                 .flex_none(),
             )
             .child(crumbs)
+            .when(self.preview.documents.get(path).and_then(|document| document.file.as_ref()).is_some_and(|file| file.text.is_some()), |element| {
+                element.child(
+                    toolbar_button("files-find", if cfg!(target_os = "macos") { "Find in file (⌘F)" } else { "Find in file (Ctrl+F)" })
+                        .on_click(cx.listener(|this, _, window, cx| { this.open_file_find(window, cx); }))
+                        .child(icon(icons::MAGNIFER).size(px(crate::surface_chrome::ICON_SIZE)).text_color(theme.text_muted)),
+                )
+            })
             .when(markdown, |element| {
                 element.child(
                     toolbar_button(
@@ -2859,6 +2887,21 @@ impl FilesSurface {
             return centered_state(read_only_message(file.read_only_reason), theme.text_muted);
         }
         let truncated = file.truncated;
+        // An editable file claims focus when its editor is created. A plain
+        // read-only preview needs the same handoff after its text is mounted.
+        if self.preview.focus_requested && !self.preview.close_requested
+            && !self.target_change_pending && !self.find.open {
+            self.preview.focus_requested = false;
+            let focus = self.tree_focus.clone();
+            let owner = cx.weak_entity();
+            window.defer(cx, move |window, cx| {
+                let _ = owner.update(cx, |surface, cx| {
+                    if !surface.preview.close_requested && !surface.target_change_pending && !surface.find.open {
+                        focus.focus(window, cx);
+                    }
+                });
+            });
+        }
         let word_wrap = self.preview.word_wrap();
         let code_scroll = if word_wrap {
             div()
@@ -3226,13 +3269,14 @@ impl FilesSurface {
             return None;
         }
         let text = document.file.as_ref()?.text.clone()?;
-        let focus_editor = !document.show_markdown;
+        let focus_editor = !document.show_markdown && !self.find.open;
         let editor =
             super::editor::new_file_editor(text, path, self.preview.word_wrap, theme, window, cx);
         let event_path = path.to_string();
         let editor_events = super::editor::subscribe_to_changes(&editor, event_path, cx);
         let editor_observer = cx.observe(&editor, |_, _, cx| cx.notify());
         if focus_editor {
+            self.preview.focus_requested = false;
             let focus = editor.focus_handle(cx);
             window.defer(cx, move |window, cx| focus.focus(window, cx));
         }
@@ -3296,6 +3340,7 @@ impl FilesSurface {
             &theme,
         );
         let row_height = self.preview.line_height();
+        let find_ranges = self.find.ranges_for_line(index, line.len());
         div()
             .min_h(row_height)
             .flex_none()
@@ -3333,7 +3378,9 @@ impl FilesSurface {
                     // the code size could drift from the geometry the glyphs
                     // are measured against.
                     .text_size(px(self.preview.preview_text_size()))
-                    .child(gpui::StyledText::new(line.clone()).with_runs(runs)),
+                    .child(crate::popover::search_highlight_underlay(
+                        gpui::StyledText::new(line.clone()).with_runs(runs), find_ranges, &theme,
+                    )),
             )
             .into_any_element()
     }

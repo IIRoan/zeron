@@ -106,9 +106,22 @@ impl Subagents {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_owned();
+            let already_bound = self.spawns.contains_key(child);
             buffered = self.bind(child, &call);
             if let Some(owner) = self.spawns.get(child) {
                 item.to_mut()["id"] = owner.clone().into();
+                // Registration is proof of a child assignment even before it
+                // speaks. Buffered traffic already carries its lifecycle,
+                // including a child that completed before registration.
+                if !already_bound && buffered.is_empty() {
+                    buffered.push(tag(
+                        owner,
+                        AgentEvent::Steered {
+                            assistant_message_id: None,
+                            next_assistant_message_id: None,
+                        },
+                    ));
+                }
             }
         }
         let mut events: Vec<_> = map_item(phase, &item)
@@ -241,6 +254,95 @@ mod tests {
         assert_eq!(
             children.route("alpha", vec![text("ok")]),
             vec![tag("spawn", text("ok"))]
+        );
+    }
+
+    #[test]
+    fn quiet_spawns_announce_one_assignment_in_both_protocols() {
+        for item in [
+            serde_json::json!({"type":"collabAgentToolCall", "id":"spawn", "tool":"spawnAgent",
+                "status":"completed", "receiverThreadIds":["alpha"]}),
+            serde_json::json!({"type":"subAgentActivity", "id":"spawn", "kind":"started",
+                "agentThreadId":"alpha", "agentPath":"/root/alpha"}),
+        ] {
+            let mut children = Subagents::new("root".into());
+            let events = children.parent_item(Phase::Completed, &item);
+            assert_eq!(
+                events.last(),
+                Some(&tag(
+                    "spawn",
+                    AgentEvent::Steered {
+                        assistant_message_id: None,
+                        next_assistant_message_id: None,
+                    }
+                ))
+            );
+            assert!(children.parent_item(Phase::Completed, &item).is_empty());
+        }
+    }
+
+    #[test]
+    fn child_that_finished_before_registration_is_never_restarted() {
+        let mut children = Subagents::new("root".into());
+        assert!(
+            children
+                .notification(
+                    "alpha",
+                    "turn/completed",
+                    &serde_json::json!({
+                        "turn":{"id":"alpha-turn", "status":"completed"}
+                    })
+                )
+                .is_empty()
+        );
+        let events = children.parent_item(
+            Phase::Completed,
+            &serde_json::json!({
+                "type":"subAgentActivity", "id":"spawn", "kind":"started",
+                "agentThreadId":"alpha", "agentPath":"/root/alpha"
+            }),
+        );
+        assert!(events.iter().any(|event| matches!(event,
+            AgentEvent::Subagent { event, .. } if matches!(event.as_ref(), AgentEvent::Done { .. })
+        )));
+        assert!(!events.iter().any(|event| matches!(event,
+            AgentEvent::Subagent { event, .. } if matches!(event.as_ref(), AgentEvent::Steered { .. })
+        )));
+    }
+
+    #[test]
+    fn restored_quiet_child_announces_new_turns_without_duplicate_starts() {
+        let mut children = Subagents::new("root".into());
+        children.restore(&serde_json::json!({"turns":[{"items":[{
+            "type":"subAgentActivity", "id":"spawn", "kind":"started",
+            "agentThreadId":"alpha", "agentPath":"/root/alpha"
+        }]}]}));
+        let started = serde_json::json!({"turn":{"id":"new-turn"}});
+        assert_eq!(
+            children.notification("alpha", "turn/started", &started),
+            vec![tag(
+                "spawn",
+                AgentEvent::Steered {
+                    assistant_message_id: None,
+                    next_assistant_message_id: None,
+                }
+            )]
+        );
+        assert!(
+            children
+                .notification("alpha", "turn/started", &started)
+                .is_empty()
+        );
+        assert_eq!(
+            children
+                .notification("alpha", "turn/completed", &started)
+                .len(),
+            1
+        );
+        assert!(
+            children
+                .notification("alpha", "turn/started", &started)
+                .is_empty()
         );
     }
 }

@@ -1855,6 +1855,13 @@ impl Changes {
         self.notifications = Some(notifications);
     }
 
+    pub(crate) fn open_git_command(&mut self, command: crate::source_control::GitCommand, cx: &mut Context<Self>) {
+        self.file_selection = None;
+        self.set_scope(DiffScope::WorkingTree, cx);
+        self.source_control(cx).update(cx, |view, cx| view.request_git_command(command, cx));
+        cx.notify();
+    }
+
     fn source_control(
         &mut self,
         cx: &mut Context<Self>,
@@ -1871,6 +1878,7 @@ impl Changes {
         });
         self.source_control_events = Some(cx.subscribe(&view, |_, _, event, cx| {
             match event {
+                crate::source_control::SourceControlEvent::Updated => cx.notify(),
                 crate::source_control::SourceControlEvent::OpenDiff(selection) => cx.emit(ChangesEvent::OpenChange(selection.clone())),
                 crate::source_control::SourceControlEvent::Success { title, message } => cx.emit(ChangesEvent::Success { title: title.clone(), message: message.clone() }),
                 crate::source_control::SourceControlEvent::OpenFile(path) => cx.emit(ChangesEvent::OpenFile(path.clone())),
@@ -3174,6 +3182,10 @@ impl Changes {
         self.source_control
             .as_ref()
             .is_some_and(|view| view.read(cx).has_confirmation())
+    }
+
+    pub(crate) fn git_picker_open(&self, cx: &App) -> bool {
+        self.source_control.as_ref().is_some_and(|view| view.read(cx).git_picker_open())
     }
 
     /// Handle Escape before focused descendants such as a terminal receive it.
@@ -5321,12 +5333,12 @@ impl Render for Changes {
             self.ensure_file_watch(cx);
         }
         if self.scope == DiffScope::WorkingTree && self.file_selection.is_none() {
+            // Changes is already cached by its host. The header also renders
+            // source-control controls, so keep its body live when those actions
+            // invalidate Changes rather than replaying a second cached scene.
             return div()
                 .size_full()
-                .child(
-                    self.source_control(cx)
-                        .cached(gpui::StyleRefinement::default().size_full()),
-                )
+                .child(self.source_control(cx))
                 .into_any_element();
         }
         if self.scope == DiffScope::History {

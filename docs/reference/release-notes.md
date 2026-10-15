@@ -2,7 +2,7 @@
 
 The desktop shows **What’s new** after starting an updated build. The modal
 contains **This update** and **Previous release**, with upstream’s original
-Markdown notes and a separate section for changes made in `IIRoan/zeron`.
+Markdown notes and a separate section for changes made in this fork.
 Upstream notes may describe other platforms; they do not imply those features
 are enabled in the Linux fork.
 

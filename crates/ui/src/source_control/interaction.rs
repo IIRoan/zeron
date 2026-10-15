@@ -173,14 +173,14 @@ impl SourceControl {
             " Changes".into()
         };
         let enabled = repo.complete && !self.is_busy();
-        let mut actions = vec![(FileAction::Diff, "Open Changes".into(), true)];
+        let mut actions = vec![(FileAction::Diff, "Open Changes".into(), self.staging_pending(&key.repository, &key.path).is_none())];
         if can_open_file(file) && !repo.submodules.contains(&file.path) {
             actions.push((FileAction::Open, "Open File".into(), true));
         }
         actions.push((
             FileAction::Stage,
             format!("{}{suffix}", if key.staged { "Unstage" } else { "Stage" }),
-            enabled,
+            self.stage_paths_enabled(&key.repository, &self.staging_paths(key), !key.staged),
         ));
         if !key.staged && !file.is_conflicted() && !repo.submodules.contains(&file.path) {
             actions.push((
@@ -228,7 +228,11 @@ impl SourceControl {
                     matches!(action, FileAction::AcceptIncoming),
                     cx,
                 ),
-            FileAction::Diff => cx.emit(SourceControlEvent::OpenDiff(selection)),
+            FileAction::Diff => {
+                if self.staging_pending(&key.repository, &key.path).is_none() {
+                    cx.emit(SourceControlEvent::OpenDiff(selection));
+                }
+            }
             FileAction::Open => {
                 cx.emit(SourceControlEvent::OpenFile(if key.repository.is_empty() {
                     key.path
@@ -424,7 +428,8 @@ impl SourceControl {
                     self.list_scroll
                         .scroll_to_item(row, gpui::ScrollStrategy::Nearest);
                 }
-                if let Some(selection) = self.selected.clone() {
+                if let Some(selection) = self.selected.clone()
+                    && self.staging_pending(&selection.repository, &selection.path).is_none() {
                     cx.emit(SourceControlEvent::OpenDiff(selection));
                 }
                 cx.notify();
@@ -440,7 +445,8 @@ impl SourceControl {
                 }
             }
             "enter" => {
-                if let Some(selection) = self.selected.clone() {
+                if let Some(selection) = self.selected.clone()
+                    && self.staging_pending(&selection.repository, &selection.path).is_none() {
                     cx.emit(SourceControlEvent::OpenDiff(selection));
                 }
             }

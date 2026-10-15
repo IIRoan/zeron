@@ -1253,7 +1253,8 @@ impl Shell {
             .border_b_1()
             .border_color(theme.border)
             .child(popover::dialog_title(&theme, "Project settings"))
-            .child(note(&theme, &editor.project.name));
+            .child(note(&theme, &editor.project.name))
+            .child(self.render_project_icon_controls(&editor.project.space, cx));
         let card = popover::dialog_card(&theme)
             .w(px(840.0))
             .max_w((viewport.width - px(40.0)).max(px(200.0)))

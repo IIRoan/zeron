@@ -37,6 +37,8 @@ sha2.workspace = true
 reqwest.workspace = true
 ignore.workspace = true
 fff-search.workspace = true
+regex = "1"
+globset = "0.4"
 
 same-file = "1"
 tempfile.workspace = true

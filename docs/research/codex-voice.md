@@ -225,7 +225,3 @@ failed at opening audio devices: this environment exposes a network output
 monitor, without a usable default microphone. No real speech or acoustic echo
 trial is claimed. macOS/Windows signed package and physical-device trials also
 remain unverified; protocol/fixture success does not establish those results.
-
-Implementation review and local test results are recorded in the ignored
-`.personal/codex-voice/` working notes. No push, deployment or remote PR is part
-of this task.

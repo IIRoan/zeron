@@ -175,9 +175,12 @@ pub(super) struct ProjectTerminalUi {
     bar_width: std::rc::Rc<std::cell::Cell<f32>>,
     output_height: std::rc::Rc<std::cell::Cell<f32>>,
     poll: Option<Task<()>>,
+    /// Saves and bulk actions exclude individual service actions.
     busy: bool,
     pending_action: Option<&'static str>,
-    pending_service: Option<String>,
+    /// Individual actions only disable the affected service. Keep the scope
+    /// until completion so a checkout handoff waits for every old request.
+    service_actions: std::collections::HashMap<(String, String), &'static str>,
     content_started: Option<std::time::Instant>,
     operation_error: Option<String>,
     epoch: u64,
@@ -186,6 +189,28 @@ pub(super) struct ProjectTerminalUi {
     /// Scope of the checkout services were last activated for.
     last_activation: Option<String>,
     handoff_error: Option<String>,
+}
+
+impl ProjectTerminalUi {
+    fn has_pending_actions(&self) -> bool {
+        self.busy || !self.service_actions.is_empty()
+    }
+
+    fn control_busy(&self, service: Option<&str>) -> bool {
+        if self.busy || self.handoff.is_some() {
+            return true;
+        }
+        let Some(service) = service else {
+            return self.has_pending_actions();
+        };
+        let Some(context) = &self.context else {
+            return true;
+        };
+        let scope = context.scope();
+        self.service_actions
+            .keys()
+            .any(|(pending_scope, id)| pending_scope != &scope || id == service)
+    }
 }
 
 impl Shell {
@@ -235,7 +260,7 @@ impl Shell {
         if !window.is_window_active()
             || !matches!(self.route, Route::Chat)
             || self.project_terminals.handoff.is_some()
-            || self.project_terminals.busy
+            || self.project_terminals.has_pending_actions()
         {
             return;
         }
@@ -723,7 +748,7 @@ impl Shell {
         action: &'static str,
         cx: &mut Context<Self>,
     ) {
-        if self.project_terminals.busy || self.project_terminals.handoff.is_some() {
+        if self.project_terminals.control_busy(service.as_deref()) {
             return;
         }
         let Some(context) = self.project_terminals.context.clone() else {
@@ -734,11 +759,10 @@ impl Shell {
                 .selected
                 .insert(context.scope(), service.clone());
         }
-        self.project_terminals.pending_action = Some(action);
-        self.project_terminals.pending_service = service.clone();
         self.request_project_terminals(
             methods::CONTROL_PROJECT_TERMINALS,
             context.params(serde_json::json!({ "serviceId": service, "action": action })),
+            Some(action),
             cx,
         );
     }
@@ -747,13 +771,30 @@ impl Shell {
         &mut self,
         method: &'static str,
         params: serde_json::Value,
+        action: Option<&'static str>,
         cx: &mut Context<Self>,
     ) {
+        let service = (method == methods::CONTROL_PROJECT_TERMINALS)
+            .then(|| params["serviceId"].as_str())
+            .flatten();
+        if self.project_terminals.control_busy(service) {
+            return;
+        }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
         let context = self.project_terminals.context.clone();
-        self.project_terminals.busy = true;
+        let service_key = service
+            .zip(context.as_ref())
+            .map(|(id, context)| (context.scope(), id.to_string()));
+        if let Some(key) = &service_key {
+            self.project_terminals
+                .service_actions
+                .insert(key.clone(), action.unwrap_or("start"));
+        } else {
+            self.project_terminals.busy = true;
+            self.project_terminals.pending_action = action;
+        }
         self.project_terminals.operation_error = None;
         self.project_terminals.poll = None;
         self.project_terminals.epoch += 1;
@@ -764,18 +805,27 @@ impl Shell {
                 .call_as::<ProjectTerminalsSnapshot>(method, params)
                 .await;
             this.update(cx, |shell, cx| {
-                // Finish the old request before handing off a newer selection.
-                shell.project_terminals.busy = false;
-                shell.project_terminals.pending_action = None;
-                shell.project_terminals.pending_service = None;
+                // Only release this request; other service actions can still
+                // be running, including in the previously selected checkout.
+                if let Some(key) = &service_key {
+                    shell.project_terminals.service_actions.remove(key);
+                } else {
+                    shell.project_terminals.busy = false;
+                    shell.project_terminals.pending_action = None;
+                }
                 cx.notify();
-                if shell.project_terminals.context != context
-                    || shell.project_terminals.epoch != epoch
-                {
+                if shell.project_terminals.context != context {
                     return;
                 }
+                let current = shell.project_terminals.epoch == epoch;
+                // Invalidate polls begun before completion. An older action's
+                // snapshot can omit a newer service; the next poll refreshes it.
+                shell.project_terminals.epoch += 1;
                 match result {
                     Ok(snapshot) => {
+                        if !current {
+                            return;
+                        }
                         shell.project_terminals.handoff_error = None;
                         if method == methods::SAVE_PROJECT_TERMINALS {
                             if let Some(editor) = shell.project_terminals.editor.open_mut() {
@@ -824,7 +874,7 @@ impl Shell {
         let params = editor
             .project
             .params(serde_json::json!({ "config": config }));
-        self.request_project_terminals(methods::SAVE_PROJECT_TERMINALS, params, cx);
+        self.request_project_terminals(methods::SAVE_PROJECT_TERMINALS, params, None, cx);
     }
 
     pub(super) fn render_terminal_toolbar(
@@ -911,26 +961,30 @@ impl Shell {
         } else if self.project_terminals.handoff.is_some() {
             "Moving services to this checkout…".to_string()
         } else if let Some(action) = self.project_terminals.pending_action {
-            let target = self
-                .project_terminals
-                .pending_service
-                .as_ref()
-                .and_then(|id| {
-                    self.project_terminals
-                        .snapshot
-                        .as_ref()?
-                        .config
-                        .services
-                        .iter()
-                        .find(|s| &s.id == id)
-                })
-                .map(|s| s.name.as_str())
-                .unwrap_or(if action == "stop-worktree" {
-                    "app services"
-                } else {
-                    "all services"
-                });
+            let target = if action == "stop-worktree" {
+                "app services"
+            } else {
+                "all services"
+            };
             format!("{} {target}…", action_label(action))
+        } else if !self.project_terminals.service_actions.is_empty() {
+            let mut progress = self
+                .project_terminals
+                .service_actions
+                .iter()
+                .map(|((_, id), action)| {
+                    let name = self
+                        .project_terminals
+                        .snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.config.services.iter().find(|s| &s.id == id))
+                        .map(|s| s.name.as_str())
+                        .unwrap_or(id);
+                    format!("{} {name}…", action_label(action))
+                })
+                .collect::<Vec<_>>();
+            progress.sort();
+            progress.join(" · ")
         } else if mode == TerminalMode::Services {
             let name = project
                 .as_ref()
@@ -998,7 +1052,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = Theme::of(cx).clone();
-        let busy = self.project_terminals.busy || self.project_terminals.handoff.is_some();
+        let busy = self.project_terminals.control_busy(None);
         let snapshot = self.project_terminals.snapshot.as_ref();
         let configured = snapshot.is_some_and(|s| !s.config.services.is_empty());
         let running = snapshot.is_some_and(|s| {
@@ -1034,6 +1088,7 @@ impl Shell {
             .border_color(theme.border)
             .bg(theme.wash(0.035));
         if let (Some(snapshot), Some(service)) = (snapshot, selected_service.as_ref()) {
+            let service_busy = self.project_terminals.control_busy(Some(&service.id));
             let status = service_status(snapshot, &service.id);
             let (action, glyph, label) = if service_is_active(status) {
                 ("stop", icons::STOP, "Stop")
@@ -1046,6 +1101,7 @@ impl Shell {
                 .child(
                     popover::btn_ghost(&theme, "", format!("service-{action}"))
                         .id(SharedString::from(format!("service-{action}")))
+                        .debug_selector(move || format!("service-{action}"))
                         .h(px(22.0))
                         .px(px(7.0))
                         .py_0()
@@ -1061,8 +1117,8 @@ impl Shell {
                         .tooltip(crate::settings::widgets::text_tooltip(hint))
                         .child(icon(glyph).size(px(13.0)).text_color(theme.text_muted))
                         .child(label)
-                        .when(busy, |el| el.opacity(0.4).cursor_default())
-                        .when(!busy, |el| {
+                        .when(service_busy, |el| el.opacity(0.4).cursor_default())
+                        .when(!service_busy, |el| {
                             el.on_click(cx.listener(move |this, _, _, cx| {
                                 this.control_project_terminal(Some(id.clone()), action, cx);
                             }))
@@ -1138,6 +1194,7 @@ impl Shell {
                 .on_click(|_, _, cx| cx.stop_propagation());
             let closing = self.project_terminals.actions_menu.is_closing();
             if let Some(service) = &selected_service {
+                let service_busy = self.project_terminals.control_busy(Some(&service.id));
                 let id = service.id.clone();
                 let label = format!("Restart {}", service.name);
                 menu = menu
@@ -1158,8 +1215,10 @@ impl Shell {
                                     .truncate()
                                     .child(SharedString::from(label)),
                             )
-                            .when(busy || closing, |el| el.opacity(0.4).cursor_default())
-                            .when(!busy && !closing, |el| {
+                            .when(service_busy || closing, |el| {
+                                el.opacity(0.4).cursor_default()
+                            })
+                            .when(!service_busy && !closing, |el| {
                                 el.on_click(cx.listener(move |this, _, _, cx| {
                                     this.close_project_terminal_actions(cx);
                                     this.control_project_terminal(Some(id.clone()), "restart", cx);
@@ -1648,7 +1707,7 @@ impl Shell {
         let editor = self.project_terminals.editor.get()?;
         let theme = Theme::of(cx).for_popup();
         let compact = viewport.width < px(640.0);
-        let busy = self.project_terminals.busy || editor.closed_by_save;
+        let busy = self.project_terminals.control_busy(None) || editor.closed_by_save;
         let initialized = editor.initialized;
         let selected_database = editor
             .databases
@@ -3157,7 +3216,10 @@ mod tests {
                 let a = shell.terminal_project_context(None, cx).unwrap();
                 shell.project_terminals.context = Some(a.clone());
                 shell.project_terminals.drawer = true;
-                shell.project_terminals.busy = true;
+                shell
+                    .project_terminals
+                    .service_actions
+                    .insert((a.scope(), "backend".into()), "start");
                 shell
                     .state
                     .update(cx, |state, _| state.selected_chat = Some("b".into()));
@@ -3168,8 +3230,12 @@ mod tests {
                 assert_eq!(b.params(serde_json::json!({}))["chatId"], "b");
                 shell.ensure_project_terminals(cx);
                 assert!(
-                    shell.project_terminals.busy,
+                    shell.project_terminals.has_pending_actions(),
                     "a late old-agent Start must finish before the new handoff"
+                );
+                assert!(
+                    shell.project_terminals.control_busy(Some("frontend")),
+                    "a new checkout cannot send service actions before the old handoff finishes"
                 );
                 assert_eq!(
                     shell
@@ -3270,6 +3336,301 @@ mod tests {
             },
             runs: Vec::new(),
         }
+    }
+
+    struct ServiceRpc {
+        runtime: tokio::runtime::Runtime,
+        requests: tokio::sync::mpsc::Receiver<String>,
+        replies: tokio::sync::mpsc::Sender<String>,
+    }
+
+    impl ServiceRpc {
+        fn attach(shell: gpui::WindowHandle<Shell>, cx: &mut TestAppContext) -> Self {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let (out, requests) = tokio::sync::mpsc::channel(16);
+            let (replies, inbound) = tokio::sync::mpsc::channel(16);
+            let engine = {
+                let _guard = runtime.enter();
+                crate::state::EngineHandle::from_test_client(zeron_rpc::RpcClient::new(
+                    out, inbound,
+                ))
+            };
+            shell
+                .update(cx, |shell, _, cx| {
+                    shell
+                        .state
+                        .update(cx, |state, _| state.set_test_engine(engine));
+                    shell.project_terminals.context =
+                        Some(test_project(std::path::Path::new("/project")));
+                    shell.project_terminals.snapshot = Some(service_snapshot("initial"));
+                })
+                .unwrap();
+            Self {
+                runtime,
+                requests,
+                replies,
+            }
+        }
+
+        fn take(&mut self, cx: &mut TestAppContext) -> Vec<serde_json::Value> {
+            cx.run_until_parked();
+            let mut requests = Vec::new();
+            while let Ok(request) = self.requests.try_recv() {
+                requests.push(serde_json::from_str(&request).unwrap());
+            }
+            requests
+        }
+
+        fn reply(&self, request: &serde_json::Value, result: serde_json::Value) {
+            let mut reply = result;
+            reply["id"] = request["id"].clone();
+            self.runtime.block_on(async {
+                self.replies.send(reply.to_string()).await.unwrap();
+                while self.replies.capacity() < self.replies.max_capacity() {
+                    tokio::task::yield_now().await;
+                }
+            });
+        }
+    }
+
+    fn service_snapshot(checkout: &str) -> ProjectTerminalsSnapshot {
+        ProjectTerminalsSnapshot {
+            checkout: Some(checkout.into()),
+            config: ProjectTerminalConfig {
+                services: ["backend", "frontend"]
+                    .into_iter()
+                    .map(|id| ProjectTerminalService {
+                        id: id.into(),
+                        name: id.into(),
+                        command: "sleep 60".into(),
+                        directory: ".".into(),
+                        restart_on_failure: false,
+                        setup_prerequisite: None,
+                    })
+                    .collect(),
+            },
+            runs: Vec::new(),
+        }
+    }
+
+    #[gpui::test]
+    fn independent_service_actions_are_sent_before_other_starts_complete(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let shell = test_shell(cx, dir.path());
+        let mut rpc = ServiceRpc::attach(shell, cx);
+        shell
+            .update(cx, |shell, _, cx| {
+                shell.control_project_terminal(Some("backend".into()), "start", cx);
+                shell.control_project_terminal(Some("frontend".into()), "start", cx);
+                shell.control_project_terminal(Some("backend".into()), "restart", cx);
+                shell.control_project_terminal(None, "stop", cx);
+                shell.request_project_terminals(
+                    methods::SAVE_PROJECT_TERMINALS,
+                    serde_json::json!({}),
+                    None,
+                    cx,
+                );
+            })
+            .unwrap();
+        let requests = rpc.take(cx);
+        assert_eq!(
+            requests.len(),
+            2,
+            "both starts are sent; duplicates, bulk actions and saves wait"
+        );
+        assert_eq!(requests[0]["params"]["serviceId"], "backend");
+        assert_eq!(requests[1]["params"]["serviceId"], "frontend");
+        rpc.reply(
+            &requests[1],
+            serde_json::json!({ "ok": service_snapshot("latest") }),
+        );
+        cx.run_until_parked();
+        shell
+            .update(cx, |shell, _, cx| {
+                assert!(shell.project_terminals.control_busy(Some("backend")));
+                assert!(!shell.project_terminals.control_busy(Some("frontend")));
+                assert!(shell.project_terminals.control_busy(None));
+                shell.control_project_terminal(Some("frontend".into()), "restart", cx);
+            })
+            .unwrap();
+        let restart = rpc.take(cx);
+        assert_eq!(restart.len(), 1);
+        rpc.reply(
+            &requests[0],
+            serde_json::json!({ "err": "Backend failed to start" }),
+        );
+        cx.run_until_parked();
+        shell
+            .update(cx, |shell, _, _| {
+                assert!(!shell.project_terminals.control_busy(Some("backend")));
+                assert!(shell.project_terminals.control_busy(Some("frontend")));
+                assert!(
+                    shell
+                        .project_terminals
+                        .operation_error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("Backend failed to start")),
+                    "an older request's failure stays visible"
+                );
+            })
+            .unwrap();
+        rpc.reply(
+            &restart[0],
+            serde_json::json!({ "ok": service_snapshot("finished") }),
+        );
+        cx.run_until_parked();
+        shell
+            .update(cx, |shell, _, _| {
+                assert!(!shell.project_terminals.has_pending_actions());
+                assert!(shell.project_terminals.operation_error.is_some());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn out_of_order_service_completions_preserve_newer_status(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let shell = test_shell(cx, dir.path());
+        let mut rpc = ServiceRpc::attach(shell, cx);
+        shell
+            .update(cx, |shell, _, cx| {
+                shell.control_project_terminal(Some("backend".into()), "start", cx);
+                shell.control_project_terminal(Some("frontend".into()), "start", cx);
+            })
+            .unwrap();
+        let requests = rpc.take(cx);
+        assert_eq!(requests.len(), 2);
+        rpc.reply(
+            &requests[1],
+            serde_json::json!({ "ok": service_snapshot("latest") }),
+        );
+        cx.run_until_parked();
+        rpc.reply(
+            &requests[0],
+            serde_json::json!({ "ok": service_snapshot("stale") }),
+        );
+        cx.run_until_parked();
+        shell
+            .update(cx, |shell, _, cx| {
+                assert!(!shell.project_terminals.has_pending_actions());
+                assert_eq!(
+                    shell
+                        .project_terminals
+                        .snapshot
+                        .as_ref()
+                        .unwrap()
+                        .checkout
+                        .as_deref(),
+                    Some("latest")
+                );
+                shell.project_terminals.context =
+                    Some(test_project(std::path::Path::new("/other")));
+                shell.control_project_terminal(Some("backend".into()), "start", cx);
+                shell.control_project_terminal(Some("frontend".into()), "start", cx);
+                shell.project_terminals.context =
+                    Some(test_project(std::path::Path::new("/project")));
+            })
+            .unwrap();
+        let requests = rpc.take(cx);
+        assert_eq!(requests.len(), 2);
+        rpc.reply(
+            &requests[0],
+            serde_json::json!({ "ok": service_snapshot("other") }),
+        );
+        cx.run_until_parked();
+        shell
+            .update(cx, |shell, _, _| {
+                assert!(shell.project_terminals.has_pending_actions());
+                assert!(shell.project_terminals.control_busy(Some("backend")));
+                assert_eq!(
+                    shell
+                        .project_terminals
+                        .snapshot
+                        .as_ref()
+                        .unwrap()
+                        .checkout
+                        .as_deref(),
+                    Some("latest")
+                );
+            })
+            .unwrap();
+        rpc.reply(
+            &requests[1],
+            serde_json::json!({ "ok": service_snapshot("other") }),
+        );
+        cx.run_until_parked();
+        shell
+            .update(cx, |shell, _, _| {
+                assert!(!shell.project_terminals.has_pending_actions());
+                assert_eq!(
+                    shell
+                        .project_terminals
+                        .snapshot
+                        .as_ref()
+                        .unwrap()
+                        .checkout
+                        .as_deref(),
+                    Some("latest")
+                );
+            })
+            .unwrap();
+    }
+
+    struct ServiceToolbarHost {
+        shell: Entity<Shell>,
+        _observer: Subscription,
+    }
+
+    impl Render for ServiceToolbarHost {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.shell.update(cx, |shell, cx| {
+                div()
+                    .size_full()
+                    .child(shell.render_service_toolbar_actions(window, cx))
+            })
+        }
+    }
+
+    #[gpui::test]
+    fn toolbar_can_start_another_service_while_backend_is_pending(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let shell_window = test_shell(cx, dir.path());
+        let mut rpc = ServiceRpc::attach(shell_window, cx);
+        let shell = shell_window
+            .update(cx, |shell, _, cx| {
+                shell.reduced_motion = true;
+                shell.control_project_terminal(Some("backend".into()), "start", cx);
+                let scope = shell.project_terminals.context.as_ref().unwrap().scope();
+                shell
+                    .project_terminals
+                    .selected
+                    .insert(scope, "frontend".into());
+                cx.entity()
+            })
+            .unwrap();
+        assert_eq!(rpc.take(cx).len(), 1);
+        let (_, cx) = cx.add_window_view(|_, cx| ServiceToolbarHost {
+            _observer: cx.observe(&shell, |_, _, cx| cx.notify()),
+            shell: shell.clone(),
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        let start = cx.debug_bounds("service-start").unwrap().center();
+        cx.simulate_click(start, gpui::Modifiers::default());
+        cx.run_until_parked();
+        let request: serde_json::Value =
+            serde_json::from_str(&rpc.requests.try_recv().unwrap()).unwrap();
+        assert_eq!(request["params"]["serviceId"], "frontend");
+        assert_eq!(request["params"]["action"], "start");
+        cx.update(|window, cx| window.draw(cx).clear());
+        cx.simulate_click(start, gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            rpc.requests.try_recv().is_err(),
+            "a pending service ignores duplicate clicks"
+        );
     }
 
     struct PromptHost {
@@ -3538,7 +3899,7 @@ impl Shell {
                 })
                 .unwrap_or_default()
         };
-        serde_json::json!({ "snapshot": self.project_terminals.snapshot, "busy": self.project_terminals.busy,
+        serde_json::json!({ "snapshot": self.project_terminals.snapshot, "busy": self.project_terminals.has_pending_actions(),
             "serviceSummary": self.project_terminals.snapshot.as_ref().map(service_summary),
             "dockHeight": self.terminal_geometry.get().height, "dockAnimating": self.terminal_tween.is_some(),
             "outputHeight": self.project_terminals.output_height.get(), "serviceBarWidth": self.project_terminals.bar_width.get(),

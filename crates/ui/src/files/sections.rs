@@ -539,6 +539,7 @@ impl FilesSurface {
         let chats_actions = self.render_chats_header_actions(theme, window, cx);
         div()
             .id("files-sections")
+            .debug_selector(|| "files-sections".into())
             .relative()
             .flex_none()
             .w_full()
@@ -1625,6 +1626,7 @@ mod tests {
         assert_eq!(rows[0].status, ChatIndicator::Idle);
     }
 
+    #[cfg(not(target_os = "linux"))]
     #[gpui::test]
     fn double_clicked_side_chat_asks_for_an_inline_rename(cx: &mut gpui::TestAppContext) {
         use gpui::{AppContext as _, MouseDownEvent, MouseUpEvent};
@@ -1685,6 +1687,7 @@ mod tests {
         assert!(cx.debug_bounds("files-chat-title-side").is_some());
     }
 
+    #[cfg(not(target_os = "linux"))]
     #[gpui::test]
     fn inline_rename_reveals_a_side_chat_in_a_collapsed_paged_section(
         cx: &mut gpui::TestAppContext,

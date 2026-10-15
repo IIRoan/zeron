@@ -1,17 +1,16 @@
 # Remote voice development testing
 
 Remote voice is enabled by default in desktop apps and headless engines.
-Real Mac/Fedora and physical iPhone acceptance is pending and will be performed
-by the user. Compilation and fake-provider tests
-are not evidence of subscription/media compatibility. No production rollout or
-server deployment is part of this change.
+Live cross-platform and physical-device acceptance remains pending.
+Compilation and fake-provider tests do not establish subscription or media
+compatibility.
 
 ## Desktop
 
-Start the execution host's new Zeron engine/app normally. No environment flag
+Start the execution host's Zeron engine/app normally. No environment flag
 is required. Codex must already be installed and authenticated through
-ChatGPT on that host. It needs no audio helper, microphone or speaker. Continue
-using the existing registered device and account; do not register another host.
+ChatGPT on that host. It needs no audio helper, microphone or speaker. Use a
+registered device and account.
 
 The client (the device with the microphone) needs its own standalone Codex
 installation, version 0.159 or later, from the official installer: audio runs
@@ -154,17 +153,15 @@ Use an available ARM64 simulator name on your machine. The Rust build script
 currently creates an ARM64 simulator archive; a generic x86_64 simulator build
 cannot link that archive. Keep simulator ad-hoc signing enabled so it can launch.
 
-## Local validation record
+## Coverage limits
 
-On macOS ARM64, the iOS simulator build and all six native lifecycle tests
-passed (including the shared orb frames). Rust tests cover incompatible hosts before permission, cancellation
-while an offer is stalled, a half-open heartbeat, local meters, owner drop,
+Native lifecycle and Rust tests cover incompatible hosts before permission,
+cancellation while an offer is stalled, a half-open heartbeat, local meters, owner drop,
 duplicate prepare/negotiation, late controls and bounded UniFFI callbacks.
-The full remote flow also passed with two engines over the WebSocket test relay
-and a fake Codex package whose audio helper was removed. The test checks that
+The remote-flow fixture uses two engines over the WebSocket test relay
+and a fake Codex package whose audio helper is removed. It checks that
 closing the owner releases the call without breaking the shared connection.
 
 Live sound, Wi-Fi/cellular behavior, Bluetooth, battery/CPU, latency, cross-network
-provider acceptance and real MCP delegation are still the user's acceptance tests.
-These live checks remain pending; default enablement does not establish that
-all of those environments have been verified.
+provider acceptance and real MCP delegation require physical-device validation.
+Default enablement does not establish that those environments have been verified.

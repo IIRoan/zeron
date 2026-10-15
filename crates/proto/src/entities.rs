@@ -286,6 +286,11 @@ pub fn chat_indicator(chat: &Chat, live: Option<&Session>) -> ChatIndicator {
         Some(SessionStatus::Working) => ChatIndicator::Working,
         Some(SessionStatus::AwaitingInput) => ChatIndicator::AwaitingInput,
         Some(SessionStatus::Errored) if chat.unseen() => ChatIndicator::Errored,
+        Some(SessionStatus::Idle)
+            if live.is_some_and(|s| s.running_subagents > 0 || s.running_background_tasks > 0) =>
+        {
+            ChatIndicator::Working
+        }
         _ if chat.unseen() => ChatIndicator::Completed,
         _ => ChatIndicator::Idle,
     }
@@ -321,6 +326,10 @@ pub struct Session {
     /// has not opened; read it through `view::running_subagents`.
     #[serde(default)]
     pub running_subagents: u32,
+    /// Provider-reported background tasks, including shells and agents. May
+    /// overlap `running_subagents`; readers must not add the two counts.
+    #[serde(default)]
+    pub running_background_tasks: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -603,7 +612,7 @@ pub struct WorkspaceFileSearchMatch {
     pub score: i64,
 }
 
-/// Plain-text search over a workspace's file contents (smart case). Binary
+/// Search over a workspace's file contents (smart case by default). Binary
 /// and oversized files are skipped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -615,6 +624,33 @@ pub struct SearchWorkspaceContentRequest {
     pub limit: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub per_file_limit: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<WorkspaceContentSearchOptions>,
+}
+
+/// Explicit controls for repository search. Omitted options preserve the
+/// original literal, smart-case behavior used by older clients.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceContentSearchOptions {
+    /// None = smart case, false = ignore case, true = match case.
+    #[serde(default)]
+    pub match_case: Option<bool>,
+    #[serde(default)]
+    pub whole_word: bool,
+    #[serde(default)]
+    pub use_regex: bool,
+    /// Comma-separated workspace-relative glob patterns.
+    #[serde(default)]
+    pub include: String,
+    #[serde(default)]
+    pub exclude: String,
+    /// Workspace-relative directory, independent of include/exclude globs.
+    #[serde(default)]
+    pub folder: String,
+    /// Explicitly include files excluded by ignore rules.
+    #[serde(default)]
+    pub include_ignored: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -640,6 +676,13 @@ pub struct WorkspaceContentSearchResult {
     pub truncated: bool,
     /// The host's index was still scanning; results may be incomplete.
     pub indexing: bool,
+    /// Older hosts ignore unknown request fields. Let clients distinguish
+    /// explicit search controls from a legacy search that ignored them.
+    #[serde(default)]
+    pub options_supported: bool,
+    /// Folder scopes and searching ignored files require a newer host.
+    #[serde(default)]
+    pub advanced_options_supported: bool,
 }
 
 /// Start (or keep alive) the host's search index for a workspace, so the
@@ -954,6 +997,11 @@ pub struct RepositoryGitBranch {
     pub name: String,
     pub remote: bool,
     pub current: bool,
+    /// Most recent checkout in this worktree's HEAD reflog.
+    #[serde(default)]
+    pub last_used_at: Option<u64>,
+    #[serde(default)]
+    pub commit_time: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -993,6 +1041,8 @@ pub struct RepositoryGitDetails {
 pub enum RepositoryGitAction {
     Fetch,
     Pull { rebase: Option<bool> },
+    /// Pull a selected remote-tracking branch into the current branch.
+    PullFrom { branch: String },
     Push,
     Publish { remote: String },
     Sync,
@@ -1955,6 +2005,19 @@ mod tests {
     }
 
     #[test]
+    fn older_content_search_frames_default_new_controls_and_capabilities() {
+        let options: WorkspaceContentSearchOptions = serde_json::from_value(serde_json::json!({"include":"*.rs"})).unwrap();
+        assert_eq!(options.include, "*.rs");
+        assert!(options.folder.is_empty());
+        assert!(!options.include_ignored);
+        let answer: WorkspaceContentSearchResult = serde_json::from_value(serde_json::json!({
+            "matches":[], "truncated":false, "indexing":false, "optionsSupported":true
+        })).unwrap();
+        assert!(answer.options_supported);
+        assert!(!answer.advanced_options_supported);
+    }
+
+    #[test]
     fn workspace_write_outcomes_have_stable_tags() {
         let written = WriteWorkspaceFileOutcome::Written {
             file: WorkspaceFileWriteResult {
@@ -2096,6 +2159,18 @@ pub enum WorkspaceMutationRejection {
 #[cfg(test)]
 mod mutation_contract_tests {
     use super::*;
+    #[test]
+    fn branch_metadata_from_older_peers_remains_readable() {
+        let branch: RepositoryGitBranch = serde_json::from_value(serde_json::json!({
+            "name": "main", "remote": false, "current": true
+        })).unwrap();
+        assert_eq!(branch.last_used_at, None);
+        assert_eq!(branch.commit_time, None);
+        let action: RepositoryGitAction = serde_json::from_value(serde_json::json!({
+            "kind": "pullFrom", "branch": "refs/remotes/origin/main"
+        })).unwrap();
+        assert!(matches!(action, RepositoryGitAction::PullFrom { .. }));
+    }
     #[test]
     fn stash_actions_from_older_peers_do_not_reinstate_the_index() {
         for kind in ["applyStash", "popStash"] {

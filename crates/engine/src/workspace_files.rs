@@ -38,7 +38,7 @@ pub const DIRECTORY_PAGE_SIZE: usize = 500;
 pub const MAX_DIRECTORY_ENTRIES: usize = 50_000;
 pub const MAX_SEARCH_QUERY_CHARS: usize = 256;
 pub const MAX_SEARCH_RESULTS: usize = 200;
-pub const MAX_CONTENT_RESULTS: usize = 200;
+pub const MAX_CONTENT_RESULTS: usize = 2000;
 pub const DEFAULT_CONTENT_RESULTS: usize = 100;
 pub const DEFAULT_CONTENT_RESULTS_PER_FILE: usize = 3;
 pub const WORKSPACE_FILE_RPC_TIMEOUT: Duration = Duration::from_secs(6);
@@ -455,11 +455,15 @@ impl WorkspaceFiles {
         validate_workspace_search_query(&request.query)?;
         let workspace = self.resolve_target(&request.target).await?;
         let search = self.inner.repos.workspace_search().clone();
-        tokio::task::spawn_blocking(move || {
-            search_content_blocking(&search, &workspace.root, &request)
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_on_drop = CancelOnDrop::new(cancel.clone());
+        let result = tokio::task::spawn_blocking(move || {
+            search_content_cancellable(&search, &workspace.root, &request, cancel)
         })
         .await
-        .map_err(|error| WorkspaceFilesError::Io(format!("search worker failed: {error}")))?
+        .map_err(|error| WorkspaceFilesError::Io(format!("search worker failed: {error}")))?;
+        cancel_on_drop.disarm();
+        result
     }
 
     pub async fn warm_search(
@@ -1040,7 +1044,7 @@ fn normalize_watch_path_including_temp(root: &Path, path: &Path) -> Option<Strin
     path_to_wire(relative).ok()
 }
 
-fn is_internal_temp_wire_path(path: &str) -> bool {
+pub(crate) fn is_internal_temp_wire_path(path: &str) -> bool {
     path.rsplit('/')
         .next()
         .is_some_and(|name| name.starts_with(".zeron-save-") && name.ends_with(".tmp"))
@@ -1440,10 +1444,20 @@ fn search_including_ignored(
         .collect())
 }
 
+#[cfg(test)]
 fn search_content_blocking(
     search: &WorkspaceSearch,
     root: &Path,
     request: &SearchWorkspaceContentRequest,
+) -> Result<WorkspaceContentSearchResult, WorkspaceFilesError> {
+    search_content_cancellable(search, root, request, Arc::new(AtomicBool::new(false)))
+}
+
+fn search_content_cancellable(
+    search: &WorkspaceSearch,
+    root: &Path,
+    request: &SearchWorkspaceContentRequest,
+    cancel: Arc<AtomicBool>,
 ) -> Result<WorkspaceContentSearchResult, WorkspaceFilesError> {
     validate_workspace_search_query(&request.query)?;
     let limit = request
@@ -1455,8 +1469,20 @@ fn search_content_blocking(
         .map_or(DEFAULT_CONTENT_RESULTS_PER_FILE, usize::from)
         .min(limit);
     let found = search
-        .search_content(root, &request.query, limit, per_file)
-        .map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
+        .search_content_cancellable(
+            root,
+            &request.query,
+            limit,
+            per_file,
+            &request.options.clone().unwrap_or_default(),
+            cancel,
+        )
+        .map_err(|error| match error {
+            crate::workspace_search::WorkspaceSearchError::InvalidQuery(message) => {
+                WorkspaceFilesError::BadParams(message)
+            }
+            error => WorkspaceFilesError::Io(error.to_string()),
+        })?;
     Ok(WorkspaceContentSearchResult {
         matches: found
             .matches
@@ -1477,6 +1503,8 @@ fn search_content_blocking(
             .collect(),
         truncated: found.truncated,
         indexing: found.indexing,
+        options_supported: true,
+        advanced_options_supported: true,
     })
 }
 
@@ -2667,6 +2695,15 @@ mod tests {
         query: &str,
         per_file: Option<u16>,
     ) -> Result<WorkspaceContentSearchResult, WorkspaceFilesError> {
+        content_with_options(root, query, per_file, None)
+    }
+
+    fn content_with_options(
+        root: &Path,
+        query: &str,
+        per_file: Option<u16>,
+        options: Option<zeron_proto::WorkspaceContentSearchOptions>,
+    ) -> Result<WorkspaceContentSearchResult, WorkspaceFilesError> {
         let search = WorkspaceSearch::new();
         search.warm(root).unwrap();
         let request = SearchWorkspaceContentRequest {
@@ -2678,6 +2715,7 @@ mod tests {
             query: query.into(),
             limit: None,
             per_file_limit: per_file,
+            options,
         };
         // Wait out the initial scan so the result is never `indexing`.
         for _ in 0..200 {
@@ -2720,6 +2758,62 @@ mod tests {
         assert_eq!(found.column, 4);
         assert_eq!(found.preview, "let needle = 1;");
         assert_eq!(found.ranges, vec![(0, 10)]);
+    }
+
+    #[test]
+    fn content_search_scopes_intersect_globs_and_ignored_files_are_opt_in() {
+        use zeron_proto::WorkspaceContentSearchOptions;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        for (path, text) in [
+            (".ignore", "generated/\n"),
+            ("src/main.rs", "needle\n"),
+            ("nested/src/other.rs", "needle\n"),
+            ("src/note.txt", "needle\n"),
+            ("generated/ignored.rs", "😀 Needle needles needle\n"),
+            ("generated/image.bin", "needle\0"),
+            ("generated/.zeron-save-test.tmp", "needle\n"),
+            (".git/hidden", "needle\n"),
+        ] {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let paths = |options| content_with_options(&root, "needle", Some(100), Some(options)).unwrap()
+            .matches.into_iter().map(|found| found.path).collect::<std::collections::BTreeSet<_>>();
+        let base = WorkspaceContentSearchOptions { include: "src".into(), ..Default::default() };
+        assert_eq!(paths(base.clone()), ["nested/src/other.rs", "src/main.rs", "src/note.txt"].map(String::from).into());
+        assert_eq!(paths(WorkspaceContentSearchOptions { include: "./src".into(), ..base.clone() }), ["src/main.rs", "src/note.txt"].map(String::from).into());
+        assert_eq!(paths(WorkspaceContentSearchOptions { folder: "src".into(), include: "*.rs".into(), ..base.clone() }), ["src/main.rs".to_owned()].into());
+        assert!(paths(WorkspaceContentSearchOptions { folder: "generated".into(), ..Default::default() }).is_empty());
+        let ignored = WorkspaceContentSearchOptions { folder: "generated".into(), include_ignored: true,
+            whole_word: true, match_case: Some(false), ..Default::default() };
+        let result = content_with_options(&root, "needle", Some(100), Some(ignored.clone())).unwrap();
+        assert!(result.advanced_options_supported);
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].path, "generated/ignored.rs");
+        assert_eq!(result.matches[0].column, "😀 ".len() as u64);
+        assert_eq!(result.matches[0].ranges, [(5, 11), (20, 26)]);
+        assert!(paths(WorkspaceContentSearchOptions { exclude: "*.rs".into(), ..ignored }).is_empty());
+        for folder in ["../", "/tmp", "src/../../"] {
+            assert!(matches!(content_with_options(&root, "needle", None, Some(
+                WorkspaceContentSearchOptions { folder: folder.into(), ..Default::default() })), Err(WorkspaceFilesError::BadParams(_))));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn content_search_ignored_scan_never_follows_links_or_reads_git_contents() {
+        use zeron_proto::WorkspaceContentSearchOptions;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.rs"), "needle").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("linked")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret.rs"), root.join("alias.rs")).unwrap();
+        let options = WorkspaceContentSearchOptions { include_ignored: true, ..Default::default() };
+        assert!(content_with_options(&root, "needle", None, Some(options.clone())).unwrap().matches.is_empty());
+        assert!(content_with_options(&root, "needle", None, Some(WorkspaceContentSearchOptions { folder: "linked".into(), ..options })).unwrap().matches.is_empty());
     }
 
     #[test]
@@ -2790,6 +2884,119 @@ mod tests {
         let sensitive = content(&root, "Needle", Some(10)).unwrap();
         assert!(sensitive.matches.iter().all(|m| m.path == "README.md"));
         assert_eq!(sensitive.matches.len(), 1);
+    }
+
+    #[test]
+    fn content_search_controls_filter_before_limiting_and_preserve_byte_locations() {
+        use zeron_proto::WorkspaceContentSearchOptions;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/tests")).unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(
+            root.join("src/main.rs"),
+            "  😀 Needle needles needle\nNeedle\nneedle\nneedle\nneedle\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/tests/test.rs"), "needle\n").unwrap();
+        std::fs::write(root.join("docs/note.txt"), "needle\n").unwrap();
+        std::fs::write(root.join("README.md"), "needle\n").unwrap();
+        let options = WorkspaceContentSearchOptions {
+            match_case: Some(false),
+            whole_word: true,
+            include: "src/**, docs/**".into(),
+            exclude: "**/tests/**".into(),
+            ..Default::default()
+        };
+        let found =
+            content_with_options(&root, "Needle", Some(2000), Some(options.clone())).unwrap();
+        assert!(found.options_supported);
+        assert_eq!(
+            found.matches.len(),
+            6,
+            "all matching lines, including more than three in one file"
+        );
+        assert!(
+            found
+                .matches
+                .iter()
+                .all(|m| m.path == "src/main.rs" || m.path == "docs/note.txt")
+        );
+        let line = found
+            .matches
+            .iter()
+            .find(|m| m.path == "src/main.rs" && m.line == 1)
+            .unwrap();
+        assert_eq!(line.column, "  😀 ".len() as u64);
+        assert_eq!(line.ranges.len(), 2, "whole word excludes needles");
+        assert!(line.ranges.iter().all(
+            |&(start, end)| line.preview.is_char_boundary(start as usize)
+                && line.preview.is_char_boundary(end as usize)
+        ));
+        let sensitive = content_with_options(
+            &root,
+            "Needle",
+            Some(2000),
+            Some(WorkspaceContentSearchOptions {
+                match_case: Some(true),
+                ..options
+            }),
+        )
+        .unwrap();
+        assert_eq!(sensitive.matches.len(), 2);
+    }
+
+    #[test]
+    fn content_search_regex_and_brace_globs_are_explicit_and_invalid_patterns_fail() {
+        use zeron_proto::WorkspaceContentSearchOptions;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "let value = 42;\n").unwrap();
+        std::fs::write(root.join("src/a.ts"), "let value = 84;\n").unwrap();
+        std::fs::write(root.join("src/a.txt"), "let value = 99;\n").unwrap();
+        std::fs::write(root.join("Cargo.toml"), "value = 10\n").unwrap();
+        let options = WorkspaceContentSearchOptions {
+            use_regex: true,
+            include: "**/*.{rs,ts}".into(),
+            ..Default::default()
+        };
+        let found =
+            content_with_options(&root, r"value\s*=\s*\d+", Some(2000), Some(options.clone()))
+                .unwrap();
+        assert_eq!(found.matches.len(), 2);
+        let literal = content_with_options(&root, r"value\s*=\s*\d+", Some(2000), None).unwrap();
+        assert!(literal.matches.is_empty());
+        let absent_scope = content_with_options(&root, "value", None, Some(WorkspaceContentSearchOptions { include: "absent/**".into(), ..options.clone() })).unwrap();
+        assert!(absent_scope.matches.is_empty(), "an empty filtered regex search must never broaden to the workspace");
+        assert!(matches!(
+            content_with_options(&root, "[", None, Some(options.clone())),
+            Err(WorkspaceFilesError::BadParams(_))
+        ));
+        assert!(matches!(
+            content_with_options(
+                &root,
+                "value",
+                None,
+                Some(WorkspaceContentSearchOptions {
+                    include: "[".into(),
+                    ..options
+                })
+            ),
+            Err(WorkspaceFilesError::BadParams(_))
+        ));
+        let filename = content_with_options(
+            &root,
+            "value",
+            None,
+            Some(WorkspaceContentSearchOptions {
+                include: "Cargo.toml".into(),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        assert_eq!(filename.matches.len(), 1);
+        assert_eq!(filename.matches[0].path, "Cargo.toml");
     }
 
     #[test]

@@ -128,6 +128,8 @@ actions!(
         ToggleSidebar,
         ToggleChanges,
         ToggleFiles,
+        SearchRepository,
+        QuickOpenFile,
         AddSpacePalette,
         ToggleCommandPalette,
         OpenModelPicker,
@@ -546,6 +548,10 @@ pub fn apply_keymap(
     // so a palette binding must too: one for the palette's focused search
     // input, one for the card itself. Bound after the jumps, they win the tie.
     let palette_input = format!("{} > PaletteSearch", command_palette::KEY_CONTEXT);
+    cx.bind_keys([
+        KeyBinding::new(&platform_combo("mod-shift-f"), SearchRepository, None),
+        KeyBinding::new(&platform_combo("mod-p"), QuickOpenFile, None),
+    ]);
     cx.bind_keys((0..command_palette::Tab::ALL.len()).flat_map(|ix| {
         let combo = platform_combo(&format!("mod-{}", ix + 1));
         [
@@ -1991,8 +1997,8 @@ pub struct Shell {
     /// Session-transient disclosure state, matching the Archived shelf.
     pub(super) pinned_open: bool,
     pub(super) sessions_open: bool,
-    /// The sidebar's archived accordion (t3code Sidebar): OPEN by default
-    /// (user request), session-transient. `archived_shown` pages the
+    /// The sidebar's archived accordion starts collapsed each launch.
+    /// Disclosure is session-transient. `archived_shown` pages the
     /// expanded list ("Show more" reveals another page).
     pub(super) archived_open: bool,
     pub(super) archived_shown: usize,
@@ -2110,7 +2116,7 @@ pub struct Shell {
     /// Session-row context menu, including the Copy submenu.
     chat_menu: popover::Popup<ChatMenuState>,
     /// The Copy submenu's hover grace, its painted bounds, and which side
-    /// of the menu it opens on (the sidebar options menu's recipe).
+    /// of the menu it opens on.
     chat_copy_intent: popover::HoverIntent<u8>,
     chat_copy_bounds: Option<gpui::Bounds<Pixels>>,
     chat_copy_left: bool,
@@ -2150,10 +2156,6 @@ pub struct Shell {
     spaces_menu: popover::Popup<spaces::SpacesMenu>,
     /// Hover/drag + scroll-linger state of the dropdown's floating rail.
     spaces_menu_bar: popover::MenuScrollbarState,
-    /// Persisted organization/sort/metadata controls beside the project filter.
-    sidebar_view_menu: popover::Popup<spaces::SidebarViewMenu>,
-    /// Natural-tab-order focus target for the icon-only view-options button.
-    sidebar_view_trigger_focus: gpui::FocusHandle,
     /// Current pinned-row metrics shared by hit testing and displacement animations.
     sidebar_pinned_heights: Vec<f32>,
     project_icons: project_icon::ProjectIcons,
@@ -2557,7 +2559,7 @@ impl Shell {
             bottom_stack_has_composer: std::rc::Rc::new(std::cell::Cell::new(false)),
             composer_dock: Default::default(),
             new_thread_artwork_ready: Default::default(),
-            archived_open: true,
+            archived_open: false,
             pinned_open: true,
             sessions_open: true,
             archived_shown: 0,
@@ -2660,8 +2662,6 @@ impl Shell {
             pending_workspace_command: None,
             spaces_menu: popover::Popup::default(),
             spaces_menu_bar: popover::MenuScrollbarState::default(),
-            sidebar_view_menu: popover::Popup::default(),
-            sidebar_view_trigger_focus: cx.focus_handle().tab_stop(true),
             sidebar_pinned_heights: Vec::new(),
             project_icons: Default::default(),
             chat_status_hover: None,
@@ -4136,7 +4136,7 @@ impl Shell {
             &file,
             window,
             move |this: &mut Self, source, event, window, cx| {
-                if matches!(event, FilesEvent::OpenFile(_) | FilesEvent::RevealFile(_))
+                if matches!(event, FilesEvent::OpenFile(_) | FilesEvent::OpenFileAt { .. } | FilesEvent::RevealFile(_))
                     && !this.accepts_file_navigation(&event_panel_key, &source, cx)
                 {
                     return;
@@ -4181,6 +4181,14 @@ impl Shell {
                             this.open_workbench_file(path.clone(), window, cx);
                         } else {
                             this.add_file_surface_at(owner, path.clone(), None, window, cx);
+                        }
+                    }
+                    FilesEvent::OpenFileAt { path, line, column } => {
+                        let owner = (source.read(cx).chat_id().to_owned(), owner_state.clone());
+                        if owner.0 == this.active_chat {
+                            this.open_search_file_at(path.clone(), *line, *column, window, cx);
+                        } else {
+                            this.add_file_surface_at(owner, path.clone(), Some((*line, Some(FileColumn::Byte(*column)))), window, cx);
                         }
                     }
                     FilesEvent::RevealFile(path) => {
@@ -5422,7 +5430,7 @@ impl Shell {
                             return;
                         }
                         // Leaving the trigger anywhere but toward the submenu
-                        // closes it, as in the sidebar options menu.
+                        // closes it.
                         window.on_mouse_event(move |event: &gpui::MouseMoveEvent, phase, _, cx| {
                             if phase != gpui::DispatchPhase::Bubble {
                                 return;
@@ -6531,6 +6539,7 @@ impl Shell {
             || self.project_terminals.editor.is_open()
             || self.project_terminals.actions_menu.is_open()
             || self.command_palette.is_open()
+            || self.active_changes(cx).is_some_and(|changes| changes.read(cx).git_picker_open(cx))
             || self.voice.read(cx).stage_open
             || self.section_dialog.is_open()
             || self.section_menu.is_some()
@@ -7643,42 +7652,6 @@ impl Shell {
                     ))
             }))
             .into_any_element()
-    }
-
-    /// The sidebar's view options ride the titlebar at the sidebar's trailing
-    /// edge, sliding and fading with it as it collapses. They never cross
-    /// back over the control cluster on a narrow sidebar.
-    fn render_sidebar_options_titlebar(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let sidebar = self.sidebar_now();
-        let reveal = (sidebar / self.sidebar_content_width().max(1.0)).clamp(0.0, 1.0);
-        if reveal <= 0.01 {
-            return None;
-        }
-        let cluster_end = self.eval_tween(
-            self.titlebar_tween,
-            cluster_buttons_start(
-                cfg!(target_os = "macos"),
-                self.fullscreen.unwrap_or(false),
-                self.linux_left_caption_count(),
-            ),
-        ) + CLUSTER_BUTTONS_WIDTH
-            + TITLEBAR_ACTION_SLOT_WIDTH * self.titlebar_plus_alpha(cx);
-        let left = (sidebar - Theme::SPACE_SM - 24.0).max(cluster_end + TITLEBAR_GROUP_GAP);
-        let theme = Theme::of(cx).clone();
-        let trigger = self.render_sidebar_view_trigger(&theme, cx);
-        Some(
-            div()
-                .absolute()
-                .top_0()
-                .left(px(left))
-                .h(px(Theme::TITLEBAR_HEIGHT))
-                .pt(px(Theme::TITLEBAR_TOP_PAD))
-                .flex()
-                .items_center()
-                .opacity(reveal)
-                .child(trigger)
-                .into_any_element(),
-        )
     }
 
     /// The titlebar owns new-session creation regardless of sidebar state. It
@@ -14282,6 +14255,26 @@ impl Render for Shell {
                     this.toggle_explorer(window, cx);
                 }
             }))
+            .on_action(cx.listener(|this, _: &SearchRepository, window, cx| {
+                if matches!(this.route, Route::Chat)
+                    && !this.overlay_owns_keyboard(cx)
+                    && this.session_workspace_visible(cx)
+                {
+                    this.open_explorer(window, cx);
+                    if let Some(files) = this.files.get(&this.panel_key(cx)).cloned() {
+                        files.update(cx, |files, cx| files.focus_code_search(window, cx));
+                    }
+                }
+            }))
+            .on_action(cx.listener(|this, _: &QuickOpenFile, window, cx| {
+                if matches!(this.route, Route::Chat)
+                    && !this.overlay_owns_keyboard(cx)
+                    && this.session_workspace_visible(cx)
+                {
+                    this.toggle_command_palette(window, cx);
+                    this.select_palette_tab(command_palette::Tab::Files, cx);
+                }
+            }))
             // Chat-scoped like the panel toggles: Settings has no current
             // session to archive. Quiet under an open popover, like the other
             // session-nav shortcuts.
@@ -14714,7 +14707,6 @@ impl Render for Shell {
                     .children(voice_stage)
                     .child(self.render_titlebar_cluster(cx))
                     .child(self.toasts.clone())
-                    .children(self.render_sidebar_options_titlebar(cx))
                     .children(overlays);
                 let entrance = motion::entrance(
                     window,
@@ -14918,20 +14910,6 @@ mod tests {
         assert_eq!(chat_sync_pill_caption(&chat), Some("Sync queued — changes are saved"));
         chat.sync_state = S::Connecting;
         assert_eq!(chat_sync_pill_caption(&chat), Some("Syncing…"));
-    }
-
-    #[test]
-    fn narrowest_sidebar_keeps_its_options_button_beside_the_titlebar_controls() {
-        for is_macos in [true, false] {
-            let cluster_end = cluster_buttons_start(is_macos, false, 0)
-                + CLUSTER_BUTTONS_WIDTH
-                + TITLEBAR_ACTION_SLOT_WIDTH;
-            let options_right = cluster_end + TITLEBAR_GROUP_GAP + 24.0;
-            assert!(
-                options_right + Theme::SPACE_SM <= SIDEBAR_MIN,
-                "options button ends at {options_right} in a {SIDEBAR_MIN} sidebar"
-            );
-        }
     }
 
     #[test]
@@ -15145,6 +15123,7 @@ mod tests {
             started_at: Some(updated_at),
             updated_at,
             running_subagents: 0,
+            running_background_tasks: 0,
         }
     }
 
@@ -18844,7 +18823,7 @@ impl Shell {
         serde_json::json!({
             "sessionVisible": self.session_workspace_visible(cx),
             "selectedChat": self.state.read(cx).selected_chat,
-            "recentChatsOpen": self.command_palette.as_open().is_some_and(|palette| palette.chats_only),
+            "recentChatsOpen": self.command_palette.as_open().is_some_and(|palette| palette.recent_chats),
             "setupPending": self.state.read(cx).selected_chat.as_deref().is_some_and(|chat| self.state.read(cx).worktree_setup_pending(chat)),
             "terminalHeight": self.terminal_geometry.get().height,
             "toast": self.toasts.read(cx).fixture_state(),

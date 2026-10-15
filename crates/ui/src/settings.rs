@@ -24,6 +24,7 @@ pub mod devices;
 pub mod files;
 pub mod harnesses;
 pub mod notifications;
+pub(crate) mod project_icons;
 pub mod shortcuts;
 pub mod thread_naming;
 pub mod wallpaper;
@@ -841,6 +842,9 @@ pub struct UiSettings {
     pub sidebar_show_project_label: bool,
     pub sidebar_compact: bool,
     pub sidebar_show_project_icon: bool,
+    /// Device-local artwork overrides, scoped to workspace profile and repository identity.
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub project_icons_by_profile: HashMap<String, HashMap<String, project_icons::CustomProjectIcon>>,
     pub sidebar_show_harness: bool,
     pub sidebar_show_branch: bool,
     pub sidebar_show_pull_request: bool,
@@ -1032,6 +1036,7 @@ impl Default for UiSettings {
             sidebar_show_project_label: true,
             sidebar_compact: true,
             sidebar_show_project_icon: true,
+            project_icons_by_profile: HashMap::new(),
             sidebar_show_harness: true,
             sidebar_show_branch: true,
             sidebar_show_pull_request: true,
@@ -1692,6 +1697,7 @@ impl UiSettings {
             sidebar_show_project_label,
             sidebar_compact,
             sidebar_show_project_icon,
+            project_icons_by_profile,
             sidebar_show_harness,
             sidebar_show_branch,
             sidebar_show_pull_request,
@@ -2725,6 +2731,7 @@ mod tests {
             sidebar_sort: SidebarSort::Created,
             sidebar_compact: true,
             sidebar_show_project_icon: false,
+            project_icons_by_profile: HashMap::new(),
             sidebar_show_project_label: false,
             sidebar_show_harness: false,
             sidebar_show_branch: false,

@@ -376,17 +376,21 @@ impl Shell {
         true
     }
 
-    /// Opening or closing a panel re-splits the width (a dragged divider
-    /// holds until then). A surface host that stays open eases from `before`
-    /// to its new share; `skip` is the panel the caller is opening or
-    /// closing, which runs its own tween.
+    /// Opening or closing a panel re-splits the content columns upstream.
+    /// Linux keeps the workbench's saved width, constrained by the live fit.
+    /// A surface host that stays open eases from `before` to its new width;
+    /// `skip` runs its own opening or closing tween.
     pub(super) fn resplit_panels(
         &mut self,
         before: PaintedPanels,
         skip: Option<AuxiliaryPanel>,
         cx: &App,
     ) {
-        let right_open = self.split_panel_widths(cx);
+        let right_open = if cfg!(target_os = "linux") {
+            self.settled_fit().0.right && self.right_pane_open(cx) && !self.right_pane_expanded
+        } else {
+            self.split_panel_widths(cx)
+        };
         let takeover_running = self.tween_active(self.main_takeover_tween);
         // Files keeps its own width, but a window too narrow for it beside the
         // conversation and the surface host squeezes it; ease that change too.
@@ -450,6 +454,10 @@ impl Shell {
             PaneResizeKind::Right | PaneResizeKind::Terminal | PaneResizeKind::PullRequests => {}
         }
         self.right_edge_bounce = None;
+        // An explicit seam reset may replace the saved workbench width too.
+        if cfg!(target_os = "linux") {
+            self.split_panel_widths(cx);
+        }
         self.resplit_panels(before, None, cx);
     }
 
@@ -624,22 +632,21 @@ impl Shell {
     }
 
     /// Record this frame's window width. A change is direct manipulation:
-    /// it drops width tweens and keeps the open columns equal, applied
-    /// directly so nothing lags the window edge.
+    /// it drops width tweens so nothing lags the window edge. Linux keeps
+    /// the saved workbench width; its rendered width follows the live fit.
     pub(super) fn observe_viewport_width(&mut self, viewport: f32, cx: &App) {
         self.viewport_resized = (self.viewport_width - viewport).abs() > 1.0;
         if self.viewport_resized {
             self.clear_panel_transitions();
         }
         self.viewport_width = viewport;
-        // Re-split directly whenever the window changed since the last
-        // split, sub-pixel steps included. Only a shown surface host outside
-        // takeover takes a share, so a chat switch, a visit to Settings or a
-        // relaunch keeps a dragged divider; panel toggles re-split on their
-        // own (see `Self::resplit_panels`).
+        // Upstream re-splits directly when the window changes, sub-pixel
+        // steps included. Chat switches, Settings and relaunches keep a
+        // dragged divider; panel toggles use `Self::resplit_panels`.
         let last = *self.split_viewport.get_or_insert(viewport);
         let (fit, _) = self.settled_fit();
-        if matches!(self.route, Route::Chat)
+        if !cfg!(target_os = "linux")
+            && matches!(self.route, Route::Chat)
             && fit.right
             && !self.right_pane_expanded
             && (viewport - last).abs() > 0.01
