@@ -806,9 +806,11 @@ impl SessionDoc {
                         })
                         .and_then(|j| serde_json::from_value::<zeron_proto::ToolCall>(j).ok());
                     if let Some(spawn) = spawn_call {
-                        if !spawn.is_subagent_spawn()
-                            || !matches!(&call, Some(zeron_proto::ToolCall::Unknown { name, .. }) if name == "Skill")
-                        {
+                        let can_refresh = call.as_ref().is_some_and(|call| {
+                            call.is_subagent_spawn()
+                                || matches!(call, zeron_proto::ToolCall::Unknown { name, .. } if name == "Skill")
+                        });
+                        if !spawn.is_subagent_spawn() || !can_refresh {
                             return Ok(false);
                         }
                         let clean = crate::parts::sanitize_tool_call(spawn);
@@ -1812,6 +1814,18 @@ mod tests {
                 },
             )
             .unwrap()
+        );
+        // Resume re-confirms a forked skill even when its original card is
+        // already a spawn. Consume that refresh in place on every resume.
+        let refreshed = zeron_proto::ToolCall::Unknown {
+            name: "Agent: scan".into(),
+            input: None,
+        };
+        assert!(
+            doc.update_subagent_spawn_call("toolu_spawn", &refreshed).unwrap()
+        );
+        assert!(
+            doc.update_subagent_spawn_call("toolu_spawn", &refreshed).unwrap()
         );
         let entries = doc.read_entries().unwrap();
         match &entries[0].parts[0] {
