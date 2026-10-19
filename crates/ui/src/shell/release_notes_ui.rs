@@ -276,6 +276,7 @@ impl Shell {
                 link: None,
                 workspace_root: None,
                 code: None,
+                math: crate::settings::math_style(cx),
             };
             content = content.child(div().flex_none().id("release-notes-upstream-content")
                 .debug_selector(|| "release-notes-upstream-content".into())
