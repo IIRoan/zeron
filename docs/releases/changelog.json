@@ -4,6 +4,20 @@
   "fork_repository": "IIRoan/zeron",
   "releases": [
     {
+      "version": "0.2.114",
+      "upstream_commit": "2e8f02ec2dfc521a20a5c43fcdbf4fae2381853a",
+      "upstream_url": "https://github.com/zeronsh/zeron/releases/tag/v0.2.114",
+      "published_at": "2026-10-18T16:34:39Z",
+      "notes_source": "github_release",
+      "upstream_notes": "## What's Changed\n* OpenCode v2: answer the question tool's session forms by @jakoritarleite in https://github.com/zeronsh/zeron/pull/833\n* fix: send cursor model defaults for plus subscriptions by @laurentcodes in https://github.com/zeronsh/zeron/pull/920\n* Reorder sidebar sections by dragging their header by @jsgrrchg in https://github.com/zeronsh/zeron/pull/909\n* Sidebar: show a session hover card beside each chat row by @jsgrrchg in https://github.com/zeronsh/zeron/pull/903\n* Session card: side chats and subagents  by @jsgrrchg in https://github.com/zeronsh/zeron/pull/895\n* Render LaTeX math in messages with zatex by @SinaKhalili in https://github.com/zeronsh/zeron/pull/912\n\n## New Contributors\n* @jakoritarleite made their first contribution in https://github.com/zeronsh/zeron/pull/833\n\n**Full Changelog**: https://github.com/zeronsh/zeron/compare/v0.2.113...v0.2.114",
+      "fork_changes": [
+        "Add per-service context menu controls",
+        "Redesign project settings with shared deferred motion",
+        "Polish Linux workbench and remove stale documentation"
+      ],
+      "fork_through_commit": "69332009f27bc2cd04731cec2794c00b47e55b56"
+    },
+    {
       "version": "0.2.113",
       "upstream_commit": "6ac8859998909bc5afd55838afb0635c281f31c3",
       "upstream_url": "https://github.com/zeronsh/zeron/releases/tag/v0.2.113",
