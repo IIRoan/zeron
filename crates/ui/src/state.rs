@@ -5200,7 +5200,14 @@ mod tests {
             let mut probe = AppState::new();
             probe.sessions = vec![row.clone()];
             let chat = chat("row", 0, Some(0));
-            assert_eq!(probe.display_status_for(&chat, now), ChatIndicator::Working);
+            assert_eq!(
+                probe.display_status_for(&chat, now),
+                if subagents > 0 {
+                    ChatIndicator::Working
+                } else {
+                    ChatIndicator::Completed
+                }
+            );
             assert_eq!(probe.indicator_for("row", now), Indicator::None);
             assert_eq!(
                 probe.display_status_for(&chat, cutoff),

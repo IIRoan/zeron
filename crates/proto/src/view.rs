@@ -295,7 +295,7 @@ mod gate_tests {
     }
 
     #[test]
-    fn parked_chats_with_background_work_stay_active_until_it_finishes() {
+    fn parked_chats_stay_active_for_subagents_but_not_background_commands() {
         let now = Utc::now();
         let mut chat: Chat = serde_json::from_value(serde_json::json!({
             "id": "chat", "deviceId": "dev", "archived": false,
@@ -310,15 +310,26 @@ mod gate_tests {
             chat.last_seen_at = None;
             assert_eq!(
                 display_status(&chat, Some(&session), now),
-                ChatIndicator::Working
+                if subagents > 0 {
+                    ChatIndicator::Working
+                } else {
+                    ChatIndicator::Completed
+                }
             );
             // The completed parent turn can still accept another message.
             assert_eq!(effective_indicator(Some(&session), now), Indicator::None);
             chat.last_seen_at = Some(now);
             assert_eq!(
                 display_status(&chat, Some(&session), now),
-                ChatIndicator::Working
+                if subagents > 0 {
+                    ChatIndicator::Working
+                } else {
+                    ChatIndicator::Idle
+                }
             );
+            // Completion is a display decision, not a request to stop the
+            // runtime or lose the provider's background-task bookkeeping.
+            assert_eq!(running_background_tasks(Some(&session), now), background);
             let stale = now + chrono::Duration::milliseconds(SESSION_STALE_MS + 1);
             assert_eq!(
                 display_status(&chat, Some(&session), stale),

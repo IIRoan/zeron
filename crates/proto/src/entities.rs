@@ -286,9 +286,10 @@ pub fn chat_indicator(chat: &Chat, live: Option<&Session>) -> ChatIndicator {
         Some(SessionStatus::Working) => ChatIndicator::Working,
         Some(SessionStatus::AwaitingInput) => ChatIndicator::AwaitingInput,
         Some(SessionStatus::Errored) if chat.unseen() => ChatIndicator::Errored,
-        Some(SessionStatus::Idle)
-            if live.is_some_and(|s| s.running_subagents > 0 || s.running_background_tasks > 0) =>
-        {
+        // A finished agent can leave a server or watcher running indefinitely.
+        // Keep its runtime alive through background-task bookkeeping, but only
+        // active subagents keep the completed parent displaying progress.
+        Some(SessionStatus::Idle) if live.is_some_and(|s| s.running_subagents > 0) => {
             ChatIndicator::Working
         }
         _ if chat.unseen() => ChatIndicator::Completed,
