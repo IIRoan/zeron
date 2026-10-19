@@ -14,7 +14,8 @@
         "Add per-service context menu controls",
         "Redesign project settings with shared deferred motion",
         "Polish Linux workbench and remove stale documentation",
-        "Show Claude skills that fork into subagents as named, linked agent cards, and clear their running count when the skill finishes."
+        "Show Claude skills that fork into subagents as named, linked agent cards, and clear their running count when the skill finishes.",
+        "Stop the session-list progress animation when an agent finishes, even if it leaves a background server or watcher running."
       ],
       "fork_through_commit": "69332009f27bc2cd04731cec2794c00b47e55b56"
     },
