@@ -30,7 +30,10 @@ case "$first" in
 
 *scenario:forked-skill*)
   emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":["Skill"],"cwd":"/tmp","session_id":"sess-skill"}'
-  emit '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"skill","name":"Skill","input":{"skill":"code-review","args":"private review target"}}]}}'
+  case "$first" in
+    *resumed*) : ;; # --resume does not replay the original Skill tool call.
+    *) emit '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"skill","name":"Skill","input":{"skill":"code-review","args":"private review target"}}]}}' ;;
+  esac
   case "$first" in
     *parked*) emit '{"type":"result","subtype":"success","session_id":"sess-skill"}' ;;
   esac
