@@ -28,6 +28,24 @@ uuid_of() { printf '%s\n' "$1" | sed 's/.*"uuid":"\([^"]*\)".*/\1/'; }
 
 case "$first" in
 
+*scenario:forked-skill*)
+  emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":["Skill"],"cwd":"/tmp","session_id":"sess-skill"}'
+  emit '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"skill","name":"Skill","input":{"skill":"code-review","args":"private review target"}}]}}'
+  case "$first" in
+    *parked*) emit '{"type":"result","subtype":"success","session_id":"sess-skill"}' ;;
+  esac
+  while [ ! -f start-child ]; do sleep 0.01; done
+  # Real forked-skill shape: child traffic is keyed to Skill's tool id,
+  # without any Agent/Task call or task_started notification.
+  emit '{"type":"assistant","parent_tool_use_id":"skill","message":{"content":[{"type":"text","text":"Reviewing the implementation"},{"type":"tool_use","id":"child-read","name":"Read","input":{"file_path":"src/main.rs"}}]}}'
+  while [ ! -f finish-child ]; do sleep 0.01; done
+  case "$first" in
+    *failed*) emit '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"skill","is_error":true}]}}' ;;
+    *) emit '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"skill","is_error":false}]}}' ;;
+  esac
+  emit '{"type":"result","subtype":"success","session_id":"sess-skill"}'
+  ;;
+
 *scenario:command-echo*)
   content=$(printf '%s\n' "$first" | sed 's/.*"content":"\([^"]*\)".*/\1/')
   emit "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"$content\"}}}"

@@ -744,6 +744,28 @@ impl SessionDoc {
         status: Option<&str>,
         tail: Option<&str>,
     ) -> Result<bool, DocError> {
+        self.update_subagent_part(part_id, subagent_ref, status, tail, None)
+    }
+
+    /// A forked Skill is identified after its original entry may have closed.
+    /// Refresh that chip in place; the harness only sends this after observing
+    /// actual child traffic. Other ordinary tools cannot be promoted.
+    pub fn update_subagent_spawn_call(
+        &self,
+        part_id: &str,
+        call: &zeron_proto::ToolCall,
+    ) -> Result<bool, DocError> {
+        self.update_subagent_part(part_id, None, None, None, Some(call))
+    }
+
+    fn update_subagent_part(
+        &self,
+        part_id: &str,
+        subagent_ref: Option<&str>,
+        status: Option<&str>,
+        tail: Option<&str>,
+        spawn_call: Option<&zeron_proto::ToolCall>,
+    ) -> Result<bool, DocError> {
         let messages = self.doc.get_list("messages");
         for i in (0..messages.len()).rev() {
             let Some(loro::ValueOrContainer::Container(loro::Container::Map(entry))) =
@@ -776,15 +798,22 @@ impl SessionDoc {
                     // claude's background shells settled through the
                     // subagent subtype, 2026-08-20) must not decorate an
                     // ordinary chip with a ref to a doc it never had.
-                    let is_spawn = part
+                    let call = part
                         .get("call")
                         .and_then(|v| match v {
                             loro::ValueOrContainer::Value(v) => serde_json::to_value(v).ok(),
                             _ => None,
                         })
-                        .and_then(|j| serde_json::from_value::<zeron_proto::ToolCall>(j).ok())
-                        .is_some_and(|c| c.is_subagent_spawn());
-                    if !is_spawn {
+                        .and_then(|j| serde_json::from_value::<zeron_proto::ToolCall>(j).ok());
+                    if let Some(spawn) = spawn_call {
+                        if !spawn.is_subagent_spawn()
+                            || !matches!(&call, Some(zeron_proto::ToolCall::Unknown { name, .. }) if name == "Skill")
+                        {
+                            return Ok(false);
+                        }
+                        let clean = crate::parts::sanitize_tool_call(spawn);
+                        part.insert("call", loro_value_from_json(&serde_json::to_value(clean)?))?;
+                    } else if !call.is_some_and(|c| c.is_subagent_spawn()) {
                         return Ok(false);
                     }
                     if let Some(r) = subagent_ref {
@@ -1771,6 +1800,16 @@ mod tests {
                 Some("c1--sub--toolu_bash"),
                 Some("done"),
                 None
+            )
+            .unwrap()
+        );
+        assert!(
+            !doc.update_subagent_spawn_call(
+                "toolu_bash",
+                &zeron_proto::ToolCall::Unknown {
+                    name: "Agent: mistaken shell".into(),
+                    input: None,
+                },
             )
             .unwrap()
         );

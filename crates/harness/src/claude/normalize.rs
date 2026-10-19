@@ -203,6 +203,11 @@ pub(crate) struct Normalizer {
     /// which then opened as an empty, never-created subagent doc (user
     /// report 2026-08-20).
     agent_spawn_tools: std::collections::HashSet<String>,
+    /// Skills can run inline or fork into a child. Only tagged child traffic
+    /// proves a particular invocation spawned an agent.
+    skill_calls: std::collections::HashMap<String, ToolCall>,
+    forked_skills: std::collections::HashSet<String>,
+    settled_skills: std::collections::HashSet<String>,
     /// Rotates at each assistant-frame close and at each steer; SessionStarted
     /// carries the first value so folds can attribute deltas from the start.
     assistant_message_id: String,
@@ -218,6 +223,9 @@ impl Normalizer {
             agent_tasks: std::collections::HashMap::new(),
             agent_tool_spawns: std::collections::HashMap::new(),
             agent_spawn_tools: std::collections::HashSet::new(),
+            skill_calls: std::collections::HashMap::new(),
+            forked_skills: std::collections::HashSet::new(),
+            settled_skills: std::collections::HashSet::new(),
             assistant_message_id: new_message_id(),
             session_id: None,
         }
@@ -269,6 +277,7 @@ impl Normalizer {
             };
             if !(text.contains("\"Agent\"")
                 || text.contains("\"Task\"")
+                || text.contains("\"Skill\"")
                 || text.contains("agentId"))
             {
                 continue;
@@ -291,14 +300,24 @@ impl Normalizer {
                         if block.get("type").and_then(Value::as_str) == Some("tool_use")
                             && matches!(
                                 block.get("name").and_then(Value::as_str),
-                                Some("Agent" | "Task")
+                                Some("Agent" | "Task" | "Skill")
                             )
                             && let Some(id) = block
                                 .get("id")
                                 .and_then(Value::as_str)
                                 .filter(|id| !id.is_empty())
                         {
-                            norm.agent_spawn_tools.insert(id.to_owned());
+                            if block.get("name").and_then(Value::as_str) == Some("Skill") {
+                                norm.skill_calls.insert(
+                                    id.to_owned(),
+                                    decode_tool_use(
+                                        "Skill",
+                                        block.get("input").unwrap_or(&Value::Null),
+                                    ),
+                                );
+                            } else {
+                                norm.agent_spawn_tools.insert(id.to_owned());
+                            }
                         }
                     }
                 }
@@ -336,6 +355,57 @@ impl Normalizer {
     /// Normalize one stdout frame into 0+ unified events. `interrupted` folds
     /// a post-interrupt `result` into `Done { status: Interrupted }`.
     pub fn normalize(&mut self, frame: Frame, interrupted: bool) -> Vec<AgentEvent> {
+        let events = self.normalize_frame(frame, interrupted);
+        let mut out = Vec::with_capacity(events.len());
+        for event in events {
+            if let AgentEvent::Subagent {
+                parent_tool_use_id,
+                event: child,
+            } = &event
+                && !matches!(child.as_ref(), AgentEvent::Done { .. })
+                && let Some(ToolCall::Unknown { input, .. }) =
+                    self.skill_calls.get(parent_tool_use_id)
+                && self.forked_skills.insert(parent_tool_use_id.clone())
+            {
+                let skill = input
+                    .as_ref()
+                    .and_then(|input| input.get("skill"))
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or("Skill");
+                // Refresh the original chip before the child event stamps
+                // its document link. Ordinary skills remain ordinary tools.
+                out.push(AgentEvent::ToolCall {
+                    id: parent_tool_use_id.clone(),
+                    call: ToolCall::Unknown {
+                        name: format!("Agent: {skill}"),
+                        input: input.clone(),
+                    },
+                });
+                self.agent_spawn_tools.insert(parent_tool_use_id.clone());
+            }
+            if let AgentEvent::Subagent {
+                parent_tool_use_id,
+                event: child,
+            } = &event
+                && self.forked_skills.contains(parent_tool_use_id)
+            {
+                match child.as_ref() {
+                    AgentEvent::Done { .. } => {
+                        self.settled_skills.insert(parent_tool_use_id.clone());
+                    }
+                    AgentEvent::UserMessage { .. } | AgentEvent::Steered { .. } => {
+                        self.settled_skills.remove(parent_tool_use_id);
+                    }
+                    _ => {}
+                }
+            }
+            out.push(event);
+        }
+        out
+    }
+
+    fn normalize_frame(&mut self, frame: Frame, interrupted: bool) -> Vec<AgentEvent> {
         match frame {
             Frame::System(f) => {
                 // A background subagent's completion arrives as an UNTAGGED
@@ -511,6 +581,9 @@ impl Normalizer {
                 for b in f.message.blocks() {
                     if b.kind == "tool_use" && matches!(b.name.as_str(), "Agent" | "Task") {
                         self.agent_spawn_tools.insert(b.id.clone());
+                    } else if b.kind == "tool_use" && b.name == "Skill" {
+                        self.skill_calls
+                            .insert(b.id.clone(), decode_tool_use(&b.name, &b.input));
                     }
                 }
                 let mut out: Vec<AgentEvent> = f
@@ -645,11 +718,34 @@ impl Normalizer {
                 f.message
                     .blocks()
                     .filter(|b: &ContentBlock| b.kind == "tool_result")
-                    .map(|b| AgentEvent::ToolResult {
-                        id: b.tool_use_id.clone(),
-                        is_error: b.is_error.unwrap_or(false),
-                        output: None,
-                        diff: None,
+                    .flat_map(|b| {
+                        let result = AgentEvent::ToolResult {
+                            id: b.tool_use_id.clone(),
+                            is_error: b.is_error.unwrap_or(false),
+                            output: None,
+                            diff: None,
+                        };
+                        // Unlike an asynchronous Agent launch, a forked Skill
+                        // returns after its child has finished. Its tool result
+                        // is the terminal signal, even without task_notification.
+                        let done = (self.forked_skills.contains(&b.tool_use_id)
+                            && !self.settled_skills.contains(&b.tool_use_id))
+                        .then(|| {
+                            tag(
+                                &b.tool_use_id,
+                                AgentEvent::Done {
+                                    status: if b.is_error.unwrap_or(false) {
+                                        DoneStatus::Errored
+                                    } else {
+                                        DoneStatus::Completed
+                                    },
+                                    result: None,
+                                    error: None,
+                                    session_id: None,
+                                },
+                            )
+                        });
+                        std::iter::once(result).chain(done)
                     })
                     .collect()
             }
@@ -783,6 +879,81 @@ impl Normalizer {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn forked_skill_is_promoted_once_before_its_child_traffic() {
+        for child in [
+            r#"{"type":"assistant","parent_tool_use_id":"skill","message":{"content":[{"type":"text","text":"reviewing"}]}}"#,
+            r#"{"type":"stream_event","parent_tool_use_id":"skill","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"reviewing"}}}"#,
+            r#"{"type":"user","parent_tool_use_id":"skill","message":{"content":[{"type":"text","text":"review this"}]}}"#,
+        ] {
+            let mut n = Normalizer::new();
+            let call = n.normalize(super::super::wire::parse_frame(
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"skill","name":"Skill","input":{"skill":"code-review","args":"16"}}]}}"#,
+            ).unwrap(), false);
+            assert!(
+                matches!(&call[0], AgentEvent::ToolCall { call, .. } if !call.is_subagent_spawn())
+            );
+            let events = n.normalize(super::super::wire::parse_frame(child).unwrap(), false);
+            assert!(
+                matches!(&events[..], [AgentEvent::ToolCall { id, call }, AgentEvent::Subagent { .. }]
+                if id == "skill" && matches!(call, ToolCall::Unknown { name, .. } if name == "Agent: code-review"))
+            );
+            let repeated = n.normalize(super::super::wire::parse_frame(child).unwrap(), false);
+            assert!(
+                repeated
+                    .iter()
+                    .all(|event| matches!(event, AgentEvent::Subagent { .. }))
+            );
+            let done = n.normalize(super::super::wire::parse_frame(
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"skill","is_error":false}]}}"#,
+            ).unwrap(), false);
+            assert!(
+                matches!(&done[..], [AgentEvent::ToolResult { .. }, AgentEvent::Subagent { event, .. }]
+                if matches!(event.as_ref(), AgentEvent::Done { status: DoneStatus::Completed, .. }))
+            );
+        }
+    }
+
+    #[test]
+    fn inline_skill_does_not_spawn_and_forked_skill_failure_is_not_overwritten() {
+        let mut n = Normalizer::new();
+        n.normalize(super::super::wire::parse_frame(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"skill","name":"Skill","input":{"skill":"code-review"}}]}}"#,
+        ).unwrap(), false);
+        let result = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"skill","is_error":false}]}}"#;
+        let inline = n.normalize(super::super::wire::parse_frame(result).unwrap(), false);
+        assert!(matches!(&inline[..], [AgentEvent::ToolResult { .. }]));
+        n.normalize(super::super::wire::parse_frame(
+            r#"{"type":"assistant","parent_tool_use_id":"skill","message":{"content":[{"type":"text","text":"reviewing"}]}}"#,
+        ).unwrap(), false);
+        let failure = n.normalize(super::super::wire::parse_frame(
+            r#"{"type":"system","subtype":"task_notification","tool_use_id":"skill","status":"failed"}"#,
+        ).unwrap(), false);
+        assert!(matches!(&failure[..], [AgentEvent::Subagent { event, .. }]
+            if matches!(event.as_ref(), AgentEvent::Done { status: DoneStatus::Errored, .. })));
+        let late = n.normalize(super::super::wire::parse_frame(result).unwrap(), false);
+        assert!(matches!(&late[..], [AgentEvent::ToolResult { .. }]));
+    }
+
+    #[test]
+    fn resumed_skill_keeps_its_name_when_child_traffic_confirms_a_fork() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("projects/project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("session-1.jsonl"), concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"skill","name":"Skill","input":{"skill":"code-review","args":"16"}}]}}"#,
+            "\n",
+        )).unwrap();
+        let mut n = Normalizer::restore_spawns(dir.path(), "session-1");
+        let events = n.normalize(super::super::wire::parse_frame(
+            r#"{"type":"assistant","parent_tool_use_id":"skill","message":{"content":[{"type":"text","text":"reviewing"}]}}"#,
+        ).unwrap(), false);
+        assert!(
+            matches!(&events[0], AgentEvent::ToolCall { id, call: ToolCall::Unknown { name, .. } }
+            if id == "skill" && name == "Agent: code-review")
+        );
+    }
 
     #[test]
     fn decodes_typed_tools() {

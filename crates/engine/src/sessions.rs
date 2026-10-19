@@ -3005,6 +3005,17 @@ async fn drive_run(
             }
             continue;
         }
+        // A Skill's child can first speak after its parent entry has closed.
+        // Its confirmed spawn refresh belongs on the original chip, before
+        // the parked/stale-echo gates, without reopening the parent turn.
+        if let AgentEvent::ToolCall { id, call } = &event
+            && call.is_subagent_spawn()
+            && !folded.iter().any(|part| matches!(part, MessagePart::Tool { id: part_id, .. } if part_id == id))
+            && doc_ref.update_subagent_spawn_call(id, call).unwrap_or(false)
+        {
+            inner.publish(&chat_id, &event);
+            continue;
+        }
         // PARKED: a steer boundary, a terminal Done, or SELF-CONTINUED OUTPUT
         // re-opens the session; everything else stays gated. The ACP child
         // keeps forwarding `session/update` frames after a turn completes,
