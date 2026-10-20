@@ -398,6 +398,11 @@ mod tests {
                 }
                 methods::DIRECT_REGISTRY => RpcReply::value(&json!({"rows":[]})),
                 methods::LIST_MODELS => RpcReply::value(&json!([])),
+                methods::DIRECT_SESSION => Ok(RpcReply::Stream(
+                    futures::stream::once(async { json!({"ready":true}) })
+                        .chain(futures::stream::pending())
+                        .boxed(),
+                )),
                 _ => panic!("Gateway forwarded an unauthorized method: {method}"),
             }
         }
@@ -439,6 +444,11 @@ mod tests {
                 .is_err()
         );
         assert!(rpc.call(methods::LIST_MODELS, json!({})).await.is_ok());
+        let mut stream = rpc
+            .subscribe_scoped(methods::DIRECT_SESSION, json!({}))
+            .await
+            .unwrap();
+        assert_eq!(stream.recv().await.unwrap()["ready"], true);
         // Even valid credentials never permit browser-origin or query-token dials.
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         let mut request = url.clone().into_client_request().unwrap();
@@ -453,6 +463,12 @@ mod tests {
             .revoke(paired["credentialId"].as_str().unwrap())
             .unwrap();
         assert!(rpc.call(methods::LIST_MODELS, json!({})).await.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(7), stream.recv())
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(
             crate::connect_ws_authorized(&url, Some(&format!("Bearer {token}")))
                 .await

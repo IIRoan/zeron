@@ -83,9 +83,10 @@ The regression suite uses a real engine, WebSocket gateway, mobile Rust client
 and mock harness. Run:
 
 ```sh
-cargo test --locked -p zeron-rpc remote::tests
+cargo test --locked -p zeron-rpc
 cargo test --locked -p zeron-engine --test direct_mobile
 cargo test --locked -p zeron-client
+cargo test --locked -p zeron-doc direct_tests
 ```
 
 Real iPhone installation, network switching, background suspension and wake

@@ -183,7 +183,11 @@ impl From<DemoOptions> for zc::DemoOptions {
 /// How the client authenticates against the edge.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum Credentials {
-    Direct { endpoint: String, instance_id: String, token: String },
+    Direct {
+        endpoint: String,
+        instance_id: String,
+        token: String,
+    },
     /// WorkOS session scoped to `org_id`.
     WorkOs {
         user_id: String,
@@ -199,7 +203,15 @@ pub enum Credentials {
 impl From<Credentials> for zc::Credentials {
     fn from(c: Credentials) -> Self {
         match c {
-            Credentials::Direct { endpoint, instance_id, token } => zc::Credentials::Direct { endpoint, instance_id, token },
+            Credentials::Direct {
+                endpoint,
+                instance_id,
+                token,
+            } => zc::Credentials::Direct {
+                endpoint,
+                instance_id,
+                token,
+            },
             Credentials::WorkOs {
                 user_id,
                 org_id,

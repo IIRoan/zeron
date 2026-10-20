@@ -372,11 +372,21 @@ pub async fn connect_ws(url: &str) -> Result<RpcClient, RpcError> {
 }
 
 /// Native direct connections put credentials in a header, never in URLs/logs.
-pub async fn connect_ws_authorized(url: &str, authorization: Option<&str>) -> Result<RpcClient, RpcError> {
+pub async fn connect_ws_authorized(
+    url: &str,
+    authorization: Option<&str>,
+) -> Result<RpcClient, RpcError> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-    let mut request = url.into_client_request().map_err(|e| RpcError::Transport(e.to_string()))?;
+    let mut request = url
+        .into_client_request()
+        .map_err(|e| RpcError::Transport(e.to_string()))?;
     if let Some(value) = authorization {
-        request.headers_mut().insert("authorization", value.parse().map_err(|_| RpcError::BadParams("invalid authorization".into()))?);
+        request.headers_mut().insert(
+            "authorization",
+            value
+                .parse()
+                .map_err(|_| RpcError::BadParams("invalid authorization".into()))?,
+        );
     }
     let (ws, _) = tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(request))
         .await

@@ -26,6 +26,12 @@ jobs:
       IOS_TEAM_ID: ${{ vars.IOS_TEAM_ID }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Workflow isolation checks
+        run: |
+          python3 scripts/tests/test_fork_workflows.py
+          python3 scripts/check-fork-workflows.py
       - name: Select Xcode and simulator
         run: |
           set -euo pipefail
@@ -50,9 +56,10 @@ jobs:
           cache-on-failure: true
       - name: Direct transport and real engine regressions
         run: |
-          cargo test --locked -p zeron-rpc remote::tests
+          cargo test --locked -p zeron-rpc
           cargo test --locked -p zeron-engine --test direct_mobile
           cargo test --locked -p zeron-client
+          cargo test --locked -p zeron-doc direct_tests
       - name: Build simulator app and tests
         working-directory: apps/ios
         run: |
@@ -60,7 +67,8 @@ jobs:
           xcodebuild -project Zeron.xcodeproj -scheme Zeron \
             -destination "platform=iOS Simulator,id=$IOS_SIMULATOR_ID" \
             -derivedDataPath "$RUNNER_TEMP/ios-derived" CODE_SIGNING_ALLOWED=NO \
-            ZERON_BUNDLE_ID="$IOS_BUNDLE_ID" build-for-testing | tee "$RUNNER_TEMP/ios-build.log"
+            ZERON_BUNDLE_ID="$IOS_BUNDLE_ID" build-for-testing 2>&1 | tee "$RUNNER_TEMP/ios-build.log"
+          git diff --exit-code -- Zeron/Core/Generated/zeron_core.swift
       - name: Start isolated direct-instance fixture
         run: |
           cargo build --locked -p zeron-engine --example direct-mobile-fixture
@@ -80,8 +88,9 @@ jobs:
             -destination "platform=iOS Simulator,id=$IOS_SIMULATOR_ID" \
             -derivedDataPath "$RUNNER_TEMP/ios-derived" \
             -resultBundlePath "$RUNNER_TEMP/ios-tests.xcresult" \
+            -parallel-testing-enabled NO \
             -only-testing:ZeronTests -only-testing:ZeronUITests/DirectInstanceTests CODE_SIGNING_ALLOWED=NO \
-            ZERON_BUNDLE_ID="$IOS_BUNDLE_ID" test-without-building | tee "$RUNNER_TEMP/ios-tests.log"
+            ZERON_BUNDLE_ID="$IOS_BUNDLE_ID" test-without-building 2>&1 | tee "$RUNNER_TEMP/ios-tests.log"
       - name: Stop simulator fixture
         if: always()
         run: if [ -n "${DIRECT_FIXTURE_PID:-}" ]; then kill "$DIRECT_FIXTURE_PID" || true; fi
@@ -109,7 +118,7 @@ jobs:
             -configuration Release -destination 'generic/platform=iOS' \
             -archivePath "$RUNNER_TEMP/Zeron.xcarchive" archive CODE_SIGNING_ALLOWED=NO \
             ZERON_BUNDLE_ID="$IOS_BUNDLE_ID" CURRENT_PROJECT_VERSION="${BUILD_NUMBER:-$GITHUB_RUN_NUMBER}" \
-            | tee "$RUNNER_TEMP/ios-archive.log"
+            2>&1 | tee "$RUNNER_TEMP/ios-archive.log"
       - name: Upload internal TestFlight
         if: inputs.testflight
         env:

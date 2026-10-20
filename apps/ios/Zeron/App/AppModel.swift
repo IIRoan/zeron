@@ -201,6 +201,7 @@ final class AppModel {
         try Task.checkCancellation()
         AccountProfile(name: "My instance", email: nil, orgName: nil).save()
         guard start(credentials) else { throw CoreError.Auth(message: "Could not open this instance.") }
+        onSignedIn?()
     }
 
     var isDirect: Bool { Credentials.stored()?.directEndpoint != nil }

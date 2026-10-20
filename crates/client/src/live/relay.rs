@@ -70,7 +70,11 @@ impl Relay {
         &self,
         device_id: &str,
     ) -> Result<Arc<zeron_voice_session::RpcTransport>> {
-        if self.direct.is_some() { return Err(ClientError::Unsupported("Voice is not available for direct instances yet".into())); }
+        if self.direct.is_some() {
+            return Err(ClientError::Unsupported(
+                "Voice is not available for direct instances yet".into(),
+            ));
+        }
         let client = self
             .links
             .client(device_id)
@@ -82,7 +86,12 @@ impl Relay {
         }))
     }
 
-    pub(crate) fn new(inner: &Arc<ClientInner>, edge: &str, bearer: Bearer, direct: Option<Arc<crate::direct::Direct>>) -> Self {
+    pub(crate) fn new(
+        inner: &Arc<ClientInner>,
+        edge: &str,
+        bearer: Bearer,
+        direct: Option<Arc<crate::direct::Direct>>,
+    ) -> Self {
         let weak = Arc::downgrade(inner);
         let started = now_ms();
         let mut config = LinkCacheConfig::new(edge, Arc::new(bearer));
@@ -134,7 +143,9 @@ impl Relay {
     /// One unary call with a deadline; a stale cached link is retried once
     /// on a fresh dial.
     pub(crate) async fn call(&self, device_id: &str, method: &str, params: Value) -> Result<Value> {
-        if let Some(direct) = &self.direct { return direct.call_for(device_id, method, params).await; }
+        if let Some(direct) = &self.direct {
+            return direct.call_for(device_id, method, params).await;
+        }
         let timeout = deadline(method);
         for attempt in 0..2 {
             let client = self

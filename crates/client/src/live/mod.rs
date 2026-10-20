@@ -228,7 +228,11 @@ impl LiveBackend {
         let edge = inner.config.edge_base().to_owned();
         let store = Arc::new(store);
         let direct = match &inner.credentials {
-            crate::Credentials::Direct { endpoint, instance_id, token } => Some(crate::direct::Direct::new(endpoint, instance_id, token)),
+            crate::Credentials::Direct {
+                endpoint,
+                instance_id,
+                token,
+            } => Some(crate::direct::Direct::new(endpoint, instance_id, token)),
             _ => None,
         };
         Self {
@@ -277,7 +281,9 @@ impl LiveBackend {
     }
 
     pub(crate) fn registry_posture(&self) -> RegistryPosture {
-        if let Some(direct) = &self.direct { return direct.posture(); }
+        if let Some(direct) = &self.direct {
+            return direct.posture();
+        }
         match lock(&self.registry).as_ref() {
             Some(client) => {
                 let stats = client.stats();
@@ -322,7 +328,9 @@ impl LiveBackend {
     /// Cheap edge reachability check (`GET /health`, 3s): a 200 un-parks
     /// every backoff in the process at once (legacy `probeEdgeHealth`).
     pub(crate) fn probe_health(&self) {
-        if self.direct.is_some() { return; }
+        if self.direct.is_some() {
+            return;
+        }
         let url = urls::health(&self.edge);
         crate::runtime::shared().spawn(async move {
             let ok = crate::auth::http()

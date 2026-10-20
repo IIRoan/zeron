@@ -105,10 +105,24 @@ async fn direct_mobile_pair_create_send_stream_restart_and_revoke() {
         1,
         "replayed delivery must not mint another command"
     );
+    gateway.abort();
+    let _ = gateway.await;
+    until("connection lost", || {
+        !matches!(
+            phone.connectivity().state,
+            zeron_client::ConnectivityState::Connected
+        )
+    })
+    .await;
+    handle
+        .send(SendRequest::text("deliver after restart"))
+        .unwrap();
     phone.on_background();
     phone.shutdown();
     drop(handle);
     drop(phone);
+    let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+    let gateway = tokio::spawn(zeron_rpc::remote::serve(listener, ipc_url, store.clone()));
     let phone = Client::new(
         config,
         credentials,
@@ -122,6 +136,11 @@ async fn direct_mobile_pair_create_send_stream_restart_and_revoke() {
     let handle = phone.open_session(&chat).unwrap();
     until("cached transcript", || {
         !handle.snapshot().entries.is_empty()
+    })
+    .await;
+    until("offline send delivered once after restart", || {
+        host_doc.doc().read_commands().unwrap().len() == 2
+            && handle.composer().pending_sends.is_empty()
     })
     .await;
     let id = store.devices().unwrap().remove(0).id;

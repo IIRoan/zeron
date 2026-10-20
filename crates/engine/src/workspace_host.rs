@@ -716,17 +716,24 @@ impl WorkspaceHost {
     }
 
     pub(crate) fn direct_rows(&self) -> Vec<zeron_doc::registry::RegistryRow> {
-        self.read(|doc| doc.direct_rows()).into_iter().filter(|row| {
-            match row.kind.as_str() {
+        self.read(|doc| doc.direct_rows())
+            .into_iter()
+            .filter(|row| match row.kind.as_str() {
                 "devices" => row.id == self.inner.config.device_id,
-                "chats" | "spaces" | "sessions" => row.fields.get("deviceId").and_then(|v| v.as_str()) == Some(self.inner.config.device_id.as_str()),
+                "chats" | "spaces" | "sessions" => {
+                    row.fields.get("deviceId").and_then(|v| v.as_str())
+                        == Some(self.inner.config.device_id.as_str())
+                }
                 "preferences" | "sidebarPins" => true,
                 _ => false,
-            }
-        }).collect()
+            })
+            .collect()
     }
 
-    pub(crate) fn direct_push(&self, ops: Vec<zeron_doc::registry::RowOp>) -> Result<(), EngineError> {
+    pub(crate) fn direct_push(
+        &self,
+        ops: Vec<zeron_doc::registry::RowOp>,
+    ) -> Result<(), EngineError> {
         self.mutate(|doc| doc.accept_direct_ops(ops));
         self.inner.persist_snapshot()?;
         Ok(())

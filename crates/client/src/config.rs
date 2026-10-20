@@ -55,7 +55,11 @@ pub struct AuthTokens {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Credentials {
     /// A paired single instance; endpoint and credential are persisted in Keychain.
-    Direct { endpoint: String, instance_id: String, token: String },
+    Direct {
+        endpoint: String,
+        instance_id: String,
+        token: String,
+    },
     /// WorkOS session scoped to `org_id` (the token carries the `org_id`
     /// claim the registry room requires).
     WorkOs {
