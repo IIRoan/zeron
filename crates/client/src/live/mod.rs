@@ -188,6 +188,7 @@ pub(crate) struct RegistryPosture {
 }
 
 pub(crate) struct LiveBackend {
+    pub(crate) direct: Option<Arc<crate::direct::Direct>>,
     pub(crate) edge: String,
     pub(crate) store: Arc<DocsStore>,
     registry: Mutex<Option<RegistryClient>>,
@@ -226,8 +227,13 @@ impl LiveBackend {
         let bearer = Bearer(Arc::downgrade(inner));
         let edge = inner.config.edge_base().to_owned();
         let store = Arc::new(store);
+        let direct = match &inner.credentials {
+            crate::Credentials::Direct { endpoint, instance_id, token } => Some(crate::direct::Direct::new(endpoint, instance_id, token)),
+            _ => None,
+        };
         Self {
-            relay: relay::Relay::new(inner, &edge, bearer),
+            direct: direct.clone(),
+            relay: relay::Relay::new(inner, &edge, bearer, direct),
             escorts: escort::Escorts::new(&inner.config.data_dir),
             delivery_wake: Arc::new(Notify::new()),
             edge,
@@ -250,6 +256,11 @@ impl LiveBackend {
     /// Spawn the registry join/event loop, the presence beat, and the
     /// registry saver.
     pub(crate) fn start(&self, inner: &Arc<ClientInner>) {
+        if let Some(direct) = &self.direct {
+            self.spawn_registry_saver(inner);
+            direct.start(inner);
+            return;
+        }
         self.spawn_registry(inner);
         self.spawn_registry_saver(inner);
         self.escorts.respawn(inner);
@@ -266,6 +277,7 @@ impl LiveBackend {
     }
 
     pub(crate) fn registry_posture(&self) -> RegistryPosture {
+        if let Some(direct) = &self.direct { return direct.posture(); }
         match lock(&self.registry).as_ref() {
             Some(client) => {
                 let stats = client.stats();
@@ -310,6 +322,7 @@ impl LiveBackend {
     /// Cheap edge reachability check (`GET /health`, 3s): a 200 un-parks
     /// every backoff in the process at once (legacy `probeEdgeHealth`).
     pub(crate) fn probe_health(&self) {
+        if self.direct.is_some() { return; }
         let url = urls::health(&self.edge);
         crate::runtime::shared().spawn(async move {
             let ok = crate::auth::http()

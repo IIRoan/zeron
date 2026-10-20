@@ -141,6 +141,7 @@ final class AppModel {
         let owner: String
         switch credentials {
         case let .workOs(userId, orgId, _), let .dev(userId, orgId): owner = "\(userId)/\(orgId)"
+        case let .direct(_, instanceId, _): owner = "direct/\(instanceId)"
         case .demo: return
         }
         let marker = coreDir.appendingPathComponent(".owner")
@@ -158,7 +159,7 @@ final class AppModel {
         if !credentials.isDemo { Self.claimCoreDir(for: credentials) }
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let config = CoreConfig(
-            edgeUrl: Self.edgeURL,
+            edgeUrl: credentials.directEndpoint ?? Self.edgeURL,
             dataDir: dir.path,
             deviceId: Self.deviceId,
             deviceName: UIDevice.current.name,
@@ -170,6 +171,7 @@ final class AppModel {
             // Only real accounts persist; dev bearers come from launch args
             // (and would be rejected by the production edge next launch).
             if case .workOs = credentials { Credentials.store(credentials) }
+            if case .direct = credentials { Credentials.store(credentials) }
             refreshWorkspace()
             client?.preloadSessions()
             backfillProfile()
@@ -192,6 +194,16 @@ final class AppModel {
         #endif
         return Endpoints.edgeURL.absoluteString
     }
+
+    @MainActor
+    func connectInstance(endpoint: String, key: String) async throws {
+        let credentials = try await pairInstance(endpoint: endpoint, key: key, name: UIDevice.current.name)
+        try Task.checkCancellation()
+        AccountProfile(name: "My instance", email: nil, orgName: nil).save()
+        guard start(credentials) else { throw CoreError.Auth(message: "Could not open this instance.") }
+    }
+
+    var isDirect: Bool { Credentials.stored()?.directEndpoint != nil }
 
     static var deviceId: String {
         if let id = UserDefaults.standard.string(forKey: "deviceId") { return id }
@@ -550,6 +562,7 @@ final class AppModel {
     }
 
     var accountDetail: String {
+        if let endpoint = Credentials.stored()?.directEndpoint { return URL(string: endpoint)?.host ?? "Direct instance" }
         if isDemo { return "Offline demo workspace" }
         let p = AccountProfile.load()
         return [p.name != nil ? p.email : nil, p.orgName].compactMap { $0 }.joined(separator: " · ").nonEmpty ?? "Zeron account"
@@ -669,6 +682,11 @@ private final class ListenerBridge: ClientListener, @unchecked Sendable {
 // MARK: - Credential persistence (Keychain)
 
 extension Credentials {
+    var directEndpoint: String? {
+        if case let .direct(endpoint, _, _) = self { return endpoint }
+        return nil
+    }
+
     var isDemo: Bool {
         if case .demo = self { return true }
         return false
@@ -682,6 +700,9 @@ extension Credentials {
               let dict = try? JSONSerialization.jsonObject(with: data) as? [String: String]
         else { return nil }
         switch dict["kind"] {
+        case "direct":
+            guard let endpoint = dict["endpoint"], let instance = dict["instanceId"], let token = dict["token"] else { return nil }
+            return .direct(endpoint: endpoint, instanceId: instance, token: token)
         case "workos":
             guard let u = dict["userId"], let o = dict["orgId"], let a = dict["access"], let r = dict["refresh"] else { return nil }
             return .workOs(userId: u, orgId: o, tokens: AuthTokens(accessToken: a, refreshToken: r))
@@ -696,6 +717,8 @@ extension Credentials {
     static func store(_ c: Credentials) {
         var dict: [String: String] = [:]
         switch c {
+        case let .direct(endpoint, instanceId, token):
+            dict = ["kind": "direct", "endpoint": endpoint, "instanceId": instanceId, "token": token]
         case let .workOs(userId, orgId, tokens):
             dict = ["kind": "workos", "userId": userId, "orgId": orgId, "access": tokens.accessToken, "refresh": tokens.refreshToken]
         case let .dev(userId, orgId):

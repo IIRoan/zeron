@@ -1,0 +1,138 @@
+name: Direct instance iOS
+run-name: Direct instance iOS (${{ inputs.testflight && 'TestFlight' || 'unsigned' }})
+on:
+  push:
+    branches: [feat/direct-mobile]
+  workflow_dispatch:
+    inputs:
+      testflight:
+        description: Upload to your internal TestFlight (requires Apple secrets and IOS_TEAM_ID / IOS_BUNDLE_ID variables)
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: ios-direct-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    if: github.repository == 'IIRoan/zeron'
+    runs-on: macos-26
+    timeout-minutes: 120
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      IOS_BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID || 'com.iiroan.zeron' }}
+      IOS_TEAM_ID: ${{ vars.IOS_TEAM_ID }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Select Xcode and simulator
+        run: |
+          set -euo pipefail
+          xcode=$(find /Applications -maxdepth 1 -name 'Xcode_26*.app' | sort -V | tail -1)
+          test -n "$xcode"
+          sudo xcode-select -s "$xcode/Contents/Developer"
+          xcodebuild -version
+          python3 - <<'PY'
+          import json, os, subprocess
+          devices = json.loads(subprocess.check_output(['xcrun', 'simctl', 'list', 'devices', 'available', '--json']))['devices']
+          phones = [d for runtime, group in devices.items() if 'iOS-26' in runtime for d in group if d['name'].startswith('iPhone')]
+          if not phones: raise SystemExit('An iOS 26 simulator is required')
+          with open(os.environ['GITHUB_ENV'], 'a') as f: f.write('IOS_SIMULATOR_ID=' + phones[0]['udid'] + '\n')
+          PY
+      - name: Rust toolchain
+        run: |
+          rustup update stable --no-self-update
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          key: direct-ios
+          cache-on-failure: true
+      - name: Direct transport and real engine regressions
+        run: |
+          cargo test --locked -p zeron-rpc remote::tests
+          cargo test --locked -p zeron-engine --test direct_mobile
+          cargo test --locked -p zeron-client
+      - name: Build simulator app and tests
+        working-directory: apps/ios
+        run: |
+          set -o pipefail
+          xcodebuild -project Zeron.xcodeproj -scheme Zeron \
+            -destination "platform=iOS Simulator,id=$IOS_SIMULATOR_ID" \
+            -derivedDataPath "$RUNNER_TEMP/ios-derived" CODE_SIGNING_ALLOWED=NO \
+            ZERON_BUNDLE_ID="$IOS_BUNDLE_ID" build-for-testing | tee "$RUNNER_TEMP/ios-build.log"
+      - name: Start isolated direct-instance fixture
+        run: |
+          cargo build --locked -p zeron-engine --example direct-mobile-fixture
+          target/debug/examples/direct-mobile-fixture "$RUNNER_TEMP/direct-fixture.env" > "$RUNNER_TEMP/direct-fixture.log" 2>&1 &
+          echo "DIRECT_FIXTURE_PID=$!" >> "$GITHUB_ENV"
+          for attempt in $(seq 1 30); do
+            if [ -s "$RUNNER_TEMP/direct-fixture.env" ]; then cat "$RUNNER_TEMP/direct-fixture.env" >> "$GITHUB_ENV"; exit 0; fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/direct-fixture.log"
+          exit 1
+      - name: Simulator unit tests and direct pairing flow
+        working-directory: apps/ios
+        run: |
+          set -o pipefail
+          xcodebuild -project Zeron.xcodeproj -scheme Zeron \
+            -destination "platform=iOS Simulator,id=$IOS_SIMULATOR_ID" \
+            -derivedDataPath "$RUNNER_TEMP/ios-derived" \
+            -resultBundlePath "$RUNNER_TEMP/ios-tests.xcresult" \
+            -only-testing:ZeronTests -only-testing:ZeronUITests/DirectInstanceTests CODE_SIGNING_ALLOWED=NO \
+            ZERON_BUNDLE_ID="$IOS_BUNDLE_ID" test-without-building | tee "$RUNNER_TEMP/ios-tests.log"
+      - name: Stop simulator fixture
+        if: always()
+        run: if [ -n "${DIRECT_FIXTURE_PID:-}" ]; then kill "$DIRECT_FIXTURE_PID" || true; fi
+      - name: Export simulator screenshots
+        if: always()
+        run: |
+          if [ -d "$RUNNER_TEMP/ios-tests.xcresult" ]; then
+            xcrun xcresulttool export attachments --path "$RUNNER_TEMP/ios-tests.xcresult" --output-path "$RUNNER_TEMP/ios-screenshots"
+          fi
+      - name: Prepare signing
+        if: inputs.testflight
+        env:
+          AC_API_KEY_P8: ${{ secrets.AC_API_KEY_P8 }}
+          AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
+          AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
+        run: |
+          python3 -m venv "$RUNNER_TEMP/asc-venv"
+          "$RUNNER_TEMP/asc-venv/bin/pip" install 'PyJWT[crypto]==2.10.1'
+          "$RUNNER_TEMP/asc-venv/bin/python" scripts/ios/direct-testflight.py prepare
+      - name: Archive for iPhone
+        working-directory: apps/ios
+        run: |
+          set -o pipefail
+          xcodebuild -project Zeron.xcodeproj -scheme Zeron \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/Zeron.xcarchive" archive CODE_SIGNING_ALLOWED=NO \
+            ZERON_BUNDLE_ID="$IOS_BUNDLE_ID" CURRENT_PROJECT_VERSION="${BUILD_NUMBER:-$GITHUB_RUN_NUMBER}" \
+            | tee "$RUNNER_TEMP/ios-archive.log"
+      - name: Upload internal TestFlight
+        if: inputs.testflight
+        env:
+          AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
+          AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
+        run: |
+          "$RUNNER_TEMP/asc-venv/bin/python" scripts/ios/direct-testflight.py upload
+      - name: Package unsigned archive
+        if: success() && !inputs.testflight
+        run: ditto -c -k --sequesterRsrc --keepParent "$RUNNER_TEMP/Zeron.xcarchive" "$RUNNER_TEMP/Zeron-unsigned.xcarchive.zip"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: direct-ios-${{ github.sha }}
+          retention-days: 14
+          path: |
+            ${{ runner.temp }}/Zeron-unsigned.xcarchive.zip
+            ${{ runner.temp }}/ios-tests.xcresult
+            ${{ runner.temp }}/ios-build.log
+            ${{ runner.temp }}/ios-screenshots
+            ${{ runner.temp }}/ios-tests.log
+            ${{ runner.temp }}/ios-archive.log
+            apps/ios/Zeron/Core/Generated/zeron_core.swift
+      - name: Remove signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/direct-asc-key.p8"

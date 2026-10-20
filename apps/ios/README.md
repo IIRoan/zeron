@@ -9,6 +9,12 @@ runs on the phone.
 gestures.** Everything in Rust is platform-neutral — the future Android app
 links the same library. See [`docs/mobile-rewrite.md`](../../docs/mobile-rewrite.md).
 
+## Direct instance mode
+
+Choose **Connect to My Instance** to pair with your own running desktop or
+headless engine, without a cloud account. See [setup, build and TestFlight
+instructions](../../docs/direct-mobile.md).
+
 ## Build & run
 
 Requires Xcode 26+ and a Rust toolchain with the iOS targets:

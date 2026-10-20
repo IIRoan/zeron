@@ -497,6 +497,27 @@ impl RegistryDoc {
         }
     }
 
+    /// Effective rows for an authenticated direct viewer, including tombstones.
+    pub fn direct_rows(&self) -> Vec<RegistryRow> {
+        let mut rows = self.authoritative.clone();
+        for op in self.pending_ops() {
+            let by_id = rows.entry(op.kind.clone()).or_default();
+            let (next, _) = apply_op(by_id.get(&op.id), op);
+            if let Some(row) = next { by_id.insert(op.id.clone(), row); }
+        }
+        rows.into_values().flat_map(|rows| rows.into_values()).collect()
+    }
+
+    /// The instance is authoritative. Keep only this viewer's unacknowledged writes.
+    pub fn replace_direct_rows(&mut self, rows: Vec<RegistryRow>) {
+        self.authoritative.clear();
+        for row in rows { self.put_authoritative(row); }
+        self.generation += 1;
+    }
+
+    /// Trusted direct peers preserve their operation clocks for retry deduplication.
+    pub fn accept_direct_ops(&mut self, ops: Vec<RowOp>) { self.enqueue_ops(ops); }
+
     pub fn device_id(&self) -> &str {
         &self.device_id
     }
@@ -1764,3 +1785,24 @@ fn row_to<T: serde::de::DeserializeOwned>(row: &RegistryRow) -> Option<T> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod direct_tests {
+    use super::*;
+    #[test]
+    fn direct_snapshot_keeps_tombstones_and_ack_cannot_resurrect_deleted_rows() {
+        let mut host = RegistryDoc::new("host");
+        host.set_local_only(true);
+        let op = RowOp { kind: KIND_CHATS.into(), id: "chat".into(), op: OpKind::Upsert,
+            set: Some(fields([("title", json!("old"))])), hlc: encode_hlc(1, 0, "phone"), clocks: None };
+        host.accept_direct_ops(vec![op.clone()]);
+        let mut deleted = op.clone(); deleted.op = OpKind::Delete; deleted.set = None; deleted.hlc = encode_hlc(2, 0, "host");
+        host.accept_direct_ops(vec![deleted]);
+        let rows = host.direct_rows();
+        assert_eq!(rows.len(), 1); assert!(rows[0].deleted);
+        let mut phone = RegistryDoc::new("phone");
+        phone.accept_direct_ops(vec![op]);
+        phone.replace_direct_rows(rows);
+        assert!(phone.overlay_row(KIND_CHATS, "chat").is_none());
+    }
+}

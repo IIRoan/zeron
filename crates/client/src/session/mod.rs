@@ -292,6 +292,7 @@ impl SessionCore {
     /// (roomGen ≥ 2). Idempotent.
     pub(crate) fn ensure_room(self: &Arc<Self>, client: &Arc<ClientInner>) {
         let Some(live) = client.live() else { return };
+        if let Some(direct) = &live.direct { direct.watch_session(client, self); return; }
         if lock(&self.room).is_some() {
             return;
         }
@@ -358,6 +359,9 @@ impl SessionCore {
 
     /// Persist the doc now (backgrounding).
     pub(crate) fn flush(&self) {
+        if let Ok(client) = self.client() && client.live().is_some_and(|l| l.direct.is_some()) {
+            let _ = crate::direct::Direct::persist_session(&client, self);
+        }
         if let Some(room) = self.room() {
             room.flush();
         }
@@ -388,7 +392,14 @@ impl SessionCore {
                 // recovery needs its host and room generation before any UI opens it.
                 live.persist_registry(&client)?;
             }
+            let before = self.doc.doc().oplog_vv();
             let result = f(&self.doc)?;
+            if let Some(live) = client.live().filter(|l| l.direct.is_some()) {
+                let bytes = self.doc.doc().export(loro::ExportMode::updates(&before))
+                    .map_err(|e| ClientError::Storage(e.to_string()))?;
+                live.store.enqueue_chat_update(&self.chat_id, &crate::new_id(), &bytes)
+                    .map_err(|e| ClientError::Storage(e.to_string()))?;
+            }
             if let Some(live) = client.live() {
                 live.store
                     .schedule_sync_job(&self.chat_id, crate::live::delivery::JOB)
@@ -990,6 +1001,9 @@ impl SessionHandle {
             .ok_or_else(|| ClientError::NotFound(self.core.chat_id.clone()))?;
         if request.text.trim().is_empty() && request.attachments.is_empty() {
             return Err(ClientError::InvalidArgument("empty message".into()));
+        }
+        if !request.attachments.is_empty() && client.live().is_some_and(|l| l.direct.is_some()) {
+            return Err(ClientError::Unsupported("Image sending is not available for direct instances yet".into()));
         }
         let composer = self.composer();
         // A turn is running, or a Run of ours is about to start one on a

@@ -65,6 +65,7 @@ final class PushNotifications: NSObject, UNUserNotificationCenterDelegate {
     /// Signed in (or launched signed in): re-register if already allowed.
     /// Tokens can change between launches; the edge keeps the latest.
     func signedIn() {
+        guard app?.isDirect != true else { return }
         Task {
             let settings = await UNUserNotificationCenter.current().notificationSettings()
             if Self.allowed(settings.authorizationStatus) {
@@ -76,7 +77,7 @@ final class PushNotifications: NSObject, UNUserNotificationCenterDelegate {
     /// The first time a session is started from this phone: the moment the
     /// ask makes sense ("tell me when it's done").
     func askAfterFirstSession() {
-        guard app?.isDemo == false, enabled, !defaults.bool(forKey: Self.askedKey) else { return }
+        guard app?.isDirect != true, app?.isDemo == false, enabled, !defaults.bool(forKey: Self.askedKey) else { return }
         defaults.set(true, forKey: Self.askedKey)
         Task { _ = await self.requestPermission() }
     }
@@ -84,6 +85,7 @@ final class PushNotifications: NSObject, UNUserNotificationCenterDelegate {
     /// Ask the system (once; later it's the Settings app's call).
     @discardableResult
     func requestPermission() async -> Bool {
+        guard app?.isDirect != true else { return false }
         let center = UNUserNotificationCenter.current()
         let status = await center.notificationSettings().authorizationStatus
         let granted: Bool
@@ -124,7 +126,7 @@ final class PushNotifications: NSObject, UNUserNotificationCenterDelegate {
 
     /// Tell the edge what this phone wants now (or that it wants nothing).
     private func sync() async {
-        guard let client = app?.client, app?.isDemo == false else { return }
+        guard let client = app?.client, app?.isDirect != true, app?.isDemo == false else { return }
         do {
             if enabled, let token {
                 try await client.registerPushTarget(token: token, environment: Self.apnsEnvironment, prefs: prefs)

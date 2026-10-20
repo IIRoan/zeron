@@ -655,3 +655,13 @@ pub fn parse_user_message(content: String) -> ParsedUserMessage {
 pub fn max_attachment_bytes() -> u64 {
     zc::attachments::MAX_ATTACHMENT_BYTES as u64
 }
+
+/// Pair a direct instance without a cloud account.
+#[uniffi::export]
+pub async fn pair_instance(endpoint: String, key: String, name: String) -> CoreResult<Credentials> {
+    let credentials = on_runtime(async move { zc::direct::pair(&endpoint, &key, &name).await }).await?;
+    match credentials {
+        zc::Credentials::Direct { endpoint, instance_id, token } => Ok(Credentials::Direct { endpoint, instance_id, token }),
+        _ => unreachable!("pair returns a direct credential"),
+    }
+}

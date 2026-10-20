@@ -324,6 +324,7 @@ impl TokenProvider {
     ) -> Self {
         use crate::config::Credentials;
         let mode = match credentials {
+            Credentials::Direct { token, .. } => Mode::Dev { bearer: token.clone() },
             Credentials::Demo(_) => Mode::Demo,
             Credentials::Dev { user_id, org_id } => Mode::Dev {
                 bearer: if org_id.is_empty() {

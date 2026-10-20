@@ -54,6 +54,8 @@ pub struct AuthTokens {
 /// How this client authenticates against the edge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Credentials {
+    /// A paired single instance; endpoint and credential are persisted in Keychain.
+    Direct { endpoint: String, instance_id: String, token: String },
     /// WorkOS session scoped to `org_id` (the token carries the `org_id`
     /// claim the registry room requires).
     WorkOs {
@@ -75,12 +77,14 @@ impl Credentials {
     pub fn org_id(&self) -> &str {
         match self {
             Credentials::WorkOs { org_id, .. } | Credentials::Dev { org_id, .. } => org_id,
+            Credentials::Direct { instance_id, .. } => instance_id,
             Credentials::Demo(_) => "demo",
         }
     }
 
     pub fn user_id(&self) -> &str {
         match self {
+            Credentials::Direct { instance_id, .. } => instance_id,
             Credentials::WorkOs { user_id, .. } | Credentials::Dev { user_id, .. } => user_id,
             Credentials::Demo(_) => "demo",
         }

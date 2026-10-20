@@ -21,8 +21,9 @@ use serde::{Deserialize, Serialize};
 mod client;
 pub mod device_room;
 mod server;
+pub mod remote;
 
-pub use client::{RpcClient, RpcSubscription, connect_ws};
+pub use client::{RpcClient, RpcSubscription, connect_ws, connect_ws_authorized};
 pub use device_room::{
     DeviceFrameHeader, DeviceLink, HostRelay, HostRelayConfig, LinkCache, LinkCacheConfig,
     NudgeHandler, PeerLiveness, PeerLivenessProbe, StaticToken, TokenError, TokenSource,
@@ -33,6 +34,10 @@ pub use server::{serve_connection, serve_ws_listener};
 /// RPC method names — single source of truth for both ends.
 /// Full surface: docs/research/feature-inventory.md §2.
 pub mod methods {
+    pub const DIRECT_REGISTRY: &str = "DirectRegistry";
+    pub const DIRECT_REGISTRY_PUSH: &str = "DirectRegistryPush";
+    pub const DIRECT_SESSION: &str = "DirectSession";
+    pub const DIRECT_SESSION_PUSH: &str = "DirectSessionPush";
     pub const VOICE_CAPABILITIES_V2: &str = "VoiceCapabilitiesV2";
     pub const PREPARE_VOICE_V2: &str = "PrepareVoiceV2";
     pub const OWN_VOICE_V2: &str = "OwnVoiceV2";

@@ -77,7 +77,7 @@ pub(crate) struct ClientInner {
     connectivity: RwLock<Connectivity>,
     path_online: AtomicBool,
     foreground: AtomicBool,
-    synced: AtomicBool,
+    pub(crate) synced: AtomicBool,
     harness_catalogs: Mutex<HashMap<String, Vec<HarnessInfo>>>,
 }
 
@@ -212,6 +212,7 @@ impl ClientInner {
     /// `(device, repo root, branch)`), only while foregrounded.
     pub(crate) fn reconcile_change_request_watches(self: &Arc<Self>) {
         let Some(live) = self.live() else { return };
+        if live.direct.is_some() { return; }
         if !self.foreground.load(Ordering::Acquire) {
             live.relay.stop_watches();
             return;
@@ -441,6 +442,7 @@ impl ClientInner {
         match self.backend() {
             Backend::Demo(demo) => demo.on_command(&core.chat_id),
             Backend::Live(live) => {
+                if live.direct.is_some() { live.delivery_wake.notify_one(); return; }
                 if has_attachments {
                     live.escorts.respawn_chat(self, &core.chat_id);
                 }
@@ -1230,6 +1232,7 @@ impl Client {
         let Some(live) = self.inner.live() else {
             return Ok(());
         };
+        if live.direct.is_some() { return Err(ClientError::Unsupported("Push notifications are not available for direct instances yet".into())); }
         let url = crate::live::urls::registry_push_target(
             &live.edge,
             self.inner.credentials.org_id(),
@@ -1262,6 +1265,7 @@ impl Client {
         let Some(live) = self.inner.live() else {
             return Ok(());
         };
+        if live.direct.is_some() { return Err(ClientError::Unsupported("Push notifications are not available for direct instances yet".into())); }
         let url = crate::live::urls::registry_push_target(
             &live.edge,
             self.inner.credentials.org_id(),
