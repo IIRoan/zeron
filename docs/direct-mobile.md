@@ -53,8 +53,12 @@ sign it out, change agent accounts or route requests to another device.
 
 ## GitHub macOS build
 
-The **Direct instance iOS** workflow builds on `macos-26-intel`, using Intel
-simulator binaries and ARM64 iPhone binaries. Branch pushes run Rust
+The **Direct instance iOS** workflow builds on Apple Silicon (`macos-26`), using
+ARM64 simulator and iPhone binaries. Manual runs can select `macos-15` as an
+alternate runner pool if GitHub cannot allocate a macOS 26 runner.
+Rust core compilation and the Swift simulator build run as separate, time-limited
+steps so a stalled build fails with logs instead of consuming the entire job.
+Branch pushes run Rust
 transport/integration tests, simulator unit tests and an unsigned iPhone archive.
 The uploaded `.xcarchive.zip` is build evidence, not an installable IPA.
 

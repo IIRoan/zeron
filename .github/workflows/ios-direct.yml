@@ -10,16 +10,20 @@ on:
         type: choice
         options: [preview, unsigned]
         default: preview
+      runner:
+        description: Apple Silicon runner image (macos-15 is an alternate pool)
+        type: choice
+        options: [macos-26, macos-15]
+        default: macos-26
 permissions:
   contents: read
 concurrency:
-  group: ios-direct-${{ github.ref }}
+  group: ios-direct-${{ github.ref }}-${{ inputs.runner || 'macos-26' }}
   cancel-in-progress: false
 jobs:
   build:
     if: github.repository == 'IIRoan/zeron'
-    # The arm64 pool can fail to acquire a runner during capacity shortages.
-    runs-on: macos-26-intel
+    runs-on: ${{ inputs.runner || 'macos-26' }}
     timeout-minutes: 120
     env:
       CARGO_INCREMENTAL: 0
@@ -68,26 +72,37 @@ jobs:
       - name: Rust toolchain
         run: |
           rustup update stable --no-self-update
-          rustup target add aarch64-apple-ios x86_64-apple-ios
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           key: direct-ios
           cache-on-failure: true
       - name: Direct transport and real engine regressions
+        timeout-minutes: 25
         run: |
           cargo test --locked -p zeron-rpc
           cargo test --locked -p zeron-engine --test direct_mobile
           cargo test --locked -p zeron-client
           cargo test --locked -p zeron-doc direct_tests
+      - name: Build Rust simulator core and Swift bindings
+        timeout-minutes: 25
+        env:
+          ARCHS: arm64
+        run: |
+          set -o pipefail
+          bash scripts/ios/build-core.sh iphonesimulator 2>&1 | tee "$RUNNER_TEMP/ios-core-build.log"
       - name: Build simulator app and tests
+        timeout-minutes: 15
         working-directory: apps/ios
+        env:
+          ZERON_SKIP_CORE: 1
         run: |
           set -o pipefail
           # Ad-hoc signing gives the simulator its Keychain access group without an Apple certificate.
           xcodebuild -project Zeron.xcodeproj -scheme Zeron \
             -destination "platform=iOS Simulator,id=$IOS_SIMULATOR_ID" \
             -derivedDataPath "$RUNNER_TEMP/ios-derived" \
-            ARCHS=x86_64 ONLY_ACTIVE_ARCH=YES \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
             CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM=ZERONLOCAL \
             ZERON_BUNDLE_ID="$IOS_BUNDLE_ID" build-for-testing 2>&1 | tee "$RUNNER_TEMP/ios-build.log"
           git diff --exit-code -- Zeron/Core/Generated/zeron_core.swift
@@ -103,6 +118,7 @@ jobs:
           cat "$RUNNER_TEMP/direct-fixture.log"
           exit 1
       - name: Simulator unit tests and direct pairing flow
+        timeout-minutes: 15
         working-directory: apps/ios
         run: |
           set -o pipefail
@@ -112,7 +128,7 @@ jobs:
             -resultBundlePath "$RUNNER_TEMP/ios-tests.xcresult" \
             -parallel-testing-enabled NO \
             -only-testing:ZeronTests -only-testing:ZeronUITests/DirectInstanceTests \
-            ARCHS=x86_64 ONLY_ACTIVE_ARCH=YES \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
             CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM=ZERONLOCAL \
             ZERON_BUNDLE_ID="$IOS_BUNDLE_ID" test-without-building 2>&1 | tee "$RUNNER_TEMP/ios-tests.log"
       - name: Stop simulator fixture
@@ -125,6 +141,7 @@ jobs:
             xcrun xcresulttool export attachments --path "$RUNNER_TEMP/ios-tests.xcresult" --output-path "$RUNNER_TEMP/ios-screenshots"
           fi
       - name: Archive for iPhone
+        timeout-minutes: 30
         working-directory: apps/ios
         env:
           DISTRIBUTION: ${{ inputs.distribution || 'unsigned' }}
@@ -183,6 +200,7 @@ jobs:
             ${{ runner.temp }}/Zeron-unsigned.xcarchive.zip
             ${{ runner.temp }}/ios-tests.xcresult
             ${{ runner.temp }}/ios-build.log
+            ${{ runner.temp }}/ios-core-build.log
             ${{ runner.temp }}/ios-screenshots
             ${{ runner.temp }}/ios-tests.log
             ${{ runner.temp }}/ios-archive.log
