@@ -113,6 +113,12 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/asc-venv"
           "$RUNNER_TEMP/asc-venv/bin/pip" install 'PyJWT[crypto]==2.10.1'
           "$RUNNER_TEMP/asc-venv/bin/python" scripts/ios/direct-testflight.py prepare
+      - name: Import existing distribution certificate
+        if: inputs.testflight
+        env:
+          IOS_DISTRIBUTION_P12: ${{ secrets.IOS_DISTRIBUTION_P12 }}
+          IOS_DISTRIBUTION_PASSWORD: ${{ secrets.IOS_DISTRIBUTION_PASSWORD }}
+        run: bash scripts/ios/import-distribution-certificate.sh
       - name: Archive for iPhone
         working-directory: apps/ios
         run: |
@@ -145,6 +151,10 @@ jobs:
             ${{ runner.temp }}/ios-tests.log
             ${{ runner.temp }}/ios-archive.log
             apps/ios/Zeron/Core/Generated/zeron_core.swift
-      - name: Remove signing key
+      - name: Remove signing credentials
         if: always()
-        run: rm -f "$RUNNER_TEMP/direct-asc-key.p8"
+        run: |
+          rm -f "$RUNNER_TEMP/direct-asc-key.p8" "$RUNNER_TEMP/direct-distribution.p12"
+          if [ -f "$RUNNER_TEMP/direct-signing.keychain-db" ]; then
+            security delete-keychain "$RUNNER_TEMP/direct-signing.keychain-db"
+          fi

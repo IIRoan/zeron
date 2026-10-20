@@ -63,6 +63,13 @@ For internal TestFlight, configure repository secrets:
 - `AC_API_KEY_ID`: key ID.
 - `AC_API_ISSUER_ID`: issuer ID.
 
+To reuse an existing distribution certificate (including one downloaded from
+EAS), also set `IOS_DISTRIBUTION_P12` to its base64-encoded P12 and
+`IOS_DISTRIBUTION_PASSWORD` to its password. The workflow imports it into a
+temporary keychain and deletes that keychain after the job. The App Store
+Connect API key is still required to provision Zeron and upload to TestFlight;
+an Expo login alone does not supply that key.
+
 Configure repository variables `IOS_TEAM_ID` and `IOS_BUNDLE_ID` for your own
 Apple team/app. Create the App Store Connect app and matching explicit App ID;
 the Live Activity extension uses `<IOS_BUNDLE_ID>.LiveActivity`. The API key
