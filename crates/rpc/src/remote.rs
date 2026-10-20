@@ -247,7 +247,7 @@ impl RpcService for Gateway {
                     .boxed(),
             ))
         } else {
-            tokio::time::timeout(Duration::from_secs(120), self.engine.call(method, params))
+            tokio::time::timeout(Duration::from_secs(180), self.engine.call(method, params))
                 .await
                 .map_err(|_| denied("Engine request timed out"))?
                 .map(RpcReply::Value)

@@ -143,7 +143,13 @@ impl Direct {
                 "This connection controls one instance".into(),
             ));
         }
-        timed_call(&rpc, method, params).await
+        tokio::time::timeout(
+            crate::live::relay::deadline(method),
+            rpc.call(method, params),
+        )
+        .await
+        .map_err(|_| ClientError::HostUnavailable("Instance did not respond".into()))?
+        .map_err(rpc_error)
     }
 
     pub(crate) fn posture(&self) -> crate::live::RegistryPosture {
@@ -334,6 +340,35 @@ impl Direct {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct SlowHost;
+
+    #[async_trait::async_trait]
+    impl zeron_rpc::RpcService for SlowHost {
+        async fn handle(
+            &self,
+            _: &str,
+            _: Value,
+        ) -> std::result::Result<zeron_rpc::RpcReply, zeron_rpc::RpcError> {
+            tokio::time::sleep(Duration::from_secs(35)).await;
+            zeron_rpc::RpcReply::value(&json!([]))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_host_operations_keep_the_existing_long_deadlines() {
+        let direct = Direct::new("https://unused.example", "instance", "token");
+        *direct.connection.lock().await =
+            Some(Arc::new(zeron_rpc::memory_client(Arc::new(SlowHost))));
+        *lock(&direct.host) = "host".into();
+        for method in [methods::LIST_MODELS, methods::CREATE_WORKTREE] {
+            assert_eq!(
+                direct.call_for("host", method, json!({})).await.unwrap(),
+                json!([])
+            );
+        }
+    }
+
     #[test]
     fn endpoint_security_boundary() {
         assert_eq!(
