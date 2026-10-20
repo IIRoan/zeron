@@ -64,9 +64,11 @@ jobs:
         working-directory: apps/ios
         run: |
           set -o pipefail
+          # Ad-hoc signing gives the simulator its Keychain access group without an Apple certificate.
           xcodebuild -project Zeron.xcodeproj -scheme Zeron \
             -destination "platform=iOS Simulator,id=$IOS_SIMULATOR_ID" \
-            -derivedDataPath "$RUNNER_TEMP/ios-derived" CODE_SIGNING_ALLOWED=NO \
+            -derivedDataPath "$RUNNER_TEMP/ios-derived" \
+            CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM=ZERONLOCAL \
             ZERON_BUNDLE_ID="$IOS_BUNDLE_ID" build-for-testing 2>&1 | tee "$RUNNER_TEMP/ios-build.log"
           git diff --exit-code -- Zeron/Core/Generated/zeron_core.swift
       - name: Start isolated direct-instance fixture
@@ -89,7 +91,8 @@ jobs:
             -derivedDataPath "$RUNNER_TEMP/ios-derived" \
             -resultBundlePath "$RUNNER_TEMP/ios-tests.xcresult" \
             -parallel-testing-enabled NO \
-            -only-testing:ZeronTests -only-testing:ZeronUITests/DirectInstanceTests CODE_SIGNING_ALLOWED=NO \
+            -only-testing:ZeronTests -only-testing:ZeronUITests/DirectInstanceTests \
+            CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM=ZERONLOCAL \
             ZERON_BUNDLE_ID="$IOS_BUNDLE_ID" test-without-building 2>&1 | tee "$RUNNER_TEMP/ios-tests.log"
       - name: Stop simulator fixture
         if: always()

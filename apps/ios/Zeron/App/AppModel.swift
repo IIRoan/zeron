@@ -39,6 +39,7 @@ final class AppModel {
 
     @MainActor lazy var voice = RemoteVoiceController(app: self)
     private(set) var client: CoreClient?
+    private var directEndpoint: String?
     private(set) var frontPage = FrontPage()
     private(set) var archived: [SessionRowVM] = []
     private(set) var connectivity: Connectivity?
@@ -168,10 +169,10 @@ final class AppModel {
         )
         do {
             client = try CoreClient(config: config, credentials: credentials, listener: bridge)
+            directEndpoint = credentials.directEndpoint
             // Only real accounts persist; dev bearers come from launch args
             // (and would be rejected by the production edge next launch).
             if case .workOs = credentials { Credentials.store(credentials) }
-            if case .direct = credentials { Credentials.store(credentials) }
             refreshWorkspace()
             client?.preloadSessions()
             backfillProfile()
@@ -182,6 +183,7 @@ final class AppModel {
         } catch {
             NSLog("core start failed: \(error)")
             client = nil
+            directEndpoint = nil
             return false
         }
     }
@@ -199,12 +201,15 @@ final class AppModel {
     func connectInstance(endpoint: String, key: String) async throws {
         let credentials = try await pairInstance(endpoint: endpoint, key: key, name: UIDevice.current.name)
         try Task.checkCancellation()
+        guard Credentials.store(credentials) else {
+            throw CoreError.Auth(message: "Could not securely save the pairing in Keychain. Check the app's signing and try again with a new pairing key.")
+        }
         AccountProfile(name: "My instance", email: nil, orgName: nil).save()
         guard start(credentials) else { throw CoreError.Auth(message: "Could not open this instance.") }
         onSignedIn?()
     }
 
-    var isDirect: Bool { Credentials.stored()?.directEndpoint != nil }
+    var isDirect: Bool { directEndpoint != nil }
 
     static var deviceId: String {
         if let id = UserDefaults.standard.string(forKey: "deviceId") { return id }
@@ -247,6 +252,7 @@ final class AppModel {
         lastDeliveryActivity = .distantPast
         client?.shutdown()
         client = nil
+        directEndpoint = nil
         Credentials.clearStored()
         AccountProfile.clear()
         clock?.invalidate()
@@ -563,7 +569,7 @@ final class AppModel {
     }
 
     var accountDetail: String {
-        if let endpoint = Credentials.stored()?.directEndpoint { return URL(string: endpoint)?.host ?? "Direct instance" }
+        if let endpoint = directEndpoint { return URL(string: endpoint)?.host ?? "Direct instance" }
         if isDemo { return "Offline demo workspace" }
         let p = AccountProfile.load()
         return [p.name != nil ? p.email : nil, p.orgName].compactMap { $0 }.joined(separator: " · ").nonEmpty ?? "Zeron account"
@@ -715,7 +721,8 @@ extension Credentials {
         }
     }
 
-    static func store(_ c: Credentials) {
+    @discardableResult
+    static func store(_ c: Credentials) -> Bool {
         var dict: [String: String] = [:]
         switch c {
         case let .direct(endpoint, instanceId, token):
@@ -725,11 +732,12 @@ extension Credentials {
         case let .dev(userId, orgId):
             dict = ["kind": "dev", "userId": userId, "orgId": orgId]
         case .demo:
-            return
+            return false
         }
         if let data = try? JSONSerialization.data(withJSONObject: dict) {
-            Keychain.save(data, service: service, account: account)
+            return Keychain.save(data, service: service, account: account)
         }
+        return false
     }
 
     static func updateTokens(_ tokens: AuthTokens) {
@@ -743,7 +751,8 @@ extension Credentials {
 }
 
 enum Keychain {
-    static func save(_ data: Data, service: String, account: String) {
+    @discardableResult
+    static func save(_ data: Data, service: String, account: String) -> Bool {
         delete(service: service, account: account)
         let q: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -752,7 +761,9 @@ enum Keychain {
             kSecValueData as String: data,
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
         ]
-        SecItemAdd(q as CFDictionary, nil)
+        let result = SecItemAdd(q as CFDictionary, nil)
+        if result != errSecSuccess { NSLog("Keychain save failed: %d", result) }
+        return result == errSecSuccess
     }
 
     static func load(service: String, account: String) -> Data? {
