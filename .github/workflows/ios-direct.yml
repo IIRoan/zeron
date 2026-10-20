@@ -18,7 +18,8 @@ concurrency:
 jobs:
   build:
     if: github.repository == 'IIRoan/zeron'
-    runs-on: macos-26
+    # The arm64 pool can fail to acquire a runner during capacity shortages.
+    runs-on: macos-26-intel
     timeout-minutes: 120
     env:
       CARGO_INCREMENTAL: 0
@@ -34,6 +35,7 @@ jobs:
           python3 scripts/tests/test_fork_workflows.py
           python3 scripts/check-fork-workflows.py
           python3 scripts/tests/test_ios_preview.py
+          python3 scripts/tests/test_ios_core_build.py
       - name: Select Xcode and simulator
         run: |
           set -euo pipefail
@@ -66,7 +68,7 @@ jobs:
       - name: Rust toolchain
         run: |
           rustup update stable --no-self-update
-          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+          rustup target add aarch64-apple-ios x86_64-apple-ios
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           key: direct-ios
@@ -85,6 +87,7 @@ jobs:
           xcodebuild -project Zeron.xcodeproj -scheme Zeron \
             -destination "platform=iOS Simulator,id=$IOS_SIMULATOR_ID" \
             -derivedDataPath "$RUNNER_TEMP/ios-derived" \
+            ARCHS=x86_64 ONLY_ACTIVE_ARCH=YES \
             CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM=ZERONLOCAL \
             ZERON_BUNDLE_ID="$IOS_BUNDLE_ID" build-for-testing 2>&1 | tee "$RUNNER_TEMP/ios-build.log"
           git diff --exit-code -- Zeron/Core/Generated/zeron_core.swift
@@ -109,6 +112,7 @@ jobs:
             -resultBundlePath "$RUNNER_TEMP/ios-tests.xcresult" \
             -parallel-testing-enabled NO \
             -only-testing:ZeronTests -only-testing:ZeronUITests/DirectInstanceTests \
+            ARCHS=x86_64 ONLY_ACTIVE_ARCH=YES \
             CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM=ZERONLOCAL \
             ZERON_BUNDLE_ID="$IOS_BUNDLE_ID" test-without-building 2>&1 | tee "$RUNNER_TEMP/ios-tests.log"
       - name: Stop simulator fixture
