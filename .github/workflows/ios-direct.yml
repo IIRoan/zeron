@@ -1,14 +1,15 @@
 name: Direct instance iOS
-run-name: Direct instance iOS (${{ inputs.testflight && 'TestFlight' || 'unsigned' }})
+run-name: Direct instance iOS (${{ inputs.distribution || 'unsigned' }})
 on:
   push:
     branches: [feat/direct-mobile]
   workflow_dispatch:
     inputs:
-      testflight:
-        description: Upload to your internal TestFlight (requires Apple secrets and IOS_TEAM_ID / IOS_BUNDLE_ID variables)
-        type: boolean
-        default: false
+      distribution:
+        description: Preview installs directly on registered Apple devices
+        type: choice
+        options: [preview, unsigned]
+        default: preview
 permissions:
   contents: read
 concurrency:
@@ -32,6 +33,7 @@ jobs:
         run: |
           python3 scripts/tests/test_fork_workflows.py
           python3 scripts/check-fork-workflows.py
+          python3 scripts/tests/test_ios_preview.py
       - name: Select Xcode and simulator
         run: |
           set -euo pipefail
@@ -46,6 +48,21 @@ jobs:
           if not phones: raise SystemExit('An iOS 26 simulator is required')
           with open(os.environ['GITHUB_ENV'], 'a') as f: f.write('IOS_SIMULATOR_ID=' + phones[0]['udid'] + '\n')
           PY
+      - name: Import distribution certificate
+        if: inputs.distribution == 'preview'
+        env:
+          IOS_DISTRIBUTION_P12: ${{ secrets.IOS_DISTRIBUTION_P12 }}
+          IOS_DISTRIBUTION_PASSWORD: ${{ secrets.IOS_DISTRIBUTION_PASSWORD }}
+        run: bash scripts/ios/import-distribution-certificate.sh
+      - name: Prepare registered-device profiles
+        if: inputs.distribution == 'preview'
+        env:
+          IOS_APP_PROFILE: ${{ secrets.IOS_APP_PROFILE }}
+          IOS_ACTIVITY_PROFILE: ${{ secrets.IOS_ACTIVITY_PROFILE }}
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: |
+          test -n "$EXPO_TOKEN" || { echo "Configure EXPO_TOKEN for the installation link."; exit 1; }
+          python3 scripts/ios/direct-preview.py prepare
       - name: Rust toolchain
         run: |
           rustup update stable --no-self-update
@@ -103,40 +120,55 @@ jobs:
           if [ -d "$RUNNER_TEMP/ios-tests.xcresult" ]; then
             xcrun xcresulttool export attachments --path "$RUNNER_TEMP/ios-tests.xcresult" --output-path "$RUNNER_TEMP/ios-screenshots"
           fi
-      - name: Prepare signing
-        if: inputs.testflight
-        env:
-          AC_API_KEY_P8: ${{ secrets.AC_API_KEY_P8 }}
-          AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
-          AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
-        run: |
-          python3 -m venv "$RUNNER_TEMP/asc-venv"
-          "$RUNNER_TEMP/asc-venv/bin/pip" install 'PyJWT[crypto]==2.10.1'
-          "$RUNNER_TEMP/asc-venv/bin/python" scripts/ios/direct-testflight.py prepare
-      - name: Import existing distribution certificate
-        if: inputs.testflight
-        env:
-          IOS_DISTRIBUTION_P12: ${{ secrets.IOS_DISTRIBUTION_P12 }}
-          IOS_DISTRIBUTION_PASSWORD: ${{ secrets.IOS_DISTRIBUTION_PASSWORD }}
-        run: bash scripts/ios/import-distribution-certificate.sh
       - name: Archive for iPhone
         working-directory: apps/ios
+        env:
+          DISTRIBUTION: ${{ inputs.distribution || 'unsigned' }}
         run: |
           set -o pipefail
+          signing=(CODE_SIGNING_ALLOWED=NO)
+          if [ "$DISTRIBUTION" = preview ]; then
+            signing=(CODE_SIGNING_ALLOWED=YES CODE_SIGN_STYLE=Manual
+              "DEVELOPMENT_TEAM=$IOS_TEAM_ID" "CODE_SIGN_IDENTITY=$IOS_SIGNING_IDENTITY"
+              "ZERON_APP_PROFILE=$ZERON_APP_PROFILE" "ZERON_ACTIVITY_PROFILE=$ZERON_ACTIVITY_PROFILE")
+          fi
           xcodebuild -project Zeron.xcodeproj -scheme Zeron \
             -configuration Release -destination 'generic/platform=iOS' \
-            -archivePath "$RUNNER_TEMP/Zeron.xcarchive" archive CODE_SIGNING_ALLOWED=NO \
-            ZERON_BUNDLE_ID="$IOS_BUNDLE_ID" CURRENT_PROJECT_VERSION="${BUILD_NUMBER:-$GITHUB_RUN_NUMBER}" \
+            -archivePath "$RUNNER_TEMP/Zeron.xcarchive" archive "${signing[@]}" \
+            ZERON_BUNDLE_ID="$IOS_BUNDLE_ID" CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" \
             2>&1 | tee "$RUNNER_TEMP/ios-archive.log"
-      - name: Upload internal TestFlight
-        if: inputs.testflight
-        env:
-          AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
-          AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
+      - name: Export and verify preview IPA
+        if: inputs.distribution == 'preview'
         run: |
-          "$RUNNER_TEMP/asc-venv/bin/python" scripts/ios/direct-testflight.py upload
+          set -o pipefail
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/Zeron.xcarchive" \
+            -exportPath "$RUNNER_TEMP/PreviewExport" \
+            -exportOptionsPlist "$RUNNER_TEMP/direct-preview-export.plist" \
+            2>&1 | tee "$RUNNER_TEMP/ios-export.log"
+          codesign --verify --deep --strict "$RUNNER_TEMP/Zeron.xcarchive/Products/Applications/Zeron.app"
+          python3 scripts/ios/direct-preview.py verify
+      - name: Publish device installation link
+        if: inputs.distribution == 'preview'
+        working-directory: scripts/ios/expo
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: |
+          npx --yes eas-cli@24.6.0 upload --platform ios \
+            --build-path "$RUNNER_TEMP/Zeron-preview.ipa" --non-interactive --json \
+            > "$RUNNER_TEMP/preview-upload.json"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          result = json.loads(Path(os.environ['RUNNER_TEMP'], 'preview-upload.json').read_text())
+          url = result['url']
+          if not url.startswith('https://expo.dev/'):
+              raise SystemExit('Unexpected Expo installation URL')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as output:
+              output.write(f'[Install Zeron preview on your registered Apple devices]({url})\n')
+          print('Zeron preview installation page:', url)
+          PY
       - name: Package unsigned archive
-        if: success() && !inputs.testflight
+        if: success() && inputs.distribution != 'preview'
         run: ditto -c -k --sequesterRsrc --keepParent "$RUNNER_TEMP/Zeron.xcarchive" "$RUNNER_TEMP/Zeron-unsigned.xcarchive.zip"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
@@ -150,11 +182,14 @@ jobs:
             ${{ runner.temp }}/ios-screenshots
             ${{ runner.temp }}/ios-tests.log
             ${{ runner.temp }}/ios-archive.log
+            ${{ runner.temp }}/ios-export.log
+            ${{ runner.temp }}/preview-upload.json
             apps/ios/Zeron/Core/Generated/zeron_core.swift
       - name: Remove signing credentials
         if: always()
         run: |
-          rm -f "$RUNNER_TEMP/direct-asc-key.p8" "$RUNNER_TEMP/direct-distribution.p12"
+          python3 scripts/ios/direct-preview.py cleanup
+          rm -f "$RUNNER_TEMP/direct-distribution.p12"
           if [ -f "$RUNNER_TEMP/direct-signing.keychain-db" ]; then
             security delete-keychain "$RUNNER_TEMP/direct-signing.keychain-db"
           fi

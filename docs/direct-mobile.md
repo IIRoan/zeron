@@ -57,26 +57,46 @@ The **Direct instance iOS** workflow builds on `macos-26`. Branch pushes run Rus
 transport/integration tests, simulator unit tests and an unsigned iPhone archive.
 The uploaded `.xcarchive.zip` is build evidence, not an installable IPA.
 
-For internal TestFlight, configure repository secrets:
+For a preview that installs directly on registered Apple devices, configure
+repository secrets:
 
-- `AC_API_KEY_P8`: App Store Connect team API private key contents.
-- `AC_API_KEY_ID`: key ID.
-- `AC_API_ISSUER_ID`: issuer ID.
-
-To reuse an existing distribution certificate (including one downloaded from
-EAS), also set `IOS_DISTRIBUTION_P12` to its base64-encoded P12 and
-`IOS_DISTRIBUTION_PASSWORD` to its password. The workflow imports it into a
-temporary keychain and deletes that keychain after the job. The App Store
-Connect API key is still required to provision Zeron and upload to TestFlight;
-an Expo login alone does not supply that key.
+- `IOS_DISTRIBUTION_P12`: base64-encoded Apple distribution certificate/P12.
+- `IOS_DISTRIBUTION_PASSWORD`: its password.
+- `IOS_APP_PROFILE`: base64-encoded ad hoc profile for the app bundle ID.
+- `IOS_ACTIVITY_PROFILE`: base64-encoded ad hoc profile for `<IOS_BUNDLE_ID>.LiveActivity`.
+- `EXPO_TOKEN`: Expo access token for uploading the built IPA and sharing its installation page.
 
 Configure repository variables `IOS_TEAM_ID` and `IOS_BUNDLE_ID` for your own
-Apple team/app. Create the App Store Connect app and matching explicit App ID;
-the Live Activity extension uses `<IOS_BUNDLE_ID>.LiveActivity`. The API key
-needs permission to manage signing and upload builds. Then manually run the
-workflow with `testflight=true`. It archives unsigned, exports with automatic
-Apple distribution signing, uploads internally and waits for processing.
-Add the resulting build to your internal testing group in App Store Connect.
+Apple team/app. Both profiles must include the same registered devices and the
+imported certificate. Existing Rocal profiles cannot sign Zeron because Apple
+ties each profile to its app ID. One authenticated Apple Developer session is
+needed to create the Zeron profiles; subsequent builds use the saved credentials.
+No TestFlight app or App Store Connect API key is required.
+
+With `eas` and `gh` already signed in locally, provision the two Zeron app IDs
+and profiles using the existing EAS certificate:
+
+```sh
+node scripts/ios/provision-preview.cjs          # check only
+node scripts/ios/provision-preview.cjs --apply  # Apple login, then save GitHub secrets
+```
+
+The helper includes the team's enabled iPhones and iPads, reuses matching
+profiles when available and does not revoke existing credentials. Apple
+passwords and verification codes stay in the local EAS login flow.
+
+Manually run **Direct instance iOS** with `distribution=preview`. GitHub's macOS
+runner builds and signs the native app, verifies the exported IPA and uploads
+it to Expo. Open the installation link in the workflow summary on your registered
+iPhone/iPad (iOS/iPadOS 26 or newer). The `scripts/ios/expo` metadata only links
+the native build to Expo's distribution project; it does not convert the app to
+React Native or use Expo's build servers.
+The Expo project requires account access to download internal builds.
+
+The signing keychain and installed profiles are removed after the job.
+Device identifiers are masked in build logs. Regenerate both profiles when
+adding a device or renewing the certificate. Choose `distribution=unsigned`
+for build validation without signing credentials.
 
 ## Implementation and validation
 

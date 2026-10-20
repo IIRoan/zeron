@@ -1,11 +1,7 @@
 #!/usr/bin/env bash
-# Optional existing certificate; otherwise Xcode manages signing through the ASC key.
+# Import the existing Apple distribution certificate for an ad hoc preview.
 set -euo pipefail
 
-if [ -z "${IOS_DISTRIBUTION_P12:-}" ] && [ -z "${IOS_DISTRIBUTION_PASSWORD:-}" ]; then
-  echo "No existing distribution certificate configured; using automatic signing."
-  exit 0
-fi
 if [ -z "${IOS_DISTRIBUTION_P12:-}" ] || [ -z "${IOS_DISTRIBUTION_PASSWORD:-}" ]; then
   echo "Configure both IOS_DISTRIBUTION_P12 and IOS_DISTRIBUTION_PASSWORD." >&2
   exit 1
@@ -36,6 +32,7 @@ security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
 python3 - <<'PY'
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 
@@ -44,5 +41,9 @@ existing = shlex.split(subprocess.check_output(
     ['security', 'list-keychains', '-d', 'user'], text=True))
 subprocess.run(['security', 'list-keychains', '-d', 'user', '-s',
                 keychain, *[path for path in existing if path != keychain]], check=True)
+identities = subprocess.check_output(
+    ['security', 'find-identity', '-v', '-p', 'codesigning', keychain], text=True)
+if not re.search(r'\b[A-F0-9]{40}\b', identities):
+    raise SystemExit('The imported certificate has no valid code-signing identity.')
 PY
 echo "Imported the existing Apple distribution certificate."
