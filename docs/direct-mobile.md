@@ -58,6 +58,10 @@ ARM64 simulator and iPhone binaries. Manual runs can select `macos-15` as an
 alternate runner pool if GitHub cannot allocate a macOS 26 runner.
 Rust core compilation and the Swift simulator build run as separate, time-limited
 steps so a stalled build fails with logs instead of consuming the entire job.
+CI selects the newest installed iOS 26 iPhone simulator and waits for it to boot.
+It generates a `Zeron-CI` scheme with debugger attachment disabled for test runs;
+the normal `Zeron` scheme retains LLDB for local development. Incomplete test
+bundles are uploaded as raw diagnostics without attempting screenshot export.
 Branch pushes run Rust
 transport/integration tests, simulator unit tests and an unsigned iPhone archive.
 The uploaded `.xcarchive.zip` is build evidence, not an installable IPA.

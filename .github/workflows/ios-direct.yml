@@ -40,20 +40,20 @@ jobs:
           python3 scripts/check-fork-workflows.py
           python3 scripts/tests/test_ios_preview.py
           python3 scripts/tests/test_ios_core_build.py
-      - name: Select Xcode and simulator
+          python3 scripts/tests/test_ios_ci.py
+      - name: Select Xcode and configure CI tests
         run: |
           set -euo pipefail
           xcode=$(find /Applications -maxdepth 1 -name 'Xcode_26*.app' | sort -V | tail -1)
           test -n "$xcode"
           sudo xcode-select -s "$xcode/Contents/Developer"
           xcodebuild -version
-          python3 - <<'PY'
-          import json, os, subprocess
-          devices = json.loads(subprocess.check_output(['xcrun', 'simctl', 'list', 'devices', 'available', '--json']))['devices']
-          phones = [d for runtime, group in devices.items() if 'iOS-26' in runtime for d in group if d['name'].startswith('iPhone')]
-          if not phones: raise SystemExit('An iOS 26 simulator is required')
-          with open(os.environ['GITHUB_ENV'], 'a') as f: f.write('IOS_SIMULATOR_ID=' + phones[0]['udid'] + '\n')
-          PY
+          python3 scripts/ios/configure-ci.py
+      - name: Boot simulator and wait for readiness
+        timeout-minutes: 6
+        run: |
+          set -o pipefail
+          xcrun simctl bootstatus "$IOS_SIMULATOR_ID" -b 2>&1 | tee "$RUNNER_TEMP/ios-simulator-boot.log"
       - name: Import distribution certificate
         if: inputs.distribution == 'preview'
         env:
@@ -99,8 +99,8 @@ jobs:
         run: |
           set -o pipefail
           # Ad-hoc signing gives the simulator its Keychain access group without an Apple certificate.
-          xcodebuild -project Zeron.xcodeproj -scheme Zeron \
-            -destination "platform=iOS Simulator,id=$IOS_SIMULATOR_ID" \
+          xcodebuild -project Zeron.xcodeproj -scheme Zeron-CI \
+            -destination "platform=iOS Simulator,id=$IOS_SIMULATOR_ID,arch=arm64" \
             -derivedDataPath "$RUNNER_TEMP/ios-derived" \
             ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
             CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM=ZERONLOCAL \
@@ -122,8 +122,8 @@ jobs:
         working-directory: apps/ios
         run: |
           set -o pipefail
-          xcodebuild -project Zeron.xcodeproj -scheme Zeron \
-            -destination "platform=iOS Simulator,id=$IOS_SIMULATOR_ID" \
+          xcodebuild -project Zeron.xcodeproj -scheme Zeron-CI \
+            -destination "platform=iOS Simulator,id=$IOS_SIMULATOR_ID,arch=arm64" \
             -derivedDataPath "$RUNNER_TEMP/ios-derived" \
             -resultBundlePath "$RUNNER_TEMP/ios-tests.xcresult" \
             -parallel-testing-enabled NO \
@@ -137,8 +137,10 @@ jobs:
       - name: Export simulator screenshots
         if: always()
         run: |
-          if [ -d "$RUNNER_TEMP/ios-tests.xcresult" ]; then
+          if [ -f "$RUNNER_TEMP/ios-tests.xcresult/Info.plist" ]; then
             xcrun xcresulttool export attachments --path "$RUNNER_TEMP/ios-tests.xcresult" --output-path "$RUNNER_TEMP/ios-screenshots"
+          else
+            echo "No completed test result bundle; retaining raw test diagnostics in the artifact."
           fi
       - name: Archive for iPhone
         timeout-minutes: 30
@@ -201,6 +203,7 @@ jobs:
             ${{ runner.temp }}/ios-tests.xcresult
             ${{ runner.temp }}/ios-build.log
             ${{ runner.temp }}/ios-core-build.log
+            ${{ runner.temp }}/ios-simulator-boot.log
             ${{ runner.temp }}/ios-screenshots
             ${{ runner.temp }}/ios-tests.log
             ${{ runner.temp }}/ios-archive.log
