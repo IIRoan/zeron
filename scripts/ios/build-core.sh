@@ -15,7 +15,15 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 PLATFORM="${1:-${PLATFORM_NAME:-iphonesimulator}}"
 case "$PLATFORM" in
-  iphonesimulator) TARGET=aarch64-apple-ios-sim ;;
+  iphonesimulator)
+    # Simulator binaries must match Xcode's selected architecture. CI sets one
+    # explicitly; standalone builds default to the current Mac's architecture.
+    case "${ARCHS:-$(uname -m)}" in
+      arm64) TARGET=aarch64-apple-ios-sim ;;
+      x86_64) TARGET=x86_64-apple-ios ;;
+      *) echo "error: set ARCHS to arm64 or x86_64 for the simulator" >&2; exit 1 ;;
+    esac
+    ;;
   iphoneos) TARGET=aarch64-apple-ios ;;
   *) echo "error: unsupported platform $PLATFORM" >&2; exit 1 ;;
 esac

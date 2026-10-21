@@ -72,7 +72,16 @@ final class SignInViewController: UIViewController, ASWebAuthenticationPresentat
         top.axis = .vertical
         top.alignment = .center
         top.spacing = 12
-        let buttons = UIStackView(arrangedSubviews: [status, signIn])
+        var directStyle = primary
+        directStyle.title = "Connect to My Instance"
+        let direct = UIButton(configuration: directStyle)
+        direct.accessibilityIdentifier = "connect-instance"
+        direct.addAction(UIAction { [weak self] _ in
+            guard let self else { return }
+            self.present(UINavigationController(rootViewController: ConnectInstanceViewController(app: self.app)), animated: true)
+        }, for: .touchUpInside)
+        signIn.configuration?.title = "Sign In to Zeron Cloud"
+        let buttons = UIStackView(arrangedSubviews: [status, direct, signIn])
         buttons.axis = .vertical
         buttons.spacing = 12
         for v in [top, buttons] {

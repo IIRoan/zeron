@@ -71,7 +71,19 @@ class WorkflowPolicyTests(unittest.TestCase):
             with self.subTest(unsafe=unsafe):
                 self.assertTrue(self.errors(unsafe, "linux-fork-tests.yml"))
 
-    def test_only_fork_test_workflow_can_run_automatically_in_fork(self):
+    def test_direct_ios_keeps_fork_guard_and_read_only_token(self):
+        text = ("on:\n  push:\n    branches: [feat/direct-mobile]\n  workflow_dispatch:\n"
+                "permissions:\n  contents: read\n"
+                f"jobs:\n  build:\n    if: {policy.FORK}\n    runs-on: macos-26\n")
+        self.assertEqual(self.errors(text, "ios-direct.yml"), [])
+        for unsafe in [text.replace(policy.FORK, "true"),
+                       text.replace("contents: read", "contents: write"),
+                       text.replace("    runs-on:", "    permissions:\n      contents: write\n    runs-on:"),
+                       text.replace("  workflow_dispatch:", "  pull_request_target:\n  workflow_dispatch:")]:
+            with self.subTest(unsafe=unsafe):
+                self.assertTrue(self.errors(unsafe, "ios-direct.yml"))
+
+    def test_unknown_workflow_cannot_run_automatically_in_fork(self):
         text = f"jobs:\n  publish:\n    if: {policy.FORK}\n    runs-on: ubuntu-latest\n"
         self.assertTrue(self.errors(text, "deploy.yml"))
 

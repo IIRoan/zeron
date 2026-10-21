@@ -1,0 +1,220 @@
+name: Direct instance iOS
+run-name: Direct instance iOS (${{ inputs.distribution || 'unsigned' }})
+on:
+  push:
+    branches: [feat/direct-mobile]
+  workflow_dispatch:
+    inputs:
+      distribution:
+        description: Preview installs directly on registered Apple devices
+        type: choice
+        options: [preview, unsigned]
+        default: preview
+      runner:
+        description: Apple Silicon runner image (macos-15 is an alternate pool)
+        type: choice
+        options: [macos-26, macos-15]
+        default: macos-26
+permissions:
+  contents: read
+concurrency:
+  group: ios-direct-${{ github.ref }}-${{ inputs.runner || 'macos-26' }}
+  cancel-in-progress: false
+jobs:
+  build:
+    if: github.repository == 'IIRoan/zeron'
+    runs-on: ${{ inputs.runner || 'macos-26' }}
+    timeout-minutes: 120
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      IOS_BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID || 'com.iiroan.zeron' }}
+      IOS_TEAM_ID: ${{ vars.IOS_TEAM_ID }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Workflow isolation checks
+        run: |
+          python3 scripts/tests/test_fork_workflows.py
+          python3 scripts/check-fork-workflows.py
+          python3 scripts/tests/test_ios_preview.py
+          python3 scripts/tests/test_ios_core_build.py
+          python3 scripts/tests/test_ios_ci.py
+      - name: Select Xcode and configure CI tests
+        run: |
+          set -euo pipefail
+          xcode=$(find /Applications -maxdepth 1 -name 'Xcode_26*.app' | sort -V | tail -1)
+          test -n "$xcode"
+          sudo xcode-select -s "$xcode/Contents/Developer"
+          xcodebuild -version
+          python3 scripts/ios/configure-ci.py
+      - name: Boot simulator and wait for readiness
+        timeout-minutes: 6
+        run: |
+          set -o pipefail
+          xcrun simctl bootstatus "$IOS_SIMULATOR_ID" -b 2>&1 | tee "$RUNNER_TEMP/ios-simulator-boot.log"
+      - name: Import distribution certificate
+        if: inputs.distribution == 'preview'
+        env:
+          IOS_DISTRIBUTION_P12: ${{ secrets.IOS_DISTRIBUTION_P12 }}
+          IOS_DISTRIBUTION_PASSWORD: ${{ secrets.IOS_DISTRIBUTION_PASSWORD }}
+        run: bash scripts/ios/import-distribution-certificate.sh
+      - name: Prepare registered-device profiles
+        if: inputs.distribution == 'preview'
+        env:
+          IOS_APP_PROFILE: ${{ secrets.IOS_APP_PROFILE }}
+          IOS_ACTIVITY_PROFILE: ${{ secrets.IOS_ACTIVITY_PROFILE }}
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: |
+          test -n "$EXPO_TOKEN" || { echo "Configure EXPO_TOKEN for the installation link."; exit 1; }
+          python3 scripts/ios/direct-preview.py prepare
+      - name: Rust toolchain
+        run: |
+          rustup update stable --no-self-update
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          key: direct-ios
+          cache-on-failure: true
+      - name: Direct transport and real engine regressions
+        timeout-minutes: 25
+        run: |
+          cargo test --locked -p zeron-rpc
+          cargo test --locked -p zeron-engine --test direct_mobile
+          cargo test --locked -p zeron-client
+          cargo test --locked -p zeron-doc direct_tests
+      - name: Build Rust simulator core and Swift bindings
+        timeout-minutes: 25
+        env:
+          ARCHS: arm64
+        run: |
+          set -o pipefail
+          bash scripts/ios/build-core.sh iphonesimulator 2>&1 | tee "$RUNNER_TEMP/ios-core-build.log"
+      - name: Build simulator app and tests
+        timeout-minutes: 15
+        working-directory: apps/ios
+        env:
+          ZERON_SKIP_CORE: 1
+        run: |
+          set -o pipefail
+          # Ad-hoc signing gives the simulator its Keychain access group without an Apple certificate.
+          xcodebuild -project Zeron.xcodeproj -scheme Zeron-CI \
+            -destination "platform=iOS Simulator,id=$IOS_SIMULATOR_ID,arch=arm64" \
+            -derivedDataPath "$RUNNER_TEMP/ios-derived" \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM=ZERONLOCAL \
+            ZERON_BUNDLE_ID="$IOS_BUNDLE_ID" build-for-testing 2>&1 | tee "$RUNNER_TEMP/ios-build.log"
+          git diff --exit-code -- Zeron/Core/Generated/zeron_core.swift
+      - name: Start isolated direct-instance fixture
+        run: |
+          cargo build --locked -p zeron-engine --example direct-mobile-fixture
+          target/debug/examples/direct-mobile-fixture "$RUNNER_TEMP/direct-fixture.env" > "$RUNNER_TEMP/direct-fixture.log" 2>&1 &
+          echo "DIRECT_FIXTURE_PID=$!" >> "$GITHUB_ENV"
+          for attempt in $(seq 1 30); do
+            if [ -s "$RUNNER_TEMP/direct-fixture.env" ]; then cat "$RUNNER_TEMP/direct-fixture.env" >> "$GITHUB_ENV"; exit 0; fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/direct-fixture.log"
+          exit 1
+      - name: Simulator unit tests and direct pairing flow
+        timeout-minutes: 15
+        working-directory: apps/ios
+        run: |
+          set -o pipefail
+          xcodebuild -project Zeron.xcodeproj -scheme Zeron-CI \
+            -destination "platform=iOS Simulator,id=$IOS_SIMULATOR_ID,arch=arm64" \
+            -derivedDataPath "$RUNNER_TEMP/ios-derived" \
+            -resultBundlePath "$RUNNER_TEMP/ios-tests.xcresult" \
+            -parallel-testing-enabled NO \
+            -only-testing:ZeronTests -only-testing:ZeronUITests/DirectInstanceTests \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM=ZERONLOCAL \
+            ZERON_BUNDLE_ID="$IOS_BUNDLE_ID" test-without-building 2>&1 | tee "$RUNNER_TEMP/ios-tests.log"
+      - name: Stop simulator fixture
+        if: always()
+        run: if [ -n "${DIRECT_FIXTURE_PID:-}" ]; then kill "$DIRECT_FIXTURE_PID" || true; fi
+      - name: Export simulator screenshots
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/ios-tests.xcresult/Info.plist" ]; then
+            xcrun xcresulttool export attachments --path "$RUNNER_TEMP/ios-tests.xcresult" --output-path "$RUNNER_TEMP/ios-screenshots"
+          else
+            echo "No completed test result bundle; retaining raw test diagnostics in the artifact."
+          fi
+      - name: Archive for iPhone
+        timeout-minutes: 30
+        working-directory: apps/ios
+        env:
+          DISTRIBUTION: ${{ inputs.distribution || 'unsigned' }}
+        run: |
+          set -o pipefail
+          signing=(CODE_SIGNING_ALLOWED=NO)
+          if [ "$DISTRIBUTION" = preview ]; then
+            signing=(CODE_SIGNING_ALLOWED=YES CODE_SIGN_STYLE=Manual
+              "DEVELOPMENT_TEAM=$IOS_TEAM_ID" "CODE_SIGN_IDENTITY=$IOS_SIGNING_IDENTITY"
+              "ZERON_APP_PROFILE=$ZERON_APP_PROFILE" "ZERON_ACTIVITY_PROFILE=$ZERON_ACTIVITY_PROFILE")
+          fi
+          xcodebuild -project Zeron.xcodeproj -scheme Zeron \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/Zeron.xcarchive" archive "${signing[@]}" \
+            ZERON_BUNDLE_ID="$IOS_BUNDLE_ID" CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" \
+            2>&1 | tee "$RUNNER_TEMP/ios-archive.log"
+      - name: Export and verify preview IPA
+        if: inputs.distribution == 'preview'
+        run: |
+          set -o pipefail
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/Zeron.xcarchive" \
+            -exportPath "$RUNNER_TEMP/PreviewExport" \
+            -exportOptionsPlist "$RUNNER_TEMP/direct-preview-export.plist" \
+            2>&1 | tee "$RUNNER_TEMP/ios-export.log"
+          codesign --verify --deep --strict "$RUNNER_TEMP/Zeron.xcarchive/Products/Applications/Zeron.app"
+          python3 scripts/ios/direct-preview.py verify
+      - name: Publish device installation link
+        if: inputs.distribution == 'preview'
+        working-directory: scripts/ios/expo
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: |
+          npx --yes eas-cli@24.6.0 upload --platform ios \
+            --build-path "$RUNNER_TEMP/Zeron-preview.ipa" --non-interactive --json \
+            > "$RUNNER_TEMP/preview-upload.json"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          result = json.loads(Path(os.environ['RUNNER_TEMP'], 'preview-upload.json').read_text())
+          url = result['url']
+          if not url.startswith('https://expo.dev/'):
+              raise SystemExit('Unexpected Expo installation URL')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as output:
+              output.write(f'[Install Zeron preview on your registered Apple devices]({url})\n')
+          print('Zeron preview installation page:', url)
+          PY
+      - name: Package unsigned archive
+        if: success() && inputs.distribution != 'preview'
+        run: ditto -c -k --sequesterRsrc --keepParent "$RUNNER_TEMP/Zeron.xcarchive" "$RUNNER_TEMP/Zeron-unsigned.xcarchive.zip"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: direct-ios-${{ github.sha }}
+          retention-days: 14
+          path: |
+            ${{ runner.temp }}/Zeron-unsigned.xcarchive.zip
+            ${{ runner.temp }}/ios-tests.xcresult
+            ${{ runner.temp }}/ios-build.log
+            ${{ runner.temp }}/ios-core-build.log
+            ${{ runner.temp }}/ios-simulator-boot.log
+            ${{ runner.temp }}/ios-screenshots
+            ${{ runner.temp }}/ios-tests.log
+            ${{ runner.temp }}/ios-archive.log
+            ${{ runner.temp }}/ios-export.log
+            ${{ runner.temp }}/preview-upload.json
+            apps/ios/Zeron/Core/Generated/zeron_core.swift
+      - name: Remove signing credentials
+        if: always()
+        run: |
+          python3 scripts/ios/direct-preview.py cleanup
+          rm -f "$RUNNER_TEMP/direct-distribution.p12"
+          if [ -f "$RUNNER_TEMP/direct-signing.keychain-db" ]; then
+            security delete-keychain "$RUNNER_TEMP/direct-signing.keychain-db"
+          fi

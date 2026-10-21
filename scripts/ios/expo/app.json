@@ -1,0 +1,15 @@
+{
+  "expo": {
+    "name": "Zeron",
+    "slug": "zeron-direct",
+    "owner": "iiroan",
+    "ios": {
+      "bundleIdentifier": "com.iiroan.zeron"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "47312f4d-ed6e-4263-8381-e93fef0fa5ee"
+      }
+    }
+  }
+}

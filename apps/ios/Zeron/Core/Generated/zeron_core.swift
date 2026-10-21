@@ -12126,6 +12126,8 @@ public func FfiConverterTypeCoreError_lower(_ value: CoreError) -> RustBuffer {
 
 public enum Credentials: Equatable, Hashable {
     
+    case direct(endpoint: String, instanceId: String, token: String
+    )
     /**
      * WorkOS session scoped to `org_id`.
      */
@@ -12162,13 +12164,16 @@ public struct FfiConverterTypeCredentials: FfiConverterRustBuffer {
         let variant: Int32 = try readInt(&buf)
         switch variant {
         
-        case 1: return .workOs(userId: try FfiConverterString.read(from: &buf), orgId: try FfiConverterString.read(from: &buf), tokens: try FfiConverterTypeAuthTokens.read(from: &buf)
+        case 1: return .direct(endpoint: try FfiConverterString.read(from: &buf), instanceId: try FfiConverterString.read(from: &buf), token: try FfiConverterString.read(from: &buf)
         )
         
-        case 2: return .dev(userId: try FfiConverterString.read(from: &buf), orgId: try FfiConverterString.read(from: &buf)
+        case 2: return .workOs(userId: try FfiConverterString.read(from: &buf), orgId: try FfiConverterString.read(from: &buf), tokens: try FfiConverterTypeAuthTokens.read(from: &buf)
         )
         
-        case 3: return .demo(options: try FfiConverterTypeDemoOptions.read(from: &buf)
+        case 3: return .dev(userId: try FfiConverterString.read(from: &buf), orgId: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 4: return .demo(options: try FfiConverterTypeDemoOptions.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -12179,21 +12184,28 @@ public struct FfiConverterTypeCredentials: FfiConverterRustBuffer {
         switch value {
         
         
-        case let .workOs(userId,orgId,tokens):
+        case let .direct(endpoint,instanceId,token):
             writeInt(&buf, Int32(1))
+            FfiConverterString.write(endpoint, into: &buf)
+            FfiConverterString.write(instanceId, into: &buf)
+            FfiConverterString.write(token, into: &buf)
+            
+        
+        case let .workOs(userId,orgId,tokens):
+            writeInt(&buf, Int32(2))
             FfiConverterString.write(userId, into: &buf)
             FfiConverterString.write(orgId, into: &buf)
             FfiConverterTypeAuthTokens.write(tokens, into: &buf)
             
         
         case let .dev(userId,orgId):
-            writeInt(&buf, Int32(2))
+            writeInt(&buf, Int32(3))
             FfiConverterString.write(userId, into: &buf)
             FfiConverterString.write(orgId, into: &buf)
             
         
         case let .demo(options):
-            writeInt(&buf, Int32(3))
+            writeInt(&buf, Int32(4))
             FfiConverterTypeDemoOptions.write(options, into: &buf)
             
         }
@@ -17032,6 +17044,23 @@ public func modelLabel(harness: String, model: String) -> String  {
 })
 }
 /**
+ * Pair a direct instance without a cloud account.
+ */
+public func pairInstance(endpoint: String, key: String, name: String)async throws  -> Credentials  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_zeron_mobile_fn_func_pair_instance(FfiConverterString.lower(endpoint),FfiConverterString.lower(key),FfiConverterString.lower(name)
+                )
+            },
+            pollFunc: ffi_zeron_mobile_rust_future_poll_rust_buffer,
+            completeFunc: ffi_zeron_mobile_rust_future_complete_rust_buffer,
+            freeFunc: ffi_zeron_mobile_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeCredentials_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+/**
  * `code`/`state` (or the provider error) of a `zeron://callback?…` URL.
  */
 public func parseAuthCallback(url: String) -> AuthCallback?  {
@@ -17266,6 +17295,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_func_model_label() != 26905) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_zeron_mobile_checksum_func_pair_instance() != 18584) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_func_parse_auth_callback() != 22318) {

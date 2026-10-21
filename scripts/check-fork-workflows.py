@@ -51,20 +51,23 @@ def errors_for(path):
     errors = []
     manual = path.name == "update-linux-fork.yml"
     tests = path.name == "linux-fork-tests.yml"
-    fork_owned = manual or tests
+    mobile = path.name == "ios-direct.yml"
+    fork_owned = manual or tests or mobile
     if fork_owned:
         events = re.findall(r"^  ([A-Za-z_]+):", section(text, "on"), re.M)
         if manual and events != ["workflow_dispatch"]:
             errors.append(f"{path.name}: the fork updater must be manually triggered only")
         if tests and sorted(events) != ["pull_request", "push", "workflow_dispatch"]:
             errors.append(f"{path.name}: fork tests may only run for pushes, pull requests or manual dispatch")
+        if mobile and sorted(events) != ["push", "workflow_dispatch"]:
+            errors.append(f"{path.name}: direct iOS builds may only run for pushes or manual dispatch")
         if section(text, "permissions").strip() != "contents: read":
             errors.append(f"{path.name}: fork workflows must have read-only token permissions")
     for index, name in enumerate(names):
         end = names[index + 1].start() if index + 1 < len(names) else len(jobs)
         block = jobs[name.end():end]
         conditions = re.findall(r"^    if: (.+)$", block, re.M)
-        expected = MANUAL if manual else FORK if tests else UPSTREAM
+        expected = MANUAL if manual else FORK if fork_owned else UPSTREAM
         valid = len(conditions) == 1 and (
             conditions[0].strip() == expected if fork_owned else upstream_only(conditions[0].strip()))
         if not valid:
@@ -88,4 +91,4 @@ if __name__ == "__main__":
     if failures:
         print("Fork workflow isolation check failed:\n" + "\n".join(failures), file=sys.stderr)
         sys.exit(1)
-    print("Fork workflow isolation verified: upstream jobs are guarded; fork tests and manual updater are read-only.")
+    print("Fork workflow isolation verified: upstream jobs are guarded; fork workflows are read-only.")

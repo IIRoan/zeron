@@ -20,9 +20,10 @@ use serde::{Deserialize, Serialize};
 
 mod client;
 pub mod device_room;
+pub mod remote;
 mod server;
 
-pub use client::{RpcClient, RpcSubscription, connect_ws};
+pub use client::{RpcClient, RpcSubscription, connect_ws, connect_ws_authorized};
 pub use device_room::{
     DeviceFrameHeader, DeviceLink, HostRelay, HostRelayConfig, LinkCache, LinkCacheConfig,
     NudgeHandler, PeerLiveness, PeerLivenessProbe, StaticToken, TokenError, TokenSource,
@@ -38,6 +39,10 @@ pub mod methods {
     pub const REPLY_BROWSER_HOST: &str = "ReplyBrowserHost";
     pub const LIST_BROWSER_TABS: &str = "ListBrowserTabs";
     pub const CONTROL_BROWSER: &str = "ControlBrowser";
+    pub const DIRECT_REGISTRY: &str = "DirectRegistry";
+    pub const DIRECT_REGISTRY_PUSH: &str = "DirectRegistryPush";
+    pub const DIRECT_SESSION: &str = "DirectSession";
+    pub const DIRECT_SESSION_PUSH: &str = "DirectSessionPush";
     pub const VOICE_CAPABILITIES_V2: &str = "VoiceCapabilitiesV2";
     pub const PREPARE_VOICE_V2: &str = "PrepareVoiceV2";
     pub const OWN_VOICE_V2: &str = "OwnVoiceV2";

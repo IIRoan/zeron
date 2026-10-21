@@ -129,6 +129,7 @@ final class MoreViewController: UIViewController, UICollectionViewDelegate {
     }
 
     private func notificationRows() -> [Row] {
+        if app.isDirect { return [Row(id: "notify:unavailable", title: "Notifications", subtitle: "Not available for direct instances yet", symbol: "bell.slash")] }
         var rows = [Row(id: "notify:enabled", title: "Notifications", subtitle: notificationStatus == .denied ? "Turned off in iOS Settings" : "When a session finishes, needs you or fails", symbol: "bell", accessory: .toggle(notificationsOn))]
         if notificationsOn {
             rows += PushNotifications.Kind.allCases.map { kind in
