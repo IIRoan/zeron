@@ -154,6 +154,16 @@ fn matching(
 }
 
 impl BranchPicker {
+    fn new_branch_name(&self, cx: &App) -> Option<String> {
+        let name = self.search.read(cx).text().trim();
+        (self.command == BranchCommand::Checkout
+            && !self.loading
+            && self.error.is_none()
+            && self.rows.is_empty()
+            && !name.is_empty())
+        .then(|| name.to_owned())
+    }
+
     fn rebuild(&mut self, cx: &App) {
         let query = self.search.read(cx).text();
         self.rows = matching(&self.entries, self.command, query, self.show_all, now());
@@ -273,6 +283,53 @@ impl SourceControl {
         }
     }
 
+    fn branch_picker_current(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(picker) = &self.branch_picker else {
+            return false;
+        };
+        if self.target.as_ref() != Some(&picker.target)
+            || self.active_repository != picker.repository
+            || self.git_state().is_none_or(|state| {
+                state.head != picker.state.head || state.branch != picker.state.branch
+            })
+        {
+            self.close_branch_picker(window, cx);
+            self.notify_error(
+                &self.active_repository.clone(),
+                "The branch changed; reopen the branch picker",
+                cx,
+            );
+            return false;
+        }
+        true
+    }
+
+    fn create_picker_branch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.git_enabled() {
+            return;
+        }
+        let Some(name) = self
+            .branch_picker
+            .as_ref()
+            .and_then(|picker| picker.new_branch_name(cx))
+        else {
+            return;
+        };
+        if !self.branch_picker_current(window, cx) {
+            return;
+        }
+        self.close_branch_picker(window, cx);
+        self.confirm_git(
+            Action::CreateBranch {
+                name: name.clone(),
+                start: None,
+            },
+            format!("Create branch {name}?"),
+            "This branch doesn't exist. Create it from the current HEAD and check it out?".into(),
+            cx,
+        );
+    }
+
     fn activate_branch(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if !self.git_enabled() {
             return;
@@ -288,20 +345,10 @@ impl SourceControl {
         else {
             return;
         };
-        if self.target.as_ref() != Some(&picker.target)
-            || self.active_repository != picker.repository
-            || self.git_state().is_none_or(|state| {
-                state.head != picker.state.head || state.branch != picker.state.branch
-            })
-        {
-            self.close_branch_picker(window, cx);
-            self.notify_error(
-                &self.active_repository.clone(),
-                "The branch changed; reopen the branch picker",
-                cx,
-            );
+        if !self.branch_picker_current(window, cx) {
             return;
         }
+        let picker = self.branch_picker.as_ref().unwrap();
         let command = picker.command;
         let state = picker.state.clone();
         self.close_branch_picker(window, cx);
@@ -357,10 +404,12 @@ impl SourceControl {
                 }
             }
             "enter" => {
-                if !event.is_held
-                    && let Some(&index) = picker.rows.get(picker.active)
-                {
-                    self.activate_branch(index, window, cx);
+                if !event.is_held {
+                    if let Some(&index) = picker.rows.get(picker.active) {
+                        self.activate_branch(index, window, cx);
+                    } else {
+                        self.create_picker_branch(window, cx);
+                    }
                 }
             }
             _ => return,
@@ -415,7 +464,37 @@ impl SourceControl {
         } else {
             "No matching branches".into()
         };
-        let body = if count == 0 {
+        let new_branch = picker.new_branch_name(cx);
+        let body = if let Some(name) = new_branch {
+            div()
+                .id("git-branch-create")
+                .debug_selector(|| "git-branch-create".into())
+                .role(gpui::Role::Button)
+                .aria_label(format!("Create branch {name}"))
+                .h(list_height)
+                .px(px(12.0))
+                .flex()
+                .items_center()
+                .text_size(px(13.0))
+                .text_color(theme.text)
+                .cursor_pointer()
+                .hover_bg(
+                    "git-branch-create-wash",
+                    window,
+                    theme.accent.opacity(0.15),
+                    theme.glass_hover(),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .child(format!("Create branch ‘{name}’…")),
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.create_picker_branch(window, cx);
+                }))
+                .into_any_element()
+        } else if count == 0 {
             div()
                 .h(list_height)
                 .px(px(12.0))
@@ -807,6 +886,101 @@ mod tests {
         });
         cx.simulate_keystrokes("escape");
         view.read_with(cx, |view, _| assert!(view.branch_picker.is_none()));
+    }
+
+    #[gpui::test]
+    fn missing_checkout_branch_requires_confirmation_from_keyboard(cx: &mut TestAppContext) {
+        let (view, cx) = setup(
+            cx,
+            BranchCommand::Checkout,
+            vec![entry("main", false, true, None, now())],
+        );
+        assert!(cx.debug_bounds("git-branch-create").is_none());
+        cx.simulate_keystrokes("f i x f l a s h l i s t");
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(cx.debug_bounds("git-branch-create").is_some());
+        cx.simulate_keystrokes("enter");
+        view.read_with(cx, |view, _| {
+            assert!(view.branch_picker.is_none());
+            assert!(!view.busy);
+            let confirmation = view.confirmation.as_ref().unwrap();
+            assert_eq!(confirmation.title, "Create branch fixflashlist?");
+            assert_eq!(confirmation.head.as_deref(), Some("head"));
+            assert_eq!(confirmation.branch.as_deref(), Some("main"));
+            assert!(matches!(&confirmation.command,
+                git::Command::Git(Action::CreateBranch { name, start: None }) if name == "fixflashlist"));
+        });
+    }
+
+    #[gpui::test]
+    fn missing_checkout_branch_can_be_created_by_click(cx: &mut TestAppContext) {
+        let (view, cx) = setup(
+            cx,
+            BranchCommand::Checkout,
+            vec![entry("main", false, true, None, now())],
+        );
+        cx.simulate_keystrokes("f i x");
+        cx.update(|window, cx| window.draw(cx).clear());
+        let create = cx.debug_bounds("git-branch-create").unwrap();
+        cx.simulate_click(create.center(), gpui::Modifiers::default());
+        view.read_with(cx, |view, _| {
+            assert!(view.branch_picker.is_none());
+            assert!(matches!(&view.confirmation.as_ref().unwrap().command,
+                git::Command::Git(Action::CreateBranch { name, start: None }) if name == "fix"));
+            assert!(!view.busy);
+        });
+    }
+
+    #[gpui::test]
+    fn branch_creation_requires_loaded_checkout_results_and_current_head(cx: &mut TestAppContext) {
+        let (view, cx) = setup(
+            cx,
+            BranchCommand::Checkout,
+            vec![entry("main", false, true, None, now())],
+        );
+        cx.simulate_keystrokes("m a i n");
+        view.read_with(cx, |view, cx| {
+            assert!(
+                view.branch_picker
+                    .as_ref()
+                    .unwrap()
+                    .new_branch_name(cx)
+                    .is_none()
+            );
+        });
+        cx.simulate_keystrokes("ctrl-a f i x");
+        view.update(cx, |view, cx| {
+            let picker = view.branch_picker.as_mut().unwrap();
+            assert_eq!(picker.new_branch_name(cx).as_deref(), Some("fix"));
+            picker.loading = true;
+            assert!(picker.new_branch_name(cx).is_none());
+            picker.loading = false;
+            picker.error = Some("Unable to load branches".into());
+            assert!(picker.new_branch_name(cx).is_none());
+            picker.error = None;
+            for command in [
+                BranchCommand::Pull,
+                BranchCommand::Merge,
+                BranchCommand::Rebase,
+                BranchCommand::Delete,
+            ] {
+                picker.command = command;
+                assert!(picker.new_branch_name(cx).is_none());
+            }
+            picker.command = BranchCommand::Checkout;
+            view.snapshot.as_mut().unwrap().repositories[0]
+                .git
+                .as_mut()
+                .unwrap()
+                .head = Some("changed".into());
+        });
+        cx.simulate_keystrokes("enter");
+        view.read_with(cx, |view, _| {
+            assert!(view.branch_picker.is_none());
+            assert!(view.confirmation.is_none());
+            assert!(!view.busy);
+            assert!(view.error.as_deref().unwrap().contains("branch changed"));
+        });
     }
 
     #[gpui::test]
