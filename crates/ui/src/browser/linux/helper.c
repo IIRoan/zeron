@@ -9,16 +9,32 @@
 #include <json-glib/json-glib.h>
 #include <signal.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#ifdef ZERON_WPE
+#include <wpe/webkit.h>
+#include <wpe/headless/wpe-headless.h>
+#include <cairo.h>
+#include <xkbcommon/xkbcommon.h>
+#else
 #include <webkit2/webkit2.h>
+#endif
 
 #define MAX_COMMAND (1024 * 1024)
 #define MAX_DIMENSION 8192
 
 typedef struct {
     guint id;
+#ifdef ZERON_WPE
+    WPEView *view;
+    double pointer_x, pointer_y;
+    gboolean reported_renderer;
+    WPEBuffer *waiting_buffer;
+    guint waiting_source;
+#else
     GtkWidget *window;
+#endif
     WebKitWebView *web;
     gboolean visible, dirty;
     gchar *error;
@@ -32,6 +48,28 @@ static WebKitWebContext *context;
 static GByteArray *input;
 static int profile_lock = -1;
 static gboolean shutting_down;
+#ifdef ZERON_WPE
+static WPEDisplay *display;
+static WebKitNetworkSession *network_session;
+static GMainLoop *main_loop;
+#define browser_quit() g_main_loop_quit(main_loop)
+#else
+#define browser_quit() gtk_main_quit()
+#endif
+
+typedef struct {
+    char kind;
+    guint id, length;
+    void *data;
+} Packet;
+static GAsyncQueue *output;
+static GMutex frame_mutex;
+static GHashTable *pending_frames;
+
+static gboolean output_failed(gpointer unused) {
+    browser_quit();
+    return G_SOURCE_REMOVE;
+}
 
 static gboolean write_all(const void *data, size_t length) {
     const char *p = data;
@@ -40,7 +78,7 @@ static gboolean write_all(const void *data, size_t length) {
         if (n < 0 && errno == EINTR)
             continue;
         if (n <= 0) {
-            gtk_main_quit();
+            g_main_context_invoke(NULL, output_failed, NULL);
             return FALSE;
         }
         p += n;
@@ -48,11 +86,36 @@ static gboolean write_all(const void *data, size_t length) {
     }
     return TRUE;
 }
+static gpointer write_packets(gpointer unused) {
+    for (;;) {
+        Packet *p = g_async_queue_pop(output);
+        guint32 header[2] = {GUINT32_TO_LE(p->id), GUINT32_TO_LE(p->length)};
+        gboolean ok = write_all(&p->kind, 1) && write_all(header, sizeof header) &&
+                      write_all(p->data, p->length);
+        if (p->kind == 'F') {
+            g_mutex_lock(&frame_mutex);
+            g_hash_table_remove(pending_frames, GUINT_TO_POINTER(p->id));
+            g_mutex_unlock(&frame_mutex);
+        }
+        g_free(p->data);
+        g_free(p);
+        if (!ok)
+            return NULL;
+    }
+}
+static void send_owned_packet(char kind, guint id, void *data, guint length) {
+    Packet *p = g_new(Packet, 1);
+    *p = (Packet){kind, id, length, data};
+    g_async_queue_push(output, p);
+}
 static void send_packet(char kind, guint id, const void *data, guint length) {
-    guint32 header[2] = {GUINT32_TO_LE(id), GUINT32_TO_LE(length)};
-    if (!write_all(&kind, 1) || !write_all(header, sizeof header))
+    if (!output) {
+        guint32 header[2] = {GUINT32_TO_LE(id), GUINT32_TO_LE(length)};
+        if (write_all(&kind, 1) && write_all(header, sizeof header))
+            write_all(data, length);
         return;
-    write_all(data, length);
+    }
+    send_owned_packet(kind, id, g_memdup2(data, length), length);
 }
 static void send_json(char kind, guint id, JsonBuilder *builder) {
     JsonGenerator *gen = json_generator_new();
@@ -99,7 +162,11 @@ static void im_preedit(WebKitInputMethodContext *ctx, gchar **text, GList **unde
                             webkit_input_method_underline_new(0, g_utf8_strlen(im->preedit, -1)))
             : NULL;
 }
+#ifdef ZERON_WPE
+static gboolean im_filter(WebKitInputMethodContext *ctx, gpointer event) { return FALSE; }
+#else
 static gboolean im_filter(WebKitInputMethodContext *ctx, GdkEventKey *event) { return FALSE; }
+#endif
 static void im_focus(WebKitInputMethodContext *ctx, gboolean focused) {
     JsonBuilder *b = json_builder_new();
     json_builder_begin_object(b);
@@ -246,10 +313,16 @@ static void send_menu(Page *p, JsonBuilder *b) {
     json_builder_end_object(b);
     send_json('M', p->id, b);
 }
+#ifdef ZERON_WPE
+static gboolean context_menu(WebKitWebView *web, WebKitContextMenu *menu,
+                             WebKitHitTestResult *hit, Page *p) {
+    double x = p->pointer_x, y = p->pointer_y;
+#else
 static gboolean context_menu(WebKitWebView *web, WebKitContextMenu *menu, GdkEvent *event,
                              WebKitHitTestResult *hit, Page *p) {
     double x = 0, y = 0;
     gdk_event_get_coords(event, &x, &y);
+#endif
     g_free(p->context_link);
     p->context_link = NULL;
     JsonBuilder *b = menu_builder(x / p->scale, y / p->scale);
@@ -271,8 +344,13 @@ static gboolean context_menu(WebKitWebView *web, WebKitContextMenu *menu, GdkEve
     send_menu(p, b);
     return TRUE;
 }
+#ifdef ZERON_WPE
+static gboolean option_menu(WebKitWebView *web, WebKitOptionMenu *menu,
+                            WebKitRectangle *rect, Page *p) {
+#else
 static gboolean option_menu(WebKitWebView *web, WebKitOptionMenu *menu, GdkEvent *event,
                             GdkRectangle *rect, Page *p) {
+#endif
     g_set_object(&p->options, menu);
     JsonBuilder *b = menu_builder(rect->x / p->scale, (rect->y + rect->height) / p->scale);
     for (guint i = 0; i < webkit_option_menu_get_n_items(menu); i++) {
@@ -287,20 +365,37 @@ static gboolean option_menu(WebKitWebView *web, WebKitOptionMenu *menu, GdkEvent
     send_menu(p, b);
     return TRUE;
 }
-static void download(WebKitWebContext *ctx, WebKitDownload *item, gpointer data) {
+static void download(GObject *ctx, WebKitDownload *item, gpointer data) {
     webkit_download_cancel(item);
 }
+#ifndef ZERON_WPE
 static gboolean damaged(GtkWidget *widget, GdkEvent *event, Page *p) {
     p->dirty = TRUE;
     return FALSE;
 }
+#else
+static double number(JsonObject *o, const char *key);
+static const char *string(JsonObject *o, const char *key);
+#include "wpe_platform.h"
+#endif
 static void free_page(gpointer data) {
     Page *p = data;
     if (p->options) {
         webkit_option_menu_close(p->options);
         g_clear_object(&p->options);
     }
+#ifdef ZERON_WPE
+    g_object_set_data(G_OBJECT(p->view), "zeron-page", NULL);
+    if (p->waiting_source) g_source_remove(p->waiting_source);
+    if (p->waiting_buffer) {
+        wpe_view_buffer_released(p->view, p->waiting_buffer);
+        g_clear_object(&p->waiting_buffer);
+    }
+    wpe_view_unmap(p->view);
+    g_object_unref(p->web);
+#else
     gtk_widget_destroy(p->window);
+#endif
     g_free(p->error);
     g_free(p->context_link);
     g_free(p);
@@ -312,16 +407,32 @@ static Page *new_page(guint id) {
     p->height = 600;
     p->scale = 1;
     p->visible = TRUE;
+#ifdef ZERON_WPE
+    p->web = g_object_new(WEBKIT_TYPE_WEB_VIEW, "display", display,
+                         "web-context", context, "network-session", network_session, NULL);
+    p->view = webkit_web_view_get_wpe_view(p->web);
+    g_object_set_data(G_OBJECT(p->view), "zeron-page", p);
+    WPEToplevel *toplevel = wpe_display_create_toplevel(display, 1);
+    wpe_toplevel_resized(toplevel, p->width, p->height);
+    wpe_view_set_toplevel(p->view, toplevel);
+    g_object_unref(toplevel);
+    wpe_view_resized(p->view, p->width, p->height);
+    wpe_view_set_visible(p->view, TRUE);
+    wpe_view_map(p->view);
+#else
     p->window = gtk_offscreen_window_new();
     p->web = WEBKIT_WEB_VIEW(webkit_web_view_new_with_context(context));
+#endif
     BrowserIM *im = g_object_new(browser_im_get_type(), NULL);
     im->id = id;
     webkit_web_view_set_input_method_context(p->web, WEBKIT_INPUT_METHOD_CONTEXT(im));
     g_object_unref(im);
     webkit_settings_set_enable_developer_extras(webkit_web_view_get_settings(p->web), FALSE);
+#ifndef ZERON_WPE
     gtk_container_add(GTK_CONTAINER(p->window), GTK_WIDGET(p->web));
     gtk_window_set_default_size(GTK_WINDOW(p->window), p->width, p->height);
     g_signal_connect(p->window, "damage-event", G_CALLBACK(damaged), p);
+#endif
     g_signal_connect(p->web, "notify::uri", G_CALLBACK(changed), p);
     g_signal_connect(p->web, "notify::title", G_CALLBACK(changed), p);
     g_signal_connect(p->web, "notify::is-loading", G_CALLBACK(changed), p);
@@ -332,10 +443,13 @@ static Page *new_page(guint id) {
     g_signal_connect(p->web, "permission-request", G_CALLBACK(permission), p);
     g_signal_connect(p->web, "context-menu", G_CALLBACK(context_menu), p);
     g_signal_connect(p->web, "show-option-menu", G_CALLBACK(option_menu), p);
+#ifndef ZERON_WPE
     gtk_widget_show_all(p->window);
+#endif
     g_hash_table_insert(pages, GUINT_TO_POINTER(id), p);
     return p;
 }
+#ifndef ZERON_WPE
 static gboolean render_frames(gpointer unused) {
     GHashTableIter it;
     gpointer value;
@@ -344,23 +458,33 @@ static gboolean render_frames(gpointer unused) {
         Page *p = value;
         if (!p->visible || !p->dirty)
             continue;
+        // Never queue stale video or wait for the GPUI consumer on GTK's
+        // event loop. Leave damage pending until the previous frame is sent.
+        g_mutex_lock(&frame_mutex);
+        gboolean pending = g_hash_table_contains(pending_frames, GUINT_TO_POINTER(p->id));
+        g_mutex_unlock(&frame_mutex);
+        if (pending)
+            continue;
         p->dirty = FALSE;
-        GdkPixbuf *pix = gtk_offscreen_window_get_pixbuf(GTK_OFFSCREEN_WINDOW(p->window));
-        if (!pix)
+        cairo_surface_t *surface = gtk_offscreen_window_get_surface(GTK_OFFSCREEN_WINDOW(p->window));
+        if (!surface)
             continue;
-        guint w = gdk_pixbuf_get_width(pix), h = gdk_pixbuf_get_height(pix),
-              channels = gdk_pixbuf_get_n_channels(pix);
-        guint stride = gdk_pixbuf_get_rowstride(pix);
-        const guchar *src = gdk_pixbuf_read_pixels(pix);
-        if (w > MAX_DIMENSION || h > MAX_DIMENSION) {
-            g_object_unref(pix);
-            continue;
-        }
-        if (w != p->width || h != p->height) {
+        // Match GTK's get_pixbuf viewport in device coordinates. The backing
+        // surface can be larger on a HiDPI display even with GDK_SCALE=1.
+        cairo_rectangle_int_t viewport = {0, 0, p->width, p->height};
+        cairo_surface_t *image = cairo_surface_map_to_image(surface, &viewport);
+        cairo_format_t format = cairo_image_surface_get_format(image);
+        guint w = cairo_image_surface_get_width(image), h = cairo_image_surface_get_height(image);
+        if (cairo_surface_status(image) != CAIRO_STATUS_SUCCESS ||
+            (format != CAIRO_FORMAT_ARGB32 && format != CAIRO_FORMAT_RGB24) ||
+            w > MAX_DIMENSION || h > MAX_DIMENSION || w != p->width || h != p->height) {
             p->dirty = TRUE;
-            g_object_unref(pix);
+            cairo_surface_unmap_image(surface, image);
             continue;
         }
+        cairo_surface_flush(image);
+        guint stride = cairo_image_surface_get_stride(image);
+        const guchar *src = cairo_image_surface_get_data(image);
         guint length = 12 + w * h * 4;
         guchar *out = g_malloc(length);
         ((guint32 *)out)[0] = GUINT32_TO_LE(w);
@@ -369,22 +493,36 @@ static gboolean render_frames(gpointer unused) {
         guint32 scale_bits;
         memcpy(&scale_bits, &scale, 4);
         ((guint32 *)out)[2] = GUINT32_TO_LE(scale_bits);
-        for (guint y = 0; y < h; y++)
+        // Cairo is already native-endian BGRA on our Linux targets. Avoid the
+        // pixbuf conversion plus a second RGB -> BGRA pass on every frame.
+        for (guint y = 0; y < h; y++) {
+            const guint32 *row = (const guint32 *)(src + y * stride);
+            guchar *dst = out + 12 + y * w * 4;
             for (guint x = 0; x < w; x++) {
-                const guchar *s = src + y * stride + x * channels;
-                guchar *d = out + 12 + (y * w + x) * 4;
-                // GPUI's image atlas uses BGRA byte order.
-                d[0] = s[2];
-                d[1] = s[1];
-                d[2] = s[0];
-                d[3] = channels == 4 ? s[3] : 255;
+                guint32 pixel = row[x];
+                guint alpha = format == CAIRO_FORMAT_RGB24 ? 255 : pixel >> 24;
+                guint blue = pixel & 255, green = (pixel >> 8) & 255, red = (pixel >> 16) & 255;
+                // RenderImage accepts straight alpha; Cairo's source is premultiplied.
+                if (alpha && alpha != 255) {
+                    blue = MIN(255, (blue * 255 + alpha / 2) / alpha);
+                    green = MIN(255, (green * 255 + alpha / 2) / alpha);
+                    red = MIN(255, (red * 255 + alpha / 2) / alpha);
+                }
+                dst[x * 4] = blue;
+                dst[x * 4 + 1] = green;
+                dst[x * 4 + 2] = red;
+                dst[x * 4 + 3] = alpha;
             }
-        send_packet('F', p->id, out, length);
-        g_free(out);
-        g_object_unref(pix);
+        }
+        cairo_surface_unmap_image(surface, image);
+        g_mutex_lock(&frame_mutex);
+        g_hash_table_add(pending_frames, GUINT_TO_POINTER(p->id));
+        g_mutex_unlock(&frame_mutex);
+        send_owned_packet('F', p->id, out, length);
     }
     return G_SOURCE_CONTINUE;
 }
+#endif
 static double number(JsonObject *o, const char *key) {
     return json_object_has_member(o, key) ? json_object_get_double_member(o, key) : 0;
 }
@@ -392,6 +530,9 @@ static const char *string(JsonObject *o, const char *key) {
     return json_object_has_member(o, key) ? json_object_get_string_member(o, key) : "";
 }
 static void input_event(Page *p, JsonObject *o, const char *command) {
+#ifdef ZERON_WPE
+    wpe_input(p, o, command);
+#else
     GdkEventType type = !strcmp(command, "move")       ? GDK_MOTION_NOTIFY
                         : !strcmp(command, "down")     ? GDK_BUTTON_PRESS
                         : !strcmp(command, "up")       ? GDK_BUTTON_RELEASE
@@ -454,6 +595,7 @@ static void input_event(Page *p, JsonObject *o, const char *command) {
     }
     gtk_widget_event(GTK_WIDGET(p->web), e);
     gdk_event_free(e);
+#endif
 }
 static void copied(GObject *web, GAsyncResult *result, gpointer data) {
     GError *error = NULL;
@@ -476,12 +618,91 @@ static void evaluated(GObject *web, GAsyncResult *result, gpointer data) {
     g_clear_object(&v);
     g_clear_error(&error);
 }
+
+typedef struct { guint id; gchar *request_id; } Automation;
+static void automation_reply(Automation *op, JsonNode *result, const char *error) {
+    JsonBuilder *b = json_builder_new();
+    json_builder_begin_object(b);
+    member_string(b, "requestId", op->request_id);
+    if (error) member_string(b, "error", error);
+    else {
+        json_builder_set_member_name(b, "result");
+        if (result) json_builder_add_value(b, json_node_copy(result));
+        else json_builder_add_null_value(b);
+    }
+    json_builder_end_object(b);
+    send_json('A', op->id, b);
+    g_free(op->request_id);
+    g_free(op);
+}
+static void automation_evaluated(GObject *web, GAsyncResult *result, gpointer data) {
+    GError *error = NULL;
+    JSCValue *value = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(web), result, &error);
+    gchar *text = value ? jsc_value_to_json(value, 0) : NULL;
+    JsonParser *parser = json_parser_new();
+    if (error) automation_reply(data, NULL, error->message);
+    else if (text && strlen(text) > MAX_COMMAND) automation_reply(data, NULL, "browser_result_too_large: return a smaller result");
+    else if (text && json_parser_load_from_data(parser, text, -1, NULL))
+        automation_reply(data, json_parser_get_root(parser), NULL);
+    else automation_reply(data, NULL, NULL);
+    g_object_unref(parser);
+    g_free(text);
+    g_clear_object(&value);
+    g_clear_error(&error);
+}
+static cairo_status_t screenshot_bytes(void *closure, const unsigned char *data, unsigned int length) {
+    GByteArray *bytes = closure;
+    if (bytes->len + length > 8 * 1024 * 1024) return CAIRO_STATUS_WRITE_ERROR;
+    g_byte_array_append(bytes, data, length);
+    return CAIRO_STATUS_SUCCESS;
+}
+static void automation_screenshot(GObject *web, GAsyncResult *result, gpointer data) {
+    GError *error = NULL;
+#ifdef ZERON_WPE
+    WebKitImage *image = webkit_web_view_get_snapshot_finish(WEBKIT_WEB_VIEW(web), result, &error);
+    GBytes *pixels = image ? webkit_image_as_bytes(image) : NULL;
+    cairo_surface_t *surface = pixels ? cairo_image_surface_create_for_data(
+        (guchar *)g_bytes_get_data(pixels, NULL), CAIRO_FORMAT_ARGB32,
+        webkit_image_get_width(image), webkit_image_get_height(image), webkit_image_get_stride(image)) : NULL;
+#else
+    cairo_surface_t *surface = webkit_web_view_get_snapshot_finish(WEBKIT_WEB_VIEW(web), result, &error);
+#endif
+    if (!surface) {
+        automation_reply(data, NULL, error ? error->message : "browser_screenshot_failed");
+        g_clear_error(&error);
+#ifdef ZERON_WPE
+        g_clear_object(&image);
+#endif
+        return;
+    }
+    GByteArray *bytes = g_byte_array_new();
+    if (cairo_surface_write_to_png_stream(surface, screenshot_bytes, bytes) != CAIRO_STATUS_SUCCESS) {
+        automation_reply(data, NULL, "browser_screenshot_failed: image exceeds 8 MB or could not be encoded");
+    } else {
+        gchar *encoded = g_base64_encode(bytes->data, bytes->len);
+        JsonBuilder *b = json_builder_new();
+        json_builder_begin_object(b);
+        member_string(b, "mimeType", "image/png");
+        member_string(b, "data", encoded);
+        json_builder_end_object(b);
+        JsonNode *root = json_builder_get_root(b);
+        automation_reply(data, root, NULL);
+        json_node_free(root);
+        g_object_unref(b);
+        g_free(encoded);
+    }
+    g_byte_array_unref(bytes);
+    cairo_surface_destroy(surface);
+#ifdef ZERON_WPE
+    g_object_unref(image);
+#endif
+}
 static void shutdown_ready(GObject *manager, GAsyncResult *result, gpointer unused) {
     GError *error = NULL;
     GList *cookies = webkit_cookie_manager_get_cookies_finish(WEBKIT_COOKIE_MANAGER(manager), result, &error);
     g_list_free_full(cookies, (GDestroyNotify)soup_cookie_free);
     g_clear_error(&error);
-    gtk_main_quit();
+    browser_quit();
 }
 static void begin_shutdown(void) {
     if (shutting_down)
@@ -491,7 +712,12 @@ static void begin_shutdown(void) {
     // Let WebKit process the pending cookie operations before leaving its loop.
     // get_cookies is available on older WebKitGTK 4.1 runtimes too (the
     // get_all_cookies API would require WebKitGTK 2.42).
-    webkit_cookie_manager_get_cookies(webkit_web_context_get_cookie_manager(context),
+#ifdef ZERON_WPE
+    WebKitCookieManager *manager = webkit_network_session_get_cookie_manager(network_session);
+#else
+    WebKitCookieManager *manager = webkit_web_context_get_cookie_manager(context);
+#endif
+    webkit_cookie_manager_get_cookies(manager,
                                      "http://localhost/", NULL, shutdown_ready, NULL);
 }
 
@@ -516,7 +742,23 @@ static void command(JsonObject *o) {
         g_hash_table_remove(pages, GUINT_TO_POINTER(id));
         return;
     }
-    if (!strcmp(cmd, "load")) {
+    if (!strcmp(cmd, "automate") || !strcmp(cmd, "screenshot")) {
+        Automation *op = g_new0(Automation, 1);
+        op->id = id;
+        op->request_id = g_strdup(string(o, "requestId"));
+        if (!strcmp(cmd, "screenshot"))
+            webkit_web_view_get_snapshot(p->web, WEBKIT_SNAPSHOT_REGION_VISIBLE,
+                                        WEBKIT_SNAPSHOT_OPTIONS_NONE, NULL, automation_screenshot, op);
+        else webkit_web_view_evaluate_javascript(p->web, string(o, "script"), -1, NULL, NULL, NULL,
+                                               automation_evaluated, op);
+    } else if (!strcmp(cmd, "click")) {
+        input_event(p, o, "move");
+        input_event(p, o, "down");
+        input_event(p, o, "up");
+    } else if (!strcmp(cmd, "keypress")) {
+        input_event(p, o, "key_down");
+        input_event(p, o, "key_up");
+    } else if (!strcmp(cmd, "load")) {
         const char *url = string(o, "url");
         if (allowed(url))
             webkit_web_view_load_uri(p->web, url);
@@ -588,18 +830,26 @@ static void command(JsonObject *o) {
             p->height = h;
             p->scale = scale;
             webkit_web_view_set_zoom_level(p->web, scale);
+#ifdef ZERON_WPE
+            wpe_view_resized(p->view, w, h);
+#else
             gtk_window_set_default_size(GTK_WINDOW(p->window), w, h);
             gtk_widget_set_size_request(GTK_WIDGET(p->web), w, h);
             gtk_widget_queue_resize(p->window);
+#endif
             p->dirty = TRUE;
         }
     } else if (!strcmp(cmd, "visible")) {
         p->visible = number(o, "value") != 0;
+#ifdef ZERON_WPE
+        wpe_view_set_visible(p->view, p->visible);
+#else
         if (p->visible) {
             gtk_widget_show(p->window);
             p->dirty = TRUE;
         } else
             gtk_widget_hide(p->window);
+#endif
     } else if (!strcmp(cmd, "eval"))
         webkit_web_view_evaluate_javascript(p->web, string(o, "script"), -1, NULL, NULL, NULL,
                                             evaluated, GUINT_TO_POINTER(id));
@@ -619,7 +869,7 @@ static gboolean read_commands(gint fd, GIOCondition condition, gpointer unused) 
         memcpy(&length, input->data, 4);
         length = GUINT32_FROM_LE(length);
         if (length > MAX_COMMAND) {
-            gtk_main_quit();
+            browser_quit();
             return G_SOURCE_REMOVE;
         }
         if (input->len < 4 + length)
@@ -648,10 +898,17 @@ static gboolean storage_directory(const gchar *path) {
     return fd >= 0;
 }
 
+#include "storage_compat.h"
+
 static gboolean configure_storage(int argc, char **argv) {
     if (argc == 1) {
         // Explicitly unscoped contexts are used by fixtures/unresolved identity.
+#ifdef ZERON_WPE
+        context = webkit_web_context_new();
+        network_session = webkit_network_session_new_ephemeral();
+#else
         context = webkit_web_context_new_ephemeral();
+#endif
         return TRUE;
     }
     if (argc != 3 || strcmp(argv[1], "--profile") || !g_path_is_absolute(argv[2])) {
@@ -672,6 +929,15 @@ static gboolean configure_storage(int argc, char **argv) {
         send_packet('E', 0, error, strlen(error));
         return FALSE;
     }
+#ifdef ZERON_WPE
+    if (!prepare_wpe_profile(argv[2])) return FALSE;
+#else
+    if (profile_uses_wpe(argv[2])) {
+        const char *error = "This browser profile requires WPE WebKit 2.54 or newer. Install its runtime and use a WPE-enabled Zeron build; the GTK fallback cannot read its updated site storage.";
+        send_packet('E', 0, error, strlen(error));
+        return FALSE;
+    }
+#endif
     gchar *data = g_build_filename(argv[2], "data", NULL);
     gchar *cache = g_build_filename(argv[2], "cache", NULL);
     gchar *cookies = g_build_filename(argv[2], "cookies.sqlite", NULL);
@@ -683,6 +949,12 @@ static gboolean configure_storage(int argc, char **argv) {
         g_free(error);
     } else {
         close(fd);
+#ifdef ZERON_WPE
+        context = webkit_web_context_new();
+        network_session = webkit_network_session_new(data, cache);
+        WebKitCookieManager *manager = webkit_network_session_get_cookie_manager(network_session);
+        webkit_cookie_manager_set_persistent_storage(manager, cookies, WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE);
+#else
         WebKitWebsiteDataManager *manager = webkit_website_data_manager_new(
             "base-data-directory", data, "base-cache-directory", cache, NULL);
         webkit_cookie_manager_set_persistent_storage(
@@ -690,6 +962,7 @@ static gboolean configure_storage(int argc, char **argv) {
             WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE);
         context = webkit_web_context_new_with_website_data_manager(manager);
         g_object_unref(manager);
+#endif
     }
     g_free(data);
     g_free(cache);
@@ -700,6 +973,10 @@ static gboolean configure_storage(int argc, char **argv) {
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     umask(0077);
+#ifdef ZERON_WPE
+    main_loop = g_main_loop_new(NULL, FALSE);
+    if (!init_wpe()) return 1;
+#else
     // Offscreen GTK surfaces need CPU-addressable frames, never native GL child windows.
     g_setenv("WEBKIT_DISABLE_DMABUF_RENDERER", "1", TRUE);
     g_setenv("GDK_SCALE", "1", TRUE);
@@ -708,18 +985,35 @@ int main(int argc, char **argv) {
         g_printerr("Could not connect WebKitGTK to the display.\n");
         return 1;
     }
+#endif
     pages = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, free_page);
     input = g_byte_array_new();
     if (!configure_storage(argc, argv))
         return 1;
+    output = g_async_queue_new();
+    pending_frames = g_hash_table_new(g_direct_hash, g_direct_equal);
+    g_thread_unref(g_thread_new("browser-output", write_packets, NULL));
     send_packet('R', 0, "", 0);
+#ifdef ZERON_WPE
+    g_signal_connect(network_session, "download-started", G_CALLBACK(download), NULL);
+#else
     g_signal_connect(context, "download-started", G_CALLBACK(download), NULL);
+#endif
     g_unix_fd_add(STDIN_FILENO, G_IO_IN | G_IO_HUP | G_IO_ERR, read_commands, NULL);
+#ifdef ZERON_WPE
+    g_main_loop_run(main_loop);
+#else
     g_timeout_add(16, render_frames, NULL);
     gtk_main();
+#endif
     g_hash_table_destroy(pages);
     g_byte_array_unref(input);
     g_object_unref(context);
+#ifdef ZERON_WPE
+    g_object_unref(network_session);
+    g_object_unref(display);
+    g_main_loop_unref(main_loop);
+#endif
     if (profile_lock >= 0)
         close(profile_lock);
     return 0;

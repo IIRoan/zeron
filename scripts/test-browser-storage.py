@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import shutil
 import struct
 import sys
 import subprocess
@@ -105,6 +106,7 @@ class Helper:
         kind, _, data = self.events.get(timeout=15)
         if expect_error:
             assert kind == b'E', (kind, data)
+            self.startup_error = data
             assert self.process.wait(timeout=5) != 0
             self.process.stdin.close()
             self.process.stdout.close()
@@ -171,15 +173,18 @@ def main():
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument('--helper', type=str)
     group.add_argument('--fixture', type=str)
+    parser.add_argument('--alternate-helper', help='Legacy GTK helper for WPE migration and rollback checks')
     args = parser.parse_args()
+    if args.alternate_helper and not args.helper:
+        parser.error('--alternate-helper requires --helper')
     server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     origin = f'http://127.0.0.1:{server.server_port}'
     with tempfile.TemporaryDirectory(prefix='zeron-browser-storage-') as temporary:
         root = Path(temporary)
-        def run(profile, mode):
+        def run(profile, mode, helper=None):
             if args.helper:
-                browser = Helper(args.helper, root / profile)
+                browser = Helper(helper or args.helper, root / profile)
                 try:
                     browser.page(1, origin + '/' + mode)
                     if mode == 'write':
@@ -221,6 +226,26 @@ def main():
                 Helper(args.helper, bad, expect_error=True)
                 assert (root / 'a' / 'cookies.sqlite').stat().st_mode & 0o077 == 0
                 print('PASS profile locking, independent profiles, storage errors, file permissions', flush=True)
+                if args.alternate_helper:
+                    profile = 'backend-upgrade'
+                    run(profile, 'write', args.alternate_helper)
+                    run(profile, 'read', args.helper)
+                    assert (root / profile / 'wpe-storage-v1').is_file()
+                    old = Helper(args.alternate_helper, root / profile, expect_error=True)
+                    assert b'WPE' in old.startup_error, old.startup_error
+                    run(profile, 'delete', args.helper)
+                    run(profile, 'empty', args.helper)
+                    backup = root / profile / 'before-wpe-v1'
+                    assert (backup / 'snapshot-complete').is_file()
+                    shutil.copytree(backup, root / 'restored-legacy')
+                    run('restored-legacy', 'read', args.alternate_helper)
+                    failed = 'failed-upgrade'
+                    run(failed, 'write', args.alternate_helper)
+                    (root / failed / 'before-wpe-v1').write_text('incomplete snapshot')
+                    Helper(args.helper, root / failed, expect_error=True)
+                    assert not (root / failed / 'wpe-storage-v1').exists()
+                    run(failed, 'read', args.alternate_helper)
+                    print('PASS WPE migration, guarded fallback, snapshot restore, failed-upgrade recovery', flush=True)
         finally:
             # Cleanup must attempt every synthetic profile without replacing the test failure.
             primary_error = sys.exc_info()[1]

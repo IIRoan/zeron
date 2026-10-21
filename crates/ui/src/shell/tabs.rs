@@ -501,13 +501,13 @@ impl Shell {
             content_width,
         } = self.titlebar_trailing_layout(on_canvas, cx);
 
-        // What runs alongside the open chat: its working subagents and side
-        // chats, counted on the session card's toggle.
-        let running_lanes = {
+        // Working side chats, counted on the session card's toggle.
+        // Subagents have their own control below the composer.
+        let running_side_chats = {
             let state = self.state.read(cx);
             let now = Utc::now();
             state.selected_chat.as_deref().map_or(0, |chat| {
-                let side_chats = state
+                state
                     .chats
                     .iter()
                     .filter(|side| {
@@ -516,8 +516,7 @@ impl Shell {
                             && state.display_status_for(side, now)
                                 == zeron_proto::ChatIndicator::Working
                     })
-                    .count() as u32;
-                state.running_subagents_for(chat, now) + side_chats
+                    .count() as u32
             })
         };
         let trailing: Option<gpui::AnyElement> = if on_canvas {
@@ -684,10 +683,9 @@ impl Shell {
                 cx.listener(|this, _, _, _| this.note_session_info_press()),
             )
             .when(open, |button| button.bg(crate::theme::wash(0.09)))
-            // Running subagents and side chats ride the card's lanes: the
-            // button counts them, open or closed, for as long as they run.
-            .when(running_lanes > 0, |button| {
-                crate::running_pill::mark_titlebar_button(button, running_lanes, &theme)
+            // Side chats ride the card's lanes; count them while they run.
+            .when(running_side_chats > 0, |button| {
+                crate::running_pill::mark_titlebar_button(button, running_side_chats, &theme)
             })
         });
         let inner = div()

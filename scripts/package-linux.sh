@@ -20,6 +20,11 @@ STAGE="$OUT_DIR/zeron-$VERSION-linux-$ARCH"
 TARBALL="$STAGE.tar.gz"
 
 cd "$ROOT"
+ZERON_PACKAGE_BROWSER_RUNTIME="${ZERON_BROWSER_WPE_RUNTIME:-}"
+if [[ -n "$ZERON_PACKAGE_BROWSER_RUNTIME" ]]; then
+  test -f "$ZERON_PACKAGE_BROWSER_RUNTIME/manifest.json"
+  export PKG_CONFIG_PATH="$ZERON_PACKAGE_BROWSER_RUNTIME/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+fi
 if [[ "$PROFILE" == "release" ]]; then
   cargo build --release -p zeron
   BIN="$ROOT/target/release/zeron"
@@ -36,6 +41,9 @@ install -m 644 "$ROOT/scripts/muute-redis.compose.yaml" "$STAGE/"
 install -m 644 "$ROOT/dist/zeron.desktop" "$STAGE/zeron.desktop"
 install -m 644 "$ROOT/dist/zeron.png" "$STAGE/zeron.png"
 install -m 644 "$ROOT/LICENSE" "$ROOT/THIRD_PARTY_NOTICES.md" "$STAGE/"
+if [[ -n "$ZERON_PACKAGE_BROWSER_RUNTIME" ]]; then
+  cp -a "$ZERON_PACKAGE_BROWSER_RUNTIME" "$STAGE/browser-runtime"
+fi
 mkdir -p "$STAGE/licenses/fonts"
 cp "$ROOT/crates/ui/assets/fonts/licenses/"* "$STAGE/licenses/fonts/"
 cp "$ROOT/crates/voice/NOTICE.md" "$STAGE/licenses/parakeet-v3.txt"

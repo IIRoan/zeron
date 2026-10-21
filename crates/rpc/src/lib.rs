@@ -33,6 +33,11 @@ pub use server::{serve_connection, serve_ws_listener};
 /// RPC method names — single source of truth for both ends.
 /// Full surface: docs/research/feature-inventory.md §2.
 pub mod methods {
+    pub const ATTACH_BROWSER_HOST: &str = "AttachBrowserHost";
+    pub const UPDATE_BROWSER_HOST: &str = "UpdateBrowserHost";
+    pub const REPLY_BROWSER_HOST: &str = "ReplyBrowserHost";
+    pub const LIST_BROWSER_TABS: &str = "ListBrowserTabs";
+    pub const CONTROL_BROWSER: &str = "ControlBrowser";
     pub const VOICE_CAPABILITIES_V2: &str = "VoiceCapabilitiesV2";
     pub const PREPARE_VOICE_V2: &str = "PrepareVoiceV2";
     pub const OWN_VOICE_V2: &str = "OwnVoiceV2";

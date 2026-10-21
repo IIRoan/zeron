@@ -72,6 +72,7 @@ pub mod shell;
 pub mod sound;
 pub mod source_control;
 pub mod state;
+mod subagents;
 pub(crate) mod surface_chrome;
 pub mod syntax_cache;
 pub mod terminal;

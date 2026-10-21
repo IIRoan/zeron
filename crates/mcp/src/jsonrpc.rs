@@ -21,6 +21,12 @@ const PROTOCOL_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
 const LATEST_PROTOCOL: &str = "2025-06-18";
 
 const INSTRUCTIONS: &str = "\
+When browser tools are available, call browser_list_tabs to find this chat's tabs. \
+The user must enable the bot button on a tab before you can control it. Use \
+browser_snapshot for current element refs, browser_wait after navigation, and \
+browser_screenshot to inspect the rendered page. Refresh a snapshot after a stale \
+ref error. A timeout can occur after an action took effect; inspect before retrying.\n\
+\n\
 Zeron runs coding agents in chats, each hosted on a device, optionally in a project \
 (a folder on that specific device). These tools operate the local Zeron engine: \
 discover devices/projects/chats, create chats with a chosen harness and \
@@ -181,6 +187,13 @@ pub async fn handle_request(tools: &Tools, id: Value, method: &str, params: Valu
                 .cloned()
                 .unwrap_or_else(|| json!({}));
             match tools.call(name, arguments).await {
+                Ok(value) if name == "browser_screenshot" => {
+                    if let (Some(mime), Some(data)) = (value["mimeType"].as_str(), value["data"].as_str()) {
+                        ok_response(id, json!({"content":[{"type":"image","mimeType":mime,"data":data}],"isError":false}))
+                    } else {
+                        ok_response(id, json!({"content":[{"type":"text","text":"browser_screenshot_failed: invalid image response"}],"isError":true}))
+                    }
+                }
                 Ok(value) => ok_response(
                     id,
                     json!({
@@ -232,4 +245,31 @@ fn error_response(id: Value, code: i64, message: &str) -> Value {
         "id": id,
         "error": { "code": code, "message": message },
     })
+}
+
+#[cfg(test)]
+mod browser_tests {
+    use super::*;
+    use zeron_rpc::{RpcService, RpcReply, RpcError, methods};
+    struct ScreenshotEngine;
+    #[async_trait::async_trait]
+    impl RpcService for ScreenshotEngine {
+        async fn handle(&self, method: &str, _: Value) -> Result<RpcReply, RpcError> {
+            match method {
+                methods::ENGINE_INFO => RpcReply::value(&json!({"deviceId":"device","workspaceScope":"local","capabilities":[zeron_proto::capabilities::BROWSER_CONTROL_V1]})),
+                methods::CONTROL_BROWSER => RpcReply::value(&json!({"mimeType":"image/png","data":"iVBORw0KGgo="})),
+                _ => Err(RpcError::UnknownMethod(method.into())),
+            }
+        }
+    }
+    #[tokio::test]
+    async fn browser_screenshots_are_mcp_image_content() {
+        let tools = Tools::new(Arc::new(crate::Zeron::with_client(zeron_rpc::memory_client(Arc::new(ScreenshotEngine)), crate::Origin {chat_id:Some("chat".into()),device_id:None})));
+        let response = handle_request(&tools, json!(1), "tools/call", json!({"name":"browser_screenshot","arguments":{"browserId":"host/1"}})).await;
+        assert_eq!(response["result"]["content"][0]["type"], "image");
+        assert_eq!(response["result"]["content"][0]["mimeType"], "image/png");
+        assert_eq!(response["result"]["content"][0]["data"], "iVBORw0KGgo=");
+        assert_eq!(response["result"]["isError"], false);
+        assert!(response["result"].get("structuredContent").is_none());
+    }
 }

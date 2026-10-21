@@ -1,7 +1,5 @@
-//! How many subagents are running, drawn the same way wherever it turns up:
-//! the "● 3" pill on the sidebar's chat rows (beside the row's own activity
-//! indicator) and the Subagents header, and the pulsing button with a count
-//! badge on the titlebar's explorer toggle.
+//! Activity counts: the "● 3" pill in the composer's Subagents control,
+//! and the count badge for side chats on the session-details toggle.
 
 use gpui::{
     AnyElement, App, AppContext as _, Bounds, Context, Entity, Hsla, IntoElement, Render,
@@ -12,8 +10,7 @@ use gpui::{
 use crate::motion::{self, ZERON_PULSE};
 use crate::theme::Theme;
 
-/// Pill height. The sidebar's status slot is 13px and its rows 29px; 16px
-/// matches the sidebar's pull-request badge so the two never disagree.
+/// Compact enough to sit inside the composer footer's button.
 const HEIGHT: f32 = 16.0;
 const DOT: f32 = 5.0;
 /// Pill padding either side of the content, and the gap between dot and digits.

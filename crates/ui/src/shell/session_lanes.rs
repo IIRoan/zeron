@@ -5,7 +5,7 @@
 //! section of session-card rows; clicking a row opens it in the right pane.
 //! Settled subagents fold into one "finished" row, closed until opened.
 
-use zeron_doc::{MessagePart, SubagentStatus};
+use crate::subagents::{SubagentLane, SubagentRow, subagent_rows};
 use zeron_proto::{Chat, ChatIndicator};
 
 use super::session_info::SESSION_CARD_WIDTH;
@@ -50,114 +50,6 @@ impl LaneState {
             self.shown_chats =
                 INITIAL_ROWS + (index + 1 - INITIAL_ROWS).div_ceil(PAGE_ROWS) * PAGE_ROWS;
         }
-    }
-}
-
-/// A spawn chip of the open transcript, as its lane lists it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct SubagentRow {
-    pub doc_id: String,
-    pub title: SharedString,
-    pub status: Option<SubagentStatus>,
-    /// When the latest turn that spawned (or steered) it was written — the
-    /// closest thing a subagent has to a last-updated time.
-    pub spawned_at: DateTime<Utc>,
-}
-
-impl SubagentRow {
-    /// A settled subagent is frozen: its tab reads the uploaded blob first.
-    pub fn frozen(&self) -> bool {
-        matches!(
-            self.status,
-            Some(SubagentStatus::Done) | Some(SubagentStatus::Failed)
-        )
-    }
-
-    fn indicator(&self) -> ChatIndicator {
-        match self.status {
-            Some(SubagentStatus::Running) => ChatIndicator::Working,
-            Some(SubagentStatus::Done) => ChatIndicator::Completed,
-            Some(SubagentStatus::Failed) => ChatIndicator::Errored,
-            None => ChatIndicator::Idle,
-        }
-    }
-}
-
-/// The open chat's subagents, one row per subagent doc: running ones first,
-/// longest-running leading, then the settled ones most recently updated first
-/// (later spawns lead within one turn).
-/// Only genuine spawn chips with a stamped doc ref qualify — the chip IS the
-/// index (there is no listing endpoint), and a stray ref on a non-Agent tool
-/// must not surface as a phantom subagent.
-pub(super) fn subagent_rows(state: &AppState, chat_id: &str) -> Vec<SubagentRow> {
-    if state.selected_chat.as_deref() != Some(chat_id) {
-        return Vec::new();
-    }
-    let mut rows: Vec<SubagentRow> = Vec::new();
-    for entry in &state.transcript {
-        let spawned_at =
-            DateTime::<Utc>::from_timestamp_millis(entry.created_at).unwrap_or_else(Utc::now);
-        for part in &entry.parts {
-            let MessagePart::Tool {
-                call,
-                subagent_ref: Some(doc_id),
-                subagent_status,
-                ..
-            } = part
-            else {
-                continue;
-            };
-            if !call.is_subagent_spawn() {
-                continue;
-            }
-            let row = SubagentRow {
-                doc_id: doc_id.clone(),
-                title: crate::transcript::subagent_tab_title(call),
-                status: *subagent_status,
-                spawned_at,
-            };
-            match rows.iter_mut().find(|r| r.doc_id == row.doc_id) {
-                // A reopened (steered) subagent updates its row in place.
-                Some(existing) => *existing = row,
-                None => rows.push(row),
-            }
-        }
-    }
-    // Stable sort over the reversed spawn order: ties keep the later spawn
-    // on top.
-    rows.reverse();
-    rows.sort_by_key(|row| std::cmp::Reverse(row.spawned_at));
-    // Running subagents lead, longest-running first: one started long ago is
-    // buried under everything spawned since, and is the one to find and steer.
-    // Oldest-first also keeps the lane still as new subagents join at its
-    // foot. The settled tail keeps the newest-first order above.
-    let (mut running, settled): (Vec<_>, Vec<_>) = rows
-        .into_iter()
-        .partition(|row| row.status == Some(SubagentStatus::Running));
-    // Ties keep spawn order, like the lane's oldest-first order.
-    running.reverse();
-    running.sort_by_key(|row| row.spawned_at);
-    running.extend(settled);
-    running
-}
-
-/// The subagent lane: what has not settled rides it, the rest folds away.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(super) struct SubagentLane {
-    /// Running first, then any row whose status is not stamped yet.
-    pub active: Vec<SubagentRow>,
-    /// Done and failed, most recently updated first.
-    pub finished: Vec<SubagentRow>,
-}
-
-impl SubagentLane {
-    pub fn new(rows: Vec<SubagentRow>) -> Self {
-        let (finished, active) = rows.into_iter().partition(SubagentRow::frozen);
-        Self { active, finished }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.active.is_empty() && self.finished.is_empty()
     }
 }
 
@@ -706,7 +598,7 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeron_doc::{MessageRole, MessageStatus, SessionMessageEntry};
+    use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry, SubagentStatus};
     use zeron_proto::ToolCall;
 
     fn chat(id: &str, parent: Option<&str>, minutes_ago: i64) -> Chat {

@@ -174,6 +174,12 @@ impl Zeron {
         }
     }
 
+    /// Call once without replaying a mutation after a connection failure.
+    pub async fn call_once(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+        let client = self.client().await?;
+        client.call(method, params).await.map_err(|error| anyhow!("{method}: {error}"))
+    }
+
     /// Open a watch stream (reconnecting once if the socket is gone).
     pub async fn subscribe(&self, method: &str, params: Value) -> anyhow::Result<RpcSubscription> {
         let client = self.client().await?;

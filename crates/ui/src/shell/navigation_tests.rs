@@ -149,6 +149,39 @@ fn assert_surface(shell: &Entity<Shell>, cx: &mut VisualTestContext, surface: Ri
 }
 
 #[gpui::test]
+fn composer_subagent_popover_opens_the_existing_transcript_tab(cx: &mut TestAppContext) {
+    let (shell, cx) = setup(cx);
+    shell.update(cx, |shell, cx| {
+        shell.state.update(cx, |state, cx| {
+            state.transcript = vec![crate::subagents::tests::entry(
+                "first",
+                zeron_doc::SubagentStatus::Running,
+            )];
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear());
+    let trigger = cx.debug_bounds("composer-subagents").unwrap();
+    shell.read_with(cx, |shell, cx| {
+        let surface = shell.composer.read(cx).surface_bounds().get().unwrap();
+        assert!(
+            trigger.top() >= surface.bottom(),
+            "subagents belong below the input"
+        );
+    });
+    cx.simulate_click(trigger.center(), gpui::Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear());
+    let row = cx.debug_bounds("composer-subagent-first").unwrap().center();
+    cx.simulate_click(row, gpui::Modifiers::default());
+    shell.read_with(cx, |shell, cx| {
+        assert_eq!(shell.resolved_right_active(cx), RightSurface::Subagent(1));
+        assert_eq!(shell.subagent_tabs.len(), 2, "reuse the existing tab");
+        assert_eq!(shell.state.read(cx).selected_chat.as_deref(), Some("parent"));
+    });
+}
+
+#[gpui::test]
 fn repeated_keys_stay_in_read_only_pane_and_follow_reordering(cx: &mut TestAppContext) {
     let (shell, cx) = setup(cx);
     let tab = cx.debug_bounds("right-surface-tab-0").unwrap().center();

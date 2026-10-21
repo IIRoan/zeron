@@ -65,6 +65,7 @@ use crate::theme::Theme;
 use crate::transcript::{self, Transcript, TranscriptEvent};
 
 mod actions_ui;
+mod browser_control;
 mod chat_dropzone;
 #[cfg(test)]
 mod chat_dropzone_tests;
@@ -2100,6 +2101,11 @@ pub struct Shell {
     browsers: std::collections::HashMap<u64, Entity<crate::browser::BrowserSurface>>,
     browser_subs: std::collections::HashMap<u64, Subscription>,
     browser_seq: u64,
+    browser_host_id: String,
+    browser_host_task: Option<Task<()>>,
+    browser_host_connected: bool,
+    browser_host_revision: u64,
+    browser_host_tabs: Vec<zeron_proto::browser::BrowserTab>,
     /// Pull request tabs in session panes, keyed like the other surfaces.
     chat_pull_requests: std::collections::HashMap<u64, chat_pull_requests::ChatPullRequest>,
     chat_pull_request_seq: u64,
@@ -2464,6 +2470,7 @@ impl Shell {
         let composer_events = cx.subscribe(&composer, {
             let transcript = transcript.clone();
             move |this: &mut Shell, _, event: &ComposerEvent, cx| match event {
+                ComposerEvent::OpenSubagent(event) => this.open_subagent(event, cx),
                 ComposerEvent::WorkspaceCommand(command) => {
                     this.pending_workspace_command = Some(*command);
                     cx.notify();
@@ -2642,6 +2649,11 @@ impl Shell {
             browsers: std::collections::HashMap::new(),
             browser_subs: std::collections::HashMap::new(),
             browser_seq: 0,
+            browser_host_id: uuid::Uuid::new_v4().to_string(),
+            browser_host_task: None,
+            browser_host_connected: false,
+            browser_host_revision: 0,
+            browser_host_tabs: Vec::new(),
             chat_pull_requests: std::collections::HashMap::new(),
             chat_pull_request_seq: 0,
             browser_context: crate::browser::BrowserContext::default(),
@@ -4052,14 +4064,25 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.active_chat.is_empty() {
-            return;
+        let _ = self.add_browser_surface_for(self.active_chat.clone(), url, true, window, cx);
+    }
+
+    fn add_browser_surface_for(
+        &mut self,
+        chat_id: String,
+        url: Option<String>,
+        activate: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<u64> {
+        if chat_id.is_empty() {
+            return None;
         }
         self.sync_browser_profile(cx);
-        let key = self.panel_key(cx);
+        let key = chat_id.clone();
         let remote = {
             let state = self.state.read(cx);
-            state.selected_chat_row().is_some_and(|chat| {
+            state.chats.iter().find(|chat| chat.id == chat_id).is_some_and(|chat| {
                 Some(chat.device_id.as_str()) != state.local_device_id.as_deref()
             })
         };
@@ -4069,7 +4092,7 @@ impl Shell {
             crate::browser::BrowserSurface::new(self.browser_context.clone(), remote, window, cx)
         });
         if let Some(handle) = self.state.read(cx).engine().cloned() {
-            let chat_id = self.active_chat.clone();
+            let chat_id = chat_id.clone();
             browser.update(cx, |browser, cx| {
                 browser.watch_previews(handle, chat_id, cx)
             });
@@ -4079,6 +4102,15 @@ impl Shell {
             match event {
                 crate::browser::BrowserEvent::Changed => cx.notify(),
                 crate::browser::BrowserEvent::NewTab(url) => {
+                    let enabled = this.browsers.get(&id).is_some_and(|browser| browser.read(cx).agent_control);
+                    if enabled && url.is_some() {
+                        if let Some(new_id) = this.add_browser_surface_for(owner.clone(), url.clone(), false, window, cx) {
+                            this.browsers[&new_id].update(cx, |browser, cx| browser.set_agent_control(true, cx));
+                            this.publish_browser_tabs(cx);
+                            cx.notify();
+                        }
+                        return;
+                    }
                     // A background page cannot open a tab in the wrong session.
                     if this.panel_key(cx) == owner
                         && this.resolved_right_active(cx) == RightSurface::Browser(id)
@@ -4097,14 +4129,16 @@ impl Shell {
             .entry(key)
             .or_default()
             .push(RightSurface::Browser(id));
-        self.set_right_active(RightSurface::Browser(id), cx);
+        if activate { self.set_right_active(RightSurface::Browser(id), cx); }
         browser.update(cx, |browser, cx| {
             if let Some(url) = url {
-                browser.navigate(&url, window, cx);
-            } else {
+                if activate { browser.navigate(&url, window, cx); }
+                else { browser.navigate_for_agent(&url, window, cx); }
+            } else if activate {
                 browser.focus_address(window, cx);
             }
         });
+        Some(id)
     }
 
     /// The picker's Diffs card / the `+` menu's Diff row: every click opens a
@@ -4543,6 +4577,10 @@ impl Shell {
         event: &TranscriptEvent,
         cx: &mut Context<Self>,
     ) {
+        self.open_subagent(event, cx);
+    }
+
+    fn open_subagent(&mut self, event: &TranscriptEvent, cx: &mut Context<Self>) {
         match event {
             TranscriptEvent::OpenSubagent {
                 chat_id,
@@ -8463,20 +8501,6 @@ impl Shell {
         let shows_metadata = branch.is_some() || change_request.is_some();
         let queued = queued && !undelivered;
         let working = status == zeron_proto::ChatIndicator::Working && !queued && !undelivered;
-        // Subagents running under this chat show as a "● N" pill beside the
-        // row's own activity indicator, never in place of it: the pill takes
-        // the time stamp's spot (compact) or leads the status (regular), and
-        // keeps showing after the parent's own turn has settled.
-        let running_subagents = self.state.read(cx).running_subagents_for(&id, Utc::now());
-        let subagent_pill = |suffix: &str| {
-            (running_subagents > 0).then(|| {
-                crate::running_pill::running_pill(
-                    format!("{row_id}-subagents-{suffix}"),
-                    running_subagents,
-                    theme,
-                )
-            })
-        };
         let compact_status = compact.then(|| {
             let glyph = if working {
                 loaders::mini_glyph_spinner(
@@ -8617,7 +8641,6 @@ impl Shell {
                         .flex_row()
                         .items_center()
                         .gap(px(6.0))
-                        .children(subagent_pill("label"))
                         .child(
                             div()
                                 .flex()
@@ -8642,7 +8665,6 @@ impl Shell {
                     .gap(px(6.0))
                     .text_size(crate::typography::ui_rems(10.0))
                     .font_weight(gpui::FontWeight::MEDIUM)
-                    .children(subagent_pill("idle"))
                     .child(time_ago.clone())
                     .into_any_element(),
             }
@@ -9053,11 +9075,6 @@ impl Shell {
                         let text_hint = compact_jump_label
                             .as_ref()
                             .is_some_and(|label| label.chars().count() > 3);
-                        // Running subagents take the time stamp's place; the
-                        // legend and the hover archive still win.
-                        let pill = (!show_legend && !show_archive)
-                            .then(|| subagent_pill("compact"))
-                            .flatten();
                         let archive_id = id.clone();
                         el.children(change_request.clone().map(|summary| {
                             if preview {
@@ -9087,7 +9104,6 @@ impl Shell {
                                 .when(text_hint, |el| {
                                     el.min_w(crate::typography::ui_rems(COMPACT_JUMP_HINT_WIDTH))
                                 })
-                                // A running-subagents pill can be wider than the plain time.
                                 .when(!text_hint, |el| el.min_w(px(30.0)))
                                 // Fixed height so swapping the time text for the
                                 // archive glyph never resizes the slot.
@@ -9137,8 +9153,6 @@ impl Shell {
                                     .flex_none()
                                     .text_color(theme.text_muted)
                                     .into_any_element()
-                                } else if let Some(pill) = pill {
-                                    pill
                                 } else {
                                     div()
                                         .whitespace_nowrap()
@@ -14078,6 +14092,8 @@ impl Render for Shell {
         }
 
         self.sync_browser_profile(cx);
+        self.ensure_browser_host(window, cx);
+        self.publish_browser_tabs(cx);
         // Manual tween drive bookkeeping for this pass (see [`WidthTween`]).
         self.reduced_motion = motion::reduced_motion(cx);
         self.motion_active.set(false);

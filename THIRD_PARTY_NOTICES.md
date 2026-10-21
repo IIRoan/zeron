@@ -457,3 +457,13 @@ as `Voice/WebRTC-LICENSE.txt`. The binary also contains WebRTC's own bundled
 third-party components (such as BoringSSL, libsrtp, Opus, libyuv and Abseil)
 under their respective licenses; see the WebRTC source tree's `third_party/`
 for each license.
+
+## Optional Linux browser runtime
+
+Linux archives may include WPE WebKit, libwpe, ICU and libxml2 from the Debian
+packages pinned in `scripts/prepare-browser-runtime.py`. Their original copyright
+and license files are preserved under `browser-runtime/usr/share/doc/`; package
+URLs and SHA-256 checksums are recorded in `browser-runtime/manifest.json`.
+Corresponding Debian source packages are available from
+https://deb.debian.org/debian/pool/main/ under `w/wpewebkit/`, `libw/libwpe/`,
+`i/icu/` and `libx/libxml2/`.

@@ -1,4 +1,4 @@
-//! WebKitGTK renders offscreen in an isolated helper process. GPUI composites
+//! WebKit renders offscreen in an isolated helper process. GPUI composites
 //! its frames, so browser content uses the same clipping and blur as other UI.
 use super::model::{PageState, Presentation};
 use gpui::{Bounds, Pixels, RenderImage};
@@ -7,13 +7,20 @@ use std::{
     collections::HashMap,
     io::{Read, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{Child, Stdio},
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
 };
 use tokio::sync::mpsc::Sender;
+
+mod runtime;
+
+struct HelperExecutable {
+    path: std::path::PathBuf,
+    wpe: bool,
+}
 
 #[derive(Clone, Debug)]
 pub enum NativeEvent {
@@ -34,17 +41,15 @@ pub struct BrowserData {
 
 struct Worker {
     child: Mutex<Child>,
-    stdin: Mutex<Option<ChildStdin>>,
+    commands: Mutex<Option<std::sync::mpsc::SyncSender<Vec<u8>>>>,
     routes: Arc<Mutex<HashMap<u32, Weak<Route>>>>,
     next_id: AtomicU32,
 }
 impl Drop for Worker {
     fn drop(&mut self) {
-        // EOF asks the helper to drain pending work. Closing the pipe cannot
-        // block on a hung helper, unlike writing another command to a full pipe.
-        if let Ok(stdin) = self.stdin.get_mut() {
-            stdin.take();
-        }
+        // Closing the command mailbox drains pending input and then sends EOF.
+        // Keep the existing bounded profile-lock handoff for immediate reopen.
+        if let Ok(commands) = self.commands.get_mut() { commands.take(); }
         if let Ok(child) = self.child.get_mut() {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
             loop {
@@ -62,7 +67,10 @@ impl Drop for Worker {
         }
     }
 }
+
 struct Route {
+    notification_pending: AtomicBool,
+    pending: Mutex<HashMap<String, tokio::sync::oneshot::Sender<Result<Value, String>>>>,
     tx: Sender<NativeEvent>,
     state: Mutex<PageState>,
     frame: Mutex<Option<(Arc<RenderImage>, f32)>>,
@@ -71,22 +79,48 @@ struct Route {
     evaluation: Mutex<Option<Value>>,
 }
 
-fn helper_path() -> Result<std::path::PathBuf, String> {
+fn helper_paths() -> Result<Vec<HelperExecutable>, String> {
     let root = std::env::var_os("XDG_CACHE_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|p| std::path::PathBuf::from(p).join(".cache")))
         .ok_or("Could not locate the browser cache directory")?
         .join("zeron/browser");
-    extract_helper(&root)
+    let software = extract_helper(&root)?;
+    #[cfg(zeron_wpe)]
+    {
+        let hardware = extract_binary(
+            &root,
+            include_bytes!(concat!(env!("OUT_DIR"), "/zeron-webkit-wpe")),
+        )?;
+        Ok(vec![
+            HelperExecutable {
+                path: hardware,
+                wpe: true,
+            },
+            HelperExecutable {
+                path: software,
+                wpe: false,
+            },
+        ])
+    }
+    #[cfg(not(zeron_wpe))]
+    Ok(vec![HelperExecutable {
+        path: software,
+        wpe: false,
+    }])
 }
 
 fn extract_helper(root: &std::path::Path) -> Result<std::path::PathBuf, String> {
-    use sha2::{Digest, Sha256};
     const HELPER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/zeron-webkit"));
-    let hash = format!("{:x}", Sha256::digest(HELPER));
+    extract_binary(root, HELPER)
+}
+
+fn extract_binary(root: &std::path::Path, binary: &[u8]) -> Result<std::path::PathBuf, String> {
+    use sha2::{Digest, Sha256};
+    let hash = format!("{:x}", Sha256::digest(binary));
     std::fs::create_dir_all(root).map_err(|e| e.to_string())?;
     let path = root.join(format!("webkit-{hash}"));
-    if std::fs::read(&path).ok().as_deref() != Some(HELPER) {
+    if std::fs::read(&path).ok().as_deref() != Some(binary) {
         // Different profiles can now initialize concurrently. Each extraction
         // needs its own staging file, even within the same application process.
         let temp = root.join(format!(
@@ -100,7 +134,7 @@ fn extract_helper(root: &std::path::Path) -> Result<std::path::PathBuf, String> 
                 .create_new(true)
                 .mode(0o700)
                 .open(&temp)?;
-            f.write_all(HELPER)?;
+            f.write_all(binary)?;
             f.sync_all()?;
             std::fs::rename(&temp, &path)
         })();
@@ -118,7 +152,7 @@ fn read_startup(stdout: &mut impl Read) -> Result<(), String> {
     let mut header = [0u8; 9];
     stdout.read_exact(&mut header).map_err(|error| {
         format!(
-            "Browser helper could not start: {error}. Check the WebKitGTK 4.1 runtime and display."
+            "Browser helper could not start: {error}. Check the browser runtime and graphics support."
         )
     })?;
     let length = u32::from_le_bytes(header[5..9].try_into().unwrap()) as usize;
@@ -134,6 +168,65 @@ fn read_startup(stdout: &mut impl Read) -> Result<(), String> {
         b'E' => Err(String::from_utf8_lossy(&message).into_owned()),
         _ => Err("Invalid browser startup response".into()),
     }
+}
+
+type HelperProcess = (Child, std::process::ChildStdin, std::process::ChildStdout);
+
+fn start_helper(
+    executable: &HelperExecutable,
+    profile: Option<&std::path::Path>,
+) -> Result<HelperProcess, String> {
+    let mut command = runtime::command(&executable.path, profile, executable.wpe)?;
+    if std::env::var("ZERON_BROWSER_RENDERER").as_deref() == Ok("software") {
+        command.env("LIBGL_ALWAYS_SOFTWARE", "1");
+    }
+    if let Some(profile) = profile {
+        command.arg("--profile").arg(profile);
+    }
+    let mut child = command
+        .env_remove("LD_LIBRARY_PATH")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| format!("Could not start browser helper: {e}"))?;
+    let stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut stdout = stdout;
+        let result = read_startup(&mut stdout).map(|_| stdout);
+        let _ = ready_tx.send(result);
+    });
+    match ready_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok(Ok(stdout)) => Ok((child, stdin, stdout)),
+        result => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(match result {
+                Ok(Err(error)) => error,
+                Err(error) => format!("Browser startup did not complete: {error}"),
+                _ => unreachable!(),
+            })
+        }
+    }
+}
+
+fn start_available_helper(
+    executables: &[HelperExecutable],
+    profile: Option<&std::path::Path>,
+) -> Result<HelperProcess, String> {
+    let mut failure = "No browser helper was built".to_owned();
+    for executable in executables {
+        match start_helper(executable, profile) {
+            Ok(process) => return Ok(process),
+            Err(error) => {
+                tracing::debug!(helper = %executable.path.display(), %error, "browser backend startup failed");
+                failure = error;
+            }
+        }
+    }
+    Err(failure)
 }
 
 impl BrowserData {
@@ -176,41 +269,19 @@ impl BrowserData {
             }
         }
         #[cfg(test)]
-        let executable = self
+        let executables = self
             .helper_override
             .clone()
-            .map(Ok)
-            .unwrap_or_else(helper_path)?;
+            .map(|path| Ok(vec![HelperExecutable { path, wpe: false }]))
+            .unwrap_or_else(helper_paths)?;
         #[cfg(not(test))]
-        let executable = helper_path()?;
-        let mut command = Command::new(executable);
-        if let Some(profile) = &self.profile {
-            command.arg("--profile").arg(&profile.root);
-        }
-        let mut child = command.env_remove("LD_LIBRARY_PATH").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn()
-            .map_err(|e| format!("Could not start WebKitGTK: {e}. Install the WebKitGTK 4.1 runtime for your distribution."))?;
-        let stdin = child.stdin.take().unwrap();
-        let stdout = child.stdout.take().unwrap();
-        // Report startup/storage failures on the page instead of silently opening
-        // an ephemeral session. Bound the wait if the display/runtime hangs.
-        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
-        std::thread::spawn(move || {
-            let mut stdout = stdout;
-            let result = read_startup(&mut stdout).map(|_| stdout);
-            let _ = ready_tx.send(result);
-        });
-        let mut stdout = match ready_rx.recv_timeout(std::time::Duration::from_secs(10)) {
-            Ok(Ok(stdout)) => stdout,
-            result => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(match result {
-                    Ok(Err(error)) => error,
-                    Err(error) => format!("Browser startup did not complete: {error}"),
-                    _ => unreachable!(),
-                });
-            }
-        };
+        let executables = helper_paths()?;
+        // Retry only the startup handshake, before any page commands or user
+        // input exist. Missing WPE runtimes/GPUs can use GTK without replaying
+        // navigation or switching a live tab to another browser session.
+        let (child, mut stdin, mut stdout) = start_available_helper(
+            &executables, self.profile.as_ref().map(|profile| profile.root.as_path()),
+        )?;
         let routes: Arc<Mutex<HashMap<u32, Weak<Route>>>> = Arc::default();
         let reader_routes = routes.clone();
         std::thread::Builder::new().name("browser-frames".into()).spawn(move || {
@@ -220,17 +291,20 @@ impl BrowserData {
                     let id = u32::from_le_bytes(header[1..5].try_into().unwrap());
                     let length = u32::from_le_bytes(header[5..9].try_into().unwrap()) as usize;
                     if length > 8192 * 8192 * 4 + 12 { return Err(std::io::Error::other("Browser packet is too large")); }
-                    let mut data = vec![0; length]; stdout.read_exact(&mut data)?;
+                    let mut frame_header = [0u8; 12];
+                    let frame = header[0] == b'F' && length >= 12;
+                    if frame { stdout.read_exact(&mut frame_header)?; }
+                    let mut data = vec![0; length - if frame {12} else {0}];
+                    stdout.read_exact(&mut data)?;
                     let route = reader_routes.lock().unwrap().get(&id).and_then(Weak::upgrade);
                     let Some(route) = route else { continue; };
                     let event = match header[0] {
                         b'F' => {
-                            if data.len() < 12 { continue; }
-                            let width = u32::from_le_bytes(data[..4].try_into().unwrap());
-                            let height = u32::from_le_bytes(data[4..8].try_into().unwrap());
-                            let scale=f32::from_bits(u32::from_le_bytes(data[8..12].try_into().unwrap()));
+                            if !frame { continue; }
+                            let width = u32::from_le_bytes(frame_header[..4].try_into().unwrap());
+                            let height = u32::from_le_bytes(frame_header[4..8].try_into().unwrap());
+                            let scale=f32::from_bits(u32::from_le_bytes(frame_header[8..12].try_into().unwrap()));
                             if !scale.is_finite() || !(0.5..=4.).contains(&scale) {continue;}
-                            data.drain(..12);
                             let Some(pixels) = image::RgbaImage::from_raw(width, height, data) else { continue; };
                             *route.frame.lock().unwrap() = Some((Arc::new(RenderImage::new([image::Frame::new(pixels)])),scale));
                             NativeEvent::Frame
@@ -248,6 +322,18 @@ impl BrowserData {
                             *route.state.lock().unwrap() = state; NativeEvent::Changed
                         }
                         b'M' => {let Ok(menu)=serde_json::from_slice(&data) else {continue;};NativeEvent::Menu(menu)}
+                        b'A' => {
+                            if let Ok(value) = serde_json::from_slice::<Value>(&data)
+                                && let Some(request_id) = value["requestId"].as_str()
+                                && let Some(reply) = route.pending.lock().unwrap().remove(request_id)
+                            {
+                                let result = if let Some(error) = value["error"].as_str() {
+                                    Err(error.to_owned())
+                                } else { Ok(value["result"].clone()) };
+                                let _ = reply.send(result);
+                            }
+                            continue;
+                        }
                         b'C' => NativeEvent::Clipboard(String::from_utf8_lossy(&data).into_owned()),
                         b'N' => NativeEvent::NewTab(String::from_utf8_lossy(&data).into_owned()),
                         #[cfg(feature = "browser-fixture")]
@@ -258,7 +344,13 @@ impl BrowserData {
                     // never accumulates video frames or blocks the engine.
                     match event {
                         NativeEvent::NewTab(_) | NativeEvent::Clipboard(_) | NativeEvent::Menu(_) => { let _ = route.tx.blocking_send(event); }
-                        _ => { let _ = route.tx.try_send(event); }
+                        _ => {
+                            if !route.notification_pending.swap(true, Ordering::AcqRel)
+                                && route.tx.try_send(event).is_err()
+                            {
+                                route.notification_pending.store(false, Ordering::Release);
+                            }
+                        }
                     }
                 }
             })();
@@ -266,14 +358,26 @@ impl BrowserData {
                 for route in reader_routes.lock().unwrap().values().filter_map(Weak::upgrade) {
                     let mut state = route.state.lock().unwrap();
                     state.loading = false;
-                    state.error = Some("The browser helper stopped. Check that WebKitGTK 4.1 is installed, then reopen the tab.".into());
+                    state.error = Some("The browser helper stopped. Check the browser runtime, then reopen the tab.".into());
+                    route.pending.lock().unwrap().clear();
                     drop(state); let _ = route.tx.try_send(NativeEvent::Changed);
                 }
             }
         }).map_err(|e| e.to_string())?;
+        // A full or stopped helper cannot block keyboard/mouse delivery on
+        // GPUI. The bounded mailbox also prevents unbounded input accumulation.
+        let (commands, pending) = std::sync::mpsc::sync_channel::<Vec<u8>>(256);
+        std::thread::Builder::new().name("browser-commands".into()).spawn(move || {
+            while let Ok(data) = pending.recv() {
+                if stdin.write_all(&(data.len() as u32).to_le_bytes())
+                    .and_then(|_| stdin.write_all(&data)).is_err() {
+                    break;
+                }
+            }
+        }).map_err(|error| error.to_string())?;
         let worker = Arc::new(Worker {
             child: Mutex::new(child),
-            stdin: Mutex::new(Some(stdin)),
+            commands: Mutex::new(Some(commands)),
             routes,
             next_id: AtomicU32::new(1),
         });
@@ -283,13 +387,25 @@ impl BrowserData {
 }
 impl Worker {
     fn send(&self, id: u32, mut command: Value) -> Result<(), String> {
+        let closing = command["cmd"] == "close";
         command["id"] = id.into();
         let data = serde_json::to_vec(&command).map_err(|e| e.to_string())?;
-        let mut stdin = self.stdin.lock().unwrap();
-        let pipe = stdin.as_mut().ok_or("Browser helper is shutting down")?;
-        pipe.write_all(&(data.len() as u32).to_le_bytes())
-            .and_then(|_| pipe.write_all(&data))
-            .map_err(|e| e.to_string())
+        if data.len() > 1024 * 1024 {
+            return Err("Browser command is too large".into());
+        }
+        let sender = self.commands.lock().unwrap().as_ref()
+            .ok_or("Browser helper is shutting down")?.clone();
+        match sender.try_send(data) {
+            Ok(()) => Ok(()),
+            // A closed tab must not leave a live page behind when input is
+            // backed up. Wait for its close off the UI thread, in queue order.
+            Err(std::sync::mpsc::TrySendError::Full(data)) if closing => {
+                std::thread::Builder::new().name("browser-close".into()).spawn(move || {
+                    let _ = sender.send(data);
+                }).map(|_| ()).map_err(|error| error.to_string())
+            }
+            Err(error) => Err(format!("Browser input unavailable: {error}")),
+        }
     }
 }
 
@@ -332,6 +448,8 @@ impl NativePage {
         let worker = data.worker()?;
         let id = worker.next_id.fetch_add(1, Ordering::Relaxed);
         let route = Arc::new(Route {
+            notification_pending: AtomicBool::new(false),
+            pending: Default::default(),
             tx,
             state: Mutex::default(),
             frame: Mutex::default(),
@@ -362,12 +480,30 @@ impl NativePage {
         })
     }
     pub fn load(&self, url: &str) -> Result<(), String> {
-        self.worker.send(self.id, json!({"cmd":"load","url":url}))
+        {
+            let mut state = self.route.state.lock().unwrap();
+            state.loading = true;
+            state.error = None;
+        }
+        let result = self.worker.send(self.id, json!({"cmd":"load","url":url}));
+        if let Err(error) = &result {
+            let mut state = self.route.state.lock().unwrap();
+            state.loading = false;
+            state.error = Some(error.clone());
+        }
+        result
     }
     pub fn reload(&self) {
+        self.route.state.lock().unwrap().loading = true;
         self.command(json!({"cmd":"reload"}));
     }
     pub fn history(&self, forward: bool) {
+        {
+            let mut state = self.route.state.lock().unwrap();
+            if if forward { state.can_forward } else { state.can_back } {
+                state.loading = true;
+            }
+        }
         self.command(json!({"cmd":if forward {"forward"} else {"back"}}));
     }
     pub fn state(&self) -> PageState {
@@ -412,7 +548,13 @@ impl NativePage {
         }
     }
     pub fn command(&self, value: Value) {
-        let _ = self.worker.send(self.id, value);
+        if let Err(error) = self.worker.send(self.id, value) {
+            let mut state = self.route.state.lock().unwrap();
+            state.loading = false;
+            state.error = Some(error);
+            drop(state);
+            let _ = self.route.tx.try_send(NativeEvent::Changed);
+        }
     }
     #[cfg(feature = "browser-fixture")]
     pub fn evaluate(&self, script: &str) {
@@ -426,8 +568,81 @@ impl NativePage {
 }
 impl Drop for NativePage {
     fn drop(&mut self) {
+        self.route.pending.lock().unwrap().clear();
         self.command(json!({"cmd":"close"}));
         self.worker.routes.lock().unwrap().remove(&self.id);
+    }
+}
+
+struct PendingEvaluation(Arc<Route>, String);
+impl Drop for PendingEvaluation {
+    fn drop(&mut self) {
+        self.0.pending.lock().unwrap().remove(&self.1);
+    }
+}
+
+async fn evaluate(worker: &Worker, route: &Arc<Route>, id: u32, command: Value) -> Result<Value, String> {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    {
+        let mut pending = route.pending.lock().unwrap();
+        if pending.len() >= 32 { return Err("browser_busy: too many pending page operations".into()); }
+        pending.insert(request_id.clone(), tx);
+    }
+    let _pending = PendingEvaluation(route.clone(), request_id.clone());
+    let mut command = command;
+    command["requestId"] = request_id.into();
+    worker.send(id, command)?;
+    let value = rx.await.map_err(|_| "browser_closed: tab or helper closed".to_owned())??;
+    Ok(value)
+}
+
+impl NativePage {
+    pub fn automate(&self, command: zeron_proto::browser::BrowserAction) -> super::automation::BrowserWork {
+        use zeron_proto::browser::BrowserAction as Action;
+        use futures::FutureExt;
+        let worker = self.worker.clone();
+        let route = self.route.clone();
+        let id = self.id;
+        async move {
+            if route.state.lock().unwrap().loading {
+                return Err("browser_loading: wait for the page to finish loading".into());
+            }
+            if let Some(error) = &route.state.lock().unwrap().error {
+                return Err(format!("browser_page_error: {error}"));
+            }
+            let script = match &command {
+                Action::Screenshot => return evaluate(&worker, &route, id, json!({"cmd":"screenshot"})).await,
+                Action::Evaluate { script } => script.clone(),
+                Action::Type { text } => {
+                    worker.send(id, json!({"cmd":"text","text":text}))?;
+                    "({ok:true})".into()
+                }
+                Action::Keypress { key } => {
+                    let key = match key.as_str() {
+                        "Enter" => "Return", "Backspace" => "BackSpace", "ArrowLeft" => "Left", "ArrowRight" => "Right",
+                        "ArrowUp" => "Up", "ArrowDown" => "Down", "PageUp" => "Page_Up", "PageDown" => "Page_Down",
+                        "Tab" | "Escape" | "Delete" | "Home" | "End" => key,
+                        "Space" => "space",
+                        key if key.chars().count() == 1 => key,
+                        _ => return Err("browser_invalid_key: use Enter, Tab, Escape, arrow keys, or one character".into()),
+                    };
+                    worker.send(id, json!({"cmd":"keypress","key":key,"text":""}))?;
+                    "({ok:true})".into()
+                }
+                _ => super::automation::script(&command)?,
+            };
+            let value = evaluate(&worker, &route, id, json!({"cmd":"automate","script":script})).await?;
+            let value = if matches!(command, Action::Evaluate { .. }) { value } else { super::automation::checked_result(value)? };
+            if matches!(command, Action::Click { .. }) {
+                let point = &value["point"];
+                let x = point["x"].as_f64().ok_or("browser_invalid_target")?;
+                let y = point["y"].as_f64().ok_or("browser_invalid_target")?;
+                worker.send(id, json!({"cmd":"click","x":x,"y":y,"button":1}))?;
+                return evaluate(&worker, &route, id, json!({"cmd":"automate","script":"({clicked:true})"})).await;
+            }
+            Ok(value)
+        }.boxed()
     }
 }
 
@@ -450,6 +665,8 @@ impl super::BrowserSurface {
             let _ = this.update_in(cx, |this, _, cx| {
                 this.native_startup = None;
                 let result = result.and_then(|mut native| {
+                    native.route.notification_pending.store(false, Ordering::Release);
+                    let _ = native.route.tx.try_send(NativeEvent::Changed);
                     native.present(this.presentation);
                     let result = this
                         .page
@@ -480,10 +697,11 @@ impl super::BrowserSurface {
         let Some(native) = &mut self.native else {
             return;
         };
+        native.route.notification_pending.store(false, Ordering::Release);
         native.update_frame(window);
         match event {
             NativeEvent::NewTab(url) => {
-                if self.presentation == Presentation::Live {
+                if self.presentation == Presentation::Live || self.agent_control {
                     cx.emit(super::BrowserEvent::NewTab(Some(url)));
                 }
             }

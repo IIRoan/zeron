@@ -91,6 +91,25 @@ async fn capture_frame(
     capture(directory, name)
 }
 
+#[cfg(target_os = "linux")]
+fn validate_browser_content(directory: &std::path::Path, name: &str, region: gpui::Bounds<gpui::Pixels>, window_width: f32) -> anyhow::Result<()> {
+    let image = image::open(directory.join(format!("{name}.png")))?.to_rgb8();
+    let scale = image.width() as f32 / window_width;
+    let x0 = (f32::from(region.origin.x) * scale).max(0.) as u32;
+    let y0 = (f32::from(region.origin.y) * scale).max(0.) as u32;
+    let x1 = ((f32::from(region.origin.x + region.size.width) * scale) as u32).min(image.width());
+    let y1 = ((f32::from(region.origin.y + region.size.height) * scale) as u32).min(image.height());
+    let mut ink = 0;
+    for y in (y0..y1).step_by(4) {
+        for x in (x0..x1).step_by(4) {
+            let [r,g,b] = image.get_pixel(x,y).0;
+            if r < 100 && g > r.saturating_add(8) && b < g { ink += 1; }
+        }
+    }
+    anyhow::ensure!(ink > 50, "{name}: the browser frame is blank ({ink} content samples)");
+    Ok(())
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn validate_blur(
     directory: &std::path::Path,
@@ -218,8 +237,13 @@ fn main() -> anyhow::Result<()> {
             s
         });
         let boot = EngineBootConfig { data_dir: data, ipc_port: 0, edge_url: String::new(), edge_token: None, org_id: None, workos_client_id: None, default_harness: HarnessId::ClaudeCode };
+        let fixture_size = if std::env::var_os("ZERON_BROWSER_AUTOMATION_CAPTURE_ONLY").is_some() {
+            size(px(1200.), px(900.))
+        } else {
+            size(px(1000.), px(680.))
+        };
         let window = cx.open_window(WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(Bounds::new(gpui::point(px(12.),px(30.)), size(px(1000.),px(680.))))),
+            window_bounds: Some(WindowBounds::Windowed(Bounds::new(gpui::point(px(12.),px(30.)), fixture_size))),
             titlebar: Some(gpui::TitlebarOptions { title: None, appears_transparent: true, traffic_light_position: Some(gpui::point(px(14.),px(14.))) }),
             app_owns_titlebar_drag: true,
             ..Default::default()
@@ -259,6 +283,31 @@ fn main() -> anyhow::Result<()> {
                     }
                     pause(cx, 500).await;
                     capture_frame(window, &output, "browser-preview-dark", cx).await?;
+                    if std::env::var_os("ZERON_BROWSER_AUTOMATION_CAPTURE_ONLY").is_some() {
+                        first.update(cx, |browser, cx| browser.fixture_set_agent_control(true, cx));
+                        for (mode, name) in [
+                            (appearance::AppearanceMode::Dark, "browser-agent-control-dark"),
+                            (appearance::AppearanceMode::Light, "browser-agent-control-light"),
+                        ] {
+                            cx.update(|cx| appearance::set_mode(mode, cx));
+                            for (surface, suffix) in [
+                                (zeron_theme::SurfacePreference::Frosted, "frosted"),
+                                (zeron_theme::SurfacePreference::Opaque, "opaque"),
+                            ] {
+                                cx.update(|cx| appearance::set_surface(surface, cx));
+                                pause(cx, 350).await;
+                                capture_frame(window, &output, &format!("{name}-{suffix}"), cx).await?;
+                                #[cfg(target_os = "linux")]
+                                {
+                                    let region = first.read_with(cx, |browser, _| browser.fixture_linux_bounds());
+                                    let width = gpui::AnyWindowHandle::from(window).update(cx, |_, window, _| f32::from(window.viewport_size().width))?;
+                                    validate_browser_content(&output, &format!("{name}-{suffix}"), region, width)?;
+                                }
+                            }
+                        }
+                        std::fs::write(output.join("result.txt"), "PASS: native browser with agent-control toolbar, dark/light and frosted/opaque captures.\n")?;
+                        return Ok(());
+                    }
                     // Real DOM click, native navigation and history.
                     first.read_with(cx, |b, _| b.fixture_eval("document.getElementById('details').click()"));
                     let deadline = std::time::Instant::now() + Duration::from_secs(15);

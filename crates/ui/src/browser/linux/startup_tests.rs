@@ -91,6 +91,89 @@ fn init(cx: &mut TestAppContext) {
     });
 }
 
+#[test]
+fn failed_gpu_startup_releases_the_profile_before_starting_the_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let write = |name: &str, ready: bool| {
+        let path = dir.path().join(name);
+        let packet = if ready { "b'R', 0, 0" } else { "b'E', 0, 6" };
+        let body = if ready { "b''" } else { "b'no GPU'" };
+        std::fs::write(
+            &path,
+            format!(
+                r#"#!/usr/bin/env python3
+import fcntl, pathlib, struct, sys, time
+profile = pathlib.Path(sys.argv[2])
+lock = (profile / 'profile.lock').open('a')
+fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+sys.stdout.buffer.write(struct.pack('<cII', {packet}) + {body})
+sys.stdout.buffer.flush()
+{finish}
+"#,
+                finish = if ready {
+                    "sys.stdin.buffer.read()"
+                } else {
+                    "time.sleep(60)"
+                }
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    };
+    let candidates = [write("gpu.py", false), write("software.py", true)]
+        .map(|path| HelperExecutable { path, wpe: false });
+    let (mut child, stdin, _) = start_available_helper(&candidates, Some(dir.path())).unwrap();
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
+fn stalled_helper_input_does_not_block_the_sender_and_is_bounded() {
+    let root = tempfile::tempdir().unwrap();
+    let executable = root.path().join("helper.py");
+    std::fs::write(
+        &executable,
+        r#"#!/usr/bin/env python3
+import struct, sys, time
+sys.stdout.buffer.write(struct.pack('<cII', b'R', 0, 0))
+sys.stdout.buffer.flush()
+time.sleep(60)
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let data = BrowserData {
+        helper_override: Some(executable),
+        ..Default::default()
+    };
+    let worker = data.worker().unwrap();
+    let started = Instant::now();
+    let mut bounded = false;
+    for _ in 0..300 {
+        if worker
+            .send(1, json!({"cmd":"text","text":"x".repeat(16000)}))
+            .is_err()
+        {
+            bounded = true;
+            break;
+        }
+    }
+    assert!(
+        bounded,
+        "hung helpers must not accumulate unbounded commands"
+    );
+    assert!(
+        worker.send(1, json!({"cmd":"close"})).is_ok(),
+        "closing a tab must survive input backpressure"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "input blocked the caller"
+    );
+    let _ = worker.child.lock().unwrap().kill();
+}
+
 fn until(cx: &mut TestAppContext, mut condition: impl FnMut(&mut TestAppContext) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {

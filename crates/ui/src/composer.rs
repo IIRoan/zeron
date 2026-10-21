@@ -5363,6 +5363,8 @@ impl Render for ComposerInput {
 #[derive(Debug, Clone)]
 pub enum ComposerEvent {
     WorkspaceCommand(WorkspaceCommand),
+    /// The footer opens the same transcript surface as a spawn chip.
+    OpenSubagent(crate::transcript::TranscriptEvent),
     /// Arm the shared-element transition before the draft route is replaced
     /// by the newly-created session. Emitting this before `select_chat` keeps
     /// the first destination frame on the same timeline as the source frame.
@@ -6142,7 +6144,9 @@ pub struct Composer {
     /// The footer's rings: plan usage of the session harness's live
     /// account, and context occupancy — each opening a popover.
     account_usage: Entity<crate::account_usage::AccountUsage>,
-    /// A side chat's composer: its footer keeps only the context ring.
+    subagents: Entity<crate::subagents::Subagents>,
+    _subagent_events: Subscription,
+    /// A side chat's footer keeps its subagents and context ring.
     side_chat: bool,
     _picker_focus: Subscription,
     _input_events: Subscription,
@@ -6228,6 +6232,12 @@ impl Composer {
         });
         let pickers = cx.new(|cx| Pickers::new(state.clone(), cx));
         let account_usage = cx.new(|cx| crate::account_usage::AccountUsage::new(state.clone(), cx));
+        let subagents = cx.new(|cx| {
+            crate::subagents::Subagents::new(state.clone(), input.focus_handle(cx), cx)
+        });
+        let subagent_events = cx.subscribe(&subagents, |_, _, event, cx| {
+            cx.emit(ComposerEvent::OpenSubagent(event.clone()));
+        });
         // The footer toolbar (checkout kind + ref picker) is rendered INLINE
         // by the composer from picker state — a pickers-side notify (refs
         // loaded, popover toggled, pick made) must repaint the composer too.
@@ -6318,6 +6328,8 @@ impl Composer {
         });
         let current_key = state.read(cx).selected_chat.clone().unwrap_or_default();
         let mut composer = Self {
+            subagents,
+            _subagent_events: subagent_events,
             state,
             input,
             queue_edit_draft: None,
@@ -6593,8 +6605,7 @@ impl Composer {
         self.show_error(message, cx);
     }
 
-    /// Mark this as a side chat's composer: below the input it shows only
-    /// the context ring (no checkout/ref footer, no plan usage).
+    /// A side chat's footer shows its subagents and context ring.
     pub(crate) fn set_side_chat(&mut self, cx: &mut Context<Self>) {
         self.side_chat = true;
         cx.notify();
@@ -11714,6 +11725,7 @@ impl Render for Composer {
                                 .items_center()
                                 .opacity(session_chrome_opacity)
                                 .child(div().flex_1().min_w_0().children(footer.flatten()))
+                                .child(self.subagents.clone())
                                 .child(
                                     // The footer row's own 4px gap: the PR badge
                                     // ends flush with the row, so the rings keep

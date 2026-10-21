@@ -1,6 +1,7 @@
 use std::{env, path::PathBuf, process::Command};
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(zeron_wpe)");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         println!("cargo:rerun-if-changed=src/dictation/permission.m");
         let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
@@ -28,6 +29,9 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed=src/browser/linux/helper.c");
+    println!("cargo:rerun-if-changed=src/browser/linux/wpe_platform.h");
+    println!("cargo:rerun-if-changed=src/browser/linux/storage_compat.h");
+    println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
         return;
     }
@@ -62,4 +66,47 @@ fn main() {
         .status()
         .expect("C compiler is required to build the Linux browser helper");
     assert!(status.success(), "Linux browser helper compilation failed");
+
+    // WPE is optional at build and run time. Releases built with its headers
+    // prefer real GPU compositing; GTK remains available on older systems.
+    let wpe = Command::new("pkg-config")
+        .args(["--atleast-version=2.54", "wpe-webkit-2.0"])
+        .output()
+        .is_ok_and(|result| result.status.success());
+    if wpe {
+        let flags = Command::new("pkg-config")
+            .args([
+                "--cflags",
+                "--libs",
+                "wpe-webkit-2.0",
+                "json-glib-1.0",
+                "cairo",
+                "xkbcommon",
+            ])
+            .output()
+            .expect("WPE browser build flags");
+        assert!(
+            flags.status.success(),
+            "WPE browser development dependencies are incomplete"
+        );
+        let status = Command::new(env::var("CC").unwrap_or_else(|_| "cc".into()))
+            .env_remove("LD_LIBRARY_PATH")
+            .env_remove("LIBRARY_PATH")
+            .args([
+                "-std=c11",
+                "-O2",
+                "-Wall",
+                "-Wextra",
+                "-Wno-unused-parameter",
+                "-DZERON_WPE",
+                "src/browser/linux/helper.c",
+                "-o",
+            ])
+            .arg(output.with_file_name("zeron-webkit-wpe"))
+            .args(String::from_utf8(flags.stdout).unwrap().split_whitespace())
+            .status()
+            .expect("C compiler is required to build the WPE browser helper");
+        assert!(status.success(), "WPE browser helper compilation failed");
+        println!("cargo:rustc-cfg=zeron_wpe");
+    }
 }

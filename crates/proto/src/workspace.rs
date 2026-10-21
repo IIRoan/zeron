@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 /// builds may share a semver with upstream while exposing a different RPC and
 /// document surface.
 pub mod capabilities {
+    pub const BROWSER_CONTROL_V1: &str = "browser-control-v1";
     /// The host decodes durable composer references at the harness boundary.
     pub const COMPOSER_REFERENCES_V1: &str = "composer-references-v1";
     pub const MESSAGE_QUEUE_V1: &str = "message-queue-v1";
@@ -26,6 +27,7 @@ pub mod capabilities {
     pub const SIDEBAR_SECTION_ORDER_V1: &str = "sidebar-section-order-v1";
 
     pub const CURRENT: &[&str] = &[
+        BROWSER_CONTROL_V1,
         COMPOSER_REFERENCES_V1,
         MESSAGE_QUEUE_V1,
         MESSAGE_QUEUE_ACTIONS_V1,
@@ -110,6 +112,7 @@ mod tests {
                 "workspaceScope": "local",
                 "cursorSdkVersion": "1.0.31",
                 "capabilities": [
+                    "browser-control-v1",
                     "composer-references-v1",
                     "message-queue-v1",
                     "message-queue-actions-v1",

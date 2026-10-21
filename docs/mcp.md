@@ -104,6 +104,10 @@ and opens either in the right pane.
 
 ## Tools
 
+On Linux, agents can also control explicitly enabled browser tabs in their own
+chat. See [Browser automation](browser-automation.md) for tools, consent,
+platform support, and validation.
+
 Chats are referenced by full id, a unique id prefix, or an exact title.
 Projects by id, path, display name, or unique path suffix. Devices by id or
 name (default: the local engine's device).

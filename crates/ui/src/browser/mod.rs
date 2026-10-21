@@ -14,6 +14,7 @@ use windows_webview as native;
 pub mod model;
 pub(crate) mod profile;
 mod view;
+pub(crate) mod automation;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use gpui::{
@@ -97,6 +98,7 @@ impl BrowserContext {
 }
 
 pub struct BrowserSurface {
+    pub(crate) agent_control: bool,
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     context: BrowserContext,
     address: Entity<ComposerInput>,
@@ -180,6 +182,7 @@ impl BrowserSurface {
         #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
         let _ = (window, context);
         Self {
+            agent_control: false,
             #[cfg(any(target_os = "macos", target_os = "linux", windows))]
             context,
             address,
@@ -346,6 +349,14 @@ impl BrowserSurface {
     }
 
     pub fn navigate(&mut self, input: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.navigate_inner(input, true, window, cx);
+    }
+
+    pub(crate) fn navigate_for_agent(&mut self, input: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.navigate_inner(input, false, window, cx);
+    }
+
+    fn navigate_inner(&mut self, input: &str, take_focus: bool, window: &mut Window, cx: &mut Context<Self>) {
         let url = match model::normalize_address(input) {
             Ok(url) => url,
             Err(message) => {
@@ -390,7 +401,7 @@ impl BrowserSurface {
             if let Err(error) = result {
                 self.page.error = Some(format!("Could not open this page: {error}"));
             }
-            window.focus(&self.focus, cx);
+            if take_focus { window.focus(&self.focus, cx); }
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
         {

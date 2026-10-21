@@ -664,7 +664,9 @@ impl Tools {
 
     pub fn list(&self) -> Vec<ToolDef> {
         let in_chat = self.zeron.origin().chat_id.is_some();
-        catalog()
+        let mut catalog = catalog();
+        if in_chat { catalog.extend(crate::browser::catalog()); }
+        catalog
             .into_iter()
             .filter(|tool| in_chat || tool.name != SHOW_VISUAL)
             .collect()
@@ -677,6 +679,9 @@ impl Tools {
     /// `Ok` is the tool's structured result; `Err` is a message the model
     /// should read (surfaced as `isError`, never as a protocol error).
     pub async fn call(&self, name: &str, args: Value) -> Result<Value, String> {
+        if name.starts_with("browser_") {
+            return crate::browser::call(&self.zeron, name, args).await.map_err(|error| format!("{error:#}"));
+        }
         let result = match name {
             "whoami" => self.whoami().await,
             "list_devices" => self.list_devices().await,

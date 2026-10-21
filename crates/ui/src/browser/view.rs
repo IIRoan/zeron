@@ -670,7 +670,17 @@ impl Render for BrowserSurface {
         let toolbar = surface_chrome::toolbar(&theme)
             .when(!external, |el| el.child(back).child(forward).child(reload))
             .child(address)
-            .child(open);
+            .child(open)
+            .when(cfg!(target_os = "linux"), |el| {
+                el.child(button(
+                    "browser-agent-control",
+                    if self.agent_control { "Disable agent control of this tab" } else { "Allow this chat's agent to control this tab" },
+                    icons::BOT, true, &theme, cx,
+                ).when(self.agent_control, |el| el.bg(crate::theme::ink(0.10)))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.set_agent_control(!this.agent_control, cx);
+                })))
+            });
 
         let body = div()
             .id("browser-page")

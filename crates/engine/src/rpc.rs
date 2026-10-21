@@ -720,6 +720,7 @@ enum MutateParams {
 
 #[derive(Clone)]
 pub struct EngineRpc {
+    browser: crate::browser::BrowserBroker,
     voice: crate::voice::VoiceManager,
     sessions: SessionsEngine,
     doc_host: DocHost,
@@ -768,6 +769,7 @@ impl EngineRpc {
         };
         let github = GitHubCli::new().with_store(repos.data_dir());
         Self {
+            browser: Default::default(),
             voice: sessions.voice_manager(),
             sessions,
             doc_host,
@@ -794,6 +796,11 @@ impl EngineRpc {
 
     pub fn with_previews(mut self, previews: zeron_preview::PreviewService) -> Self {
         self.previews = Some(previews);
+        self
+    }
+
+    pub fn with_browser(mut self, browser: crate::browser::BrowserBroker) -> Self {
+        self.browser = browser;
         self
     }
 
@@ -1977,6 +1984,27 @@ impl RpcService for EngineRpc {
                 .await;
         }
         match method {
+            methods::ATTACH_BROWSER_HOST => {
+                let id = params.get("hostId").and_then(|v| v.as_str()).ok_or_else(|| RpcError::BadParams("hostId required".into()))?;
+                Ok(RpcReply::Stream(self.browser.attach(id.into())?))
+            }
+            methods::UPDATE_BROWSER_HOST => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Update { host_id: String, revision: u64, tabs: Vec<zeron_proto::browser::BrowserTab> }
+                let update: Update = parse_params(params)?;
+                self.browser.update(&update.host_id, update.revision, update.tabs)?;
+                RpcReply::value(&serde_json::json!({}))
+            }
+            methods::REPLY_BROWSER_HOST => {
+                self.browser.reply(parse_params(params)?)?;
+                RpcReply::value(&serde_json::json!({}))
+            }
+            methods::LIST_BROWSER_TABS => {
+                let chat = params.get("chatId").and_then(|v| v.as_str()).ok_or_else(|| RpcError::BadParams("chatId required".into()))?;
+                RpcReply::value(&self.browser.list(chat))
+            }
+            methods::CONTROL_BROWSER => Ok(RpcReply::Value(self.browser.execute(parse_params(params)?).await?)),
             methods::ENGINE_INFO => RpcReply::value(&self.engine_info),
             methods::ENGINE_READY => RpcReply::value(&serde_json::json!({ "ready": true })),
             methods::LIST_HARNESSES => RpcReply::value(&self.registry.descriptors()),
