@@ -655,6 +655,18 @@ async fn switching_worktrees_cancels_old_crash_recovery_and_rejects_unrelated_ag
     f.control("a", "start", None).await;
     tokio::time::timeout(Duration::from_secs(15),async{loop{let snapshot=f.core.project_actions.project_terminals.checkout_snapshot("project",&f.root,&f.a,&f.core.repos.worktree_settings().effective(&f.root,&f.a).unwrap()).unwrap();if snapshot.runs.iter().any(|r|r.status==Status::Restarting){break;}tokio::time::sleep(Duration::from_millis(20)).await;}}).await.unwrap();
     let b = f.control("b", "activate", None).await;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if std::fs::read_to_string(f.b.join("attempts"))
+                .is_ok_and(|attempts| !attempts.is_empty())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the replacement checkout's service must execute its startup command");
     tokio::time::sleep(Duration::from_millis(1200)).await;
     assert_eq!(
         std::fs::read_to_string(f.a.join("attempts"))

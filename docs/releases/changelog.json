@@ -4,6 +4,16 @@
   "fork_repository": "IIRoan/zeron",
   "releases": [
     {
+      "version": "0.2.129",
+      "upstream_commit": "8b7afb306d25ecd3508200eaad66aeb8cf46e736",
+      "upstream_url": "https://github.com/zeronsh/zeron/releases/tag/v0.2.129",
+      "published_at": "2026-10-28T10:13:47Z",
+      "notes_source": "github_release",
+      "upstream_notes": "**Full Changelog**: https://github.com/zeronsh/zeron/compare/v0.2.128...v0.2.129",
+      "fork_changes": [],
+      "fork_through_commit": "88dab5337b39f43d66a3e3d2938ae8688dcdaf6a"
+    },
+    {
       "version": "0.2.128",
       "upstream_commit": "ab189159f10cf8e63c0502be75a59bbc487e0eaf",
       "upstream_url": "https://github.com/zeronsh/zeron/releases/tag/v0.2.128",

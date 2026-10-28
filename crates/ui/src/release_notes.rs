@@ -351,7 +351,13 @@ mod tests {
             .current_index(zeron_update::current_version())
             .unwrap();
         assert!(catalog.releases.get(index + 1).is_some());
-        assert!(!catalog.releases[index].release.fork_changes.is_empty());
+        // An upstream-only update can have no new fork commits, while the
+        // bundled history must retain the earlier fork changes.
+        assert!(
+            catalog.releases[index..]
+                .iter()
+                .any(|entry| !entry.release.fork_changes.is_empty())
+        );
         assert!(catalog.current_index("99.0.0").is_none());
     }
 
