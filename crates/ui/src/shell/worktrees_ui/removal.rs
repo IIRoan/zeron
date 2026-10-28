@@ -227,7 +227,7 @@ impl Shell {
                                 .is_some_and(|cwd| path_within(Path::new(cwd), &root, local))
                     });
                     if selected_removed {
-                        shell.open_new_session(Some(project.space.clone()), cx);
+                        shell.open_new_session(Some(crate::shell::NewSessionTarget::Project(project.space.clone())), cx);
                     }
                 }
                 if epoch != shell.worktree_settings.epoch {

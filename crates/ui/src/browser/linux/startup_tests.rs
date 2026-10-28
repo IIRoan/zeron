@@ -92,6 +92,33 @@ fn init(cx: &mut TestAppContext) {
 }
 
 #[test]
+fn helper_shutdown_cancels_pending_automation() {
+    let (tx, mut events) = tokio::sync::mpsc::channel(4);
+    let (reply, mut result) = tokio::sync::oneshot::channel();
+    let route = Arc::new(Route {
+        notification_pending: AtomicBool::new(false),
+        pending: Mutex::new(HashMap::from([("request".into(), reply)])),
+        tx,
+        state: Mutex::default(),
+        frame: Mutex::default(),
+        surface: Mutex::default(),
+        input: Mutex::new(json!({})),
+        #[cfg(feature = "browser-fixture")]
+        evaluation: Mutex::default(),
+    });
+    let routes = Mutex::new(HashMap::from([(1, Arc::downgrade(&route))]));
+
+    helper_stopped(&routes, Engine::Wpe);
+
+    assert!(matches!(
+        result.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+    ));
+    assert!(route.state.lock().unwrap().error.is_some());
+    assert!(matches!(events.try_recv(), Ok(NativeEvent::Changed)));
+}
+
+#[test]
 fn failed_gpu_startup_releases_the_profile_before_starting_the_fallback() {
     let dir = tempfile::tempdir().unwrap();
     let write = |name: &str, ready: bool| {
@@ -121,11 +148,12 @@ sys.stdout.buffer.flush()
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         path
     };
-    let candidates = [write("gpu.py", false), write("software.py", true)]
-        .map(|path| HelperExecutable { path, wpe: false });
-    let (mut child, stdin, _) = start_available_helper(&candidates, Some(dir.path())).unwrap();
-    drop(stdin);
-    assert!(child.wait().unwrap().success());
+    let gpu = write("gpu.py", false);
+    let fallback = write("software.py", true);
+    assert!(spawn_gtk(&gpu, Some(dir.path())).is_err());
+    let worker = spawn_gtk(&fallback, Some(dir.path())).unwrap();
+    drop(worker);
+
 }
 
 #[test]
@@ -147,7 +175,7 @@ time.sleep(60)
         helper_override: Some(executable),
         ..Default::default()
     };
-    let worker = data.worker().unwrap();
+    let worker = data.worker(None).unwrap();
     let started = Instant::now();
     let mut bounded = false;
     for _ in 0..300 {
@@ -339,7 +367,7 @@ fn concurrent_profiles_can_extract_the_helper_into_a_cold_cache() {
             .map(|_| {
                 scope.spawn(|| {
                     barrier.wait();
-                    extract_helper(root.path()).unwrap()
+                    extract_helper(root.path(), "webkit", GTK_HELPER).unwrap()
                 })
             })
             .collect();

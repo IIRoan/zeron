@@ -906,7 +906,7 @@ pub fn modal(
     card: AnyElement,
     closing: Option<Instant>,
 ) -> AnyElement {
-    modal_with(id.into(), viewport, card, 16.0, closing)
+    modal_with(id.into(), viewport, card, 16.0, closing, None)
 }
 
 /// [`modal`] with custom rounding for glass palettes. Both use a light
@@ -919,7 +919,18 @@ pub fn modal_glass(
     corner_radius: f32,
     closing: Option<Instant>,
 ) -> AnyElement {
-    modal_with(id.into(), viewport, card, corner_radius, closing)
+    modal_with(id.into(), viewport, card, corner_radius, closing, None)
+}
+
+/// A glass palette whose top stays fixed as its results change height.
+pub fn modal_glass_at_top(
+    id: impl Into<ElementId>,
+    viewport: gpui::Size<Pixels>,
+    card: AnyElement,
+    top: Pixels,
+    closing: Option<Instant>,
+) -> AnyElement {
+    modal_with(id.into(), viewport, card, 16.0, closing, Some(top))
 }
 
 fn modal_with(
@@ -928,6 +939,7 @@ fn modal_with(
     card: AnyElement,
     corner_radius: f32,
     closing: Option<Instant>,
+    top: Option<Pixels>,
 ) -> AnyElement {
     let scrim = scrim_alpha(0.35);
     let layer = div()
@@ -937,7 +949,8 @@ fn modal_with(
         .h(viewport.height)
         .flex()
         .items_center()
-        .justify_center();
+        .when_some(top, |layer, top| layer.flex_col().pt(top))
+        .when(top.is_none(), |layer| layer.justify_center());
     let child_id = |name: &'static str| ElementId::NamedChild(id.clone().into(), name.into());
     // The backdrop blur ignores element opacity, so it rides the same
     // progress as the card instead of popping in or out at full strength.

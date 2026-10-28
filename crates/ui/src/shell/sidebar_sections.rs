@@ -866,6 +866,9 @@ impl Shell {
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     popover::close_popup(this, cx, |this| &mut this.section_dialog);
                                 }))
+                                .role(gpui::Role::Button)
+                                .aria_label("Close")
+                                .tooltip(crate::settings::widgets::text_tooltip("Close"))
                                 .child(
                                     icon(icons::CLOSE)
                                         .size(px(16.0))

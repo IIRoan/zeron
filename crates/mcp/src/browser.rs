@@ -260,6 +260,7 @@ mod tests {
             Origin {
                 chat_id: Some("origin".into()),
                 device_id: None,
+                side_chats_only: false,
             },
         ));
         let tools = Tools::new(zeron);

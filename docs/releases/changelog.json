@@ -4,6 +4,30 @@
   "fork_repository": "IIRoan/zeron",
   "releases": [
     {
+      "version": "0.2.128",
+      "upstream_commit": "ab189159f10cf8e63c0502be75a59bbc487e0eaf",
+      "upstream_url": "https://github.com/zeronsh/zeron/releases/tag/v0.2.128",
+      "published_at": "2026-10-28T00:15:43Z",
+      "notes_source": "github_release",
+      "upstream_notes": "## What's Changed\n* Folded user bubbles fade out; long chats scroll smoothly again by @zeronsh[bot] in https://github.com/zeronsh/zeron/pull/1089\n* Access modes and plan mode for every agent; Muse answers every approval stage by @zeronsh[bot] in https://github.com/zeronsh/zeron/pull/1088\n\n\n**Full Changelog**: https://github.com/zeronsh/zeron/compare/v0.2.127...v0.2.128",
+      "fork_changes": [
+        "Offer to create missing branches from the checkout picker",
+        "Enable direct mobile control on the installed desktop source",
+        "Preserve installed desktop source for direct mobile setup"
+      ],
+      "fork_through_commit": "b305b531906945ad5bbfe26699e25eaaefc5349f"
+    },
+    {
+      "version": "0.2.127",
+      "upstream_commit": "31d26eeb6b9447cc6ef26e994f0dc62849014ab0",
+      "upstream_url": "https://github.com/zeronsh/zeron/releases/tag/v0.2.127",
+      "published_at": "2026-10-27T18:58:16Z",
+      "notes_source": "github_release",
+      "upstream_notes": "## What's Changed\n* Cloud: per-account caps on awake machines and chats by @wingleeio in https://github.com/zeronsh/zeron/pull/1069\n* Vault: keep the canary tests offline by @alexandre-vl in https://github.com/zeronsh/zeron/pull/993\n* Codex view_image shows in the chat, and the Browser says where local files open by @alexandre-vl in https://github.com/zeronsh/zeron/pull/1012\n* Claude subagents: forward a foreground subagent's text and thinking by @alexandre-vl in https://github.com/zeronsh/zeron/pull/1042\n* Messages an agent sends other chats read as one line naming the recipient (desktop, iOS, Android) by @wingleeio in https://github.com/zeronsh/zeron/pull/1068\n* Sidebar: a session left before its message lands shows its run, not Failed by @alexandre-vl in https://github.com/zeronsh/zeron/pull/1066\n* Claude subagents: count and open only this chat's spawns by @alexandre-vl in https://github.com/zeronsh/zeron/pull/1041\n* Landing: a privacy policy at zeron.sh/privacy by @zeronsh[bot] in https://github.com/zeronsh/zeron/pull/1070\n* Session card: a row click switches sessions while the card is open by @alexandre-vl in https://github.com/zeronsh/zeron/pull/1065\n* Fork: settle the running subagent chips a fork copies by @alexandre-vl in https://github.com/zeronsh/zeron/pull/1045\n* Tooltips on the icon-only buttons that had none by @alexandre-vl in https://github.com/zeronsh/zeron/pull/1048\n* Claude subagents: give a typed /skill's fork a chip and a tab by @alexandre-vl in https://github.com/zeronsh/zeron/pull/1043\n* Sidebar: start a new chat from a \"No project\" group by @alexandre-vl in https://github.com/zeronsh/zeron/pull/996\n* Cursor shim tests: give a shim's first frame time for node to start by @alexandre-vl in https://github.com/zeronsh/zeron/pull/1051\n* Compact mode: stop clipping subagent cards in the tool fold by @alexandre-vl in https://github.com/zeronsh/zeron/pull/1025\n* macOS browser: clicks outside the page take the keyboard back by @alexandre-vl in https://github.com/zeronsh/zeron/pull/997\n* Providers: a switch to turn native subagents off by @alexandre-vl in https://github.com/zeronsh/zeron/pull/1046\n* Questions: show what was answered, and close one without answering by @alexandre-vl in https://github.com/zeronsh/zeron/pull/1022\n* Claude subagents: fill a typed fork's tab while the CLI holds it by @alexandre-vl in https://github.com/zeronsh/zeron/pull/1044\n* Remote chats: show the sync, not an outage, while a room catches up by @alexandre-vl in https://github.com/zeronsh/zeron/pull/1038\n* Agents can show local images in chat: show_image, and Markdown images in replies by @alexandre-vl in https://github.com/zeronsh/zeron/pull/1036\n* Provider sign-ins get past the preview room's device limit by @zeronsh[bot] in https://github.com/zeronsh/zeron/pull/1060\n* Settings search: find any setting from the sidebar, with ⌘F by @alexandre-vl in https://github.com/zeronsh/zeron/pull/1018\n* Shortcuts on non-US Mac layouts: bound where macOS puts them (AZERTY ⌘1 is ⌘&) by @alexandre-vl in https://github.com/zeronsh/zeron/pull/1013\n* Browser element annotations by @Master0fFate in https://github.com/zeronsh/zeron/pull/814\n* Linux browser: WPE WebKit at the display's rate, frames shared with GPUI as dma-bufs by @alexandre-vl in https://github.com/zeronsh/zeron/pull/1039\n* Smooth scrolling: mouse-wheel notches glide like Chrome's, with a setting by @alexandre-vl in https://github.com/zeronsh/zeron/pull/1005\n* Render Markdown in user messages and the rail's preview card by @zeronsh[bot] in https://github.com/zeronsh/zeron/pull/1067\n\n\n**Full Changelog**: https://github.com/zeronsh/zeron/compare/v0.2.126...v0.2.127",
+      "fork_changes": [],
+      "fork_through_commit": "b305b531906945ad5bbfe26699e25eaaefc5349f"
+    },
+    {
       "version": "0.2.114",
       "upstream_commit": "2e8f02ec2dfc521a20a5c43fcdbf4fae2381853a",
       "upstream_url": "https://github.com/zeronsh/zeron/releases/tag/v0.2.114",

@@ -18,5 +18,14 @@ if [[ -z "${CXX:-}" ]] && ! command -v c++ >/dev/null 2>&1; then
   done
 fi
 if [[ -d "$ZERON_DEV_ROOT/target/linux-sysroot/usr/lib64/pkgconfig" ]]; then
-  export PKG_CONFIG_PATH="$ZERON_DEV_ROOT/target/linux-sysroot/usr/lib64/pkgconfig:$ZERON_DEV_ROOT/target/linux-sysroot/usr/share/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+  # The updater/check scripts also source this file. Keep an existing browser
+  # runtime and sysroot order stable so Cargo can reuse native dependencies.
+  for zeron_pkgconfig_dir in \
+    "$ZERON_DEV_ROOT/target/linux-sysroot/usr/share/pkgconfig" \
+    "$ZERON_DEV_ROOT/target/linux-sysroot/usr/lib64/pkgconfig"; do
+    case ":${PKG_CONFIG_PATH:-}:" in
+      *":$zeron_pkgconfig_dir:"*) ;;
+      *) export PKG_CONFIG_PATH="$zeron_pkgconfig_dir${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" ;;
+    esac
+  done
 fi

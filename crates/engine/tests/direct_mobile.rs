@@ -42,15 +42,17 @@ async fn direct_mobile_pair_create_send_stream_restart_and_revoke() {
     .unwrap();
     let ipc = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ipc_url = format!("ws://{}", ipc.local_addr().unwrap());
-    let ipc_task = tokio::spawn(zeron_rpc::serve_ws_listener(ipc, core.rpc_service()));
+    let token = zeron_rpc::ipc_auth::issue_token(&dir.path().join("engine")).unwrap();
+    let ipc_task = tokio::spawn(zeron_rpc::serve_ws_listener(ipc, core.rpc_service(), token));
     let store = zeron_rpc::remote::RemoteStore::open(dir.path().join("gateway")).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let url = format!("http://{address}");
-    let gateway = tokio::spawn(zeron_rpc::remote::serve(
+    let gateway = tokio::spawn(zeron_rpc::remote::serve_with_data_dir(
         listener,
         ipc_url.clone(),
         store.clone(),
+        Some(dir.path().join("engine")),
     ));
     tokio::time::sleep(Duration::from_millis(100)).await;
     let credentials = zeron_client::direct::pair(&url, &store.pairing_key().unwrap(), "Test phone")
@@ -122,7 +124,12 @@ async fn direct_mobile_pair_create_send_stream_restart_and_revoke() {
     drop(handle);
     drop(phone);
     let listener = tokio::net::TcpListener::bind(address).await.unwrap();
-    let gateway = tokio::spawn(zeron_rpc::remote::serve(listener, ipc_url, store.clone()));
+    let gateway = tokio::spawn(zeron_rpc::remote::serve_with_data_dir(
+        listener,
+        ipc_url,
+        store.clone(),
+        Some(dir.path().join("engine")),
+    ));
     let phone = Client::new(
         config,
         credentials,
@@ -243,11 +250,17 @@ async fn direct_mobile_answers_questions_and_interrupts_runs() {
     .unwrap();
     let ipc = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ipc_url = format!("ws://{}", ipc.local_addr().unwrap());
-    let ipc_task = tokio::spawn(zeron_rpc::serve_ws_listener(ipc, core.rpc_service()));
+    let token = zeron_rpc::ipc_auth::issue_token(&dir.path().join("engine")).unwrap();
+    let ipc_task = tokio::spawn(zeron_rpc::serve_ws_listener(ipc, core.rpc_service(), token));
     let store = zeron_rpc::remote::RemoteStore::open(dir.path().join("gateway")).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    let gateway = tokio::spawn(zeron_rpc::remote::serve(listener, ipc_url, store.clone()));
+    let gateway = tokio::spawn(zeron_rpc::remote::serve_with_data_dir(
+        listener,
+        ipc_url,
+        store.clone(),
+        Some(dir.path().join("engine")),
+    ));
     tokio::time::sleep(Duration::from_millis(100)).await;
     let credentials = zeron_client::direct::pair(&url, &store.pairing_key().unwrap(), "Phone")
         .await

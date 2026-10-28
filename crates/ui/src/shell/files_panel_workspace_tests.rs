@@ -165,13 +165,13 @@ fn files_panel_workspace_navigation_and_external_updates() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     listener.set_nonblocking(true).unwrap();
-    // Transfer the bound socket to the RPC server instead of releasing and
-    // re-binding the port while other local fixtures are starting servers.
-    let service = core.rpc_service();
+    // Publish IPC auth while retaining the bound socket, so concurrent fixtures
+    // cannot claim this port between choosing it and starting the server.
+    let token = zeron_rpc::ipc_auth::issue_token(&directory.path().join("ui")).unwrap();
     let _ipc = {
-        let _runtime_context = runtime.enter();
+        let _entered = runtime.enter();
         let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-        runtime.spawn(zeron_rpc::serve_ws_listener(listener, service))
+        runtime.spawn(zeron_rpc::serve_ws_listener(listener, core.rpc_service(), token))
     };
     let output = std::env::var_os("ZERON_FILES_CAPTURES").map(PathBuf::from);
     let application = if output.is_some() {

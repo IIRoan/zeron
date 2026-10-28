@@ -328,9 +328,10 @@ fn main() -> anyhow::Result<()> {
         .rename_chat("source-control-fixture", "Test source control")?;
     let listener = runtime.block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))?;
     let port = listener.local_addr()?.port();
-    let _ipc = runtime.spawn(zeron_rpc::serve_ws_listener(listener, core.rpc_service()));
     let data = temp.path().join("ui");
     std::fs::create_dir(&data)?;
+    let token = zeron_rpc::ipc_auth::issue_token(&data)?;
+    let _ipc = runtime.spawn(zeron_rpc::serve_ws_listener(listener, core.rpc_service(), token));
     let boot = EngineBootConfig {
         data_dir: data.clone(),
         ipc_port: port,

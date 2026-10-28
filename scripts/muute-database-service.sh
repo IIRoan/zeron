@@ -10,8 +10,11 @@ export COMPOSE_PROJECT_NAME="$muute_database_project"
 
 case "${1:-run}" in
   ready)
-    docker compose -f compose.db-only.yaml exec -T db pg_isready -U postgres -d postgres
-    docker compose -p "$muute_redis_project" -f compose.redis.yaml -f "$muute_helper_directory/muute-redis.compose.yaml" exec -T redis redis-cli ping
+    # Resolve containers directly to keep checks within Zeron's five-second limit.
+    muute_database_container=$(docker ps -q --filter "label=com.docker.compose.project=$muute_database_project" --filter "label=com.docker.compose.service=db")
+    muute_redis_container=$(docker ps -q --filter "label=com.docker.compose.project=$muute_redis_project" --filter "label=com.docker.compose.service=redis")
+    docker exec "$muute_database_container" pg_isready -U postgres -d postgres
+    docker exec "$muute_redis_container" redis-cli ping
     bun -e '
       import { createConnection } from "node:net";
       await Promise.all([5432, 6379, 8025, 1025, 10000, 10001, 10002].map(port =>

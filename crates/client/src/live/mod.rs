@@ -14,6 +14,7 @@
 //! relaunch.
 
 pub(crate) mod delivery;
+pub(crate) mod direct;
 pub(crate) mod escort;
 pub(crate) mod relay;
 pub(crate) mod room;
@@ -188,7 +189,7 @@ pub(crate) struct RegistryPosture {
 }
 
 pub(crate) struct LiveBackend {
-    pub(crate) direct: Option<Arc<crate::direct::Direct>>,
+    pub(crate) self_hosted: Option<Arc<crate::direct::Direct>>,
     pub(crate) edge: String,
     pub(crate) store: Arc<DocsStore>,
     registry: Mutex<Option<RegistryClient>>,
@@ -200,6 +201,8 @@ pub(crate) struct LiveBackend {
     registry_dirty: Arc<AtomicBool>,
     last_liveness_probe: AtomicI64,
     pub(crate) relay: relay::Relay,
+    /// Direct peer connections (terminals), started with the backend.
+    pub(crate) direct: std::sync::OnceLock<Option<zeron_preview::viewer::ViewerPeers>>,
     pub(crate) escorts: escort::Escorts,
     pub(crate) delivery_wake: Arc<Notify>,
     cancel: CancellationToken,
@@ -236,7 +239,8 @@ impl LiveBackend {
             _ => None,
         };
         Self {
-            direct: direct.clone(),
+            self_hosted: direct.clone(),
+            direct: std::sync::OnceLock::new(),
             relay: relay::Relay::new(inner, &edge, bearer, direct),
             escorts: escort::Escorts::new(&inner.config.data_dir),
             delivery_wake: Arc::new(Notify::new()),
@@ -260,18 +264,29 @@ impl LiveBackend {
     /// Spawn the registry join/event loop, the presence beat, and the
     /// registry saver.
     pub(crate) fn start(&self, inner: &Arc<ClientInner>) {
-        if let Some(direct) = &self.direct {
+        if let Some(direct) = &self.self_hosted {
             self.spawn_registry_saver(inner);
             direct.start(inner);
             return;
         }
+        // Signaling first: pairing with a host can then start the moment a
+        // terminal wants it.
+        let _ = self.direct.set(direct::start(inner));
         self.spawn_registry(inner);
         self.spawn_registry_saver(inner);
         self.escorts.respawn(inner);
         delivery::start(inner, self.delivery_wake.clone(), self.cancel.clone());
     }
 
+    /// The direct peers, when they started.
+    pub(crate) fn direct(&self) -> Option<&zeron_preview::viewer::ViewerPeers> {
+        self.direct.get().and_then(Option::as_ref)
+    }
+
     pub(crate) fn stop(&self) {
+        if let Some(direct) = self.direct() {
+            direct.stop();
+        }
         self.cancel.cancel();
         if let Some(client) = lock(&self.registry).take() {
             crate::runtime::shared().spawn(client.shutdown());
@@ -281,7 +296,7 @@ impl LiveBackend {
     }
 
     pub(crate) fn registry_posture(&self) -> RegistryPosture {
-        if let Some(direct) = &self.direct {
+        if let Some(direct) = &self.self_hosted {
             return direct.posture();
         }
         match lock(&self.registry).as_ref() {
@@ -328,7 +343,7 @@ impl LiveBackend {
     /// Cheap edge reachability check (`GET /health`, 3s): a 200 un-parks
     /// every backoff in the process at once (legacy `probeEdgeHealth`).
     pub(crate) fn probe_health(&self) {
-        if self.direct.is_some() {
+        if self.self_hosted.is_some() {
             return;
         }
         let url = urls::health(&self.edge);

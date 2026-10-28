@@ -34,6 +34,7 @@ async fn browser_mcp_routes_through_the_running_engine_and_honors_revocation() {
         Origin {
             chat_id: Some("origin".into()),
             device_id: Some(core.device_id.clone()),
+            side_chats_only: false,
         },
     ))));
     assert_eq!(

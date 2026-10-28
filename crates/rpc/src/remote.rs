@@ -255,8 +255,29 @@ impl RpcService for Gateway {
     }
 }
 
+async fn connect_gateway_ipc(url: &str, data_dir: Option<&Path>) -> Result<RpcClient, RpcError> {
+    let port = url
+        .strip_prefix("ws://127.0.0.1:")
+        .and_then(|port| port.parse::<u16>().ok())
+        .ok_or_else(|| denied("Gateway IPC must be a localhost WebSocket port"))?;
+    crate::connect_ipc(port, data_dir).await
+}
+
 pub async fn serve(listener: TcpListener, ipc: String, store: RemoteStore) -> anyhow::Result<()> {
-    let engine = crate::connect_ws(&ipc).await?;
+    let data_dir = std::env::var_os("ZERON_DATA_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".zeron")));
+    serve_with_data_dir(listener, ipc, store, data_dir).await
+}
+
+/// Serve using an explicit engine directory for IPC token discovery.
+pub async fn serve_with_data_dir(
+    listener: TcpListener,
+    ipc: String,
+    store: RemoteStore,
+    data_dir: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let engine = connect_gateway_ipc(&ipc, data_dir.as_deref()).await?;
     let info = engine.call(methods::ENGINE_INFO, json!({})).await?;
     let scope = json!({"deviceId": info["deviceId"], "workspaceScope": info["workspaceScope"]});
     let instance = store.identity(scope)?;
@@ -283,8 +304,9 @@ pub async fn serve(listener: TcpListener, ipc: String, store: RemoteStore) -> an
         let Ok(permit) = limit.clone().try_acquire_owned() else {
             continue;
         };
-        let (ipc, store, instance, device, info) = (
+        let (ipc, data_dir, store, instance, device, info) = (
             ipc.clone(),
+            data_dir.clone(),
             store.clone(),
             instance.clone(),
             device.clone(),
@@ -310,7 +332,7 @@ pub async fn serve(listener: TcpListener, ipc: String, store: RemoteStore) -> an
             };
             let Ok(Ok(socket)) = tokio::time::timeout(Duration::from_secs(5), tokio_tungstenite::accept_hdr_async_with_config(socket, check, Some(config))).await else { return };
             let Some(credential) = credential else { return };
-            let Ok(engine) = crate::connect_ws(&ipc).await else { return };
+            let Ok(engine) = connect_gateway_ipc(&ipc, data_dir.as_deref()).await else { return };
             if engine.call(methods::ENGINE_INFO, json!({})).await.ok().as_ref() != Some(&info) { return; }
             let engine = Arc::new(engine);
             let service = Arc::new(Gateway { engine, store: store.clone(), instance, device, credential: credential.clone() });
@@ -414,12 +436,19 @@ mod tests {
         let store = RemoteStore::open(dir.path().into()).unwrap();
         let ipc = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let ipc_url = format!("ws://{}", ipc.local_addr().unwrap());
-        let ipc_task = tokio::spawn(crate::serve_ws_listener(ipc, Arc::new(FakeEngine)));
+        let ipc_dir = dir.path().join("engine");
+        let token = crate::ipc_auth::issue_token(&ipc_dir).unwrap();
+        let ipc_task = tokio::spawn(crate::serve_ws_listener(ipc, Arc::new(FakeEngine), token));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}/rpc", listener.local_addr().unwrap());
-        let server = tokio::spawn(serve(listener, ipc_url, store.clone()));
+        let server = tokio::spawn(serve_with_data_dir(
+            listener,
+            ipc_url,
+            store.clone(),
+            Some(ipc_dir),
+        ));
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(crate::connect_ws(&url).await.is_err());
+        assert!(crate::connect_ws(&url, None).await.is_err());
         assert!(
             crate::connect_ws_authorized(&url, Some("Bearer bad"))
                 .await

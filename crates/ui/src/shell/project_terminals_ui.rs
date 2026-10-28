@@ -3646,7 +3646,7 @@ mod tests {
         assert_eq!(
             requests.len(),
             2,
-            "both starts are sent; duplicates, bulk actions and saves wait"
+            "both starts are sent; duplicates, bulk actions and saves wait: {requests:?}"
         );
         assert_eq!(requests[0]["params"]["serviceId"], "backend");
         assert_eq!(requests[1]["params"]["serviceId"], "frontend");

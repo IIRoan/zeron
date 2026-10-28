@@ -30,7 +30,7 @@ async fn wait_for(store: &ProjectTerminals, root: &Path, id: &str, status: Statu
         }
     })
     .await
-    .expect("service reaches expected status");
+    .unwrap_or_else(|error| panic!("service {id} must reach {status:?}: {error}; snapshot: {:?}", store.snapshot("project", root)));
 }
 
 #[tokio::test]

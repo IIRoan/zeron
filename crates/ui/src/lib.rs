@@ -24,6 +24,7 @@ pub mod badges;
 pub mod browser;
 pub mod change_requests;
 pub mod changes;
+pub mod cloud;
 mod comment_ui;
 pub mod comments;
 pub mod composer;
@@ -51,7 +52,8 @@ mod new_thread_background_image;
 mod new_thread_background_mask;
 mod notice;
 mod progress_toast;
-pub mod notify;
+pub use zeron_notify as notify;
+pub mod onboarding;
 pub mod orb;
 pub mod overscroll;
 pub mod pickers;
@@ -65,10 +67,12 @@ mod pull_request_test_support;
 pub mod pull_requests;
 pub mod queue;
 pub mod rail;
+pub(crate) mod reply_images;
 mod roll_text;
 pub mod running_pill;
 pub mod settings;
 pub mod shell;
+pub mod smooth_scroll;
 pub mod sound;
 pub mod source_control;
 pub mod state;
@@ -178,7 +182,12 @@ pub fn run_app(config: UiConfig) {
         gpui_base::init(cx);
         start_ui_lag_monitor(cx);
         let data_dir = config.boot().data_dir.clone();
-        let ui_settings = settings::UiSettings::load(&data_dir);
+        let mut ui_settings = settings::UiSettings::load(&data_dir);
+        // Older keymaps stored custom combos as the recording layout typed
+        // them; convert against the layout, which only the app can read.
+        ui_settings
+            .keymap
+            .adopt_layout_neutral(&settings::key_equivalents(cx));
         settings::init(ui_settings.clone(), data_dir.clone(), cx);
         let font_availability = typography::register_fonts(cx);
         // Typography first: theme installation reads the effective family, so
@@ -240,6 +249,14 @@ pub fn run_app(config: UiConfig) {
             }
         })
         .detach();
+        // Sessions run in the background engine, which outlives this window
+        // (and posts the desktop banners); embedding stays the fallback, or
+        // the choice with ZERON_EMBED_ENGINE=1. An embedded engine posts the
+        // banners itself.
+        zeron_engine::desktop_notify::enable();
+        if std::env::var_os("ZERON_EMBED_ENGINE").is_none_or(|value| value.is_empty() || value == "0") {
+            state::launch_background_engine();
+        }
         state::AppState::bootstrap(state.clone(), config.boot(), cx);
 
         // Graceful teardown: an in-process engine drains live runs and flushes
@@ -248,25 +265,21 @@ pub fn run_app(config: UiConfig) {
         cx.on_app_quit(move |cx| {
             settings::flush(cx);
             app_update::install_on_quit(cx);
-            if let Some(handle) = quit_state.read(cx).engine().cloned() {
-                // GPUI gives quit hooks 200 ms, far less than stopping agents
-                // and services takes. Returning early abandons the shutdown and
-                // leaves a windowless process that keeps the engine and its
-                // services alive, so the next launch attaches to that old
-                // engine. Wait here instead, with a bound.
-                let (done, finished) = std::sync::mpsc::channel();
-                gpui_tokio::Tokio::handle(cx).spawn(async move {
-                    handle.shutdown().await;
-                    let _ = done.send(());
+            // The background engine outlives this app: banners resume at
+            // once rather than after the last focus report goes stale.
+            let unfocus = quit_state.read(cx).viewport_closing();
+            let shutdown =
+                quit_state.read(cx).engine().cloned().map(|handle| {
+                    gpui_tokio::Tokio::spawn(cx, async move { handle.shutdown().await })
                 });
-                if finished
-                    .recv_timeout(std::time::Duration::from_secs(30))
-                    .is_err()
-                {
-                    tracing::warn!("engine shutdown did not finish within 30 seconds");
+            async move {
+                if let Some(unfocus) = unfocus {
+                    unfocus.await;
+                }
+                if let Some(task) = shutdown {
+                    let _ = task.await;
                 }
             }
-            async {}
         })
         .detach();
 
@@ -285,6 +298,17 @@ pub fn run_app(config: UiConfig) {
         // synchronously, so `set_menus` reads the final bindings for the ⌘-key
         // equivalents (gpui snapshots the keymap at set time).
         cx.set_menus(app_menus::app_menus());
+        // Switching keyboard layout moves the keys behind ⌘-shortcuts (AZERTY
+        // reaches ⌘1 as ⌘&): rebind against the new layout, then refresh the
+        // menu bar's snapshot of the keymap and redraw the hints that name
+        // those keys.
+        cx.on_keyboard_layout_change(|cx| {
+            let settings = settings::current(cx);
+            shell::apply_keymap(cx, &settings.keymap, settings.composer_send_behavior);
+            cx.set_menus(app_menus::app_menus());
+            cx.refresh_windows();
+        })
+        .detach();
         cx.activate(true);
     });
 }
@@ -334,12 +358,17 @@ fn start_url_listener(
     let state = state.downgrade();
     cx.spawn(async move |cx| {
         while let Some(url) = urls.next().await {
-            if state
-                .update(cx, |state, cx| state.open_deep_link(&url, cx))
-                .is_err()
-            {
-                break;
-            }
+            let handled = if let Some(target) = notify::link_target(&url) {
+                let target = target.to_owned();
+                cx.update(|cx| {
+                    let state = state.upgrade().ok_or(())?;
+                    open_notification_target(target, &state, cx);
+                    Ok::<(), ()>(())
+                }).is_ok()
+            } else {
+                state.update(cx, |state, cx| state.open_deep_link(&url, cx)).is_ok()
+            };
+            if !handled { break; }
         }
     })
     .detach();

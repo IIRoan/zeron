@@ -10,6 +10,8 @@ use crate::motion::HoverFade as _;
 use crate::popover::{self, MenuScrollbarMetrics, MenuScrollbarState, ScrollRailHost};
 use crate::theme::Theme;
 
+pub use super::search::page_reveal;
+
 /// Width of the section column beside the settings page, published by the
 /// shell each frame so dropdowns and responsive pages measure the page pane.
 struct SettingsSidebarWidth(f32);
@@ -203,7 +205,8 @@ impl RenderOnce for DropdownRows {
 /// a [`ScrollRailHost`] impl on the page delegating here, and a root
 /// `.relative()` host carrying only the list-hover `on_hover` around the
 /// `.overflow_y_scroll().track_scroll(&self.scroll.scroll)` page, with
-/// [`popover::rail`] supplying the rail and all of its listeners.
+/// [`popover::rail`] supplying the rail and all of its listeners and
+/// [`page_reveal`] gliding a settings-search pick into view.
 pub struct PageScroll {
     /// Tracked by the page's scrolling list directly — including the appshots
     /// half of the shortcuts page, which renders from its own file.
@@ -540,13 +543,16 @@ pub fn row_divider(theme: &Theme) -> gpui::Hsla {
     theme.border.opacity(0.6)
 }
 
+/// The corners of a [`section_card`].
+pub const BLOCK_RADIUS: f32 = 12.0;
+
 /// A filled, rounded block of related settings rows. Standalone blocks keep
 /// a section's worth of air above them; inside [`section`] the wrapper owns
 /// the spacing and zeroes this margin.
 pub fn section_card(theme: &Theme) -> gpui::Div {
     div()
         .mt(px(24.0))
-        .rounded(px(12.0))
+        .rounded(px(BLOCK_RADIUS))
         .bg(block_fill(theme))
         .overflow_hidden()
         .flex()
@@ -591,13 +597,30 @@ pub fn row_tile(theme: &Theme, icon_path: &'static str) -> gpui::Div {
 /// Row title. These metrics intentionally match the Shortcuts rows, whose
 /// title/description rhythm is the reference for the other settings cards.
 pub fn row_title(theme: &Theme, title: impl Into<SharedString>) -> gpui::Div {
+    let title = title.into();
+    #[cfg(test)]
+    ROW_TITLES.with_borrow_mut(|titles| titles.push(title.clone()));
     div()
         .min_w_0()
         .text_size(crate::typography::ui_rems(ROW_TITLE_SIZE))
         .line_height(crate::typography::ui_rems(17.0))
         .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(theme.text)
-        .child(title.into())
+        .child(title)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Every [`row_title`] rendered since the last [`take_row_titles`].
+    static ROW_TITLES: std::cell::RefCell<Vec<SharedString>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The row titles rendered since the last call: what the settings search
+/// must be able to find.
+#[cfg(test)]
+pub(crate) fn take_row_titles() -> Vec<SharedString> {
+    ROW_TITLES.take()
 }
 
 /// The quiet meta line under a row title: `text-[12px]
@@ -1461,6 +1484,8 @@ impl<V: 'static> Select<V> {
 pub enum ActionTone {
     Quiet,
     Outlined,
+    /// The secondary action: a borderless filled pill, the same as a
+    /// dropdown trigger beside it.
     Filled,
     Solid,
     Danger,
@@ -1479,13 +1504,21 @@ fn action_rest(theme: &Theme, tone: ActionTone) -> gpui::Div {
         .text_size(crate::typography::ui_rems(12.5))
         .cursor_pointer();
     match tone {
-        ActionTone::Quiet => button.text_color(theme.text_muted),
+        ActionTone::Quiet => button
+            .text_color(theme.text_muted)
+            .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text)),
+        ActionTone::Filled => {
+            let lifted = select_fill(theme, true);
+            button
+                .bg(select_fill(theme, false))
+                .text_color(theme.text)
+                .hover(move |s| s.bg(lifted))
+        }
         ActionTone::Outlined => button
             .bg(theme.input_glass_bg())
             .border_1()
             .border_color(theme.border)
             .text_color(theme.text),
-        ActionTone::Filled => button.bg(select_fill(theme, false)).text_color(theme.text),
         ActionTone::Solid => button
             .bg(theme.solid)
             .font_weight(gpui::FontWeight::MEDIUM)
@@ -1524,6 +1557,13 @@ pub fn action_button(
         .interactivity()
         .on_hover(crate::motion::hover_listener(fade_key));
     button
+}
+
+/// A labeled action for settings pages that do not own a Window.
+pub fn text_action(theme: &Theme, tone: ActionTone, label: impl Into<SharedString>) -> gpui::Div {
+    let label = label.into();
+    action_button(theme, tone, SharedString::from(format!("settings-action-{label}")))
+        .child(label)
 }
 
 /// Each tone's hover treatment at progress `t`.

@@ -541,6 +541,8 @@ impl Pickers {
                     .id("compact-model-back")
                     .role(gpui::Role::Button)
                     .aria_label("Back")
+                    .aria_keyshortcuts("Escape")
+                    .tooltip(|_, cx| cx.new(|_| PickerHint("Back · Esc".into())).into())
                     .flex_none()
                     .size(px(COMPACT_ROW_HEIGHT))
                     .rounded(px(popover::MENU_ITEM_RADIUS))
@@ -1494,7 +1496,7 @@ mod tests {
     }
 }
 
-struct PickerHint(SharedString);
+pub(super) struct PickerHint(pub(super) SharedString);
 impl Render for PickerHint {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).for_popup();

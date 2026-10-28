@@ -247,6 +247,11 @@ impl PullRequestDetailPage {
         let can_send = !sending
             && self.detail.is_some()
             && !self.comment_input.read(cx).text().trim().is_empty();
+        let send_label = if sending {
+            "Sending comment"
+        } else {
+            "Send comment"
+        };
         let mut stack = div().relative().flex().flex_col().gap(px(8.0));
         if let Some(submission) = &self.submission {
             let excerpt: String = submission
@@ -271,12 +276,10 @@ impl PullRequestDetailPage {
                     .gap(px(8.0))
                     .text_size(crate::typography::ui_rems(12.0))
                     .text_color(theme.text_muted)
-                    .child(crate::loaders::mini_glyph_spinner(
+                    .child(crate::loaders::ring_spinner(
                         "pr-comment-pending-spinner",
-                        1.5,
-                        theme.glyph,
-                        cx.entity_id(),
-                        cx,
+                        12.0,
+                        theme.text_muted,
                     ))
                     .child(div().flex_none().child("Posting comment"))
                     .child(
@@ -413,12 +416,10 @@ impl PullRequestDetailPage {
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .child(crate::loaders::mini_glyph_spinner(
+                                    .child(crate::loaders::ring_spinner(
                                         "pr-send-spinner",
-                                        1.5,
-                                        theme.glyph,
-                                        cx.entity_id(),
-                                        cx,
+                                        12.0,
+                                        theme.text_muted,
                                     ))
                             } else {
                                 crate::composer::send_circle(
@@ -430,11 +431,8 @@ impl PullRequestDetailPage {
                             }
                             .debug_selector(|| "pr-send-comment".into())
                             .role(gpui::Role::Button)
-                            .aria_label(if sending {
-                                "Sending comment"
-                            } else {
-                                "Send comment"
-                            })
+                            .aria_label(send_label)
+                            .tooltip(widgets::text_tooltip(send_label))
                             .tab_index(0)
                             .focus_visible(|style| style.border_2().border_color(theme.accent))
                             .on_click(cx.listener(

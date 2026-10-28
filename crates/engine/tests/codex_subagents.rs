@@ -62,9 +62,12 @@ async fn check_persistence(
         cwd: dir.path().display().to_string(),
         sandbox: SandboxLevel::ReadOnly,
         auto_approve: true,
+        access: Default::default(),
+        plan: false,
         attachments: vec![],
         worktree: None,
         resume: None,
+        env: Default::default(),
     };
     core.sessions
         .dispatch(
@@ -246,6 +249,9 @@ async fn check_quiet_children(scenario: &str) {
     }))
     .unwrap();
     let mut request = RunRequest {
+        access: Default::default(),
+        plan: false,
+        env: Default::default(),
         mcp: None,
         prompt: format!("scenario:{scenario}"),
         harness: None,

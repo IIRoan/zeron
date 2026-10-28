@@ -23,7 +23,8 @@ async fn main() -> anyhow::Result<()> {
     let core = EngineCore::assemble(root.path(), Arc::new(registry), HarnessId::Mock, None)?;
     let ipc = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let ipc_url = format!("ws://{}", ipc.local_addr()?);
-    tokio::spawn(zeron_rpc::serve_ws_listener(ipc, core.rpc_service()));
+    let token = zeron_rpc::ipc_auth::issue_token(root.path())?;
+    tokio::spawn(zeron_rpc::serve_ws_listener(ipc, core.rpc_service(), token));
     let store = zeron_rpc::remote::RemoteStore::open(root.path().join("gateway"))?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let url = format!("http://{}", listener.local_addr()?);
@@ -33,5 +34,11 @@ async fn main() -> anyhow::Result<()> {
         output,
         format!("TEST_RUNNER_ZERON_DIRECT_ENDPOINT={url}\nTEST_RUNNER_ZERON_DIRECT_KEY={key}\n"),
     )?;
-    zeron_rpc::remote::serve(listener, ipc_url, store).await
+    zeron_rpc::remote::serve_with_data_dir(
+        listener,
+        ipc_url,
+        store,
+        Some(root.path().to_path_buf()),
+    )
+    .await
 }
