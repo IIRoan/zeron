@@ -321,6 +321,13 @@ struct DeleteProjectActionParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct BackgroundTaskParams {
+    chat_id: String,
+    task_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RunProjectActionParams {
     space_id: String,
     chat_id: String,
@@ -2272,6 +2279,9 @@ fn forwardable(method: &str) -> bool {
             | methods::PREPARE_WORKTREE
             | methods::CANCEL_WORKTREE_SETUP
             | methods::GET_WORKTREE_SETUP_LOG
+            // Background processes run in the chat host's runtime.
+            | methods::STOP_BACKGROUND_TASK
+            | methods::READ_BACKGROUND_TASK_OUTPUT
             // Checkout diffs are produced on the device holding the checkout.
             | methods::WATCH_CHECKOUT_DIFFS
             | methods::WATCH_WORKSPACE_GIT_STATUS
@@ -3201,6 +3211,19 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "removed": removed }))
+            }
+            methods::STOP_BACKGROUND_TASK => {
+                let p: BackgroundTaskParams = parse_params(params)?;
+                let stopping = self.sessions.stop_background_task(&p.chat_id, &p.task_id);
+                RpcReply::value(&serde_json::json!({ "stopping": stopping }))
+            }
+            methods::READ_BACKGROUND_TASK_OUTPUT => {
+                let p: BackgroundTaskParams = parse_params(params)?;
+                let output = self
+                    .sessions
+                    .background_task_output(&p.chat_id, &p.task_id)
+                    .await;
+                RpcReply::value(&output)
             }
             methods::SEND_QUEUED_MESSAGE_NOW => {
                 let p: QueuedMessageParams = parse_params(params)?;

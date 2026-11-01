@@ -472,6 +472,7 @@ pub(crate) fn seed(
                 terminal_activity: None,
                 running_subagents: 0,
                 running_background_tasks: 0,
+                background_tasks: Vec::new(),
                 chat_id: demo.id.into(),
                 device_id: demo.device.into(),
                 status,

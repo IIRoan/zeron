@@ -4,6 +4,26 @@
   "fork_repository": "IIRoan/zeron",
   "releases": [
     {
+      "version": "0.2.131",
+      "upstream_commit": "0a153df5ad84a2036d327bd785281888689f4030",
+      "upstream_url": "https://github.com/zeronsh/zeron/releases/tag/v0.2.131",
+      "published_at": "2026-10-31T19:37:45Z",
+      "notes_source": "github_release",
+      "upstream_notes": "## What's Changed\n* Background processes: see, read and stop what an agent left running by @zeronsh[bot] in https://github.com/zeronsh/zeron/pull/1092\n* Edge: a stored user number for every user in the directory by @wingleeio in https://github.com/zeronsh/zeron/pull/1107\n* Edge: record every WorkOS organization and its members by @wingleeio in https://github.com/zeronsh/zeron/pull/1113\n* Edge: profile routes by @wingleeio in https://github.com/zeronsh/zeron/pull/1115\n* Sync: update loro to 1.17 so streaming chats stop leaking memory by @Gratenes in https://github.com/zeronsh/zeron/pull/1116\n\n## New Contributors\n* @Gratenes made their first contribution in https://github.com/zeronsh/zeron/pull/1116\n\n**Full Changelog**: https://github.com/zeronsh/zeron/compare/v0.2.130...v0.2.131",
+      "fork_changes": [],
+      "fork_through_commit": "2c1491cb3d306b65a42504c0cec747cb2e5dca91"
+    },
+    {
+      "version": "0.2.130",
+      "upstream_commit": "369d42815190ea6c4865c92dc060c54d790f4dcd",
+      "upstream_url": "https://github.com/zeronsh/zeron/releases/tag/v0.2.130",
+      "published_at": "2026-10-29T20:21:51Z",
+      "notes_source": "github_release",
+      "upstream_notes": "## What's Changed\n* Add fx as a native ACP provider by @zeronsh[bot] in https://github.com/zeronsh/zeron/pull/1099\n* Edge: badges for users in the directory by @wingleeio in https://github.com/zeronsh/zeron/pull/1105\n* Direct links: let WebRTC packets fragment, so links over Tailscale carry data by @wingleeio in https://github.com/zeronsh/zeron/pull/1106\n\n\n**Full Changelog**: https://github.com/zeronsh/zeron/compare/v0.2.129...v0.2.130",
+      "fork_changes": [],
+      "fork_through_commit": "2c1491cb3d306b65a42504c0cec747cb2e5dca91"
+    },
+    {
       "version": "0.2.129",
       "upstream_commit": "8b7afb306d25ecd3508200eaad66aeb8cf46e736",
       "upstream_url": "https://github.com/zeronsh/zeron/releases/tag/v0.2.129",

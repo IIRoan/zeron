@@ -821,6 +821,8 @@ pub(crate) struct RawSession {
     running_subagents: u32,
     #[serde(default)]
     running_background_tasks: u32,
+    #[serde(default)]
+    background_tasks: Vec<zeron_proto::BackgroundTask>,
 }
 
 impl From<RawSession> for Session {
@@ -836,6 +838,7 @@ impl From<RawSession> for Session {
             terminal_activity: raw.terminal_activity,
             running_subagents: raw.running_subagents,
             running_background_tasks: raw.running_background_tasks,
+            background_tasks: raw.background_tasks,
         }
     }
 }
@@ -951,6 +954,7 @@ mod tests {
             terminal_activity: None,
             running_subagents: 0,
             running_background_tasks: 0,
+            background_tasks: Vec::new(),
         }
     }
 

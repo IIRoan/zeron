@@ -110,6 +110,16 @@ pub fn running_background_tasks(session: Option<&Session>, now: DateTime<Utc>) -
         .map_or(0, |s| s.running_background_tasks)
 }
 
+/// Background processes of a chat, staleness-checked like
+/// [`running_subagents`]: engines heartbeat a live runtime's row, so a row
+/// past [`SESSION_STALE_MS`] belongs to an engine that took its processes
+/// with it. Pure.
+pub fn background_tasks(session: Option<&Session>, now: DateTime<Utc>) -> &[crate::BackgroundTask] {
+    session
+        .filter(|s| now.signed_duration_since(s.updated_at).num_milliseconds() <= SESSION_STALE_MS)
+        .map_or(&[], |s| s.background_tasks.as_slice())
+}
+
 /// The full display status for a chat row / tab dot: live states win, then the
 /// synced seen marker decides completed-vs-idle. Staleness gating rides on
 /// [`effective_indicator`]; the derivation itself is [`crate::chat_indicator`].
@@ -402,6 +412,7 @@ mod gate_tests {
             terminal_activity: None,
             running_subagents: running,
             running_background_tasks: 0,
+            background_tasks: Vec::new(),
         }
     }
 

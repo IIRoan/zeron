@@ -228,6 +228,10 @@ pub mod methods {
     pub const PREPARE_WORKTREE: &str = "PrepareWorktree";
     pub const CANCEL_WORKTREE_SETUP: &str = "CancelWorktreeSetup";
     pub const GET_WORKTREE_SETUP_LOG: &str = "GetWorktreeSetupLog";
+    // A chat's background processes (`Session::background_tasks`) live in
+    // its host's runtime: `{chatId, taskId}`, relay-forwardable.
+    pub const STOP_BACKGROUND_TASK: &str = "StopBackgroundTask";
+    pub const READ_BACKGROUND_TASK_OUTPUT: &str = "ReadBackgroundTaskOutput";
     // Terminals (ControlRpc, relay-forwardable; SubscribeTerminal streams).
     pub const OPEN_TERMINAL: &str = "OpenTerminal";
     pub const SUBSCRIBE_TERMINAL: &str = "SubscribeTerminal";
