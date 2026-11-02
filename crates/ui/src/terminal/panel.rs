@@ -57,6 +57,10 @@ const BLINK_MS: u64 = 500;
 const BLINK_IDLE: Duration = Duration::from_secs(15);
 /// The copy flash's fade.
 const COPY_FLASH: Duration = Duration::from_millis(320);
+/// OSC 52 copies count only this soon after the user's input to that terminal.
+/// (Re)attaching replays up to 1 MB of old output, and a copy in that backlog
+/// must not silently replace the clipboard.
+const OSC52_INPUT_WINDOW: Duration = Duration::from_secs(5);
 
 actions!(terminal, [ToggleTerminal]);
 
@@ -307,9 +311,21 @@ struct TerminalTab {
     /// The host answers terminal queries itself; this emulator's answers
     /// would arrive second (and late, across a network) and read as input.
     host_replies: bool,
+    /// When the user last typed, pasted or clicked into this terminal.
+    last_input: Option<Instant>,
     resize_task: Option<Task<()>>,
     /// Open + subscribe/reconnect lifecycle; dropping it cancels the stream.
     _run: Option<Task<()>>,
+}
+
+impl TerminalTab {
+    /// The program's OSC 52 copy, if it followed the user's own input.
+    fn take_user_copy(&mut self) -> Option<String> {
+        let text = self.emulator.take_clipboard()?;
+        self.last_input
+            .is_some_and(|at| at.elapsed() < OSC52_INPUT_WINDOW)
+            .then_some(text)
+    }
 }
 
 #[derive(Default)]
@@ -582,6 +598,7 @@ impl TerminalPanel {
             sync_task: None,
             marked_text: None,
             host_replies: false,
+            last_input: None,
             resize_task: None,
             _run: None,
         });
@@ -1027,6 +1044,9 @@ impl TerminalPanel {
             TerminalEvent::Data { seq, data } => {
                 tab.last_seq = seq;
                 let responses = tab.emulator.feed(&decode_base64(&data));
+                if let Some(text) = tab.take_user_copy() {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                }
                 if tab.emulator.alt_screen() {
                     tab.predictor.reset();
                 }
@@ -1080,6 +1100,7 @@ impl TerminalPanel {
         }
         let key = tab.key;
         tab.input.push(bytes);
+        tab.last_input = Some(Instant::now());
         self.pump_input(&chat, key, cx);
         self.restart_blink(cx);
     }
@@ -1091,6 +1112,7 @@ impl TerminalPanel {
         let chat = self.selected_chat(cx);
         let Some(key) = self.with_active_tab(cx, |tab| {
             tab.input.push(bytes);
+            tab.last_input = Some(Instant::now());
             tab.key
         }) else {
             return;
@@ -1294,6 +1316,9 @@ impl TerminalPanel {
                     .is_some_and(|due| due <= std::time::Instant::now())
                 {
                     let responses = tab.emulator.finish_sync();
+                    if let Some(text) = tab.take_user_copy() {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                    }
                     if !responses.is_empty() && !tab.host_replies {
                         tab.input.push(&responses);
                         panel.pump_input(&chat, key, cx);

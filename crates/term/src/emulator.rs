@@ -26,7 +26,7 @@ use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::selection::{Selection, SelectionRange};
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::{Config, Term, TermMode};
+use alacritty_terminal::term::{ClipboardType, Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{
     Color as AnsiColor, CursorShape as AnsiCursorShape, CursorStyle as AnsiCursorStyle, NamedColor,
     Processor, Rgb as AnsiRgb,
@@ -198,6 +198,7 @@ pub struct Emulator {
     capture: EventCapture,
     title: Option<String>,
     bell: bool,
+    clipboard: Option<String>,
 }
 
 impl Emulator {
@@ -220,6 +221,7 @@ impl Emulator {
             capture,
             title: None,
             bell: false,
+            clipboard: None,
         }
     }
 
@@ -257,6 +259,11 @@ impl Emulator {
                 Event::Title(title) => self.title = Some(title),
                 Event::ResetTitle => self.title = None,
                 Event::Bell => self.bell = true,
+                // OSC 52 copy (Claude Code, tmux, nvim…). Loads stay denied:
+                // alacritty's default `Osc52::OnlyCopy` never emits them.
+                Event::ClipboardStore(ClipboardType::Clipboard, text) => {
+                    self.clipboard = Some(text)
+                }
                 _ => {}
             }
         }
@@ -283,6 +290,11 @@ impl Emulator {
     /// True once a BEL arrived; reading clears it.
     pub fn take_bell(&mut self) -> bool {
         std::mem::take(&mut self.bell)
+    }
+
+    /// Latest text the running program copied via OSC 52; reading clears it.
+    pub fn take_clipboard(&mut self) -> Option<String> {
+        self.clipboard.take()
     }
 
     /// Arrow keys should send SS3 (`ESC O A`) instead of CSI.
@@ -600,6 +612,20 @@ mod tests {
 
     fn emu(cols: u16, rows: u16) -> Emulator {
         Emulator::new(cols, rows)
+    }
+
+    #[test]
+    fn osc52_copy_surfaces_once_and_paste_queries_are_ignored() {
+        let mut e = emu(20, 5);
+        // "hello" base64-encoded, BEL- and ST-terminated.
+        e.feed(b"\x1b]52;c;aGVsbG8=\x07");
+        assert_eq!(e.take_clipboard().as_deref(), Some("hello"));
+        assert_eq!(e.take_clipboard(), None);
+        e.feed(b"\x1b]52;c;d29ybGQ=\x1b\\");
+        assert_eq!(e.take_clipboard().as_deref(), Some("world"));
+        // A paste query must neither copy nor answer with clipboard contents.
+        assert!(e.feed(b"\x1b]52;c;?\x07").is_empty());
+        assert_eq!(e.take_clipboard(), None);
     }
 
     #[test]
