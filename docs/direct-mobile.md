@@ -102,6 +102,11 @@ the native build to Expo's distribution project; it does not convert the app to
 React Native or use Expo's build servers.
 The Expo project requires account access to download internal builds.
 
+`scripts/ios/build-preview.sh [git-ref]` does all of this from a terminal: it
+pushes the ref to a temporary `ios-preview` branch, runs the workflow, waits
+and prints an `itms-services://` link. The link installs on the phone without
+an Expo login, because the install manifest Expo serves is public.
+
 The signing keychain and installed profiles are removed after the job.
 Device identifiers are masked in build logs. Regenerate both profiles when
 adding a device or renewing the certificate. Choose `distribution=unsigned`
