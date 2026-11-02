@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Build a signed iOS preview on GitHub's macOS runners and print the iPhone
-# install link (~50 min). See docs/direct-mobile.md.
+# install link. A build takes 1-2 hours with a cold Rust cache, plus any wait
+# for a runner. See docs/direct-mobile.md.
 #
 #   scripts/ios/build-preview.sh [git-ref]    (default: HEAD; committed code only)
-#   IOS_RUNNER=macos-15 scripts/ios/build-preview.sh   # if macos-26 runners are busy
 #
 # Pushes the ref to a temporary `ios-preview` branch on IIRoan/zeron (no
 # workflow fires on that push), runs "Direct instance iOS" with
@@ -18,22 +18,34 @@ SHA=$(git rev-parse --verify "${1:-HEAD}^{commit}")
 echo "Building $(git log -1 --format='%h %s' "$SHA")"
 
 git push --force --quiet origin "$SHA:refs/heads/$BRANCH"
-START=$(date -u -d '-2 min' +%FT%TZ)
-OUT=$(gh workflow run ios-direct.yml -R "$REPO" --ref "$BRANCH" -f distribution=preview -f runner="${IOS_RUNNER:-macos-26}" 2>&1)
-RUN=$(grep -o 'actions/runs/[0-9]*' <<<"$OUT" | grep -o '[0-9]*$' || true)
-for _ in $(seq 30); do
-  [ -n "$RUN" ] && break
-  sleep 5
-  RUN=$(gh run list -R "$REPO" -w ios-direct.yml -b "$BRANCH" -e workflow_dispatch -L 5 \
-    --json databaseId,createdAt -q "[.[] | select(.createdAt >= \"$START\")][0].databaseId // empty")
-done
-[ -n "$RUN" ] || { echo "error: workflow run not found: $OUT" >&2; exit 1; }
-echo "Run: https://github.com/$REPO/actions/runs/$RUN (takes ~50 min)"
+trap 'git push --quiet origin --delete "$BRANCH" 2>/dev/null || true' EXIT
 
-ok=0
-gh run watch "$RUN" -R "$REPO" --exit-status --interval 60 || ok=$?
-git push --quiet origin --delete "$BRANCH" || true
-[ "$ok" = 0 ] || { echo "error: build failed, see https://github.com/$REPO/actions/runs/$RUN" >&2; exit 1; }
+# GitHub cancels a job after 15 minutes if no runner takes it, leaving it with
+# no steps. Keep trying both Apple Silicon pools, for up to about 3 hours.
+POOLS=(macos-26 macos-15)
+ok=1
+for attempt in $(seq 0 11); do
+  POOL=${POOLS[attempt % 2]}
+  START=$(date -u -d '-2 min' +%FT%TZ)
+  OUT=$(gh workflow run ios-direct.yml -R "$REPO" --ref "$BRANCH" -f distribution=preview -f runner="$POOL" 2>&1)
+  RUN=$(grep -o 'actions/runs/[0-9]*' <<<"$OUT" | grep -o '[0-9]*$' || true)
+  for _ in $(seq 30); do
+    [ -n "$RUN" ] && break
+    sleep 5
+    RUN=$(gh run list -R "$REPO" -w ios-direct.yml -b "$BRANCH" -e workflow_dispatch -L 5 \
+      --json databaseId,createdAt -q "[.[] | select(.createdAt >= \"$START\")][0].databaseId // empty")
+  done
+  [ -n "$RUN" ] || { echo "error: workflow run not found: $OUT" >&2; exit 1; }
+  echo "Run: https://github.com/$REPO/actions/runs/$RUN on $POOL"
+
+  ok=0
+  gh run watch "$RUN" -R "$REPO" --exit-status --interval 60 || ok=$?
+  [ "$ok" = 0 ] && break
+  [ "$(gh run view "$RUN" -R "$REPO" --json jobs -q '.jobs[0].steps | length')" = 0 ] \
+    || { echo "error: build failed, see https://github.com/$REPO/actions/runs/$RUN" >&2; exit 1; }
+  echo "No $POOL runner was free, trying again"
+done
+[ "$ok" = 0 ] || { echo "error: no macOS runner was free after 12 attempts" >&2; exit 1; }
 
 PAGE=$(gh run view "$RUN" -R "$REPO" --log | grep -o 'https://expo\.dev/accounts/[^ ]*/builds/[0-9a-f-]*' | tail -1 || true)
 [ -n "$PAGE" ] || { echo "error: no Expo link in the run log" >&2; exit 1; }

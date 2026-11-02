@@ -104,8 +104,9 @@ The Expo project requires account access to download internal builds.
 
 `scripts/ios/build-preview.sh [git-ref]` does all of this from a terminal: it
 pushes the ref to a temporary `ios-preview` branch, runs the workflow, waits
-and prints an `itms-services://` link. The link installs on the phone without
-an Expo login, because the install manifest Expo serves is public.
+and prints an `itms-services://` link. If no runner is free, it keeps trying
+both Apple Silicon pools. The link installs on the phone without an Expo login,
+because the install manifest Expo serves is public.
 
 The signing keychain and installed profiles are removed after the job.
 Device identifiers are masked in build logs. Regenerate both profiles when
