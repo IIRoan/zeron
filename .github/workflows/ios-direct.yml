@@ -78,7 +78,8 @@ jobs:
           key: direct-ios
           cache-on-failure: true
       - name: Direct transport and real engine regressions
-        timeout-minutes: 25
+        # A cold Rust cache needs ~30 minutes for these test builds.
+        timeout-minutes: 45
         run: |
           cargo test --locked -p zeron-rpc
           cargo test --locked -p zeron-engine --test direct_mobile
