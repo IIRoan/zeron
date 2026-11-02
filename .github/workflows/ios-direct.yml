@@ -24,7 +24,7 @@ jobs:
   build:
     if: github.repository == 'IIRoan/zeron'
     runs-on: ${{ inputs.runner || 'macos-26' }}
-    timeout-minutes: 120
+    timeout-minutes: 180
     env:
       CARGO_INCREMENTAL: 0
       CARGO_PROFILE_DEV_DEBUG: 0
@@ -86,7 +86,8 @@ jobs:
           cargo test --locked -p zeron-client
           cargo test --locked -p zeron-doc direct_tests
       - name: Build Rust simulator core and Swift bindings
-        timeout-minutes: 25
+        # ~26 minutes from a cold cache.
+        timeout-minutes: 45
         env:
           ARCHS: arm64
         run: |
@@ -144,7 +145,8 @@ jobs:
             echo "No completed test result bundle; retaining raw test diagnostics in the artifact."
           fi
       - name: Archive for iPhone
-        timeout-minutes: 30
+        # Builds the device core (thin LTO, one codegen unit) from scratch when the cache is cold.
+        timeout-minutes: 60
         working-directory: apps/ios
         env:
           DISTRIBUTION: ${{ inputs.distribution || 'unsigned' }}
