@@ -25,6 +25,8 @@ ZERON_PACKAGE_BROWSER_RUNTIME="${ZERON_BROWSER_WPE_RUNTIME:-}"
 if [[ -n "$ZERON_PACKAGE_BROWSER_RUNTIME" ]]; then
   test -f "$ZERON_PACKAGE_BROWSER_RUNTIME/manifest.json"
   export PKG_CONFIG_PATH="$ZERON_PACKAGE_BROWSER_RUNTIME/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+  # Shipping a WPE runtime without the helper would open WPE profiles with WebKitGTK, which refuses them.
+  export ZERON_WPE=1
 fi
 if [[ "$PROFILE" == "release" ]]; then
   cargo build --release -p zeron

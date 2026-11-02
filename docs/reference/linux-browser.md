@@ -20,7 +20,7 @@ The WPE helper needs WPE WebKit 2.50 or later with the WPE Platform API, JSON-GL
 sudo pacman -S wpewebkit json-glib mesa libglvnd libxkbcommon
 ```
 
-A build embeds the WPE helper when pkg-config finds `wpe-webkit-2.0 >= 2.50`, `wpe-platform-2.0`, `json-glib-1.0`, `gbm`, `egl`, `glesv2` and `xkbcommon`. Otherwise it prints a warning and the browser uses WebKitGTK. The release workflows install only the WebKitGTK packages, so release builds currently use WebKitGTK.
+A build embeds the WPE helper when pkg-config finds `wpe-webkit-2.0 >= 2.50`, `wpe-platform-2.0`, `json-glib-1.0`, `gbm`, `egl`, `glesv2` and `xkbcommon`. Otherwise it prints a warning, with pkg-config's reason, and the browser uses WebKitGTK. With `ZERON_WPE=1`, which `scripts/package-linux.sh` sets when it ships a WPE runtime, a missing or uncompilable WPE helper fails the build instead: a profile that WPE already migrated cannot be opened by WebKitGTK. The release workflows install only the WebKitGTK packages, so release builds currently use WebKitGTK.
 
 ## WebKitGTK
 

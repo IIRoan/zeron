@@ -75,7 +75,9 @@ fn main() {
 /// The WPE WebKit helper is optional: without WPE WebKit 2.50+ development
 /// files, with ones it does not compile against (an older GBM), or with
 /// `ZERON_WPE=0`, the build embeds an empty helper and the browser uses
-/// WebKitGTK.
+/// WebKitGTK. `ZERON_WPE=1` (set by package-linux.sh when it ships a WPE
+/// runtime) makes either a build error instead, so such a release never
+/// silently falls back to WebKitGTK.
 fn build_wpe_helper() {
     let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("zeron-wpe");
     let packages = [
@@ -87,7 +89,7 @@ fn build_wpe_helper() {
         "cairo",
         "xkbcommon",
     ];
-    let flags = (env::var("ZERON_WPE").as_deref() != Ok("0"))
+    let probe = (env::var("ZERON_WPE").as_deref() != Ok("0"))
         .then(|| {
             Command::new("pkg-config")
                 .arg("--cflags")
@@ -96,13 +98,21 @@ fn build_wpe_helper() {
                 .output()
                 .ok()
         })
-        .flatten()
-        .filter(|flags| flags.status.success());
-    let Some(flags) = flags else {
-        println!(
-            "cargo:warning=WPE WebKit 2.50+ development files not found; the Linux browser will use WebKitGTK"
+        .flatten();
+    let Some(flags) = probe.as_ref().filter(|flags| flags.status.success()) else {
+        let reason = probe
+            .map(|probe| {
+                String::from_utf8_lossy(&probe.stderr)
+                    .trim()
+                    .replace('\n', " ")
+            })
+            .unwrap_or_default();
+        skip_wpe_helper(
+            &output,
+            &format!(
+                "WPE WebKit 2.50+ development files not found; the Linux browser will use WebKitGTK. {reason}"
+            ),
         );
-        std::fs::write(&output, []).unwrap();
         return;
     };
     let status = Command::new(env::var("CC").unwrap_or_else(|_| "cc".into()))
@@ -118,14 +128,23 @@ fn build_wpe_helper() {
             "-o",
         ])
         .arg(&output)
-        .args(String::from_utf8(flags.stdout).unwrap().split_whitespace())
+        .args(String::from_utf8_lossy(&flags.stdout).split_whitespace())
         .arg("-lm")
         .status()
         .expect("C compiler is required to build the Linux browser helper");
     if !status.success() {
-        println!(
-            "cargo:warning=WPE WebKit helper compilation failed; the Linux browser will use WebKitGTK"
+        skip_wpe_helper(
+            &output,
+            "WPE WebKit helper compilation failed; the Linux browser will use WebKitGTK",
         );
-        std::fs::write(&output, []).unwrap();
     }
+}
+
+fn skip_wpe_helper(output: &std::path::Path, message: &str) {
+    assert!(
+        env::var("ZERON_WPE").as_deref() != Ok("1"),
+        "ZERON_WPE=1 requires the WPE helper: {message}"
+    );
+    println!("cargo:warning={message}");
+    std::fs::write(output, []).unwrap();
 }
