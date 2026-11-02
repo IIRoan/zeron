@@ -42,7 +42,8 @@ final class OnboardingViewController: UIViewController {
     private var providers: ProvidersViewController?
 
     static func shouldShow(for app: AppModel) -> Bool {
-        guard let client = app.client, !app.isDemo else { return false }
+        // Its steps set up Cloud and accounts; a directly paired phone has neither.
+        guard let client = app.client, !app.isDemo, !app.isDirect else { return false }
         return !UserDefaults.standard.bool(forKey: key(client))
     }
 
