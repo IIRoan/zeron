@@ -3,6 +3,7 @@
 # install link (~50 min). See docs/direct-mobile.md.
 #
 #   scripts/ios/build-preview.sh [git-ref]    (default: HEAD; committed code only)
+#   IOS_RUNNER=macos-15 scripts/ios/build-preview.sh   # if macos-26 runners are busy
 #
 # Pushes the ref to a temporary `ios-preview` branch on IIRoan/zeron (no
 # workflow fires on that push), runs "Direct instance iOS" with
@@ -18,7 +19,7 @@ echo "Building $(git log -1 --format='%h %s' "$SHA")"
 
 git push --force --quiet origin "$SHA:refs/heads/$BRANCH"
 START=$(date -u -d '-2 min' +%FT%TZ)
-OUT=$(gh workflow run ios-direct.yml -R "$REPO" --ref "$BRANCH" -f distribution=preview 2>&1)
+OUT=$(gh workflow run ios-direct.yml -R "$REPO" --ref "$BRANCH" -f distribution=preview -f runner="${IOS_RUNNER:-macos-26}" 2>&1)
 RUN=$(grep -o 'actions/runs/[0-9]*' <<<"$OUT" | grep -o '[0-9]*$' || true)
 for _ in $(seq 30); do
   [ -n "$RUN" ] && break
