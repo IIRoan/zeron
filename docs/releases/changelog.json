@@ -4,6 +4,26 @@
   "fork_repository": "IIRoan/zeron",
   "releases": [
     {
+      "version": "0.2.132",
+      "upstream_commit": "a7947b72138e25f837273f539b642c9895775465",
+      "upstream_url": "https://github.com/zeronsh/zeron/releases/tag/v0.2.132",
+      "published_at": "2026-11-02T10:35:55Z",
+      "notes_source": "github_release",
+      "upstream_notes": "## What's Changed\n* Change requests: stop PR watches running git in every project by @hoangvu12 in https://github.com/zeronsh/zeron/pull/1128\n* CI: one entry workflow with admission, reuse, priority/locks and a fast pull request tier by @katulevskiy in https://github.com/zeronsh/zeron/pull/1077\n\n\n**Full Changelog**: https://github.com/zeronsh/zeron/compare/v0.2.131...v0.2.132",
+      "fork_changes": [
+        "Fail Linux builds that ship a WPE runtime without the WPE helper",
+        "Skip Cloud onboarding on directly paired phones",
+        "Restore the generated Swift bindings byte for byte",
+        "Keep trying both macOS runner pools in the iOS preview script",
+        "Let the iOS preview script use the alternate macOS runner pool",
+        "Give cold-cache Rust builds room in the direct iOS workflow",
+        "Add a one-command iOS preview build that prints the install link",
+        "Allow cold Rust caches in the direct iOS test step",
+        "Copy terminal OSC 52 clipboard writes to the system clipboard"
+      ],
+      "fork_through_commit": "faa9a4ebce4270939e73c8cc41cc2af6a355848d"
+    },
+    {
       "version": "0.2.131",
       "upstream_commit": "0a153df5ad84a2036d327bd785281888689f4030",
       "upstream_url": "https://github.com/zeronsh/zeron/releases/tag/v0.2.131",
