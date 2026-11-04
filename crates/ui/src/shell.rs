@@ -9272,12 +9272,16 @@ impl Shell {
         // FAILED (explicit, with the transcript's retry affordance); a send
         // whose delivery path is degraded is QUEUED, not Working — the
         // pending pill tells the truth instead of faking a spinner.
-        let (queued, undelivered) = {
+        let (queued, undelivered, background_running) = {
             let now = Utc::now();
             let state = self.state.read(cx);
             (
                 state.send_queued(&id, now),
                 state.send_undelivered(&id, now),
+                state.session_for(&id).is_some_and(|session| {
+                    session.status == zeron_proto::SessionStatus::Idle
+                        && zeron_proto::view::has_background_tasks(Some(session), now)
+                }),
             )
         };
         let status_color = if undelivered {
@@ -9293,7 +9297,11 @@ impl Shell {
             Some("Queued")
         } else {
             match status {
-                zeron_proto::ChatIndicator::Working => Some("Working"),
+                zeron_proto::ChatIndicator::Working => Some(if background_running {
+                    "Running"
+                } else {
+                    "Working"
+                }),
                 zeron_proto::ChatIndicator::AwaitingInput => Some("Input"),
                 zeron_proto::ChatIndicator::Errored => Some("Failed"),
                 zeron_proto::ChatIndicator::Completed => Some("Done"),

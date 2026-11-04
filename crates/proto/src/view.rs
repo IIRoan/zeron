@@ -120,23 +120,37 @@ pub fn background_tasks(session: Option<&Session>, now: DateTime<Utc>) -> &[crat
         .map_or(&[], |s| s.background_tasks.as_slice())
 }
 
-/// The full display status for a chat row / tab dot: live states win, then the
-/// synced seen marker decides completed-vs-idle. Staleness gating rides on
+/// Live background work, including peers that report only a count or only
+/// a process list. The two sources may overlap.
+pub fn has_background_tasks(session: Option<&Session>, now: DateTime<Utc>) -> bool {
+    running_background_tasks(session, now) > 0 || !background_tasks(session, now).is_empty()
+}
+
+/// The full display status for a chat row / tab dot: live states and background
+/// work win, then the synced seen marker decides completed-vs-idle. Staleness gating rides on
 /// [`effective_indicator`]; the derivation itself is [`crate::chat_indicator`].
 pub fn display_status(chat: &Chat, session: Option<&Session>, now: DateTime<Utc>) -> ChatIndicator {
     if session.is_some_and(|s| session_stale(s, now)) {
         return ChatIndicator::Idle;
     }
-    if let Some(session) = session
+    let status = if let Some(session) = session
         && session.running_subagents > 0
         && running_subagents(Some(session), now) == 0
     {
         // Expire live child counts without discarding recorded turn outcomes.
         let mut settled = session.clone();
         settled.running_subagents = 0;
-        return crate::chat_indicator(chat, Some(&settled));
+        crate::chat_indicator(chat, Some(&settled))
+    } else {
+        crate::chat_indicator(chat, session)
+    };
+    if matches!(status, ChatIndicator::Idle | ChatIndicator::Completed)
+        && has_background_tasks(session, now)
+    {
+        ChatIndicator::Working
+    } else {
+        status
     }
-    crate::chat_indicator(chat, session)
 }
 
 /// Same seen/outcome rules, restricted to native work for composer controls.
@@ -537,47 +551,90 @@ mod gate_tests {
     }
 
     #[test]
-    fn parked_chats_stay_active_for_subagents_but_not_background_commands() {
+    fn parked_chats_stay_active_for_subagents_and_background_commands() {
         let now = Utc::now();
         let mut chat: Chat = serde_json::from_value(serde_json::json!({
             "id": "chat", "deviceId": "dev", "archived": false,
             "createdAt": now, "lastMessageAt": now,
         }))
         .unwrap();
-        for (subagents, background) in [(0, 2), (1, 0), (1, 2)] {
-            let mut wire = serde_json::to_value(running_session(subagents, now)).unwrap();
-            wire["status"] = "idle".into();
-            wire["runningBackgroundTasks"] = background.into();
-            let session: Session = serde_json::from_value(wire).unwrap();
+        for (subagents, background, listed) in [
+            (0, 2, false),
+            (1, 0, false),
+            (1, 2, false),
+            (0, 0, true),
+            (0, 2, true),
+        ] {
+            let mut session = running_session(subagents, now);
+            session.status = SessionStatus::Idle;
+            session.running_background_tasks = background;
+            if listed {
+                session.background_tasks.push(crate::BackgroundTask {
+                    id: "command".into(),
+                    command: "gh run watch --exit-status".into(),
+                    description: None,
+                    started_at: now,
+                });
+            }
             chat.last_seen_at = None;
             assert_eq!(
                 display_status(&chat, Some(&session), now),
-                if subagents > 0 {
-                    ChatIndicator::Working
-                } else {
-                    ChatIndicator::Completed
-                }
+                ChatIndicator::Working
             );
             // The completed parent turn can still accept another message.
             assert_eq!(effective_indicator(Some(&session), now), Indicator::None);
+            if subagents == 0 {
+                assert_eq!(
+                    native_display_status(&chat, Some(&session), now),
+                    ChatIndicator::Completed
+                );
+            }
             chat.last_seen_at = Some(now);
             assert_eq!(
                 display_status(&chat, Some(&session), now),
-                if subagents > 0 {
-                    ChatIndicator::Working
-                } else {
-                    ChatIndicator::Idle
-                }
+                ChatIndicator::Working
             );
+            if subagents == 0 {
+                assert_eq!(
+                    native_display_status(&chat, Some(&session), now),
+                    ChatIndicator::Idle
+                );
+            }
             // Completion is a display decision, not a request to stop the
             // runtime or lose the provider's background-task bookkeeping.
             assert_eq!(running_background_tasks(Some(&session), now), background);
+            assert_eq!(
+                has_background_tasks(Some(&session), now),
+                background > 0 || listed
+            );
+            let cutoff = now + chrono::Duration::milliseconds(SESSION_STALE_MS);
+            assert_eq!(
+                display_status(&chat, Some(&session), cutoff),
+                ChatIndicator::Working
+            );
             let stale = now + chrono::Duration::milliseconds(SESSION_STALE_MS + 1);
             assert_eq!(
                 display_status(&chat, Some(&session), stale),
                 ChatIndicator::Idle
             );
+            assert!(!has_background_tasks(Some(&session), stale));
+
+            // Once the last process ends, the synced seen marker determines
+            // the row's resting state again.
+            session.running_subagents = 0;
+            session.running_background_tasks = 0;
+            session.background_tasks.clear();
+            assert_eq!(
+                display_status(&chat, Some(&session), now),
+                ChatIndicator::Idle
+            );
+            chat.last_seen_at = None;
+            assert_eq!(
+                display_status(&chat, Some(&session), now),
+                ChatIndicator::Completed
+            );
         }
+        assert!(!has_background_tasks(None, now));
         let mut drained = running_session(0, now);
         drained.status = SessionStatus::Idle;
         chat.last_seen_at = None;
@@ -598,6 +655,26 @@ mod gate_tests {
             display_status(&chat, Some(&drained), stale),
             ChatIndicator::Errored
         );
+    }
+
+    #[test]
+    fn background_commands_preserve_input_and_error_attention() {
+        let now = Utc::now();
+        let chat: Chat = serde_json::from_value(serde_json::json!({
+            "id": "chat", "deviceId": "dev", "archived": false,
+            "createdAt": now, "lastMessageAt": now,
+        }))
+        .unwrap();
+        let mut session = running_session(0, now);
+        session.running_background_tasks = 2;
+        for (status, expected) in [
+            (SessionStatus::Working, ChatIndicator::Working),
+            (SessionStatus::AwaitingInput, ChatIndicator::AwaitingInput),
+            (SessionStatus::Errored, ChatIndicator::Errored),
+        ] {
+            session.status = status;
+            assert_eq!(display_status(&chat, Some(&session), now), expected);
+        }
     }
 
     #[test]

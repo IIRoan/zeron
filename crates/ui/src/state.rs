@@ -613,18 +613,18 @@ async fn query_engine_info(client: &RpcClient) -> Result<EngineInfo, RpcError> {
 pub use zeron_proto::view::{
     ChatGroup, ConnectionStatus, GatePhase, Indicator, SESSION_STALE_MS, attention_rank,
     chat_location, display_status, effective_indicator, format_time_ago, gate_phase, group_chats,
-    parse_auth_state, project_label, running_background_tasks, running_subagents, sort_active,
-    sort_chats, sort_spaces, sort_tabs,
+    has_background_tasks, parse_auth_state, project_label, running_background_tasks,
+    running_subagents, sort_active, sort_chats, sort_spaces, sort_tabs,
 };
 
 /// What a session row shows that ticks with the clock rather than with its
-/// content: the staleness-checked turn indicator and background task counts.
+/// content: the staleness-checked turn indicator, subagents and background work.
 /// A change in any of them must repaint even when the row itself is untouched.
-fn session_presence(session: &Session, now: DateTime<Utc>) -> (Indicator, u32, u32) {
+fn session_presence(session: &Session, now: DateTime<Utc>) -> (Indicator, u32, bool) {
     (
         effective_indicator(Some(session), now),
         running_subagents(Some(session), now),
-        running_background_tasks(Some(session), now),
+        has_background_tasks(Some(session), now),
     )
 }
 
@@ -941,7 +941,7 @@ pub struct AppState {
     device_presentation: Option<Vec<(Device, bool, String)>>,
     // Presence ticks also retire stale remote session indicators. Remember
     // their last published appearance even when the device rows stay online.
-    session_presence_presentation: Vec<(Indicator, u32, u32)>,
+    session_presence_presentation: Vec<(Indicator, u32, bool)>,
     /// Live edge posture (WatchConnectivity): drives the connection pill,
     /// composer honesty ("will queue"), and the Queued send badges.
     pub connectivity: zeron_proto::Connectivity,
@@ -1123,7 +1123,7 @@ fn is_text_append(frame: &TranscriptFrame) -> bool {
 }
 
 /// Each session's presence at `now` (the lease-dependent part of a frame).
-fn session_presence_at(sessions: &[Session], now: DateTime<Utc>) -> Vec<(Indicator, u32, u32)> {
+fn session_presence_at(sessions: &[Session], now: DateTime<Utc>) -> Vec<(Indicator, u32, bool)> {
     sessions
         .iter()
         .map(|session| session_presence(session, now))
@@ -3395,6 +3395,7 @@ impl AppState {
                     zeron_proto::SessionStatus::Working | zeron_proto::SessionStatus::AwaitingInput
                 ) || session.running_subagents > 0
                     || session.running_background_tasks > 0
+                    || !session.background_tasks.is_empty()
             })
             // `age_ms > SESSION_STALE_MS` first holds one millisecond past it.
             .map(|session| {
@@ -7341,22 +7342,23 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         let now = clock_epoch();
-        for (subagents, background) in [(0, 2), (1, 0)] {
+        for (subagents, background, listed) in [(0, 2, false), (1, 0, false), (0, 0, true)] {
             let mut row = session("row", SessionStatus::Idle, 10, now);
             row.running_subagents = subagents;
             row.running_background_tasks = background;
+            if listed {
+                row.background_tasks.push(zeron_proto::BackgroundTask {
+                    id: "command".into(),
+                    command: "gh run watch --exit-status".into(),
+                    description: None,
+                    started_at: now,
+                });
+            }
             let cutoff = row.updated_at + TimeDelta::milliseconds(SESSION_STALE_MS + 1);
             let mut probe = AppState::new();
             probe.sessions = vec![row.clone()];
             let chat = chat("row", 0, Some(0));
-            assert_eq!(
-                probe.display_status_for(&chat, now),
-                if subagents > 0 {
-                    ChatIndicator::Working
-                } else {
-                    ChatIndicator::Completed
-                }
-            );
+            assert_eq!(probe.display_status_for(&chat, now), ChatIndicator::Working);
             assert_eq!(probe.indicator_for("row", now), Indicator::None);
             assert_eq!(
                 probe.display_status_for(&chat, cutoff),
