@@ -68,6 +68,7 @@ async fn check_persistence(
         worktree: None,
         resume: None,
         env: Default::default(),
+        extra_mcp: Vec::new(),
     };
     core.sessions
         .dispatch(
@@ -253,6 +254,7 @@ async fn check_quiet_children(scenario: &str) {
         plan: false,
         env: Default::default(),
         mcp: None,
+        extra_mcp: Vec::new(),
         prompt: format!("scenario:{scenario}"),
         harness: None,
         model: None,

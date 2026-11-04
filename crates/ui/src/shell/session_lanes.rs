@@ -633,6 +633,9 @@ mod tests {
             subagent_ref: doc.map(str::to_owned),
             subagent_status: status,
             subagent_tail: None,
+            exit_code: None,
+            output_truncated: false,
+            output_lines: None,
         }
     }
 

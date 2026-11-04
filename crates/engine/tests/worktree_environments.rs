@@ -1579,6 +1579,7 @@ async fn agent_dispatch_prepares_only_worktrees_zeron_created() {
                 zeron_doc::SessionCommandPayload::Run {
                     request: RunRequest {
                         mcp: None,
+                        extra_mcp: Vec::new(),
                         prompt: "hello".into(),
                         harness: None,
                         model: None,

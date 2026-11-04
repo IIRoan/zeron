@@ -50,6 +50,7 @@ async fn check_forked_skill(parked: bool, failed: bool) {
     let core = assemble(dir.path());
     let request = RunRequest {
         mcp: None,
+        extra_mcp: Vec::new(),
         prompt: format!(
             "scenario:forked-skill-{}-{}",
             if parked { "parked" } else { "live" },
