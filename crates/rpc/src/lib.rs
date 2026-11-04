@@ -737,6 +737,10 @@ pub fn agent_allowed(method: &str) -> bool {
             // Showing the person something in the calling chat.
             | methods::PUBLISH_VISUAL
             | methods::PUBLISH_IMAGE
+            // Browser tools still require the viewport's per-chat opt-in.
+            // Publishing or replying as that viewport stays app-only.
+            | methods::LIST_BROWSER_TABS
+            | methods::CONTROL_BROWSER
             // Plugins: authoring, installing (lands waiting for the person),
             // checking for updates, and their tools.
             | methods::LIST_PLUGINS
@@ -1363,6 +1367,9 @@ mod tests {
             // The window's own watch of the theme files.
             methods::WATCH_THEMES,
             methods::READ_TOOL_OUTPUT,
+            methods::ATTACH_BROWSER_HOST,
+            methods::UPDATE_BROWSER_HOST,
+            methods::REPLY_BROWSER_HOST,
         ] {
             assert!(!agent_allowed(method), "{method}");
             match agent.call(method, serde_json::json!({})).await {
@@ -1380,6 +1387,11 @@ mod tests {
         }
 
         let app = connect_ws(&url, Some(&tokens.full)).await.unwrap();
+        for method in [methods::LIST_BROWSER_TABS, methods::CONTROL_BROWSER] {
+            assert!(agent_allowed(method), "{method}");
+            let asked = agent.call(method, serde_json::json!({})).await.unwrap();
+            assert!(asked.as_str().unwrap().starts_with("Agent"), "{method}: {asked}");
+        }
         for method in [methods::DECIDE_PLUGIN, methods::ACCESS_TOKEN] {
             let asked = app.call(method, serde_json::json!({})).await.unwrap();
             assert_eq!(asked, serde_json::json!("Local"), "{method}");
