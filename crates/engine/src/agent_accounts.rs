@@ -3216,6 +3216,7 @@ impl AgentAccounts {
         let access_token = str_field(tokens, "access_token").ok_or(ProbeError::NoCredentials {
             why: NoCredentials::Missing,
         })?;
+        let provider_account_id = str_field(tokens, "account_id").unwrap_or_default();
         let body = probe_json(
             "codex",
             "usage",
@@ -3223,14 +3224,12 @@ impl AgentAccounts {
                 .http
                 .get(&self.inner.endpoints.codex_usage)
                 .bearer_auth(&access_token)
-                .header(
-                    "chatgpt-account-id",
-                    str_field(tokens, "account_id").unwrap_or_default(),
-                ),
+                .header("chatgpt-account-id", &provider_account_id),
         )
         .await?;
+        // The reply names the workspace, not our user-plus-workspace slot key.
         if let Some(account_id) = str_field(&body, "account_id")
-            && account_id != slot.account_key
+            && account_id != provider_account_id
         {
             return Err(ProbeError::NoCredentials {
                 why: NoCredentials::Missing,
@@ -4061,10 +4060,20 @@ fn codex_slot_auth(slot: &Slot) -> Result<(&str, &str), EngineError> {
     let access_token = tokens
         .and_then(|tokens| tokens.get("access_token"))
         .and_then(|v| v.as_str());
+    // The provider's account id is the workspace, while the slot key also
+    // identifies the user occupying that workspace's seat.
+    let workspace_id = tokens
+        .and_then(|tokens| str_field(tokens, "id_token"))
+        .and_then(|token| jwt_claims(&token))
+        .and_then(|claims| {
+            claims
+                .get("https://api.openai.com/auth")
+                .and_then(|auth| str_field(auth, "chatgpt_account_id"))
+        });
     match (account_id, access_token) {
         (Some(account_id), Some(access_token))
             if !access_token.is_empty()
-                && account_id == slot.account_key
+                && workspace_id.as_deref() == Some(account_id)
                 && detected.account_key == slot.account_key =>
         {
             Ok((access_token, account_id))
@@ -5183,10 +5192,19 @@ mod tests {
 
     #[test]
     fn codex_reset_auth_rejects_an_account_mismatch() {
-        let claims = serde_json::json!({
+        for user_claim in [None, Some("chatgpt_user_id"), Some("user_id")] {
+            check_codex_reset_auth(user_claim);
+        }
+    }
+
+    fn check_codex_reset_auth(user_claim: Option<&str>) {
+        let mut claims = serde_json::json!({
             "email": "alice@example.com",
             "https://api.openai.com/auth": { "chatgpt_account_id": "account-alice" }
         });
+        if let Some(user_claim) = user_claim {
+            claims["https://api.openai.com/auth"][user_claim] = serde_json::json!("user-alice");
+        }
         let id_token = format!("x.{}.x", BASE64_URL.encode(claims.to_string()));
         let credentials = serde_json::json!({
             "tokens": {
@@ -5210,6 +5228,8 @@ mod tests {
         assert!(codex_slot_auth(&slot).is_err());
         slot.credentials["tokens"]["account_id"] = serde_json::json!("account-alice");
         assert_eq!(codex_slot_auth(&slot).unwrap().1, "account-alice");
+        slot.account_key = "user-bob::account-alice".into();
+        assert!(codex_slot_auth(&slot).is_err());
     }
 
     #[test]

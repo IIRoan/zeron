@@ -1916,12 +1916,115 @@ async fn a_failed_sign_ins_output_is_redacted_before_the_ui_sees_it() {
 fn codex_auth(email: &str, account_id: &str) -> String {
     let id_token = jwt(serde_json::json!({
         "email": email,
-        "https://api.openai.com/auth": { "chatgpt_account_id": account_id, "chatgpt_plan_type": "plus" },
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": account_id,
+            "chatgpt_user_id": format!("user-{email}"),
+            "chatgpt_plan_type": "plus"
+        },
     }));
     serde_json::json!({
         "tokens": { "id_token": id_token, "access_token": "codex-access", "account_id": account_id }
     })
     .to_string()
+}
+
+#[tokio::test]
+async fn codex_team_usage_refreshes_stale_cached_windows() {
+    let reset_at = 1794388625;
+    let server = MockServer::start(move |method, path, _| match (method, path) {
+        ("GET", "/backend-api/wham/usage") => (
+            200,
+            serde_json::json!({
+                "account_id": "workspace-ada",
+                "plan_type": "team",
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 57,
+                        "limit_window_seconds": 604800,
+                        "reset_at": reset_at
+                    },
+                    "secondary_window": null
+                },
+                "rate_limit_reset_credits": { "available_count": 3 }
+            })
+            .to_string(),
+        ),
+        ("GET", "/backend-api/wham/rate-limit-reset-credits") => (
+            200,
+            serde_json::json!({
+                "available_count": 3,
+                "credits": (1..=3).map(|i| serde_json::json!({
+                    "id": format!("credit-{i}"),
+                    "reset_type": "codex_rate_limits",
+                    "status": "available",
+                    "title": "Full reset"
+                })).collect::<Vec<_>>()
+            })
+            .to_string(),
+        ),
+        _ => (404, String::new()),
+    })
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (accounts, config) = accounts_with(tmp.path(), mocked(&server.base));
+    let auth = codex_auth("ada@example.com", "workspace-ada");
+    write(&config.codex_home.join("auth.json"), &auth);
+    let auth: serde_json::Value = serde_json::from_str(&auth).unwrap();
+    let detected = parse_codex_auth(auth.clone()).unwrap();
+    assert_eq!(detected.account_key, "user-ada@example.com::workspace-ada");
+    let mut entry = UsageEntry::default();
+    let old = now_ms() - 24 * 60 * 60 * 1000;
+    entry.record(
+        Ok(codex_usage_snapshot(&serde_json::json!({
+            "rate_limit": { "primary_window": {
+                "used_percent": 7, "limit_window_seconds": 604800, "reset_at": reset_at
+            } }
+        }))
+        .unwrap()),
+        credentials_fingerprint(&auth),
+        old,
+    );
+    entry.record(
+        Err(ProbeError::NoCredentials {
+            why: NoCredentials::Missing,
+        }),
+        credentials_fingerprint(&auth),
+        old + 1000,
+    );
+    {
+        let mut usage = lock(&accounts.inner.usage);
+        usage.insert(usage_key(HarnessId::Codex, &detected.account_key), entry);
+        accounts.persist_usage(&usage);
+    }
+    let (accounts, _) = accounts_with(tmp.path(), mocked(&server.base));
+    let stale = rows(&accounts.list(false).await.unwrap(), HarnessId::Codex);
+    assert!((stale[0].usage_windows[0].used_fraction - 0.07).abs() < 1e-6);
+    assert_eq!(server.hits("GET /backend-api/wham/usage"), 0);
+
+    let fresh = rows(&accounts.list(true).await.unwrap(), HarnessId::Codex);
+    assert!(fresh[0].active);
+    assert_eq!(fresh[0].usage_error, None);
+    assert!(fresh[0].usage_fetched_at.unwrap() > old);
+    assert_eq!(fresh[0].usage_windows[0].label, "Week");
+    assert!((fresh[0].usage_windows[0].used_fraction - 0.57).abs() < 1e-6);
+    assert_eq!(
+        fresh[0].usage_windows[0].resets_at.unwrap().timestamp(),
+        reset_at
+    );
+    assert_eq!(
+        fresh[0]
+            .codex_reset_credits
+            .as_ref()
+            .unwrap()
+            .available_count,
+        3
+    );
+
+    let (restarted, _) = accounts_with(tmp.path(), mocked(&server.base));
+    let cold = rows(&restarted.list(false).await.unwrap(), HarnessId::Codex);
+    assert_eq!(cold[0].usage_windows, fresh[0].usage_windows);
+    assert_eq!(cold[0].codex_reset_credits, fresh[0].codex_reset_credits);
+    assert_eq!(server.hits("GET /backend-api/wham/usage"), 1);
 }
 
 #[tokio::test]
