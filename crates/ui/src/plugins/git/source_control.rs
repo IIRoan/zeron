@@ -27,6 +27,7 @@ mod stash;
 mod branch;
 mod staging;
 mod commands;
+mod menu;
 pub(crate) use commands::{GitCommand, GIT_COMMANDS};
 use git::{Confirmation, ConfirmationDialog, GitForm, GitPanel, UndoDiscard};
 use selection::FileKey;
@@ -67,6 +68,7 @@ pub enum SourceControlEvent {
 }
 
 pub struct SourceControl {
+    plugin_active: bool,
     state: Entity<AppState>,
     notifications: Option<Entity<crate::progress_toast::Toasts>>,
     target: Option<Target>,
@@ -109,7 +111,7 @@ pub struct SourceControl {
     undo_discard: Option<UndoDiscard>,
     operation_label: Option<SharedString>,
     amend: bool,
-    actions_menu: popover::Popup<()>,
+    actions_menu: popover::Popup<menu::ActionsMenu>,
     commit_menu: popover::Popup<()>,
     actions_menu_bounds: selection::MenuBounds,
     commit_menu_bounds: selection::MenuBounds,
@@ -337,6 +339,7 @@ impl SourceControl {
             })
             .collect();
         Self {
+            plugin_active: crate::plugins::enabled(crate::plugins::PluginId::Git, cx),
             state,
             notifications: None,
             target: None,
@@ -406,9 +409,29 @@ impl SourceControl {
         })
     }
 
+    pub(crate) fn suspend_plugin(&mut self, cx: &mut Context<Self>) {
+        self.plugin_active = false;
+        self.remember_draft(cx);
+        self.poll = None;
+        self.poll_paused = true;
+        self.details_task = None;
+        self.details_key = None;
+        self.actions_menu = Default::default();
+        self.commit_menu = Default::default();
+        self.file_menu = Default::default();
+        self.confirmation = None;
+        self.pending_git_command = None;
+    }
+
     pub fn ensure_loaded(&mut self, cx: &mut Context<Self>) {
+        if !crate::plugins::enabled(crate::plugins::PluginId::Git, cx) { self.suspend_plugin(cx); return; }
+        self.plugin_active = true;
         let target = self.desired_target(cx);
         let unavailable = target.is_none() || self.state.read(cx).engine().is_none();
+        if self.target == target && self.poll.is_none() && self.snapshot.is_some() && !unavailable {
+            self.start_polling(cx);
+            return;
+        }
         if self.target == target && (self.poll.is_some() || unavailable) {
             return;
         }
@@ -457,6 +480,7 @@ impl SourceControl {
     /// a change, a mutation from this view or reappearing resets the delay.
     fn start_polling(&mut self, cx: &mut Context<Self>) {
         self.poll = None;
+        if !crate::plugins::enabled(crate::plugins::PluginId::Git, cx) { return; }
         self.poll_paused = false;
         let Some(target) = self.target.clone() else {
             return;
@@ -714,6 +738,7 @@ impl SourceControl {
     }
 
     fn commit_with_paths(&mut self, stage_paths: Vec<String>, cx: &mut Context<Self>) {
+        if !crate::plugins::enabled(crate::plugins::PluginId::Git, cx) { return; }
         if stage_paths.is_empty() && !self.can_commit(cx) { return; }
         if !stage_paths.is_empty() && !self.can_request_commit(cx) { return; }
         let Some(target) = self.target.clone() else {
@@ -1419,6 +1444,7 @@ impl Render for SourceControl {
         }
         self.ensure_loaded(cx);
         self.ensure_git_details(cx);
+        self.sync_actions_menu_focus(window, cx);
         if self.git_enabled() && let Some((target, command)) = self.pending_git_command.take() {
             if self.target.as_ref() == Some(&target) {
                 self.execute_git_command(command, window, cx);
@@ -1512,6 +1538,8 @@ impl SourceControl {
             "stagedCount": self.staged_count(),
             "git": self.git_state(), "details": self.git_details,
             "gitPanel": self.git_panel.as_ref().map(|p| format!("{p:?}")),
+            "actionsMenu": self.actions_menu.is_open(),
+            "actionsQuery": self.actions_menu.get().map(|menu| menu.search.read(cx).text().to_string()),
             "confirmation": self.confirmation.is_some(), "canUndoDiscard": self.undo_discard.is_some(),
             "busy": self.is_busy(), "amend": self.amend,
             "refreshing": self.refreshing, "refreshFeedback": self.refresh_feedback,
@@ -1530,6 +1558,33 @@ impl SourceControl {
 pub(super) mod tests {
     use super::*;
     use gpui::{AppContext, TestAppContext, VisualTestContext};
+
+    #[gpui::test]
+    fn disabled_plugin_rejects_stale_commands_and_keeps_commit_drafts(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| crate::settings::init(Default::default(), dir.path(), cx));
+        let (view, cx) = commit_setup(cx);
+        view.update(cx, |view, cx| {
+            view.commit_input.update(cx, |input, cx| input.set_text("Keep my draft", cx));
+            view.pending_git_command = Some((view.target.clone().unwrap(), GitCommand::Fetch));
+            crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| {
+                settings.plugins.set_enabled(crate::plugins::PluginId::Git, false);
+            });
+            view.suspend_plugin(cx);
+            view.request_git_command(GitCommand::Commands, cx);
+            view.set_staged_checked("".into(), vec!["file.rs".into()], true, false, cx);
+            view.commit_with_paths(vec![], cx);
+            assert!(view.pending_git_command.is_none());
+            assert!(view.staging_queue.is_none());
+            assert!(view.pending_commit.is_none());
+            assert!(view.poll.is_none());
+            assert_eq!(view.commit_input.read(cx).text(), "Keep my draft");
+            crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| {
+                settings.plugins.set_enabled(crate::plugins::PluginId::Git, true);
+            });
+            assert_eq!(view.commit_input.read(cx).text(), "Keep my draft");
+        });
+    }
 
     struct FileHost(Entity<SourceControl>);
     impl Render for FileHost {
@@ -1559,7 +1614,7 @@ pub(super) mod tests {
         }
     }
 
-    pub(in crate::source_control) fn selection_setup(cx: &mut TestAppContext) -> (Entity<SourceControl>, &mut VisualTestContext) {
+    pub(in crate::plugins::git::source_control) fn selection_setup(cx: &mut TestAppContext) -> (Entity<SourceControl>, &mut VisualTestContext) {
         cx.update(|cx| {
             gpui_base::init(cx);
             cx.set_global(Theme::default());
@@ -1651,9 +1706,9 @@ pub(super) mod tests {
         cx: &mut TestAppContext,
     ) {
         let (view, cx) = selection_setup(cx);
-        view.update(cx, |view, _| {
+        view.update(cx, |view, cx| {
             view.select_files(FileKey::new("", "a.rs", false), false, false);
-            view.actions_menu.open(());
+            view.mount_actions_menu(cx);
             view.actions_menu_bounds.set(Some(gpui::Bounds::new(
                 gpui::point(px(400.0), px(100.0)),
                 gpui::size(px(200.0), px(300.0)),

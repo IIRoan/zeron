@@ -8617,11 +8617,20 @@ impl Composer {
             .unwrap_or_default();
         let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
         self.slash.filtered = crate::popover::filter_indices(&query, &names);
+        if !crate::plugins::enabled(crate::plugins::PluginId::Git, cx) {
+            self.slash.filtered.retain(|&index| {
+                commands[index].workspace_command != Some(WorkspaceCommand::Diff)
+            });
+        }
         self.slash.active = (!self.slash.filtered.is_empty()).then_some(0);
         // A fresh query/reopen restarts the row stack at the top.
         crate::popover::reset_menu_scroll(&self.slash_scroll, &mut self.popup_bar);
         self.sync_mention_controls(cx);
         cx.notify();
+    }
+
+    pub(crate) fn refresh_plugin_commands(&mut self, cx: &mut Context<Self>) {
+        if self.slash.token.is_some() { self.refilter_slash(cx); }
     }
 
     fn move_slash(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -9168,6 +9177,13 @@ impl Composer {
         range: Range<usize>,
         cx: &mut Context<Self>,
     ) {
+        if command == WorkspaceCommand::Diff
+            && !crate::plugins::enabled(crate::plugins::PluginId::Git, cx)
+        {
+            self.slash.error = Some("Enable Git in Settings → Plugins to open source control".into());
+            cx.notify();
+            return;
+        }
         // Actions consume only their trigger. Draft text, attachments and queued
         // edits remain in the composer; selecting a command never sends them.
         self.input

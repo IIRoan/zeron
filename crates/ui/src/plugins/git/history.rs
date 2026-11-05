@@ -1377,11 +1377,6 @@ pub struct GitHistoryCount {
     _observe: Subscription,
 }
 
-pub struct GitHistoryFetchButton {
-    history: Entity<GitHistory>,
-    _observe: Subscription,
-}
-
 pub struct GitHistoryViewButton {
     history: Entity<GitHistory>,
     _observe: Subscription,
@@ -1530,16 +1525,6 @@ impl GitHistorySearchControl {
     }
 }
 
-impl GitHistoryFetchButton {
-    pub fn new(history: Entity<GitHistory>, cx: &mut Context<Self>) -> Self {
-        let observe = cx.observe(&history, |_, _, cx| cx.notify());
-        Self {
-            history,
-            _observe: observe,
-        }
-    }
-}
-
 impl GitHistoryViewButton {
     pub fn new(history: Entity<GitHistory>, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&history, |_, _, cx| cx.notify());
@@ -1547,66 +1532,6 @@ impl GitHistoryViewButton {
             history,
             _observe: observe,
         }
-    }
-}
-
-impl Render for GitHistoryFetchButton {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::of(cx).clone();
-        let fetching = self.history.read(cx).fetching_all;
-        let history = self.history.clone();
-        div()
-            .id("history-fetch-all")
-            .h(px(crate::surface_chrome::CONTROL_SIZE))
-            .px(px(8.0))
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
-            .gap(px(6.0))
-            .rounded(px(crate::surface_chrome::CONTROL_RADIUS))
-            .bg(if fetching {
-                crate::theme::wash(0.05)
-            } else {
-                crate::motion::hover_blend(
-                    "history-fetch-all",
-                    crate::theme::wash(0.0),
-                    crate::theme::wash(0.14),
-                )
-            })
-            .occlude()
-            .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
-                window.prevent_default()
-            })
-            .when(!fetching, |element| {
-                element
-                    .cursor_pointer()
-                    .on_hover(crate::motion::hover_listener("history-fetch-all"))
-                    .on_click(move |_, _, cx| {
-                        cx.stop_propagation();
-                        history.update(cx, |history, cx| history.fetch_all(cx));
-                    })
-            })
-            .child(if fetching {
-                crate::loaders::ring_spinner("history-fetch-all-spinner", 13.0, theme.text_muted)
-                    .into_any_element()
-            } else {
-                crate::icons::icon(crate::icons::CLOUD)
-                    .size(px(crate::surface_chrome::ICON_SIZE))
-                    .text_color(theme.text_muted.opacity(0.75))
-                    .into_any_element()
-            })
-            .child(
-                div()
-                    .whitespace_nowrap()
-                    .text_size(px(11.0))
-                    .text_color(if fetching {
-                        theme.text_faint
-                    } else {
-                        theme.text_muted
-                    })
-                    .child(if fetching { "Fetching…" } else { "Fetch all" }),
-            )
     }
 }
 
@@ -2015,7 +1940,20 @@ impl GitHistory {
         Some((key, cwd, target))
     }
 
+    pub(crate) fn suspend_plugin(&mut self, _cx: &mut Context<Self>) {
+        self.started = false;
+        self.request_task = None;
+        self.search_task = None;
+        self.loading = false;
+        self.search_loading = false;
+        self.search_generation = self.search_generation.wrapping_add(1);
+        self.column_menu = Default::default();
+        self.author_menu = Default::default();
+    }
+
     pub fn ensure_loaded(&mut self, cx: &mut Context<Self>) {
+        if !crate::plugins::enabled(crate::plugins::PluginId::Git, cx) { return; }
+        let resuming = !self.started;
         self.started = true;
         let Some((key, cwd, target)) = self.context(cx) else {
             self.fetching_all = false;
@@ -2053,7 +1991,10 @@ impl GitHistory {
             return;
         };
         if self.target_key.as_deref() == Some(key.as_str()) {
-            if !self.loading && self.commits.is_empty() && self.error.is_none() {
+            if resuming && self.search_active() {
+                self.request_search_page(self.search_query.clone(), 0, true, Duration::ZERO, cx);
+            }
+            if !self.loading && (resuming || (self.commits.is_empty() && self.error.is_none())) {
                 self.fetch_page(key, cwd, target, 0, true, cx);
             }
             return;

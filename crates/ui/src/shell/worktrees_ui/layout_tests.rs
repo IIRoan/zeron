@@ -373,9 +373,9 @@ fn project_settings_general_controls_share_the_full_form_width(cx: &mut TestAppC
 }
 
 #[gpui::test]
-fn project_settings_navigation_keeps_the_dialog_and_header_in_place(cx: &mut TestAppContext) {
+fn project_settings_navigation_keeps_the_sidebar_and_header_in_place(cx: &mut TestAppContext) {
     let (shell, cx) = setup(cx);
-    for (width, height, expected_height) in [(1100.0, 800.0, 640.0), (390.0, 650.0, 602.0)] {
+    for (width, height, expected_height) in [(1100.0, 800.0, 742.0), (390.0, 650.0, 592.0)] {
         cx.simulate_resize(gpui::size(px(width), px(height)));
         redraw(cx);
         let header = bounds(cx, "project-settings-header");
@@ -902,10 +902,9 @@ fn project_settings_busy_save_and_dirty_close_keep_the_form_safe(cx: &mut TestAp
             );
             shell.discard_form(UnsavedForm::WorktreeSettings, window, cx);
             assert!(!shell.worktree_settings.editor.is_open());
-            assert!(shell.worktree_settings.editor.is_closing());
             assert!(
-                shell.worktree_settings.editor.get().is_some(),
-                "the shared popup lifecycle retains the exit frame"
+                shell.worktree_settings.editor.get().is_none(),
+                "reduced motion closes the sheet immediately"
             );
         });
     });
@@ -1096,6 +1095,27 @@ fn project_settings_database_fields_remain_usable_in_compact_windows(cx: &mut Te
 }
 
 #[gpui::test]
+fn a_deferred_exit_retains_the_editor_until_its_painted_animation_finishes(cx: &mut TestAppContext) {
+    let (shell, cx) = setup(cx);
+    cx.update(|_, cx| motion::set_reduced_motion(cx, false));
+    shell.update(cx, |shell, cx| shell.close_worktree_settings(cx));
+    let duration = settings_sidebar::CLOSE.total().mul_f32(motion::speed_scale())
+        + std::time::Duration::from_millis(20);
+    // Delayed rendering must not consume or time out the exit.
+    std::thread::sleep(duration);
+    cx.executor().advance_clock(duration);
+    shell.read_with(cx, |shell, _| assert!(shell.worktree_settings.editor.get().is_some()));
+    cx.update(|window, cx| {
+        window.draw(cx).clear();
+        window.simulate_next_frame(cx);
+    });
+    shell.read_with(cx, |shell, _| assert!(shell.worktree_settings.editor.get().is_some()));
+    std::thread::sleep(duration);
+    cx.update(|window, cx| window.draw(cx).clear());
+    shell.read_with(cx, |shell, _| assert!(shell.worktree_settings.editor.get().is_none()));
+}
+
+#[gpui::test]
 fn project_settings_exit_keeps_the_current_animation_identity(cx: &mut TestAppContext) {
     let (shell, cx) = setup(cx);
     shell.update(cx, |shell, cx| {
@@ -1125,6 +1145,7 @@ fn project_settings_exit_keeps_the_current_animation_identity(cx: &mut TestAppCo
             "editing should not replay the page entrance"
         );
         let epoch = shell.worktree_settings.epoch;
+        motion::set_reduced_motion(cx, false);
         shell.close_worktree_settings(cx);
         assert!(shell.worktree_settings.epoch > epoch);
         assert!(shell.worktree_settings.editor.is_closing());
@@ -1132,7 +1153,7 @@ fn project_settings_exit_keeps_the_current_animation_identity(cx: &mut TestAppCo
         assert_eq!(
             shown,
             exiting.page_identity(SettingsPage::General),
-            "invalidating requests must not hide the page during the modal exit"
+            "invalidating requests must not hide the page during the sheet exit"
         );
     });
 }
@@ -1151,7 +1172,7 @@ fn closing_clean_project_settings_restores_focus_before_reopening(cx: &mut TestA
     cx.simulate_click(close.center(), gpui::Modifiers::default());
     cx.update(|window, cx| {
         shell.read_with(cx, |shell, _| {
-            assert!(shell.worktree_settings.editor.is_closing());
+            assert!(shell.worktree_settings.editor.get().is_none());
             assert!(!shell.worktree_settings.discard.is_open());
             assert!(shell.shortcut_focus.is_focused(window));
             assert!(!old_navigation_focus.is_focused(window));
@@ -1177,4 +1198,45 @@ fn closing_clean_project_settings_restores_focus_before_reopening(cx: &mut TestA
             "an old navigation target must not receive keys after reopening"
         );
     });
+}
+
+
+#[gpui::test]
+fn reopening_and_stacking_settings_preserves_the_environment_draft(cx: &mut TestAppContext) {
+    let (shell, cx) = setup(cx);
+    open_page(&shell, cx, SettingsPage::Workflow);
+    let prefix = shell.read_with(cx, |shell, _| {
+        shell.worktree_settings.editor.as_open().unwrap().fields.as_ref().unwrap().prefix.clone()
+    });
+    prefix.update(cx, |input, cx| input.set_text("keep-this-draft/", cx));
+    shell.update(cx, |shell, cx| {
+        shell.open_worktree_settings("project".into(), cx);
+        assert!(shell.worktree_settings.page == SettingsPage::Workflow);
+        let editor = shell.worktree_settings.editor.as_open().unwrap();
+        assert_eq!(editor.fields.as_ref().unwrap().prefix.entity_id(), prefix.entity_id());
+        let context = editor.project.clone();
+        shell.state.update(cx, |state, _| {
+            state.spaces.push(serde_json::from_value(serde_json::json!({
+                "id":"other", "deviceId":"local", "path":"/other", "createdAt":"2026-01-01T00:00:00Z"
+            })).unwrap());
+        });
+        shell.open_worktree_settings("other".into(), cx);
+        assert_eq!(shell.worktree_settings.editor.as_open().unwrap().project.space, "project");
+        shell.open_service_settings_context(context, cx);
+        assert!(shell.project_terminals.editor.is_open());
+    });
+    cx.update(|window, cx| shell.update(cx, |shell, cx| {
+        shell.request_close_form(UnsavedForm::Services, window, cx);
+        assert!(!shell.project_terminals.editor.is_open());
+        assert!(shell.worktree_settings.editor.is_open());
+        assert!(shell.worktree_settings_dirty(cx));
+        assert_eq!(prefix.read(cx).text(), "keep-this-draft/");
+    }));
+    redraw(cx);
+    let sheet = bounds(cx, "worktree-settings-sidebar");
+    let viewport = cx.update(|window, _| window.viewport_size());
+    assert_eq!(sheet.right(), viewport.width - px(settings_sidebar::EDGE));
+    assert_eq!(sheet.top(), px(settings_sidebar::EDGE));
+    assert_eq!(sheet.bottom(), viewport.height - px(settings_sidebar::EDGE));
+    assert!(sheet.left() > px(0.0), "the workspace remains beside the sheet");
 }

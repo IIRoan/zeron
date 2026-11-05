@@ -562,6 +562,13 @@ impl TerminalPanel {
             .unwrap_or_default()
     }
 
+    /// The host's surface strip follows the panel's selection, including tabs
+    /// opened or closed from keyboard actions.
+    pub fn active_tab_key(&self, cx: &App) -> Option<u64> {
+        let tabs = self.chats.get(&self.selected_chat(cx))?;
+        tabs.tabs.get(tabs.active).map(|tab| tab.key)
+    }
+
     /// Open a fresh tab for the selected chat and return its key.
     pub fn open_tab_for_selected(&mut self, cx: &mut Context<Self>) -> Option<u64> {
         let chat = self.selected_chat(cx);

@@ -69,6 +69,7 @@ icon_assets![
     (HISTORY, "history"),
     (PROJECT_DEFAULT, "project-default"),
     (REMOTE_SERVER, "remote-server"),
+    (SERVICES, "services"),
     // Service-tier bolt, drawn in the toolbar family's linear weight; the
     // filled twin marks fast mode on.
     (FAST_TIER, "fast-tier"),

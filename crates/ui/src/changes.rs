@@ -51,7 +51,7 @@ use zeron_rpc::methods;
 use crate::comments::{self, CommentSide, ReviewComment};
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::history::{
-    GitHistory, GitHistoryCount, GitHistoryEvent, GitHistoryFetchButton, GitHistorySearchControl,
+    GitHistory, GitHistoryCount, GitHistoryEvent, GitHistorySearchControl,
     GitHistoryViewButton,
 };
 use crate::markdown::render;
@@ -1700,7 +1700,6 @@ pub struct Changes {
     history: Option<Entity<GitHistory>>,
     history_count: Option<Entity<GitHistoryCount>>,
     history_search_control: Option<Entity<GitHistorySearchControl>>,
-    history_fetch_button: Option<Entity<GitHistoryFetchButton>>,
     history_view_button: Option<Entity<GitHistoryViewButton>>,
     history_events: Option<Subscription>,
     /// Pinned commit for a [`DiffScope::Commit`] pane (sha + subject drive
@@ -1805,7 +1804,6 @@ impl Changes {
             history: None,
             history_count: None,
             history_search_control: None,
-            history_fetch_button: None,
             history_view_button: None,
             history_events: None,
             commit: None,
@@ -1845,6 +1843,19 @@ impl Changes {
         changes
     }
 
+    pub(crate) fn suspend_git_plugin(&mut self, cx: &mut Context<Self>) {
+        self.watch_task = None;
+        self.started = false;
+        self.file_watch_paused = true;
+        self.scoped_task = None;
+        self.scoped_inflight = None;
+        self.scoped_for = None;
+        self.branches_task = None;
+        self.branches_for = None;
+        if let Some(view) = &self.source_control { view.update(cx, |view, cx| view.suspend_plugin(cx)); }
+        if let Some(history) = &self.history { history.update(cx, |view, cx| view.suspend_plugin(cx)); }
+    }
+
     pub(crate) fn set_notifications(&mut self, notifications: Entity<crate::progress_toast::Toasts>, cx: &mut Context<Self>) {
         if let Some(view) = &self.source_control {
             view.update(cx, |view, _| view.set_notifications(notifications.clone()));
@@ -1856,6 +1867,7 @@ impl Changes {
     }
 
     pub(crate) fn open_git_command(&mut self, command: crate::source_control::GitCommand, cx: &mut Context<Self>) {
+        if !crate::plugins::enabled(crate::plugins::PluginId::Git, cx) { return; }
         self.file_selection = None;
         self.set_scope(DiffScope::WorkingTree, cx);
         self.source_control(cx).update(cx, |view, cx| view.request_git_command(command, cx));
@@ -2428,16 +2440,6 @@ impl Changes {
         count
     }
 
-    fn history_fetch_button(&mut self, cx: &mut Context<Self>) -> Entity<GitHistoryFetchButton> {
-        if let Some(button) = &self.history_fetch_button {
-            return button.clone();
-        }
-        let history = self.history_pane(cx);
-        let button = cx.new(|cx| GitHistoryFetchButton::new(history, cx));
-        self.history_fetch_button = Some(button.clone());
-        button
-    }
-
     fn history_search_control(
         &mut self,
         cx: &mut Context<Self>,
@@ -2478,6 +2480,7 @@ impl Changes {
 
     /// Reconcile parsed content with the currently-active diff.
     fn sync(&mut self, cx: &mut Context<Self>) {
+        if !crate::plugins::enabled(crate::plugins::PluginId::Git, cx) { return; }
         if self.scope == DiffScope::WorkingTree && self.file_selection.is_none() {
             self.source_control(cx)
                 .update(cx, |view, cx| view.ensure_loaded(cx));
@@ -4120,8 +4123,6 @@ impl Changes {
         let history_count = (scope == DiffScope::History).then(|| self.history_count(cx));
         let history_search_control =
             (scope == DiffScope::History).then(|| self.history_search_control(cx));
-        let history_fetch_button =
-            (scope == DiffScope::History).then(|| self.history_fetch_button(cx));
         let history_view_button =
             (scope == DiffScope::History).then(|| self.history_view_button(cx));
         let scope_trigger = div()
@@ -4215,7 +4216,6 @@ impl Changes {
                 .items_center()
                 .gap(px(crate::surface_chrome::CONTROL_GAP))
                 .children(history_search_control)
-                .children(history_fetch_button)
                 .children(history_view_button)
                 .child(
                     Self::header_button(

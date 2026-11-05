@@ -8675,7 +8675,7 @@ impl Shell {
                         .child(SharedString::from("Reset icon")),
                 ))
                 .child(popover::menu_separator())
-                .child(
+                .when(self.services_plugin_enabled(cx), |menu| menu.child(
                     popover::menu_row(&theme, false, "space-project-terminals")
                         .id("space-project-terminals")
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -8688,7 +8688,7 @@ impl Shell {
                                 .text_color(theme.text_muted),
                         )
                         .child(SharedString::from("Project services…")),
-                )
+                ))
                 .child(
                     popover::menu_row(&theme, false, format!("space-menu-rename-{space_id}"))
                         .id("space-menu-rename")

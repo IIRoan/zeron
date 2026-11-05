@@ -586,7 +586,6 @@ impl SourceControl {
             .id("git-branch-picker")
             .debug_selector(|| "git-branch-picker".into())
             .w(width)
-            .rounded(px(8.0))
             .role(gpui::Role::Dialog)
             .aria_label(title)
             .flex()
@@ -694,7 +693,7 @@ impl SourceControl {
                     px(Theme::TITLEBAR_HEIGHT + 12.0),
                 ))
                 .child(crate::frost::frosted(
-                    8.0,
+                    popover::CARD_RADIUS,
                     crate::frost::MENU_BLUR,
                     crate::motion::menu_in("git-branch-picker-in", div().occlude().child(card)),
                 )),

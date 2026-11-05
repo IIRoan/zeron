@@ -346,7 +346,6 @@ impl SourceControl {
             .id("git-stash-picker")
             .debug_selector(|| "git-stash-picker".into())
             .w(width)
-            .rounded(px(8.0))
             .role(gpui::Role::Dialog)
             .aria_label(title)
             .flex()
@@ -376,7 +375,7 @@ impl SourceControl {
                     px(Theme::TITLEBAR_HEIGHT + 12.0),
                 ))
                 .child(crate::frost::frosted(
-                    8.0,
+                    popover::CARD_RADIUS,
                     crate::frost::MENU_BLUR,
                     crate::motion::menu_in("git-stash-picker-in", div().occlude().child(card)),
                 )),

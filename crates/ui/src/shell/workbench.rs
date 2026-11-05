@@ -8,6 +8,8 @@ enum Tool {
     Explorer,
     Changes,
     History,
+    Services,
+    Terminal,
     Views,
 }
 
@@ -51,6 +53,15 @@ impl Shell {
             self.open_explorer(window, cx);
             return;
         }
+        if tool == Tool::Terminal {
+            self.open_shell_panel(cx);
+            return;
+        }
+        if tool == Tool::Services {
+            self.open_services_panel(cx);
+            return;
+        }
+        if matches!(tool, Tool::Changes | Tool::History) && !self.git_plugin_enabled(cx) { return; }
         self.close_files_panel(cx);
         self.set_surfaces_open(true, cx);
         if tool == Tool::Views {
@@ -123,7 +134,8 @@ impl Shell {
         let explorer = self.files_panel_open(cx)
             || (self.right_pane_open(cx) && active == RightSurface::Explorer);
         let open = self.right_pane_open(cx);
-        let git = self.space_git_detected(cx);
+        let git = self.git_tools_available(cx);
+        let services = self.services_available(cx);
         let buttons = [
             (
                 Tool::Explorer,
@@ -143,16 +155,22 @@ impl Shell {
                 icons::HISTORY,
                 "History",
             ),
+            (Tool::Services, "workbench-services", icons::SERVICES, "Services"),
+            (Tool::Terminal, "workbench-terminal", icons::TERMINAL, "Terminals"),
             (Tool::Views, "workbench-views", icons::LIST, "All views"),
         ]
         .into_iter()
         .filter(|(tool, ..)| git || !matches!(tool, Tool::Changes | Tool::History))
+        .filter(|(tool, ..)| services || *tool != Tool::Services)
         .map(|(tool, id, icon_path, label)| {
             let selected = if tool == Tool::Explorer {
                 explorer
+            } else if tool == Tool::Services {
+                open && active == RightSurface::Services
             } else {
                 open && match (tool, active) {
                     (Tool::Views, RightSurface::Picker) => true,
+                    (Tool::Terminal, RightSurface::Terminal(_)) => true,
                     (Tool::Changes, RightSurface::Diff(id)) => self
                         .diffs
                         .get(&id)
@@ -165,7 +183,9 @@ impl Shell {
             };
             div()
                 .id(id)
+                .debug_selector(move || id.into())
                 .role(gpui::Role::Button)
+                .tab_index(0)
                 .aria_label(label)
                 .w_full()
                 .h(px(44.0))

@@ -113,7 +113,8 @@ fn project_file(file: &mut GitFileStatus, staged: bool) {
 impl SourceControl {
     /// Other Git mutations stay blocked until the real index is reconciled.
     pub(super) fn staging_enabled(&self) -> bool {
-        (!self.is_busy() || (self.staging_queue.is_some() && self.pending_commit.is_none()))
+        self.plugin_active
+            && (!self.is_busy() || (self.staging_queue.is_some() && self.pending_commit.is_none()))
             && self.confirmation.is_none()
             && self.load_error.is_none()
     }
@@ -188,6 +189,7 @@ impl SourceControl {
         allow_conflict_markers: bool,
         cx: &mut Context<Self>,
     ) {
+        if !crate::plugins::enabled(crate::plugins::PluginId::Git, cx) { return; }
         if !self.staging_enabled() {
             return;
         }

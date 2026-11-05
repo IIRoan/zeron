@@ -4,6 +4,7 @@ use zeron_rpc::RpcError;
 
 impl SourceControl {
     pub(super) fn refresh(&mut self, cx: &mut Context<Self>) {
+        if !crate::plugins::enabled(crate::plugins::PluginId::Git, cx) { return; }
         if self.is_busy() || self.refreshing || self.confirmation.is_some() {
             return;
         }

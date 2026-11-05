@@ -284,6 +284,13 @@ impl Shell {
         let Some(project) = self.terminal_project_context(Some(&space), cx) else {
             return;
         };
+        if let Some(editor) = self.worktree_settings.editor.as_open() {
+            if editor.project.space == space { cx.notify(); return; }
+            if editor.busy || editor.is_dirty(cx) {
+                self.show_notice(crate::toast::ToastKind::Info, "Save or close the current project settings before opening another project.", cx);
+                return;
+            }
+        }
         self.worktree_settings.epoch += 1;
         self.reset_worktree_selects();
         self.worktree_settings.lifecycle_visible = false;
@@ -307,8 +314,10 @@ impl Shell {
             self.select_worktree_settings_page(SettingsPage::Services, cx);
             cx.notify();
         } else {
-            self.open_worktree_settings(space, cx);
-            self.select_worktree_settings_page(SettingsPage::Services, cx);
+            self.open_worktree_settings(space.clone(), cx);
+            if self.worktree_settings.editor.as_open().is_some_and(|e| e.project.space == space) {
+                self.select_worktree_settings_page(SettingsPage::Services, cx);
+            }
         }
     }
 
@@ -319,7 +328,8 @@ impl Shell {
         let main = self
             .terminal_project_context(Some(&active.space), cx)
             .map(|p| p.cwd);
-        self.open_worktree_settings(active.space, cx);
+        self.open_worktree_settings(active.space.clone(), cx);
+        if !self.worktree_settings.editor.as_open().is_some_and(|e| e.project.space == active.space) { return; }
         if main.as_deref() != Some(&active.cwd) {
             self.select_worktree_settings(Some(active.cwd), cx);
         }
@@ -327,7 +337,7 @@ impl Shell {
 
     pub(super) fn close_worktree_settings(&mut self, cx: &mut Context<Self>) {
         self.worktree_settings.epoch += 1;
-        popover::close_popup(self, cx, |this| &mut this.worktree_settings.editor);
+        self.close_settings_sidebar(cx, |this| &mut this.worktree_settings.editor);
         self.worktree_settings.poll = None;
         popover::close_popup(self, cx, |this| &mut this.worktree_settings.removal);
         popover::close_popup(self, cx, |this| &mut this.worktree_settings.discard);
@@ -575,7 +585,16 @@ impl Shell {
         changed
     }
 
+    pub(super) fn suspend_service_settings_contribution(&mut self, cx: &mut Context<Self>) {
+        if self.worktree_settings.page == SettingsPage::Services {
+            self.worktree_settings.page = SettingsPage::General;
+            self.reset_worktree_selects();
+            cx.notify();
+        }
+    }
+
     fn select_worktree_settings_page(&mut self, page: SettingsPage, cx: &mut Context<Self>) {
+        if page == SettingsPage::Services && !self.services_plugin_enabled(cx) { return; }
         if !self.worktree_settings.editor.is_open() || self.worktree_settings.page == page {
             return;
         }
@@ -827,6 +846,8 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         self.worktree_settings.editor.get()?;
+        let full_viewport = viewport;
+        let viewport = settings_sidebar::content_size(viewport);
         let navigation_focus = self
             .worktree_settings
             .navigation_focus
@@ -845,9 +866,9 @@ impl Shell {
                     .any(|tree| tree.path != editor.project.cwd)
             });
         let page = self.worktree_settings.page;
-        let compact = viewport.width < px(560.0);
+        let compact = viewport.width < px(540.0);
         let padding = px(if compact { 16.0 } else { 24.0 });
-        let card_width = px(680.0).min((viewport.width - px(32.0)).max(px(0.0)));
+        let card_width = viewport.width;
         let mut scopes = vec![None];
         let mut scope_options = vec![SelectOption::new("Project defaults")];
         if let Some(snapshot) = &editor.snapshot {
@@ -1078,6 +1099,7 @@ impl Shell {
                     );
                 let mut sections = widgets::section_card(&theme).mt_0();
                 for (index, destination) in SettingsPage::ALL.into_iter().skip(1).enumerate() {
+                    if destination == SettingsPage::Services && !self.services_plugin_enabled(cx) { continue; }
                     let id =
                         SharedString::from(format!("project-settings-open-{}", destination.key()));
                     let focus = navigation_focus[destination as usize].clone();
@@ -1532,8 +1554,7 @@ impl Shell {
             .when(has_scopes, |el| {
                 el.child(div().mt(px(20.0)).child(navigation))
             });
-        // Keep the modal entrance and exit on the shared deferred layer; only
-        // content replacements get a separate, first-frame-deferred fade.
+        // Sections change inside the sheet without restarting its entrance.
         let shown = editor.page_identity(page);
         let t = motion::deferred_swap_entrance(
             window,
@@ -1553,15 +1574,14 @@ impl Shell {
                 crate::edge_fade::edge_faded(16.0, true, true, content)
                     .fade_overflow_y(&editor.scroll),
             );
-        let height = px(640.0).min((viewport.height - px(48.0)).max(px(0.0)));
-        let card = popover::dialog_card(&theme)
+        let height = viewport.height;
+        let card = div().flex().flex_col()
             .id("project-settings-card")
             .debug_selector(|| "project-settings-card".into())
             .w(card_width)
             .h(height)
             .p_0()
-            .bg(theme.surface_dialog)
-            .border_color(theme.border)
+                        .border_color(theme.border)
             .overflow_hidden()
             .child(header)
             .child(
@@ -1577,11 +1597,14 @@ impl Shell {
             )
             .child(footer);
         motion::keyed_fade_frames(window);
-        Some(popover::modal(
-            "worktree-settings",
-            viewport,
+        Some(self.render_settings_sidebar(
+            "worktree-settings-sidebar",
+            UnsavedForm::WorktreeSettings,
+            full_viewport,
             card.into_any_element(),
             self.worktree_settings.editor.closing_since(),
+            window,
+            cx,
         ))
     }
 }
@@ -1598,6 +1621,7 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
+        let compact = settings_sidebar::content_size(window.viewport_size()).width < px(540.0);
         let mut el = form_block(theme).child(note(
             theme,
             "Run in the main project folder. Ready checks finish before worktree setup; databases stay running across worktree switches.",
@@ -1696,7 +1720,8 @@ impl Shell {
                     .child(
                         div()
                             .flex()
-                            .flex_wrap()
+                            .when(compact, |el| el.flex_col())
+                            .when(!compact, |el| el.flex_wrap())
                             .gap(px(12.0))
                             .child(
                                 div()
@@ -1708,7 +1733,8 @@ impl Shell {
                                         let id = database.id.clone();
                                         move || format!("project-settings-database-name-{id}")
                                     })
-                                    .flex_1()
+                                    .when(compact, |el| el.w_full().flex_none())
+                                    .when(!compact, |el| el.flex_1())
                                     .min_w(px(140.0))
                                     .max_w_full()
                                     .child(label(theme, "Name"))
@@ -1833,7 +1859,7 @@ impl Shell {
                     } else {
                         format!("{} · {}", app.command, app.directory)
                     };
-                    summary_row(theme, icons::TERMINAL, &app.name, detail)
+                    summary_row(theme, icons::SERVICES, &app.name, detail)
                 }),
                 "No app services yet.",
             ));

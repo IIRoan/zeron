@@ -698,7 +698,7 @@ impl Shell {
             .selected_chat
             .as_deref()
             .is_some_and(|chat| self.can_reuse_chat_checkout(chat, cx));
-        let has_git_workspace = palette_workspace(self, cx).is_some()
+        let has_git_workspace = self.git_plugin_enabled(cx) && palette_workspace(self, cx).is_some()
             && self.state.read(cx).chats.iter().any(|chat| chat.id == self.active_chat && chat.cwd.is_some());
         let commands = |section| {
             PaletteSection::new(
@@ -952,6 +952,7 @@ impl Shell {
         self.close_command_palette(window, cx);
         match row.kind {
             RowKind::Command(Command::Git(command)) => {
+                if !self.git_plugin_enabled(cx) { return; }
                 self.set_surfaces_open(true, cx);
                 if self.active_changes(cx).is_none() {
                     self.add_diff_surface(window, cx);

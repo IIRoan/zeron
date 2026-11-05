@@ -77,9 +77,13 @@ mod chat_rename_tests;
 mod command_palette;
 mod file_close_dialog;
 mod release_notes_ui;
+#[path = "plugins/services/panel.rs"]
 mod project_terminals_ui;
+mod plugins;
 use project_terminals_ui::UnsavedForm;
 mod worktrees_ui;
+mod settings_sidebar;
+mod terminal_sidebar;
 use file_close_dialog::FileCloseDialog;
 mod file_mutations;
 mod files_panel;
@@ -665,6 +669,7 @@ pub enum SettingsSection {
     Agents,
     Appearance,
     Files,
+    Plugins,
     Notifications,
     Voice,
     Shortcuts,
@@ -677,13 +682,14 @@ pub enum SettingsSection {
 
 impl SettingsSection {
     /// Sections shown in Settings. `Agents` is a legacy Accounts route alias.
-    pub const ALL: [SettingsSection; 12] = [
+    pub const ALL: [SettingsSection; 13] = [
         SettingsSection::General,
         SettingsSection::Appearance,
         SettingsSection::Notifications,
         SettingsSection::Voice,
         SettingsSection::Shortcuts,
         SettingsSection::Harnesses,
+        SettingsSection::Plugins,
         SettingsSection::Devices,
         SettingsSection::Cloud,
         SettingsSection::Billing,
@@ -739,6 +745,7 @@ impl SettingsSection {
             SettingsSection::Agents => "agents",
             SettingsSection::Appearance => "appearance",
             SettingsSection::Files => "files",
+            SettingsSection::Plugins => "plugins",
             SettingsSection::Notifications => "notifications",
             SettingsSection::Voice => "voice",
             SettingsSection::Shortcuts => "shortcuts",
@@ -758,6 +765,7 @@ impl SettingsSection {
             "agents" => SettingsSection::Agents,
             "appearance" => SettingsSection::Appearance,
             "files" => SettingsSection::Files,
+            "plugins" => SettingsSection::Plugins,
             "notifications" => SettingsSection::Notifications,
             "voice" => SettingsSection::Voice,
             "shortcuts" => SettingsSection::Shortcuts,
@@ -785,6 +793,7 @@ impl SettingsSection {
             SettingsSection::Agents => "Accounts",
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Files => "Files",
+            SettingsSection::Plugins => "Plugins",
             SettingsSection::Notifications => "Notifications",
             SettingsSection::Voice => "Voice",
             SettingsSection::Shortcuts => "Shortcuts",
@@ -804,6 +813,7 @@ impl SettingsSection {
             SettingsSection::Agents => icons::KEY_MINIMALISTIC,
             SettingsSection::Appearance => icons::TUNING,
             SettingsSection::Files => icons::FOLDER,
+            SettingsSection::Plugins => icons::WIDGET,
             SettingsSection::Notifications => icons::BELL,
             SettingsSection::Voice => icons::MICROPHONE,
             SettingsSection::Shortcuts => icons::KEYBOARD,
@@ -872,6 +882,7 @@ pub enum RightSurface {
     #[default]
     Picker,
     Explorer,
+    Services,
     File(u64),
     Browser(u64),
     Diff(u64),
@@ -2174,17 +2185,21 @@ pub struct Shell {
     pub(super) jump_hints: bool,
     /// Lazy panes: no entity (and no RPC) until first opened.
     terminal: Option<Entity<TerminalPanel>>,
+    terminal_subscription: Option<Subscription>,
+    terminal_sidebar_state: Option<terminal_sidebar::TabsState>,
     /// Last resolved layout, for drag anchors and matching transcript clearance.
     terminal_geometry: crate::terminal::dock::SharedGeometry,
-    /// Embedded terminal host for right-pane Terminal surfaces — a SEPARATE
-    /// entity from the bottom drawer's (own PTYs, own grid geometry; one
-    /// panel can only size one visible grid at a time).
+    /// Additional embedded host on platforms with a separate bottom dock.
+    /// Linux surface tabs use `terminal`, keeping action and ordinary shells
+    /// in one panel with one visible grid and one tab strip.
     right_terminal: Option<Entity<TerminalPanel>>,
     /// The surface-tab strip's `+` menu (Browser / Terminal / Diffs / History rows).
     right_plus: popover::Popup<()>,
     /// Host-owned project Actions cached per (device, space).
     project_actions: crate::project_actions::ProjectActionsController,
     project_terminals: project_terminals_ui::ProjectTerminalUi,
+    settings_sidebar_focus: Option<[FocusHandle; 4]>,
+    settings_sidebars: [Option<Entity<settings_sidebar::SettingsSheet>>; 2],
     worktree_settings: worktrees_ui::WorktreeSettingsUi,
     toasts: Entity<crate::progress_toast::Toasts>,
     /// Diff surfaces by id — each tab its own [`Changes`] viewer with its own
@@ -2271,6 +2286,9 @@ pub struct Shell {
     archived_page: Option<Entity<ArchivedPage>>,
     appearance_page: Option<Entity<AppearancePage>>,
     files_settings_page: Option<Entity<FilesSettingsPage>>,
+    plugins_page: Option<Entity<settings::plugins::PluginsPage>>,
+    _plugin_settings: Subscription,
+    plugins_snapshot: crate::plugins::Preferences,
     notifications_page: Option<Entity<NotificationsPage>>,
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     accounts_page: Option<Entity<AccountsPage>>,
@@ -2609,6 +2627,12 @@ impl Shell {
             cx.observe_global::<crate::pickers::HarnessCatalogChanged>(|this: &mut Shell, cx| {
                 this.check_voice_codex(true, cx)
             });
+        let plugin_settings = cx.observe_global::<settings::SettingsStore>(|this: &mut Self, cx| {
+            if this.plugins_snapshot == settings::plugin_preferences(cx) { return; }
+            this.pull_settings(cx);
+            this.sync_plugins(cx);
+            cx.notify();
+        });
         let links = Self::session_links(None, cx);
         transcript.update(cx, |transcript, _| {
             transcript.set_workspace_link_handler(links)
@@ -2791,10 +2815,14 @@ impl Shell {
             sidebar_disclosure_motion: std::collections::HashMap::new(),
             jump_hints: false,
             terminal: None,
+            terminal_subscription: None,
+            terminal_sidebar_state: None,
             right_terminal: None,
             right_plus: popover::Popup::default(),
             project_actions: crate::project_actions::ProjectActionsController::default(),
             project_terminals: project_terminals_ui::ProjectTerminalUi::default(),
+            settings_sidebar_focus: None,
+            settings_sidebars: Default::default(),
             worktree_settings: worktrees_ui::WorktreeSettingsUi::default(),
             toasts: cx.new(|_| crate::progress_toast::Toasts::default()),
             diffs: std::collections::HashMap::new(),
@@ -2859,6 +2887,9 @@ impl Shell {
             archived_page: None,
             appearance_page: None,
             files_settings_page: None,
+            plugins_page: None,
+            _plugin_settings: plugin_settings,
+            plugins_snapshot: Default::default(),
             notifications_page: None,
             shortcuts_page: None,
             accounts_page: None,
@@ -3484,7 +3515,9 @@ impl Shell {
             self.right_pane_expanded =
                 !self.active_chat.is_empty() && panels.changes_open && panels.right_expanded;
             if let Some(panel) = self.terminal.clone() {
-                let shell_open = panels.terminal_open && !self.project_terminals.drawer;
+                let shell_open = if cfg!(target_os = "linux") {
+                    panels.changes_open && matches!(panels.right_active, RightSurface::Terminal(_))
+                } else { panels.terminal_open };
                 panel.update(cx, |panel, cx| panel.set_open(shell_open, cx));
             }
             if panels.changes_open
@@ -3581,7 +3614,11 @@ impl Shell {
     /// The current chat's terminal flag (per-session, in-memory).
     fn terminal_open(&self, cx: &App) -> bool {
         self.session_workspace_visible(cx)
-            && (self.project_terminals.drawer || self.panels.get(&self.panel_key(cx)).terminal_open)
+            && if cfg!(target_os = "linux") {
+                self.right_pane_shown(cx) && matches!(self.resolved_right_active(cx), RightSurface::Terminal(_))
+            } else {
+                self.panels.get(&self.panel_key(cx)).terminal_open
+            }
     }
 
     fn right_target(&self, cx: &App) -> f32 {
@@ -3665,6 +3702,11 @@ impl Shell {
         if self.active_chat.is_empty() {
             return;
         }
+        if cfg!(target_os = "linux") && !open {
+            if let Some(panel) = &self.terminal {
+                panel.update(cx, |panel, cx| panel.set_open(false, cx));
+            }
+        }
         if self.right_pane_open(cx) == open {
             if open {
                 self.promote_hidden_panel(AuxiliaryPanel::Right, cx);
@@ -3723,6 +3765,7 @@ impl Shell {
     }
 
     fn right_terminal_panel(&mut self, cx: &mut Context<Self>) -> Entity<TerminalPanel> {
+        if cfg!(target_os = "linux") { return self.terminal_panel(cx); }
         if let Some(terminal) = &self.right_terminal {
             return terminal.clone();
         }
@@ -3744,14 +3787,17 @@ impl Shell {
             .get(&key)
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
-        let terminals: Vec<(u64, SharedString, bool)> = self
-            .right_terminal
+        let terminal = if cfg!(target_os = "linux") { &self.terminal } else { &self.right_terminal };
+        let terminals: Vec<(u64, SharedString, bool)> = terminal
             .as_ref()
             .map(|t| t.read(cx).tab_summaries(cx))
             .unwrap_or_default();
         stored
             .iter()
+            .filter(|surface| !matches!(surface, RightSurface::Diff(_)) || self.git_plugin_enabled(cx))
+            .filter(|surface| **surface != RightSurface::Services || self.services_available(cx))
             .filter_map(|surface| match surface {
+                RightSurface::Services => Some((*surface, "Services".into(), false, None)),
                 RightSurface::Explorer => self
                     .files
                     .get(&key)
@@ -3858,6 +3904,7 @@ impl Shell {
             RightSurface::File(id) => self.file_surface_paths.get(&id)?.clone(),
             RightSurface::Picker
             | RightSurface::Explorer
+            | RightSurface::Services
             | RightSurface::Diff(_)
             | RightSurface::Terminal(_)
             | RightSurface::SideChat(_)
@@ -4006,7 +4053,18 @@ impl Shell {
         }
         let key = self.panel_key(cx);
         self.panels.update(&key, |p| p.right_active = surface);
+        if cfg!(target_os = "linux") && !matches!(surface, RightSurface::Terminal(_)) {
+            if let Some(panel) = &self.terminal {
+                panel.update(cx, |panel, cx| panel.set_open(false, cx));
+            }
+        }
         match surface {
+            RightSurface::Services => {
+                self.ensure_project_terminals(cx);
+                if let Some(panel) = &self.project_terminals.panel {
+                    panel.update(cx, |panel, cx| panel.request_focus(cx));
+                }
+            }
             RightSurface::Explorer => {
                 if let Some(files) = self.files.get(&key).cloned() {
                     files.update(cx, |files, cx| files.ensure_loaded(cx));
@@ -4026,6 +4084,7 @@ impl Shell {
                 self.composer
                     .update(cx, |composer, _| composer.focus_pending = false);
                 panel.update(cx, |panel, cx| {
+                    panel.set_open(true, cx);
                     panel.select_tab_by_key(tab, cx);
                     panel.request_focus(cx);
                 });
@@ -4386,6 +4445,7 @@ impl Shell {
     /// FRESH diff tab with its own scope/base selection (multiple diff
     /// panels, user request).
     fn add_diff_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.git_plugin_enabled(cx) { return; }
         let changes = cx.new(|cx| Changes::new(self.state.clone(), cx));
         self.register_diff_surface(changes, window, cx);
     }
@@ -4393,6 +4453,7 @@ impl Shell {
     /// A Diff tab opened on *Branch changes* (the session card's totals),
     /// opening the pane when it is closed.
     fn add_branch_diff_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.git_plugin_enabled(cx) { return; }
         if self.active_chat.is_empty() {
             return;
         }
@@ -4669,6 +4730,7 @@ impl Shell {
     /// The dedicated History surface. Keeping it as its own tab preserves its
     /// graph/search state while Diff tabs retain their ordinary scope picker.
     fn add_history_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.git_plugin_enabled(cx) { return; }
         let history = cx.new(|cx| Changes::for_history(self.state.clone(), cx));
         self.register_diff_surface(history, window, cx);
     }
@@ -4691,6 +4753,7 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.git_plugin_enabled(cx) { return; }
         changes.update(cx, |changes, cx| changes.set_notifications(self.toasts.clone(), cx));
         self.diff_seq += 1;
         let id = self.diff_seq;
@@ -4757,6 +4820,8 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.git_plugin_enabled(cx) { return; }
+        if !self.git_plugin_enabled(cx) { return; }
         let Some(chat) = self.state.read(cx).selected_chat.clone() else {
             return;
         };
@@ -4798,14 +4863,6 @@ impl Shell {
     /// The picker's Terminal card / the `+` menu's Terminal row: every click
     /// opens a fresh embedded terminal tab.
     fn add_terminal_surface(&mut self, cx: &mut Context<Self>) {
-        if cfg!(target_os = "linux") {
-            // Every entry point opens a shell in the same bottom dock.
-            self.terminal_panel(cx).update(cx, |panel, cx| {
-                panel.open_tab_for_selected(cx);
-            });
-            self.select_terminal_mode(project_terminals_ui::TerminalMode::Shells, cx);
-            return;
-        }
         let panel = self.right_terminal_panel(cx);
         let opened = panel.update(cx, |panel, cx| {
             panel.set_open(true, cx);
@@ -4813,10 +4870,10 @@ impl Shell {
         });
         if let Some(tab) = opened {
             let key = self.panel_key(cx);
-            self.right_tabs
-                .entry(key)
-                .or_default()
-                .push(RightSurface::Terminal(tab));
+            push_unique_right_surface(
+                self.right_tabs.entry(key).or_default(),
+                RightSurface::Terminal(tab),
+            );
             self.set_right_active(RightSurface::Terminal(tab), cx);
         }
     }
@@ -5135,7 +5192,7 @@ impl Shell {
                         .update(cx, |s, _| s.unwatch_subagent_doc(&tab.doc_id));
                 }
             }
-            RightSurface::Picker | RightSurface::Explorer => {}
+            RightSurface::Picker | RightSurface::Explorer | RightSurface::Services => {}
         }
         self.close_empty_right_pane(&key, cx);
         self.panels.forget_right_surface(&key, surface);
@@ -5154,6 +5211,9 @@ impl Shell {
             }
         });
         self.collapse_surfaces_if_empty(&key, cx);
+        if cfg!(target_os = "linux") && was_active && matches!(surface, RightSurface::Terminal(_)) {
+            self.set_right_active(fallback, cx);
+        }
         if restore_focus {
             self.restore_right_focus_after_close(window, cx);
         }
@@ -5348,13 +5408,22 @@ impl Shell {
         if let Some(terminal) = &self.terminal {
             return terminal.clone();
         }
-        let terminal = cx.new(|cx| TerminalPanel::new(self.state.clone(), cx));
+        let terminal = cx.new(|cx| {
+            if cfg!(target_os = "linux") {
+                TerminalPanel::new_embedded(self.state.clone(), cx)
+            } else { TerminalPanel::new(self.state.clone(), cx) }
+        });
+        if cfg!(target_os = "linux") {
+            self.terminal_subscription = Some(cx.observe(&terminal, |this, terminal, cx| {
+                if this.sync_terminal_sidebar_tabs(&terminal, cx) { cx.notify(); }
+            }));
+        }
         self.terminal = Some(terminal.clone());
         terminal
     }
 
     fn terminal_target(&self, cx: &App) -> f32 {
-        if !self.session_workspace_visible(cx) {
+        if cfg!(target_os = "linux") || !self.session_workspace_visible(cx) {
             return 0.0;
         }
         if self.terminal_open(cx) {
@@ -5379,12 +5448,7 @@ impl Shell {
             if self.terminal_open(cx) {
                 self.hide_terminal_panel(window, cx);
             } else {
-                let mode = if self.terminal_project_context(None, cx).is_some() {
-                    self.project_terminals.mode
-                } else {
-                    project_terminals_ui::TerminalMode::Shells
-                };
-                self.select_terminal_mode(mode, cx);
+                self.open_shell_panel(cx);
             }
             return;
         }
@@ -5392,12 +5456,7 @@ impl Shell {
     }
 
     fn toggle_shell_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // The services drawer counts as an open terminal, so flipping only
-        // the shell flag would leave it on screen.
-        if self.project_terminals.drawer {
-            self.hide_terminal_panel(window, cx);
-            return;
-        }
+        if cfg!(target_os = "linux") { self.toggle_terminal(window, cx); return; }
         let from = self.terminal_geometry.get().height;
         let key = self.panel_key(cx);
         let open = self.panels.toggle_terminal(&key);
@@ -6306,6 +6365,9 @@ impl Shell {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
+            }
+            SettingsSection::Plugins => {
+                self.plugins_page.get_or_insert_with(|| cx.new(settings::plugins::PluginsPage::new)).clone().into_any_element()
             }
             SettingsSection::Files => {
                 if self.files_settings_page.is_none() {
@@ -11885,7 +11947,7 @@ impl Shell {
         if let Some(overlay) = self.render_project_action_overlay(viewport, window, cx) {
             overlays.push(overlay);
         }
-        if let Some(overlay) = self.render_worktree_settings(viewport, window, cx) {
+        if let Some(overlay) = self.settings_sidebar_view(UnsavedForm::WorktreeSettings, cx) {
             overlays.push(overlay);
         }
         if let Some(overlay) =
@@ -11893,7 +11955,7 @@ impl Shell {
         {
             overlays.push(overlay);
         }
-        if let Some(overlay) = self.render_project_terminal_editor(viewport, window, cx) {
+        if let Some(overlay) = self.settings_sidebar_view(UnsavedForm::Services, cx) {
             overlays.push(overlay);
         }
         if let Some(overlay) =
@@ -12129,7 +12191,7 @@ impl Shell {
             self.main_diff = None;
             self.main_diff_sub = None;
         }
-        if let Some((_, title, view)) = self.main_diff.clone() {
+        if let Some((_, title, view)) = self.main_diff.clone().filter(|_| self.git_plugin_enabled(cx)) {
             let theme = Theme::of(cx).clone();
             let controls = view.update(cx, |view, cx| view.render_header_controls(cx));
             let diff = div()
@@ -12720,36 +12782,14 @@ impl Shell {
         .into_any_element()
     }
 
-    /// File and diff editors share the bottom dock with the conversation.
+    /// Terminals live in the tool sidebar, leaving editors the full column.
     fn render_editor_with_terminals(
         &mut self,
         editor: AnyElement,
-        window: &Window,
-        cx: &mut Context<Self>,
+        _window: &Window,
+        _cx: &mut Context<Self>,
     ) -> AnyElement {
-        if !cfg!(target_os = "linux") {
-            return editor;
-        }
-        let limit =
-            (f32::from(window.viewport_size().height) * TERMINAL_MAX_VH).max(TERMINAL_MIN_HEIGHT);
-        let height = self.eval_tween(self.terminal_tween, self.terminal_target(cx));
-        let content_height = height.max(self.terminal_target(cx)).max(
-            self.terminal_tween
-                .map(|tween| tween.from)
-                .unwrap_or(height),
-        );
-        let geometry = std::rc::Rc::new(std::cell::Cell::new(
-            crate::terminal::dock::Geometry::new(height, content_height, limit),
-        ));
-        div()
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .flex()
-            .flex_col()
-            .child(div().flex_1().min_h_0().overflow_hidden().child(editor))
-            .child(self.render_terminal_container(geometry, window, cx))
-            .into_any_element()
+        editor
     }
 
     /// Terminal panel dock at the main-column bottom: a 5px height-drag handle
@@ -12760,7 +12800,7 @@ impl Shell {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        if !self.session_workspace_visible(cx) {
+        if cfg!(target_os = "linux") || !self.session_workspace_visible(cx) {
             self.terminal_geometry
                 .set(crate::terminal::dock::Geometry::default());
             return gpui::Empty.into_any_element();
@@ -12776,23 +12816,13 @@ impl Shell {
         let content_visible = open || tween.is_some();
         let content_opacity = self.terminal_content_opacity();
         let toolbar = self.render_terminal_toolbar(window, cx);
-        let project_content = (self.project_terminals.drawer
-            || (cfg!(target_os = "linux")
-                && !open
-                && tween.is_some()
-                && self.project_terminals.mode == project_terminals_ui::TerminalMode::Services))
-            .then(|| self.render_project_terminal_content(cx));
         // Defensive: an open flag needs its entity (and set_open) even if
         // toggle_terminal never created one.
-        if project_content.is_none() && self.terminal_open(cx) && self.terminal.is_none() {
+        if self.terminal_open(cx) && self.terminal.is_none() {
             let panel = self.terminal_panel(cx);
             panel.update(cx, |panel, cx| panel.set_open(true, cx));
         }
-        let panel = if project_content.is_some() {
-            self.project_terminals.panel.clone()
-        } else {
-            self.terminal.clone()
-        };
+        let panel = self.terminal.clone();
         // The dock spans the main column's bottom: when the sidebar is fully
         // closed the column IS the window's left edge (and likewise the right
         // edge when the right pane is closed) — the panel's fill then carries
@@ -12891,7 +12921,7 @@ impl Shell {
                 .child(toolbar)
                 .when(content_visible, |inner| {
                     inner.child(div().flex_1().min_h_0().opacity(content_opacity).children(
-                        project_content.or_else(|| panel.map(|panel| panel.into_any_element())),
+                        panel.map(|panel| panel.into_any_element()),
                     ))
                 })
                 .when(open, |inner| {
@@ -12999,6 +13029,7 @@ impl Shell {
         let showing = self.right_pane_open(cx) || self.tween_active(self.right_tween) || exiting;
         let content: AnyElement = if showing {
             match self.resolved_right_active(cx) {
+                RightSurface::Services => self.render_services_sidebar(window, cx),
                 RightSurface::Explorer => {
                     if let Some(files) = self.files.get(&self.panel_key(cx)).cloned() {
                         files.update(cx, |files, cx| {
@@ -13060,6 +13091,7 @@ impl Shell {
                         || self.tween_active(self.files_tween)
                         || self.tween_active(self.sidebar_tween);
                     panel.update(cx, |panel, cx| {
+                        panel.set_open(self.right_pane_open(cx), cx);
                         panel.set_resize_suspended(resize_suspended);
                         panel.select_tab_by_key(tab, cx);
                     });
@@ -13233,16 +13265,20 @@ impl Shell {
                             |this, _, window, cx| this.add_browser_surface(None, window, cx),
                         )),
                     )
-                    .when(!cfg!(target_os = "linux"), |el| el.child(
+                    .when(self.services_available(cx), |el| el.child(
+                        row("surface-card-services", icons::SERVICES, "Services")
+                            .on_click(cx.listener(|this, _, _, cx| this.open_services_panel(cx))),
+                    ))
+                    .child(
                         row("surface-card-terminal", icons::TERMINAL, "Terminal").on_click(
                             cx.listener(|this, _, _, cx| {
                                 this.add_terminal_surface(cx);
                             }),
                         ),
-                    ))
+                    )
                     // Git surfaces only where there IS git — the pane itself
                     // no longer gates on it (terminals work anywhere).
-                    .when(self.space_git_detected(cx), |el| {
+                    .when(self.git_tools_available(cx), |el| {
                         el.child(row("surface-card-diffs", icons::SOURCE_CONTROL, "Diffs").on_click(
                             cx.listener(|this, _, window, cx| {
                                 this.add_diff_surface(window, cx);
@@ -13457,6 +13493,7 @@ impl Shell {
                 RightSurface::PullRequest(_) => icons::PULL_REQUEST,
                 RightSurface::Picker => icons::PLUS,
                 RightSurface::Explorer => icons::FILE_TREE,
+                RightSurface::Services => icons::SERVICES,
             };
             // Working chats and subagents swap their harness icon for the
             // mini spinner; subagent liveness follows the doc's streaming tail.
@@ -13727,7 +13764,7 @@ impl Shell {
                                 )
                                 .child(SharedString::from("Browser")),
                         )
-                        .when(!cfg!(target_os = "linux"), |menu| menu.child(
+                        .child(
                             popover::menu_row(&theme, false, "right-plus-terminal")
                                 .id("right-plus-terminal-row")
                                 .on_click(cx.listener(|this, _, _, cx| {
@@ -13740,8 +13777,18 @@ impl Shell {
                                         .text_color(theme.text_muted),
                                 )
                                 .child(SharedString::from("Terminal")),
+                        )
+                        .when(self.services_available(cx), |menu| menu.child(
+                            popover::menu_row(&theme, false, "right-plus-services")
+                                .id("right-plus-services-row")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.open_services_panel(cx);
+                                    this.close_right_plus(cx);
+                                }))
+                                .child(icon(icons::SERVICES).size(px(13.0)).text_color(theme.text_muted))
+                                .child("Services"),
                         ))
-                        .when(self.space_git_detected(cx), |menu| {
+                        .when(self.git_tools_available(cx), |menu| {
                             menu.child(
                                 popover::menu_row(&theme, false, "right-plus-diff")
                                     .id("right-plus-diff-row")
@@ -14342,6 +14389,7 @@ fn header_icon_button_with(
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_plugins(cx);
         self.follow_project_terminal_checkout(window, cx);
         self.ensure_project_terminals(cx);
         self.sync_file_close_dialog(window, cx);
@@ -18314,6 +18362,16 @@ mod exit_regressions {
                 .update(cx, |shell, window, cx| {
                     shell.open_chat("terminal-session".into(), cx);
                     shell.active_chat = "terminal-session".into();
+                    if cfg!(target_os = "linux") {
+                        shell.viewport_width = 1440.0;
+                        shell.state.update(cx, |state, _| state.selected_chat = Some("terminal-session".into()));
+                        // This focus-only fixture has no engine to create a PTY.
+                        // Individual surface tabs need their retained backing tab.
+                        let terminal = shell.terminal_panel(cx);
+                        if terminal.read(cx).tab_summaries(cx).is_empty() {
+                            terminal.update(cx, |panel, cx| panel.reserve_tab_for_chat("terminal-session".into(), "Terminal 1", cx));
+                        }
+                    }
                     let panel = if embedded {
                         shell.add_terminal_surface(cx);
                         if cfg!(target_os = "linux") {
@@ -19628,7 +19686,7 @@ impl Shell {
     }
 
     pub fn fixture_new_chat(&mut self, cx: &mut Context<Self>) {
-        self.open_new_session(Some("fixture-space".into()), cx);
+        self.open_new_session(Some(tabs::NewSessionTarget::Project("fixture-space".into())), cx);
         self.on_state_changed(&self.state.clone(), cx);
     }
 
@@ -19638,6 +19696,13 @@ impl Shell {
 
     pub fn fixture_workbench_state(&self, cx: &App) -> serde_json::Value {
         serde_json::json!({
+            "plugins": {
+                "git": self.git_plugin_enabled(cx),
+                "services": self.services_plugin_enabled(cx),
+                "savedGit": UiSettings::load(&self.data_dir).plugins.enabled(crate::plugins::PluginId::Git),
+                "savedServices": UiSettings::load(&self.data_dir).plugins.enabled(crate::plugins::PluginId::Services),
+            },
+            "route": format!("{:?}", self.route),
             "sessionVisible": self.session_workspace_visible(cx),
             "selectedChat": self.state.read(cx).selected_chat,
             "recentChatsOpen": self.command_palette.as_open().is_some_and(|palette| palette.recent_chats),
@@ -20893,6 +20958,7 @@ mod settings_modal_regressions {
             ("settings/voice", SettingsSection::Voice),
             ("settings/conversations", SettingsSection::General),
             ("settings/files", SettingsSection::Files),
+            ("settings/plugins", SettingsSection::Plugins),
             ("settings/appshots", SettingsSection::Appshots),
             ("settings/archived", SettingsSection::Archived),
         ] {

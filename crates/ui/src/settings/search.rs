@@ -77,6 +77,10 @@ settings_index! {
         "pr pull request badges board browser github"),
     (ThreadNaming, General, None, "Thread naming",
         "titles rename sessions model"),
+    (GitPlugin, Plugins, None, "Git",
+        "plugin enable disable source control staging unstaging branches checkout stashes history syntax diffs"),
+    (ServicesPlugin, Plugins, None, "Services",
+        "plugin enable disable project services servers databases start stop restart output terminals"),
     (WorktreeLocation, General, Some("Git"), "Custom worktree location",
         "folder directory path checkout branches"),
     (CommitCredit, General, Some("Git"), "Credit Zeron in commits",
@@ -375,6 +379,7 @@ fn page_terms(section: SettingsSection) -> &'static str {
         SettingsSection::Cloud => "machine remote github repositories usage",
         SettingsSection::Billing => "plan credits subscription payment stripe",
         SettingsSection::Files => "editor autosave wrap hidden",
+        SettingsSection::Plugins => "plugins extensions bundled native git services enable disable",
         SettingsSection::Appshots => "screenshots capture permissions",
         SettingsSection::Archived => "archive unarchive restore delete sessions threads",
     }

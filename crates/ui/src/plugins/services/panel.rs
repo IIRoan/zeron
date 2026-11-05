@@ -6,14 +6,6 @@ use zeron_proto::{
 use zeron_rpc::methods;
 
 pub(super) const TERMINAL_TOOLBAR_HEIGHT: f32 = 32.0;
-const SERVICE_BAR_HEIGHT: f32 = 28.0;
-
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-pub(super) enum TerminalMode {
-    #[default]
-    Services,
-    Shells,
-}
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct ProjectContext {
@@ -169,8 +161,8 @@ pub(super) struct ServiceMenu {
 
 #[derive(Default)]
 pub(super) struct ProjectTerminalUi {
-    pub drawer: bool,
-    pub mode: TerminalMode,
+    suspended: bool,
+    suspended_editor: Option<popover::Popup<Editor>>,
     pub editor: popover::Popup<Editor>,
     pub(super) discard: popover::Popup<DiscardPrompt>,
     pub panel: Option<Entity<TerminalPanel>>,
@@ -181,6 +173,7 @@ pub(super) struct ProjectTerminalUi {
     pub actions_menu: popover::Popup<()>,
     pub service_menu: popover::Popup<ServiceMenu>,
     bar_width: std::rc::Rc<std::cell::Cell<f32>>,
+    list_scroll: gpui::ScrollHandle,
     output_height: std::rc::Rc<std::cell::Cell<f32>>,
     poll: Option<Task<()>>,
     /// Saves and bulk actions exclude individual service actions.
@@ -222,6 +215,28 @@ impl ProjectTerminalUi {
 }
 
 impl Shell {
+    pub(super) fn suspend_services_plugin(&mut self, cx: &mut Context<Self>) {
+        if self.project_terminals.suspended { return; }
+        self.project_terminals.suspended = true;
+        self.suspend_service_settings_contribution(cx);
+        self.project_terminals.poll = None;
+        // Reconcile ownership once on re-enable, including a handoff whose
+        // response arrived while hidden. Activating the same checkout is idempotent.
+        self.project_terminals.last_activation = None;
+        self.project_terminals.epoch += 1;
+        self.project_terminals.actions_menu = Default::default();
+        self.project_terminals.service_menu = Default::default();
+        self.project_terminals.discard = Default::default();
+        if self.project_terminals.editor.is_open() {
+            self.project_terminals.suspended_editor = Some(std::mem::take(&mut self.project_terminals.editor));
+        } else {
+            self.project_terminals.editor = Default::default();
+        }
+        if let Some(panel) = &self.project_terminals.panel {
+            panel.update(cx, |panel, cx| panel.set_open(false, cx));
+        }
+    }
+
     pub(super) fn terminal_project_context(
         &self,
         space: Option<&str>,
@@ -265,7 +280,7 @@ impl Shell {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        if !window.is_window_active()
+        if !self.services_plugin_enabled(cx) || !window.is_window_active()
             || !matches!(self.route, Route::Chat)
             || self.project_terminals.handoff.is_some()
             || self.project_terminals.has_pending_actions()
@@ -295,7 +310,7 @@ impl Shell {
                 .await;
             this.update(cx, |shell, cx| {
                 shell.project_terminals.handoff = None;
-                if shell.terminal_project_context(None, cx).as_ref() == Some(&context) {
+                if shell.services_plugin_enabled(cx) && shell.terminal_project_context(None, cx).as_ref() == Some(&context) {
                     match result {
                         Ok(snapshot) => {
                             if shell.project_terminals.context.as_ref() == Some(&context) {
@@ -305,7 +320,7 @@ impl Shell {
                         Err(error) => {
                             shell.project_terminals.handoff_error =
                                 Some(format!("Could not switch project terminals: {error}"));
-                            shell.select_terminal_mode(TerminalMode::Services, cx);
+                            shell.open_services_panel(cx);
                         }
                     }
                 }
@@ -317,41 +332,50 @@ impl Shell {
         }));
     }
 
-    pub(super) fn select_terminal_mode(&mut self, mode: TerminalMode, cx: &mut Context<Self>) {
+    pub(super) fn services_available(&self, cx: &App) -> bool {
+        self.services_plugin_enabled(cx) && self.terminal_project_context(None, cx).is_some()
+    }
+
+    pub(super) fn services_panel_visible(&self, cx: &App) -> bool {
+        self.services_available(cx)
+            && self.session_chrome_visible(cx)
+            && self.right_pane_shown(cx)
+            && self.resolved_right_active(cx) == RightSurface::Services
+    }
+
+    pub(super) fn open_services_panel(&mut self, cx: &mut Context<Self>) {
+        if !self.session_workspace_visible(cx) || !self.services_available(cx) {
+            return;
+        }
+        self.project_terminals.actions_menu = Default::default();
+        self.project_terminals.service_menu = Default::default();
+        self.close_files_panel(cx);
+        self.set_surfaces_open(true, cx);
+        push_unique_right_surface(
+            self.right_tabs.entry(self.panel_key(cx)).or_default(),
+            RightSurface::Services,
+        );
+        self.set_right_active(RightSurface::Services, cx);
+    }
+
+    pub(super) fn open_shell_panel(&mut self, cx: &mut Context<Self>) {
         if !self.session_workspace_visible(cx) {
             return;
         }
-        if mode == TerminalMode::Services && self.terminal_project_context(None, cx).is_none() {
+        if cfg!(target_os = "linux") {
+            self.open_terminal_sidebar(cx);
             return;
         }
         let was_open = self.terminal_open(cx);
         let from = self.terminal_geometry.get().height;
-        if !was_open || self.project_terminals.mode != mode {
-            self.project_terminals.content_started = Some(std::time::Instant::now());
-        }
-        self.project_terminals.mode = mode;
-        self.project_terminals.actions_menu = popover::Popup::default();
-        self.project_terminals.service_menu = popover::Popup::default();
-        self.project_terminals.drawer = mode == TerminalMode::Services;
+        self.project_terminals.content_started = Some(std::time::Instant::now());
         let key = self.panel_key(cx);
-        self.panels
-            .update(&key, |panels| panels.terminal_open = true);
-        if mode == TerminalMode::Shells {
-            self.composer
-                .update(cx, |composer, _| composer.focus_pending = false);
-            self.terminal_panel(cx).update(cx, |panel, cx| {
-                panel.set_open(true, cx);
-                panel.request_focus(cx);
-            });
-        } else {
-            if let Some(panel) = &self.terminal {
-                panel.update(cx, |panel, cx| panel.set_open(false, cx));
-            }
-            self.ensure_project_terminals(cx);
-            if let Some(panel) = &self.project_terminals.panel {
-                panel.update(cx, |panel, cx| panel.request_focus(cx));
-            }
-        }
+        self.panels.update(&key, |panels| panels.terminal_open = true);
+        self.composer.update(cx, |composer, _| composer.focus_pending = false);
+        self.terminal_panel(cx).update(cx, |panel, cx| {
+            panel.set_open(true, cx);
+            panel.request_focus(cx);
+        });
         if !was_open {
             self.animate_terminal_dock(from, cx);
         }
@@ -359,10 +383,12 @@ impl Shell {
     }
 
     pub(super) fn hide_terminal_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.project_terminals.actions_menu = popover::Popup::default();
-        self.project_terminals.service_menu = popover::Popup::default();
+        if cfg!(target_os = "linux") {
+            if self.terminal_open(cx) { self.set_surfaces_open(false, cx); }
+            window.focus(&self.composer.focus_handle(cx), cx);
+            return;
+        }
         let from = self.terminal_geometry.get().height;
-        self.project_terminals.drawer = false;
         let key = self.panel_key(cx);
         self.panels
             .update(&key, |panels| panels.terminal_open = false);
@@ -414,6 +440,7 @@ impl Shell {
     }
 
     pub(super) fn open_project_terminal_settings(&mut self, space: String, cx: &mut Context<Self>) {
+        if !self.services_plugin_enabled(cx) { return; }
         self.project_terminals.actions_menu = popover::Popup::default();
         let Some(context) = self.terminal_project_context(Some(&space), cx) else {
             return;
@@ -427,7 +454,20 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         self.project_terminals.service_menu = popover::Popup::default();
-        self.project_terminals.editor.open(Editor::new(context));
+        if !self.services_plugin_enabled(cx) { return; }
+        if let Some(editor) = self.project_terminals.suspended_editor.take() {
+            // Resume the retained editor with its original project target.
+            self.project_terminals.editor = editor;
+        } else if let Some(editor) = self.project_terminals.editor.as_open() {
+            if editor.project == context { cx.notify(); return; }
+            if editor.is_dirty(cx) || self.project_terminals.control_busy(None) {
+                self.show_notice(crate::toast::ToastKind::Info, "Save or close the current service settings before opening another project.", cx);
+                return;
+            }
+            self.project_terminals.editor.open(Editor::new(context));
+        } else {
+            self.project_terminals.editor.open(Editor::new(context));
+        }
         self.project_terminals.discard = popover::Popup::default();
         self.project_terminals.poll = None;
         self.ensure_project_terminals(cx);
@@ -435,8 +475,13 @@ impl Shell {
     }
 
     pub(super) fn ensure_project_terminals(&mut self, cx: &mut Context<Self>) {
-        if !self.project_terminals.drawer && !self.project_terminals.editor.is_open() {
+        if !self.services_plugin_enabled(cx) { self.project_terminals.poll = None; return; }
+        self.project_terminals.suspended = false;
+        if !self.services_panel_visible(cx) && !self.project_terminals.editor.is_open() {
             self.project_terminals.poll = None;
+            if let Some(panel) = &self.project_terminals.panel {
+                panel.update(cx, |panel, cx| panel.set_open(false, cx));
+            }
             return;
         }
         let context = self
@@ -508,7 +553,7 @@ impl Shell {
                                 }
                             }
                         }
-                        shell.project_terminals.drawer || shell.project_terminals.editor.is_open()
+                        shell.services_panel_visible(cx) || shell.project_terminals.editor.is_open()
                     })
                     .unwrap_or(false);
                 if !keep_polling {
@@ -801,7 +846,7 @@ impl Shell {
         let service = (method == methods::CONTROL_PROJECT_TERMINALS)
             .then(|| params["serviceId"].as_str())
             .flatten();
-        if self.project_terminals.control_busy(service) {
+        if !self.services_plugin_enabled(cx) || self.project_terminals.control_busy(service) {
             return;
         }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
@@ -855,7 +900,7 @@ impl Shell {
                             if let Some(editor) = shell.project_terminals.editor.open_mut() {
                                 editor.closed_by_save = true;
                             }
-                            popover::close_popup(shell, cx, |this| {
+                            shell.close_settings_sidebar(cx, |this| {
                                 &mut this.project_terminals.editor
                             });
                             popover::close_popup(shell, cx, |this| {
@@ -903,163 +948,61 @@ impl Shell {
 
     pub(super) fn render_terminal_toolbar(
         &mut self,
-        window: &Window,
+        _: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let open = self.terminal_open(cx);
-        let mode = self.project_terminals.mode;
-        let project = self.terminal_project_context(None, cx);
-        let mut header = div()
+        div()
             .id("terminal-toolbar")
             .h(px(TERMINAL_TOOLBAR_HEIGHT))
             .w_full()
             .flex_none()
             .flex()
             .items_center()
-            .gap(px(4.0))
             .px(px(8.0))
             .bg(crate::terminal::view::terminal_panel_bg(&theme))
             .border_b_1()
-            .border_color(theme.border);
-        for (choice, id, label, hint) in [
-            (
-                TerminalMode::Services,
-                "terminal-mode-services",
-                "Services",
-                "Project services · Shared servers and tunnels for the active checkout",
-            ),
-            (
-                TerminalMode::Shells,
-                "terminal-mode-shells",
-                "Terminals",
-                "Shell terminals · Independent terminals for this agent",
-            ),
-        ] {
-            let enabled = choice == TerminalMode::Shells || project.is_some();
-            let selected = open && mode == choice;
-            let key = format!("{}-{id}", cx.entity_id());
-            let progress = motion::state_t(&key, selected, motion::TAB_SLIDE, self.reduced_motion);
-            header = header.child(
-                popover::btn_ghost(&theme, label, key.clone())
-                    .id(id)
-                    .flex_none()
-                    .text_size(px(12.0))
-                    .px(px(9.0))
-                    .py(px(4.0))
-                    .role(gpui::Role::Tab)
-                    .aria_label(hint)
-                    .aria_toggled(if selected {
-                        gpui::Toggled::True
-                    } else {
-                        gpui::Toggled::False
-                    })
+            .border_color(theme.border)
+            .child(div().flex_1().text_size(crate::typography::ui_rems(12.0))
+                .text_color(theme.text_muted).child("Terminals"))
+            .child(service_icon_button(
+                &theme, "terminal-visibility".into(),
+                if open { icons::ALT_ARROW_DOWN } else { icons::ALT_ARROW_UP },
+                if open { "Hide terminals · Ctrl+J" } else { "Show terminals · Ctrl+J" },
+            ).on_click(cx.listener(|this, _, window, cx| this.toggle_terminal(window, cx))))
+            .into_any_element()
+    }
+
+    pub(super) fn render_services_sidebar(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.ensure_project_terminals(cx);
+        let theme = Theme::of(cx).clone();
+        let context = self.terminal_project_context(None, cx);
+        let description = context.as_ref().map(|context| context.name.clone()).unwrap_or_default();
+        let hint = context.as_ref().map(|context| context.cwd.clone()).unwrap_or_default();
+        let controls = self.render_service_toolbar_actions(window, cx);
+        let width = self.project_terminals.bar_width.clone();
+        div()
+            .id("services-sidebar")
+            .debug_selector(|| "services-sidebar".into())
+            .size_full()
+            .relative()
+            .flex()
+            .flex_col()
+            .child(gpui::canvas(move |bounds, _, _| width.set(f32::from(bounds.size.width)), |_, _, _, _| {})
+                .absolute().inset_0())
+            .bg(theme.panel_bg())
+            .child(crate::surface_chrome::toolbar(&theme)
+                .child(div().id("services-project-context").flex_1().min_w_0().truncate()
+                    .text_size(crate::typography::ui_rems(12.0)).text_color(theme.text_muted)
                     .tooltip(crate::settings::widgets::text_tooltip(hint))
-                    .text_color(motion::mix(theme.text_muted, theme.text, progress))
-                    .bg(motion::hover_blend(
-                        &key,
-                        theme.wash(0.08).opacity(progress),
-                        theme.element_hover,
-                    ))
-                    .when(!enabled, |el| el.opacity(0.4).cursor_default())
-                    .when(enabled, |el| {
-                        el.on_click(cx.listener(move |this, _, _, cx| {
-                            this.select_terminal_mode(choice, cx);
-                        }))
-                    }),
-            );
-        }
-        let checking = self
-            .project_terminals
-            .snapshot
-            .as_ref()
-            .filter(|_| self.project_terminals.context.as_ref() == project.as_ref())
-            .and_then(|snapshot| {
-                snapshot.config.services.iter().find(|service| {
-                    service_readiness(snapshot, &service.id) == Some(Readiness::Checking)
-                })
-            })
-            .map(|service| service.name.clone());
-        let description = if let Some(name) = checking {
-            format!("Waiting for {name} to be ready…")
-        } else if self.project_terminals.handoff.is_some() {
-            "Moving services to this checkout…".to_string()
-        } else if let Some(action) = self.project_terminals.pending_action {
-            let target = if action == "stop-worktree" {
-                "app services"
-            } else {
-                "all services"
-            };
-            format!("{} {target}…", action_label(action))
-        } else if !self.project_terminals.service_actions.is_empty() {
-            let mut progress = self
-                .project_terminals
-                .service_actions
-                .iter()
-                .map(|((_, id), action)| {
-                    let name = self
-                        .project_terminals
-                        .snapshot
-                        .as_ref()
-                        .and_then(|snapshot| snapshot.config.services.iter().find(|s| &s.id == id))
-                        .map(|s| s.name.as_str())
-                        .unwrap_or(id);
-                    format!("{} {name}…", action_label(action))
-                })
-                .collect::<Vec<_>>();
-            progress.sort();
-            progress.join(" · ")
-        } else if mode == TerminalMode::Services {
-            let name = project
-                .as_ref()
-                .map(|p| p.name.as_str())
-                .unwrap_or("Select a project");
-            match self
-                .project_terminals
-                .snapshot
-                .as_ref()
-                .filter(|_| self.project_terminals.context.as_ref() == project.as_ref())
-            {
-                Some(snapshot) if !snapshot.config.services.is_empty() => {
-                    format!("{} · {name}", service_summary(snapshot))
-                }
-                _ => name.to_string(),
-            }
-        } else {
-            "Agent terminals".into()
-        };
-        header = header.child(
-            div()
-                .id("terminal-context")
-                .flex_1()
-                .min_w_0()
-                .truncate()
-                .text_size(px(11.0))
-                .text_color(theme.text_faint)
-                .tooltip(crate::settings::widgets::text_tooltip(description.clone()))
-                .child(SharedString::from(description)),
-        );
-        if open && mode == TerminalMode::Services {
-            header = header.child(self.render_service_toolbar_actions(window, cx));
-        }
-        header
-            .child(
-                service_icon_button(
-                    &theme,
-                    "terminal-visibility".into(),
-                    if open {
-                        icons::ALT_ARROW_DOWN
-                    } else {
-                        icons::ALT_ARROW_UP
-                    },
-                    if open {
-                        "Hide terminal panel · Ctrl+J"
-                    } else {
-                        "Show terminal panel · Ctrl+J"
-                    },
-                )
-                .on_click(cx.listener(|this, _, window, cx| this.toggle_terminal(window, cx))),
-            )
+                    .child(SharedString::from(description)))
+                .child(controls))
+            .child(div().flex_1().min_h_0().child(self.render_project_terminal_content(cx)))
             .into_any_element()
     }
 
@@ -1156,7 +1099,6 @@ impl Shell {
                 self.project_terminals
                     .selected
                     .insert(scope.clone(), service.id.clone());
-                self.project_terminals.content_started = Some(std::time::Instant::now());
                 if let Some(panel) = &self.project_terminals.panel
                     && let Some((key, _)) = self.project_terminals.tabs.get(&(scope, service.id))
                 {
@@ -1209,11 +1151,11 @@ impl Shell {
             ),
         ] {
             if action == "output" {
-                card = card.child(popover::menu_separator());
+                card = card.child(popover::picker_divider());
             }
             let enabled = closing.is_none() && self.service_menu_action_enabled(action);
             card = card.child(
-                popover::menu_row(&theme, false, format!("service-context-{action}"))
+                popover::picker_row(&theme, false, false, format!("service-context-{action}"))
                     .id(SharedString::from(format!("service-context-{action}")))
                     .debug_selector(move || format!("service-context-{action}"))
                     .role(gpui::Role::Button)
@@ -1336,9 +1278,8 @@ impl Shell {
             .justify_center()
             .role(gpui::Role::Button)
             .aria_label("Service actions")
-            .tooltip(crate::settings::widgets::text_tooltip(
-                "Service actions and settings",
-            ))
+            .when(self.project_terminals.actions_menu.get().is_none(), |el|
+                el.tooltip(crate::settings::widgets::text_tooltip("Service actions and settings")))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, _| {
@@ -1390,7 +1331,7 @@ impl Shell {
                 let label = format!("Restart {}", service.name);
                 menu = menu
                     .child(
-                        popover::menu_row(&popup_theme, false, "services-menu-restart-selected")
+                        popover::picker_row(&popup_theme, false, false, "services-menu-restart-selected")
                             .id("service-restart")
                             .role(gpui::Role::Button)
                             .aria_label(label.clone())
@@ -1416,7 +1357,7 @@ impl Shell {
                                 }))
                             }),
                     )
-                    .child(popover::menu_separator());
+                    .child(popover::picker_divider());
             }
             // With shared databases, the everyday actions leave them running;
             // only the last one stops them too.
@@ -1473,7 +1414,7 @@ impl Shell {
             };
             for &(label, action, glyph, enabled) in actions {
                 menu = menu.child(
-                    popover::menu_row(&popup_theme, false, format!("services-menu-{action}"))
+                    popover::picker_row(&popup_theme, false, false, format!("services-menu-{action}"))
                         .id(SharedString::from(format!("services-{action}")))
                         .role(gpui::Role::Button)
                         .aria_label(label)
@@ -1495,9 +1436,9 @@ impl Shell {
                 );
             }
             menu = menu
-                .child(popover::menu_separator())
+                .child(popover::picker_divider())
                 .child(
-                    popover::menu_row(&popup_theme, false, "services-menu-edit")
+                    popover::picker_row(&popup_theme, false, false, "services-menu-edit")
                         .id("services-edit")
                         .role(gpui::Role::Button)
                         .aria_label("Edit app services")
@@ -1518,7 +1459,7 @@ impl Shell {
                         }),
                 )
                 .child(
-                    popover::menu_row(&popup_theme, false, "services-menu-worktree-settings")
+                    popover::picker_row(&popup_theme, false, false, "services-menu-worktree-settings")
                         .id("services-worktree-settings")
                         .role(gpui::Role::Button)
                         .aria_label("Project settings")
@@ -1562,92 +1503,76 @@ impl Shell {
         let theme = Theme::of(cx).clone();
         let context = self.project_terminals.context.clone();
         let snapshot = self.project_terminals.snapshot.clone();
-        let compact = self.project_terminals.bar_width.get() < 520.0;
         let mut tabs = div()
             .id("project-service-tabs")
+            .debug_selector(|| "service-list".into())
+            .flex_none()
+            .w_full()
+            .min_h_0()
+            .max_h(gpui::relative(0.45))
+            .overflow_y_scroll()
+            .track_scroll(&self.project_terminals.list_scroll)
+            .p(px(6.0))
             .flex()
-            .items_center()
-            .gap(px(4.0))
-            .flex_1()
-            .min_w_0()
-            .overflow_x_scroll()
-            .when(!compact, |tabs| {
-                tabs.flex_none()
-                    .flex_shrink(1.0)
-                    .max_w(px(self.project_terminals.bar_width.get() * 0.55))
-            });
+            .flex_col()
+            .gap(px(2.0));
         if let (Some(context), Some(snapshot)) = (&context, &snapshot) {
             let scope = context.scope();
-            let mut previous_database = false;
-            for service in &snapshot.config.services {
-                // A hairline separates shared databases from the app services.
-                if previous_database && !service.is_database() {
-                    tabs = tabs.child(
-                        div()
-                            .flex_none()
-                            .w(px(1.0))
-                            .h(px(14.0))
-                            .mx(px(2.0))
-                            .bg(theme.text.opacity(0.14)),
-                    );
-                }
-                previous_database = service.is_database();
-                let active = self.project_terminals.selected.get(&scope) == Some(&service.id);
-                let id = service.id.clone();
-                let menu_id = id.clone();
-                let tab_scope = scope.clone();
-                let key = format!("{}-service-tab-{id}", cx.entity_id());
-                let progress =
-                    motion::state_t(&key, active, motion::TAB_SLIDE, self.reduced_motion);
-                tabs = tabs.child(
-                    popover::btn_ghost(&theme, "", key.clone())
+            for (database, heading) in [(true, "Databases"), (false, "App services")] {
+                let services = snapshot.config.services.iter().filter(|s| s.is_database() == database).collect::<Vec<_>>();
+                if services.is_empty() { continue; }
+                tabs = tabs.child(div().px(px(8.0)).pt(px(6.0)).pb(px(4.0))
+                    .text_size(crate::typography::ui_rems(11.0)).text_color(theme.text_faint)
+                    .child(heading));
+                for service in services {
+                    let active = self.project_terminals.selected.get(&scope) == Some(&service.id);
+                    let id = service.id.clone();
+                    let menu_id = id.clone();
+                    let tab_scope = scope.clone();
+                    let key = format!("{}-service-row-{id}", cx.entity_id());
+                    let color = service_state_color(snapshot, service, &theme);
+                    let busy = self.project_terminals.control_busy(Some(&id));
+                    let pending = self.project_terminals.service_actions.get(&(scope.clone(), id.clone()))
+                        .map(|action| format!("{}…", action_label(action)));
+                    let state_label = pending.as_deref().unwrap_or_else(|| service_state_label(snapshot, service));
+                    let status = service_status(snapshot, &id);
+                    let (action, glyph, label) = if service_is_active(status) {
+                        ("stop", icons::STOP, "Stop")
+                    } else {
+                        ("start", icons::ACTION_PLAY, "Start")
+                    };
+                    let action_id = id.clone();
+                    let action_button = service_icon_button(&theme,
+                        format!("service-row-{action}-{id}"), glyph,
+                        &format!("{label} {}", service.name))
+                        .tab_index(0)
+                        .when(busy, |el| el.opacity(0.4).cursor_default())
+                        .when(!busy, |el| el.on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.control_project_terminal(Some(action_id.clone()), action, cx);
+                        })));
+                    tabs = tabs.child(popover::picker_row(&theme, active, false, key)
                         .id(SharedString::from(format!("service-tab-{id}")))
-                        .debug_selector({
-                            let id = id.clone();
-                            move || format!("service-tab-{id}")
-                        })
-                        .flex()
-                        .items_center()
-                        .gap(px(6.0))
-                        .px(px(8.0))
-                        .py(px(3.0))
-                        .text_size(px(11.0))
+                        .debug_selector({ let id = id.clone(); move || format!("service-tab-{id}") })
+                        .tab_index(0)
+                        .min_h(px(44.0))
+                        .py(px(5.0))
                         .flex_none()
                         .role(gpui::Role::Tab)
-                        .aria_label(format!(
-                            "{}{} · {}",
-                            service.name,
-                            if service.is_database() {
-                                " (shared database)"
-                            } else {
-                                ""
-                            },
-                            service_state_label(snapshot, service)
-                        ))
-                        .aria_toggled(if active {
-                            gpui::Toggled::True
-                        } else {
-                            gpui::Toggled::False
-                        })
-                        .tooltip(crate::settings::widgets::text_tooltip(service_tooltip(
-                            snapshot, context, service,
-                        )))
-                        .bg(motion::hover_blend(
-                            &key,
-                            theme.wash(0.08).opacity(progress),
-                            theme.element_hover,
-                        ))
-                        .text_color(motion::mix(theme.text_muted, theme.text, progress))
-                        .child(status_dot(service_state_color(snapshot, service, &theme)))
-                        .when(service.is_database(), |tab| {
-                            tab.child(
-                                icon(icons::HARD_DRIVE)
-                                    .size(px(12.0))
-                                    .flex_none()
-                                    .text_color(theme.text_muted),
-                            )
-                        })
-                        .child(SharedString::from(service.name.clone()))
+                        .aria_label(format!("{} · {}", service.name, state_label))
+                        .aria_toggled(if active { gpui::Toggled::True } else { gpui::Toggled::False })
+                        .when(self.project_terminals.service_menu.get().is_none(), |el|
+                            el.tooltip(crate::settings::widgets::text_tooltip(service_tooltip(snapshot, context, service))))
+                        .child(icon(if database { icons::HARD_DRIVE } else { icons::SERVICES })
+                            .size(px(15.0)).flex_none().text_color(theme.text_muted))
+                        .child(div().flex_1().min_w_0().flex().flex_col().gap(px(2.0))
+                            .child(div().truncate().text_size(crate::typography::ui_rems(13.0))
+                                .child(SharedString::from(service.name.clone())))
+                            .child(div().flex().items_center().gap(px(5.0))
+                                .child(status_dot(color))
+                                .child(div().truncate().text_size(crate::typography::ui_rems(11.0))
+                                    .text_color(theme.text_muted).child(SharedString::from(state_label.to_string())))))
+                        .child(action_button)
                         .on_mouse_down(
                             MouseButton::Right,
                             cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
@@ -1657,10 +1582,6 @@ impl Shell {
                             }),
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            if this.project_terminals.selected.get(&tab_scope) != Some(&id) {
-                                this.project_terminals.content_started =
-                                    Some(std::time::Instant::now());
-                            }
                             this.project_terminals
                                 .selected
                                 .insert(tab_scope.clone(), id.clone());
@@ -1677,76 +1598,31 @@ impl Shell {
                             }
                             cx.notify();
                         })),
-                );
+                    );
+                }
             }
         }
         let configured = snapshot
             .as_ref()
             .is_some_and(|s| !s.config.services.is_empty());
-        let width = self.project_terminals.bar_width.clone();
-        let mut tab_bar = div()
-            .id("project-service-bar")
-            .relative()
-            .h(px(SERVICE_BAR_HEIGHT))
-            .w_full()
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap(px(12.0))
-            .px(px(8.0))
-            .border_b_1()
-            .border_color(theme.border)
-            .child(tabs)
-            .child(
-                gpui::canvas(
-                    move |bounds, window, _| {
-                        let measured = f32::from(bounds.size.width);
-                        if (width.get() - measured).abs() > 0.5 {
-                            width.set(measured);
-                            window.request_animation_frame();
-                        }
-                    },
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .inset_0(),
-            );
-        if !compact && let (Some(context), Some(snapshot)) = (&context, &snapshot) {
-            let selected = self.project_terminals.selected.get(&context.scope());
-            if let Some(service) = snapshot
-                .config
-                .services
-                .iter()
-                .find(|s| Some(&s.id) == selected)
-            {
-                let command = if service.directory.is_empty() || service.directory == "." {
-                    service.command.clone()
-                } else {
-                    format!("{} · {}", service.command, service.directory)
-                };
-                tab_bar = tab_bar.child(
-                    div()
-                        .id("selected-service-command")
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .font_family(theme.font_mono.clone())
-                        .text_size(px(11.0))
-                        .text_color(theme.text_faint)
-                        .tooltip(crate::settings::widgets::text_tooltip(service_tooltip(
-                            snapshot, context, service,
-                        )))
-                        .child(SharedString::from(command)),
-                );
-            }
-        }
         let mut body = div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(crate::terminal::view::terminal_panel_bg(&theme));
+            .size_full().min_h_0().flex().flex_col().bg(theme.panel_bg());
         if configured {
-            body = body.child(tab_bar);
+            body = body.child(tabs).child(div().h(px(1.0)).flex_none().bg(theme.border));
+            if let (Some(context), Some(snapshot)) = (&context, &snapshot) {
+                if let Some(service) = snapshot.config.services.iter().find(|s|
+                    self.project_terminals.selected.get(&context.scope()) == Some(&s.id)) {
+                    body = body.child(div().id("service-output-heading")
+                        .flex_none().px(px(12.0)).py(px(8.0)).flex().flex_col().gap(px(3.0))
+                        .child(div().text_size(crate::typography::ui_rems(12.0)).text_color(theme.text)
+                            .child(SharedString::from(format!("Output · {}", service.name))))
+                        .child(div().truncate().text_size(crate::typography::ui_rems(11.0))
+                            .text_color(theme.text_faint).child(SharedString::from(service.command.clone()))));
+                }
+                body = body.child(div().px(px(12.0)).pb(px(6.0)).flex_none()
+                    .text_size(crate::typography::ui_rems(11.0)).text_color(theme.text_faint)
+                    .child(SharedString::from(service_summary(snapshot))));
+            }
         }
         if let (Some(context), Some(snapshot)) = (&context, &snapshot) {
             let selected = self.project_terminals.selected.get(&context.scope());
@@ -1800,7 +1676,7 @@ impl Shell {
                         .gap(px(8.0))
                         .px(px(20.0))
                         .child(
-                            icon(icons::TERMINAL)
+                            icon(icons::SERVICES)
                                 .size(px(24.0))
                                 .text_color(theme.text_faint),
                         )
@@ -1909,6 +1785,8 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let editor = self.project_terminals.editor.get()?;
+        let full_viewport = viewport;
+        let viewport = settings_sidebar::content_size(viewport);
         let theme = Theme::of(cx).for_popup();
         let compact = viewport.width < px(640.0);
         let busy = self.project_terminals.control_busy(None) || editor.closed_by_save;
@@ -1923,13 +1801,16 @@ impl Shell {
             .find(|service| editor.selected.as_deref() == Some(service.id.as_str()))
             .or_else(|| editor.services.first())
             .filter(|_| selected_database.is_none());
-        let field_animation = SharedString::from(format!(
-            "project-service-settings-fields-{}",
-            selected
-                .map(|s| s.id.as_str())
-                .or(selected_database.map(|d| d.id.as_str()))
-                .unwrap_or("empty")
-        ));
+        use std::hash::{Hash, Hasher};
+        let mut field_identity = std::hash::DefaultHasher::new();
+        (selected.map(|s| &s.id), selected_database.map(|d| &d.id)).hash(&mut field_identity);
+        let field_opacity = motion::deferred_swap_entrance(
+            window,
+            "project-service-settings-fields-transition",
+            field_identity.finish(),
+            motion::FADE_QUICK,
+            motion::reduced_motion(cx),
+        );
         let mut list = div()
             .id("project-service-settings-list")
             .flex_1()
@@ -2039,7 +1920,7 @@ impl Shell {
                         cx.notify();
                     }))
                     .child(
-                        icon(icons::TERMINAL)
+                        icon(icons::SERVICES)
                             .size(px(14.0))
                             .flex_none()
                             .text_color(theme.text_muted),
@@ -2176,7 +2057,7 @@ impl Shell {
                     })
                     .when(can_open, |button| {
                         button.on_click(cx.listener(move |this, _, _, cx| {
-                            popover::close_popup(this, cx, |this| {
+                            this.close_settings_sidebar(cx, |this| {
                                 &mut this.project_terminals.editor
                             });
                             this.show_project_database_settings(space.clone(), cx);
@@ -2334,7 +2215,7 @@ impl Shell {
             .items_center()
             .gap(px(12.0))
             .child(
-                icon(icons::TERMINAL)
+                icon(icons::SERVICES)
                     .size(px(20.0))
                     .text_color(theme.text_muted),
             )
@@ -2355,17 +2236,6 @@ impl Shell {
                                 if editor.project.checkout_override.is_some() {"This worktree"} else {"Project defaults"}
                             ))),
                     ),
-            )
-            .child(
-                service_icon_button(
-                    &theme,
-                    "close-project-terminal-settings".into(),
-                    icons::CLOSE,
-                    "Close service settings",
-                )
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.request_close_form(UnsavedForm::Services, window, cx);
-                })),
             );
         let mut footer = div()
             .flex_none()
@@ -2427,13 +2297,11 @@ impl Shell {
             );
         // Same size as Project settings, which opens this editor on top of
         // itself: it then reads as a sub-page instead of a second dialog.
-        let card = popover::dialog_card(&theme)
-            .w(px(840.0))
-            .max_w((viewport.width - px(40.0)).max(px(200.0)))
-            .h(px(680.0).min((viewport.height - px(64.0)).max(px(200.0))))
+        let card = div().flex().flex_col()
+            .w(viewport.width)
+            .h(viewport.height)
             .p_0()
-            .bg(theme.surface_dialog)
-            .border_color(theme.border)
+                        .border_color(theme.border)
             .overflow_hidden()
             .child(header)
             .child(
@@ -2445,14 +2313,17 @@ impl Shell {
                     .border_color(theme.border)
                     .when(compact, |body| body.flex_col())
                     .child(navigation)
-                    .child(motion::fade_quick(field_animation, fields)),
+                    .child(fields.opacity(field_opacity)),
             )
             .child(footer);
-        Some(popover::modal(
-            "project-terminal-settings",
-            viewport,
+        Some(self.render_settings_sidebar(
+            "project-terminal-settings-sidebar",
+            UnsavedForm::Services,
+            full_viewport,
             card.into_any_element(),
             self.project_terminals.editor.closing_since(),
+            window,
+            cx,
         ))
     }
 
@@ -2530,7 +2401,7 @@ impl Shell {
         }
         match form {
             UnsavedForm::Services => {
-                popover::close_popup(self, cx, |this| &mut this.project_terminals.editor)
+                self.close_settings_sidebar(cx, |this| &mut this.project_terminals.editor)
             }
             UnsavedForm::WorktreeSettings => {
                 self.close_worktree_settings(cx);
@@ -3045,7 +2916,7 @@ mod tests {
                 shell.hide_terminal_panel(window, cx);
                 assert!(shell.terminal_tween.is_none());
                 assert!(!shell.terminal_open(cx));
-                assert_eq!(shell.terminal_target(cx), TERMINAL_TOOLBAR_HEIGHT);
+                assert_eq!(shell.terminal_target(cx), 0.0);
             })
             .unwrap();
     }
@@ -3072,6 +2943,50 @@ mod tests {
                 cx,
             )
         })
+    }
+
+    #[gpui::test]
+    fn disabling_services_retains_dirty_editor_and_regular_shells(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| settings::init(UiSettings::default(), dir.path(), cx));
+        let shell = test_shell(cx, dir.path());
+        shell.update(cx, |shell, _, cx| {
+            let context = ProjectContext {
+                space: "project".into(), device: "local".into(), name: "Project".into(),
+                target: None, chat: None, cwd: "/project".into(), checkout_override: None,
+            };
+            let service = app_service("api", "API");
+            let fields = shell.service_fields(service.clone(), false, cx);
+            fields.command.update(cx, |input, cx| input.set_text("keep my unsaved command", cx));
+            let mut editor = Editor::new(context);
+            editor.saved = vec![service];
+            editor.services = vec![fields];
+            editor.initialized = true;
+            assert!(editor.is_dirty(cx));
+            shell.project_terminals.editor.open(editor);
+            let key = shell.panel_key(cx);
+            shell.panels.update(&key, |panels| panels.terminal_open = true);
+            settings::update(SavePolicy::Immediate, cx, |settings| {
+                settings.plugins.set_enabled(crate::plugins::PluginId::Services, false);
+            });
+            shell.sync_plugins(cx);
+            assert!(!shell.project_terminals.editor.is_open());
+            assert!(!shell.services_panel_visible(cx));
+            assert!(shell.panels.get(&key).terminal_open, "ordinary shell state survives");
+            let editor = shell.project_terminals.suspended_editor.as_ref().unwrap().get().unwrap();
+            assert!(editor.is_dirty(cx));
+            assert_eq!(editor.config(cx)[0].command, "keep my unsaved command");
+            let context = editor.project.clone();
+            shell.open_service_settings_context(context.clone(), cx);
+            assert!(!shell.project_terminals.editor.is_open(), "stale entry points are gated");
+            settings::update(SavePolicy::Immediate, cx, |settings| {
+                settings.plugins.set_enabled(crate::plugins::PluginId::Services, true);
+            });
+            shell.open_service_settings_context(context, cx);
+            let editor = shell.project_terminals.editor.get().unwrap();
+            assert!(editor.is_dirty(cx));
+            assert_eq!(editor.config(cx)[0].command, "keep my unsaved command");
+        }).unwrap();
     }
 
     #[gpui::test]
@@ -3296,6 +3211,17 @@ mod tests {
                 assert_eq!(input.read(cx).text(), "bun run dev:server");
                 assert_eq!(editor.selected.as_deref(), Some("backend"));
                 assert!(editor.initialized);
+                let context = editor.project.clone();
+                shell.open_service_settings_context(context.clone(), cx);
+                assert_eq!(shell.project_terminals.editor.as_open().unwrap().services[0].command.entity_id(), input.entity_id());
+                let mut other = context;
+                other.space = "other-project".into();
+                other.cwd = "/other-project".into();
+                shell.open_service_settings_context(other, cx);
+                let retained = shell.project_terminals.editor.as_open().unwrap();
+                assert_eq!(retained.project.space, "project");
+                assert_eq!(retained.services[0].command.read(cx).text(), "bun run dev:server");
+
             })
             .unwrap();
     }
@@ -3362,7 +3288,13 @@ mod tests {
         let shell = test_shell(cx, dir.path());
         shell.update(cx, |shell, window, cx| {
             shell.active_chat = "session".into();
+            shell.viewport_width = 1440.0;
             shell.state.update(cx, |state, _| {
+                state.local_device_id = Some("local".into());
+                state.chats = vec![serde_json::from_value(serde_json::json!({
+                    "id":"session", "deviceId":"local", "spaceId":"project", "cwd":"/project",
+                    "createdAt":Utc::now(), "archived":false
+                })).unwrap()];
                 state.selected_chat = Some("session".into());
                 state.selected_space = Some("project".into());
                 state.spaces = vec![serde_json::from_value(serde_json::json!({
@@ -3373,10 +3305,10 @@ mod tests {
                 panels.terminal_open = true;
                 panels.changes_open = true;
             });
-            shell.project_terminals.drawer = true;
+            shell.open_services_panel(cx);
             shell.settings.sidebar_collapsed = false;
             assert!(shell.session_workspace_visible(cx));
-            assert!(shell.terminal_target(cx) > 0.0);
+            assert_eq!(shell.terminal_target(cx), 0.0);
             shell.state.update(cx, |state, _| state.selected_chat = None);
             assert!(!shell.session_workspace_visible(cx));
             assert!(!shell.right_pane_open(cx));
@@ -3384,14 +3316,15 @@ mod tests {
             assert_eq!(shell.terminal_target(cx), 0.0);
             assert!(shell.terminal_project_context(None, cx).is_none());
             assert!(shell.terminal_project_context(Some("project"), cx).is_some());
-            shell.select_terminal_mode(TerminalMode::Shells, cx);
+            shell.open_shell_panel(cx);
             shell.toggle_terminal(window, cx);
             assert!(shell.panels.get("session").terminal_open);
             assert!(!shell.settings.sidebar_collapsed);
             shell.state.update(cx, |state, _| state.selected_chat = Some("session".into()));
             assert!(shell.session_workspace_visible(cx));
             assert!(shell.right_pane_open(cx));
-            assert!(shell.terminal_open(cx));
+            assert_eq!(shell.resolved_right_active(cx), RightSurface::Services);
+            assert!(!shell.terminal_open(cx));
         }).unwrap();
     }
 
@@ -3420,9 +3353,11 @@ mod tests {
                     state.selected_chat = Some("a".into());
                     state.selected_space = Some("project".into());
                 });
+                shell.active_chat = "a".into();
+                shell.viewport_width = 1440.0;
                 let a = shell.terminal_project_context(None, cx).unwrap();
                 shell.project_terminals.context = Some(a.clone());
-                shell.project_terminals.drawer = true;
+                shell.open_services_panel(cx);
                 shell
                     .project_terminals
                     .service_actions
@@ -3430,11 +3365,13 @@ mod tests {
                 shell
                     .state
                     .update(cx, |state, _| state.selected_chat = Some("b".into()));
+                shell.active_chat = "b".into();
                 let b = shell.terminal_project_context(None, cx).unwrap();
                 assert_ne!(a.scope(), b.scope(), "each physical checkout retains its own service views");
                 assert_eq!(a.cwd, "/worktrees/a");
                 assert_eq!(b.cwd, "/worktrees/b");
                 assert_eq!(b.params(serde_json::json!({}))["chatId"], "b");
+                shell.open_services_panel(cx);
                 shell.ensure_project_terminals(cx);
                 assert!(
                     shell.project_terminals.has_pending_actions(),
@@ -3468,12 +3405,14 @@ mod tests {
     }
 
     #[gpui::test]
-    fn switching_terminal_categories_preserves_tabs_and_hide_remembers_the_category(
+    fn services_and_terminal_sidebars_preserve_independent_tabs_and_visibility(
         cx: &mut TestAppContext,
     ) {
         let dir = tempfile::tempdir().unwrap();
         let shell = test_shell(cx, dir.path());
         shell.update(cx, |shell, window, cx| {
+            shell.active_chat = "session".into();
+            shell.viewport_width = 1440.0;
             shell.state.update(cx, |state, _| {
                 state.local_device_id = Some("local".into());
                 state.spaces = vec![serde_json::from_value(serde_json::json!({
@@ -3486,7 +3425,7 @@ mod tests {
                     "cwd":dir.path(), "createdAt":Utc::now(), "archived":false
                 })).unwrap()];
             });
-            shell.select_terminal_mode(TerminalMode::Services, cx);
+            shell.open_services_panel(cx);
             let service_panel = shell.project_terminals.panel.clone().unwrap();
             let scope = shell.project_terminals.context.as_ref().unwrap().scope();
             let service_tab = service_panel.update(cx, |panel, cx| {
@@ -3499,27 +3438,44 @@ mod tests {
             shell_panel.update(cx, |panel, cx| {
                 panel.reserve_tab_for_chat(shell_key, "Terminal 1", cx)
             });
-            shell.select_terminal_mode(TerminalMode::Shells, cx);
+            shell.open_shell_panel(cx);
             let shell_tabs = shell_panel.read(cx).tab_summaries(cx);
             assert_eq!(shell_tabs.len(), 1);
             assert!(!shell.composer.read(cx).focus_pending);
-            assert!(!shell.project_terminals.drawer);
-            shell.select_terminal_mode(TerminalMode::Services, cx);
+            assert!(!shell.services_panel_visible(cx));
+            assert!(shell.terminal_open(cx));
+            assert!(matches!(shell.resolved_right_active(cx), RightSurface::Terminal(_)));
+            shell.open_services_panel(cx);
             assert!(!shell_panel.read(cx).is_open());
             assert_eq!(shell_panel.read(cx).tab_summaries(cx), shell_tabs);
             assert_eq!(service_panel.read(cx).tab_summaries(cx)[0].0, service_tab);
             shell.hide_terminal_panel(window, cx);
             assert!(!shell.terminal_open(cx));
-            assert_eq!(shell.terminal_target(cx), TERMINAL_TOOLBAR_HEIGHT);
+            assert_eq!(shell.terminal_target(cx), 0.0);
             shell.toggle_terminal(window, cx);
-            assert!(shell.project_terminals.drawer);
-            shell.select_terminal_mode(TerminalMode::Shells, cx);
+            assert!(shell.terminal_open(cx));
+            assert!(!shell.services_panel_visible(cx));
+            shell.open_shell_panel(cx);
             shell.hide_terminal_panel(window, cx);
             shell.toggle_terminal(window, cx);
             assert!(shell_panel.read(cx).is_open());
-            assert!(!shell.project_terminals.drawer);
+            assert!(!shell.services_panel_visible(cx));
             assert_eq!(shell_panel.read(cx).tab_summaries(cx), shell_tabs);
             assert!(shell.right_terminal.is_none());
+            shell.set_right_active(RightSurface::Picker, cx);
+            shell.ensure_project_terminals(cx);
+            assert!(!service_panel.read(cx).is_open());
+            assert!(!shell_panel.read(cx).is_open());
+            shell.open_services_panel(cx);
+            shell.open_services_panel(cx);
+            assert_eq!(shell.right_surface_rows(cx).iter().filter(|row| row.0 == RightSurface::Services).count(), 1);
+            assert_eq!(service_panel.read(cx).tab_summaries(cx)[0].0, service_tab);
+            shell.close_right_surface(RightSurface::Services, window, cx);
+            shell.ensure_project_terminals(cx);
+            assert!(!shell.services_panel_visible(cx));
+            assert!(!service_panel.read(cx).is_open());
+            assert!(!shell_panel.read(cx).is_open());
+            assert_eq!(service_panel.read(cx).tab_summaries(cx)[0].0, service_tab);
         }).unwrap();
     }
 
@@ -4101,12 +4057,14 @@ mod tests {
     }
 
     #[gpui::test]
-    fn shell_terminal_toggle_closes_an_open_services_drawer(cx: &mut TestAppContext) {
+    fn shell_terminal_toggle_hides_sidebar_without_closing_its_tabs(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let shell = test_shell(cx, dir.path());
         shell
             .update(cx, |shell, window, cx| {
-                shell.state.update(cx, |state, _| {
+                shell.active_chat = "session".into();
+            shell.viewport_width = 1440.0;
+            shell.state.update(cx, |state, _| {
                     state.local_device_id = Some("local".into());
                     state.spaces = vec![
                         serde_json::from_value(serde_json::json!({
@@ -4125,11 +4083,20 @@ mod tests {
                         .unwrap(),
                     ];
                 });
-                shell.select_terminal_mode(TerminalMode::Services, cx);
-                assert!(shell.project_terminals.drawer);
+                shell.open_services_panel(cx);
+                assert!(shell.services_panel_visible(cx));
+                assert!(!shell.terminal_open(cx));
+                shell.terminal_panel(cx).update(cx, |panel, cx| {
+                    panel.reserve_tab_for_chat("session".into(), "Terminal 1", cx);
+                });
+                shell.toggle_shell_terminal(window, cx);
+                assert!(!shell.services_panel_visible(cx));
                 assert!(shell.terminal_open(cx));
                 shell.toggle_shell_terminal(window, cx);
-                assert!(!shell.project_terminals.drawer);
+                assert!(!shell.services_panel_visible(cx));
+                assert!(!shell.right_pane_open(cx));
+                assert_eq!(shell.right_surface_rows(cx).len(), 2);
+                assert_eq!(shell.terminal.as_ref().unwrap().read(cx).tab_summaries(cx).len(), 1);
                 assert!(!shell.terminal_open(cx));
                 assert!(!shell.panels.get(&shell.panel_key(cx)).terminal_open);
             })
@@ -4253,7 +4220,7 @@ mod tests {
 #[cfg(feature = "source-control-fixture")]
 impl Shell {
     pub fn fixture_open_project_terminals(&mut self, cx: &mut Context<Self>) {
-        self.select_terminal_mode(TerminalMode::Services, cx);
+        self.open_services_panel(cx);
     }
     pub fn fixture_select_project_terminal_agent(&mut self, chat: String, cx: &mut Context<Self>) {
         self.state
@@ -4285,8 +4252,8 @@ impl Shell {
             "serviceOutput": self.project_terminals.panel.as_ref().map(text).unwrap_or_default(),
             "panelOpen": self.terminal_open(cx), "shellSessions": self.terminal.as_ref().map(|panel| panel.read(cx).fixture_session_ids(cx)).unwrap_or_default(),
             "shellTabs": self.terminal.as_ref().map(|panel| panel.read(cx).tab_summaries(cx)).unwrap_or_default(),
-            "error": self.project_terminals.operation_error.as_ref().or(self.project_terminals.error.as_ref()), "mode": if self.project_terminals.mode == TerminalMode::Services { "services" } else { "shells" }, "editor": self.project_terminals.editor.is_open(),
-            "drawer": self.project_terminals.drawer, "handoff": self.project_terminals.handoff.is_some(),
+            "error": self.project_terminals.operation_error.as_ref().or(self.project_terminals.error.as_ref()), "mode": if self.services_panel_visible(cx) { "services" } else { "shells" }, "editor": self.project_terminals.editor.is_open(),
+            "drawer": false, "sidebar": self.services_panel_visible(cx), "handoff": self.project_terminals.handoff.is_some(),
             "handoffError": self.project_terminals.handoff_error })
     }
 }

@@ -301,12 +301,13 @@ impl SourceControl {
             self.file_actions(&menu.key).into_iter().enumerate()
         {
             if matches!(action, FileAction::Stage | FileAction::CopyPath) {
-                card = card.child(popover::menu_separator());
+                card = card.child(popover::picker_divider());
             }
             let key = menu.key.clone();
             card = card.child(
-                popover::menu_row(
+                popover::picker_row(
                     &theme,
+                    false,
                     menu.active == index,
                     format!("sc-file-action-{index}"),
                 )

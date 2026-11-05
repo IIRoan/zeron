@@ -42,6 +42,8 @@ struct GitDropdown {
     closing: Option<std::time::Instant>,
     trigger_height: f32,
     bounds: selection::MenuBounds,
+    header_height: f32,
+    scroll: Option<gpui::ScrollHandle>,
 }
 
 #[cfg(test)]
@@ -64,7 +66,7 @@ pub(super) mod tests {
         }
     }
 
-    pub(in crate::source_control) fn menu_setup(
+    pub(in crate::plugins::git::source_control) fn menu_setup(
         cx: &mut TestAppContext,
         height: f32,
     ) -> (Entity<SourceControl>, &mut VisualTestContext) {
@@ -100,7 +102,7 @@ pub(super) mod tests {
                         }),
                     }],
                 });
-                view.actions_menu.open(());
+                view.mount_actions_menu(cx);
                 view.git_panel = Some(GitPanel::Actions);
                 view
             }))
@@ -115,7 +117,7 @@ pub(super) mod tests {
     fn git_menu_shows_its_last_command_when_the_window_has_room(cx: &mut TestAppContext) {
         let (_, cx) = menu_setup(cx, 900.0);
         let scroll = cx.debug_bounds("git-menu-scroll").unwrap();
-        let last = cx.debug_bounds("git-menu-refresh").unwrap();
+        let last = cx.debug_bounds("git-discard-everything").unwrap();
         assert!(scroll.size.height > px(320.0));
         assert!(last.top() >= scroll.top() && last.bottom() <= scroll.bottom());
         assert!(scroll.bottom() <= px(900.0));
@@ -131,7 +133,7 @@ pub(super) mod tests {
             ..Default::default()
         });
         cx.run_until_parked();
-        let last = cx.debug_bounds("git-menu-refresh").unwrap();
+        let last = cx.debug_bounds("git-discard-everything").unwrap();
         assert!(last.top() >= scroll.top() && last.bottom() <= scroll.bottom());
         assert!(last.bottom() <= px(280.0));
         cx.simulate_click(last.center(), gpui::Modifiers::default());
@@ -266,16 +268,16 @@ impl RenderOnce for GitDropdown {
             .clamp(1.0, 600.0)
             .min(f32::from(limits.size.height));
         let scroll_id: SharedString = format!("{}-options", self.id).into();
-        let scroll = window.with_global_id(scroll_id.clone().into(), |id, window| {
+        let scroll = self.scroll.unwrap_or_else(|| window.with_global_id(scroll_id.clone().into(), |id, window| {
             window.with_element_state(id, |previous: Option<gpui::ScrollHandle>, _| {
                 let scroll = previous.unwrap_or_default();
                 (scroll.clone(), scroll)
             })
-        });
+        }));
         let rows = div()
             .id(scroll_id)
             .debug_selector(|| "git-menu-scroll".into())
-            .max_h(px((height - 2.0 * popover::CARD_INSET - 2.0).max(1.0)))
+            .max_h(px((height - self.header_height - 2.0 * popover::CARD_INSET - 2.0).max(1.0)))
             .overflow_y_scroll()
             .track_scroll(&scroll)
             .child(self.body);
@@ -384,7 +386,31 @@ pub(super) fn button(
         .when(!enabled, |el| el.opacity(0.4))
 }
 
+/// Git actions use the same rows and spacing as Zeron's project picker.
+fn menu_button(
+    id: impl Into<String>,
+    label: impl Into<SharedString>,
+    enabled: bool,
+    theme: &Theme,
+) -> gpui::Stateful<gpui::Div> {
+    let label = label.into();
+    let id: SharedString = id.into().into();
+    popover::picker_row(&theme.for_popup(), false, false, id.clone())
+        .id(id)
+        .flex_none()
+        .when(enabled, |el| el.tab_index(0))
+        .role(gpui::Role::Button)
+        .aria_label(label.clone())
+        .tooltip(crate::settings::widgets::text_tooltip(label.clone()))
+        .child(div().flex_1().min_w_0().truncate().child(label))
+        .when(!enabled, |el| el.opacity(0.4).cursor_default())
+}
+
 impl SourceControl {
+    pub(super) fn can_undo_discard(&self) -> bool {
+        self.undo_discard.as_ref().is_some_and(|undo|
+            self.target.as_ref() == Some(&undo.target) && self.active_repository == undo.repository)
+    }
     pub(super) fn git_state(&self) -> Option<&RepositoryGitState> {
         self.snapshot
             .as_ref()?
@@ -395,13 +421,14 @@ impl SourceControl {
             .as_ref()
     }
     pub(super) fn git_enabled(&self) -> bool {
-        !self.is_busy()
+        self.plugin_active && !self.is_busy()
             && self.confirmation.is_none()
             && self.load_error.is_none()
             && self.git_state().is_some()
     }
 
     pub(super) fn ensure_git_details(&mut self, cx: &mut Context<Self>) {
+        if !crate::plugins::enabled(crate::plugins::PluginId::Git, cx) { return; }
         if self.is_busy() || self.refreshing {
             return;
         }
@@ -459,6 +486,7 @@ impl SourceControl {
         label: &'static str,
         cx: &mut Context<Self>,
     ) {
+        if !crate::plugins::enabled(crate::plugins::PluginId::Git, cx) { return; }
         if self.is_busy() {
             return;
         }
@@ -908,6 +936,14 @@ impl SourceControl {
 
     pub(super) fn close_actions_menu(&mut self, cx: &mut Context<Self>) {
         if self.actions_menu.begin_close() {
+            if let Some((owner, search, previous)) = self.actions_menu_restore_focus(cx) {
+                cx.defer(move |cx| {
+                    use gpui::AppContext as _;
+                    cx.update_window(owner, |_, window, cx| {
+                        if search.is_focused(window) { window.focus(&previous, cx); }
+                    }).ok();
+                });
+            }
             popover::reap_popup(cx, |this| &mut this.actions_menu);
             cx.notify();
         }
@@ -960,7 +996,13 @@ impl SourceControl {
         } else {
             refresh_icon
         };
-        let mut more = Self::git_icon("git-more", icons::VSC_MORE, "More Actions", enabled, &theme)
+        let mut more = crate::surface_chrome::tab("git-more", self.actions_menu.is_open(), &theme)
+            .size(px(crate::surface_chrome::CONTROL_SIZE))
+            .justify_center()
+            .aria_label("More Actions")
+            .when(self.actions_menu.get().is_none(), |el| el.tooltip(crate::settings::widgets::text_tooltip("More Actions")))
+            .when(!enabled, |el| el.opacity(0.4).cursor_default())
+            .child(icons::icon(icons::VSC_MORE).size(px(crate::surface_chrome::ICON_SIZE)).text_color(theme.text_muted))
             .relative()
             .on_mouse_down(
                 gpui::MouseButton::Left,
@@ -969,7 +1011,7 @@ impl SourceControl {
                     this.actions_menu.note_trigger_press();
                 }),
             )
-            .on_click(cx.listener(|this, _, _, cx| {
+            .on_click(cx.listener(|this, _, window, cx| {
                 cx.stop_propagation();
                 if !this.git_enabled() {
                     return;
@@ -980,24 +1022,34 @@ impl SourceControl {
                     this.close_commit_menu(cx);
                     this.git_panel = Some(GitPanel::Actions);
                     this.git_form = None;
-                    this.actions_menu.open(());
+                    this.mount_actions_menu(cx);
+                    this.focus_actions_menu(window, cx);
                     cx.notify();
                 }
             }));
         if self.actions_menu.get().is_some() {
             let menu = self.render_git_panel(cx);
+            let state = self.actions_menu.get().expect("mounted");
+            let search = state.search.clone();
+            let scroll = state.scroll.clone();
             more = more.child(GitDropdown {
                 id: "git-actions-dropdown".into(),
                 card: popover::popover_card(&theme.for_popup())
                     .id("git-actions-menu-card")
-                    .rounded(px(4.0))
-                    .w(px(300.0))
+                    .role(gpui::Role::Menu)
+                    .aria_label("Git actions")
+                    .w(px(316.0))
+                    .flex().flex_col()
+                    .on_key_down(cx.listener(Self::actions_menu_key))
                     .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_actions_menu(cx)))
-                    .on_click(|_, _, cx| cx.stop_propagation()),
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .child(popover::search_input_frame(&theme.for_popup(), search.into_any_element())),
                 body: menu,
                 closing: self.actions_menu.closing_since(),
                 trigger_height: 24.0,
                 bounds: self.actions_menu_bounds.clone(),
+                header_height: popover::SEARCH_ROW_HEIGHT,
+                scroll: Some(scroll),
             });
         }
         div()
@@ -1013,9 +1065,11 @@ impl SourceControl {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(3.0))
+                    .rounded(px(crate::surface_chrome::CONTROL_RADIUS))
                     .role(gpui::Role::Button)
                     .aria_label(refresh_label)
+                    .tab_index(0)
+                    .focus_visible(|style| style.border_2().border_color(theme.accent))
                     .tooltip(crate::settings::widgets::text_tooltip(refresh_label))
                     .when(self.refreshing, |el| el.bg(theme.accent.opacity(0.1)))
                     .when(!self.is_busy() && !self.refreshing, |el| {
@@ -1036,37 +1090,6 @@ impl SourceControl {
             )
             .child(more)
             .into_any_element()
-    }
-
-    pub(super) fn git_icon(
-        id: &'static str,
-        icon: &'static str,
-        label: &'static str,
-        enabled: bool,
-        theme: &Theme,
-    ) -> gpui::Stateful<gpui::Div> {
-        div()
-            .id(id)
-            .size(px(24.0))
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(px(3.0))
-            .role(gpui::Role::Button)
-            .aria_label(label)
-            .tooltip(crate::settings::widgets::text_tooltip(label))
-            .when(enabled, |el| {
-                el.cursor_pointer()
-                    .bg(motion::hover_blend(id, gpui::transparent_black(), theme.glass_hover()))
-                    .on_hover(motion::hover_listener(id))
-            })
-            .when(!enabled, |el| el.opacity(0.4))
-            .child(
-                icons::icon(icon)
-                    .size(px(16.0))
-                    .text_color(theme.text_muted),
-            )
     }
 
     pub(super) fn render_git_status(
@@ -1397,16 +1420,15 @@ impl SourceControl {
             let can_commit = self.can_request_commit(cx);
             let card = popover::popover_card(&theme.for_popup())
                 .id("git-commit-menu-card")
-                .rounded(px(4.0))
                 .w(px(248.0))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_commit_menu(cx)))
                 .on_click(|_, _, cx| cx.stop_propagation());
-            let menu = div().flex().flex_col().flex_none()
-                .child(button("git-commit-only", "Commit", can_commit, &theme).on_click(cx.listener(|this, _, _, cx| this.commit_with_followup(None, cx))))
-                .child(button("git-commit-push", if self.git_state().is_some_and(|s| s.upstream.is_none()) { "Commit & Publish Branch" } else { "Commit & Push" }, can_commit, &theme).on_click(cx.listener(|this, _, _, cx| this.commit_with_followup(Some(Action::Push), cx))))
-                .child(button("git-commit-sync", "Commit & Sync", can_commit, &theme).on_click(cx.listener(|this, _, _, cx| this.commit_with_followup(Some(Action::Sync), cx))))
-                .child(div().my(px(4.0)).border_b_1().border_color(theme.border))
-                .child(button("git-undo-commit", "Undo Last Commit…", enabled, &theme).on_click(cx.listener(|this, _, _, cx| { this.close_commit_menu(cx); this.confirm_git(Action::UndoCommit, "Undo last local commit?".into(), "Your files will be kept and its message will return to the commit input.".into(), cx); })));
+            let menu = div().flex().flex_col().flex_none().gap(px(2.0))
+                .child(menu_button("git-commit-only", "Commit", can_commit, &theme).on_click(cx.listener(|this, _, _, cx| this.commit_with_followup(None, cx))))
+                .child(menu_button("git-commit-push", if self.git_state().is_some_and(|s| s.upstream.is_none()) { "Commit & Publish Branch" } else { "Commit & Push" }, can_commit, &theme).on_click(cx.listener(|this, _, _, cx| this.commit_with_followup(Some(Action::Push), cx))))
+                .child(menu_button("git-commit-sync", "Commit & Sync", can_commit, &theme).on_click(cx.listener(|this, _, _, cx| this.commit_with_followup(Some(Action::Sync), cx))))
+                .child(popover::picker_divider())
+                .child(menu_button("git-undo-commit", "Undo Last Commit…", enabled, &theme).on_click(cx.listener(|this, _, _, cx| { this.close_commit_menu(cx); this.confirm_git(Action::UndoCommit, "Undo last local commit?".into(), "Your files will be kept and its message will return to the commit input.".into(), cx); })));
             trigger = trigger.child(GitDropdown {
                 id: "git-commit-options".into(),
                 card,
@@ -1414,6 +1436,8 @@ impl SourceControl {
                 closing: self.commit_menu.closing_since(),
                 trigger_height: 28.0,
                 bounds: self.commit_menu_bounds.clone(),
+                header_height: 0.0,
+                scroll: None,
             });
         }
         trigger.into_any_element()
@@ -1423,162 +1447,7 @@ impl SourceControl {
         if self.confirmation.is_some() || self.git_panel != Some(GitPanel::Actions) {
             return gpui::Empty.into_any_element();
         }
-        let theme = Theme::of(cx).clone();
-        let enabled = self.git_enabled();
-        let mut body = div().id("git-actions-panel").flex_none().p(px(4.0)).flex().flex_col().gap(px(3.0));
-                for (id, label, action) in [
-                    ("git-fetch", "Fetch", Action::Fetch),
-                    ("git-pull", "Pull", Action::Pull { rebase: None }),
-                    ("git-push", "Push", Action::Push),
-                    ("git-sync", "Sync", Action::Sync),
-                ] {
-                    body = body.child(button(id, label, enabled, &theme).on_click(
-                        cx.listener(move |this, _, _, cx| this.run_git(action.clone(), cx)),
-                    ));
-                    if id == "git-pull" {
-                        let command = super::branch::BranchCommand::Pull;
-                        body = body.child(button(command.id(), command.label(), enabled, &theme)
-                            .debug_selector(move || command.id().into())
-                            .on_click(cx.listener(move |this, _, window, cx| this.open_branch_picker(command, window, cx))));
-                    }
-                }
-                body = body.child(div().my(px(4.0)).border_b_1().border_color(theme.border));
-                let command = super::branch::BranchCommand::Checkout;
-                body = body.child(button(command.id(), command.label(), enabled, &theme)
-                    .debug_selector(move || command.id().into())
-                    .on_click(cx.listener(move |this, _, window, cx| this.open_branch_picker(command, window, cx))));
-                // A mixed selection offers each side's action separately, so
-                // the working-tree rows are never routed through Unstage.
-                for staged in [false, true] {
-                    let Some(key) = self
-                        .selected_files
-                        .iter()
-                        .find(|key| key.staged == staged)
-                        .cloned()
-                    else {
-                        continue;
-                    };
-                    let paths = self.staging_paths(&key);
-                    let discard_paths = self.discard_paths(&key);
-                    let discard_key = key.clone();
-                    let complete = self.snapshot.as_ref().is_some_and(|s| {
-                        s.repositories
-                            .iter()
-                            .any(|r| r.path == key.repository && r.complete)
-                    });
-                    let id = if staged {
-                        "git-unstage-selected"
-                    } else {
-                        "git-stage-selected"
-                    };
-                    body = body.child(
-                        button(
-                            id,
-                            format!(
-                                "{} Selected Changes ({})",
-                                if staged { "Unstage" } else { "Stage" },
-                                paths.len()
-                            ),
-                            enabled && complete,
-                            &theme,
-                        )
-                        .debug_selector(move || id.into())
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if complete && this.git_enabled() {
-                                let paths = this.staging_paths(&key);
-                                this.close_actions_menu(cx);
-                                this.set_staged(key.repository.clone(), paths, !staged, cx);
-                            }
-                        })),
-                    );
-                    if !staged {
-                        body = body.child(
-                            button(
-                                "git-discard-selected",
-                                "Discard Selected Changes…",
-                                enabled && complete && !discard_paths.is_empty(),
-                                &theme,
-                            )
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    let discard_paths = this.discard_paths(&discard_key);
-                                    if complete && this.git_enabled() && !discard_paths.is_empty() {
-                                        this.request_discard(
-                                            discard_key.repository.clone(),
-                                            discard_paths,
-                                            false,
-                                            cx,
-                                        );
-                                    }
-                                },
-                            )),
-                        );
-                    }
-                }
-                body = body.child(
-                    button("git-discard-all", "Discard All Changes…", enabled, &theme).on_click(
-                        cx.listener(|this, _, _, cx| {
-                            if this.git_enabled() {
-                                this.discard_all(false, cx);
-                            }
-                        }),
-                    ),
-                );
-                if self.undo_discard.as_ref().is_some_and(|undo| self.target.as_ref() == Some(&undo.target) && self.active_repository == undo.repository) {
-                    body = body.child(
-                        button("git-undo-discard", "Undo Discard", enabled, &theme)
-                            .on_click(cx.listener(|this, _, _, cx| this.undo_discard(cx))),
-                    );
-                }
-                if self.git_state().is_some_and(|s| s.operation.is_some()) {
-                    body = body.child(button("git-continue", "Continue Git Operation", enabled, &theme).on_click(cx.listener(|this, _, _, cx| this.run_git(Action::Continue, cx))))
-                        .child(button("git-abort", "Abort Git Operation…", enabled, &theme).on_click(cx.listener(|this, _, _, cx| this.confirm_git(Action::Abort, "Abort Git operation?".into(), "Git will restore the repository to the state before this operation.".into(), cx))));
-                }
-                if let Some(selection) = self.selected.clone()
-                    && selection.repository == self.active_repository
-                    && self.snapshot.as_ref().is_some_and(|snapshot| snapshot.repositories.iter()
-                        .any(|repo| repo.path == selection.repository && repo.files.iter().any(|file| file.path == selection.path && file.is_conflicted())))
-                {
-                    // Resolving replaces one file; a multi-selection would
-                    // suggest the whole batch is affected.
-                    let single = self.selected_files.len() <= 1;
-                    for (id, incoming) in
-                        [("git-accept-current", false), ("git-accept-incoming", true)]
-                    {
-                        let path = selection.path.clone();
-                        body = body.child(
-                            button(
-                                id,
-                                self.conflict_choice_label(incoming),
-                                enabled && single,
-                                &theme,
-                            )
-                            .debug_selector(move || id.into())
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    if this.selected_files.len() <= 1 {
-                                        this.confirm_resolve_conflict(path.clone(), incoming, cx)
-                                    }
-                                },
-                            )),
-                        );
-                    }
-                }
-                for (id, label, panel) in [
-                    ("commands", "Git Commands…", GitPanel::Commands),
-                    ("branches", "Branch…", GitPanel::Branches),
-                    ("stashes", "Stashes…", GitPanel::Stashes),
-                    ("remotes", "Remotes / Publish Branch…", GitPanel::Remotes),
-                ] {
-                    body = body.child(button(id, label, enabled, &theme).on_click(
-                        cx.listener(move |this, _, _, cx| this.open_git_panel(panel.clone(), cx)),
-                    ));
-                }
-                body = body
-                    .child(button("git-undo-commit", "Undo Last Commit…", enabled, &theme).on_click(cx.listener(|this, _, _, cx| this.confirm_git(Action::UndoCommit, "Undo last local commit?".into(), "Your files will be kept and its message will return to the commit input. Git keeps a recovery reference.".into(), cx))))
-                    .child(button("git-discard-everything", "Discard Staged and Unstaged Changes…", enabled, &theme).text_color(theme.danger).on_click(cx.listener(|this, _, _, cx| { if this.git_enabled() { this.discard_all(true, cx); } })))
-                    .child(button("git-refresh", "Refresh", enabled, &theme).debug_selector(|| "git-menu-refresh".into()).on_click(cx.listener(|this, _, _, cx| { this.git_panel = None; this.close_actions_menu(cx); this.refresh(cx); })));
-        body.into_any_element()
+        self.render_actions_menu_rows(cx)
     }
 
     pub(super) fn discard_button(

@@ -39,102 +39,54 @@ async fn pause(cx: &mut AsyncApp, ms: u64) {
         .await;
 }
 
-/// Screenshots are evidence, not part of the fixture's behavior: a missing
-/// capture backend is reported and the command loop continues.
-fn capture(path: &Path) {
+/// Capture only this fixture's native window. Desktop screenshot actions can
+/// modify the clipboard; Linux QA runs this fixture on X11/Xwayland instead.
+async fn capture(window: gpui::WindowHandle<shell::Shell>, cx: &mut AsyncApp, path: &Path) {
+    if std::env::var("ZERON_FIXTURE_SCREENSHOTS").as_deref() == Ok("off") { return; }
+    let _ = gpui::AnyWindowHandle::from(window).update(cx, |_, w, cx| {
+        w.refresh();
+        let arena = w.draw(cx);
+        w.present_if_needed();
+        arena.clear();
+    });
+    pause(cx, 100).await;
     if let Err(error) = screenshot(path) {
-        eprintln!("Skipping screenshot {}: {error}", path.display());
+        eprintln!("Could not capture fixture {}: {error}", path.display());
     }
 }
 
-/// `ZERON_FIXTURE_SCREENSHOTS` selects `niri`, `x11` or `off`. By default
-/// niri is used when its socket is present, otherwise the X11 display.
 #[cfg(target_os = "linux")]
 fn screenshot(path: &Path) -> anyhow::Result<()> {
-    let backend = std::env::var("ZERON_FIXTURE_SCREENSHOTS").unwrap_or_default();
-    if backend == "off" {
-        return Ok(());
-    }
-    let niri = match backend.as_str() {
-        "niri" => true,
-        "x11" => false,
-        "" => std::env::var_os("NIRI_SOCKET").is_some(),
-        other => anyhow::bail!("Unknown ZERON_FIXTURE_SCREENSHOTS backend {other:?}"),
-    };
-    if niri {
-        let output = std::process::Command::new("niri")
-            .args(["msg", "-j", "windows"])
-            .output()?;
-        anyhow::ensure!(output.status.success(), "niri could not list windows");
-        let windows: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-        let window = windows
-            .as_array()
-            .and_then(|windows| {
-                windows
-                    .iter()
-                    .find(|w| w["title"] == "Zeron Source Control Fixture")
-            })
-            .ok_or_else(|| anyhow::anyhow!("Fixture window not found"))?;
-        let path = path
-            .parent()
-            .unwrap()
-            .canonicalize()?
-            .join(path.file_name().unwrap());
-        let status = std::process::Command::new("niri")
-            .args([
-                "msg",
-                "action",
-                "screenshot-window",
-                "--id",
-                &window["id"].to_string(),
-                "--write-to-disk",
-                "true",
-                "--path",
-            ])
-            .arg(path)
-            .status()?;
-        anyhow::ensure!(status.success(), "Window screenshot failed");
-        return Ok(());
-    }
-    anyhow::ensure!(
-        std::env::var_os("DISPLAY").is_some(),
-        "No niri session or X11 display is available"
-    );
-    use x11rb::{
-        connection::Connection,
-        protocol::xproto::{ConnectionExt, ImageFormat},
-    };
+    use x11rb::{connection::Connection, protocol::xproto::{AtomEnum, ConnectionExt, ImageFormat}};
     let (conn, screen) = x11rb::connect(None)?;
-    let screen = &conn.setup().roots[screen];
-    let result = conn
-        .get_image(
-            ImageFormat::Z_PIXMAP,
-            screen.root,
-            0,
-            0,
-            screen.width_in_pixels,
-            screen.height_in_pixels,
-            u32::MAX,
-        )?
-        .reply()?;
-    let mut pixels = result.data;
-    anyhow::ensure!(
-        pixels.len() == screen.width_in_pixels as usize * screen.height_in_pixels as usize * 4,
-        "Expected 32-bit X11 pixels"
-    );
-    for pixel in pixels.as_chunks_mut::<4>().0 {
-        pixel.swap(0, 2);
-        pixel[3] = 255;
+    let root = conn.setup().roots[screen].root;
+    let mut candidates = conn.query_tree(root)?.reply()?.children;
+    let mut owned = None;
+    while let Some(window) = candidates.pop() {
+        let Ok(name) = conn.get_property(false, window, AtomEnum::WM_NAME, AtomEnum::ANY, 0, 256)?.reply() else { continue; };
+        if String::from_utf8_lossy(&name.value) == "Zeron Source Control Fixture" {
+            owned = Some(window);
+            break;
+        }
+        if let Ok(tree) = conn.query_tree(window)?.reply() { candidates.extend(tree.children); }
     }
-    image::RgbaImage::from_raw(
-        screen.width_in_pixels as u32,
-        screen.height_in_pixels as u32,
-        pixels,
-    )
-    .unwrap()
-    .save(path)?;
+    let owned = owned.ok_or_else(|| anyhow::anyhow!("X11 fixture window not found; launch with WAYLAND_DISPLAY unset"))?;
+    if std::env::var_os("ZERON_FIXTURE_FORCE_FOCUS").is_some() {
+        conn.set_input_focus(x11rb::protocol::xproto::InputFocus::PARENT, owned, x11rb::CURRENT_TIME)?.check()?;
+        conn.flush()?;
+    }
+    let geometry = conn.get_geometry(owned)?.reply()?;
+    let image = conn.get_image(ImageFormat::Z_PIXMAP, owned, 0, 0, geometry.width, geometry.height, u32::MAX)?.reply()?;
+    let mut pixels = image.data;
+    anyhow::ensure!(pixels.len() == geometry.width as usize * geometry.height as usize * 4, "expected 32-bit X11 pixels");
+    for pixel in pixels.chunks_exact_mut(4) { pixel.swap(0, 2); pixel[3] = 255; }
+    image::RgbaImage::from_raw(geometry.width as u32, geometry.height as u32, pixels)
+        .ok_or_else(|| anyhow::anyhow!("invalid native image size"))?.save(path)?;
     Ok(())
 }
+
+#[cfg(not(target_os = "linux"))]
+fn screenshot(_: &Path) -> anyhow::Result<()> { Ok(()) }
 
 fn main() -> anyhow::Result<()> {
     // Every Git process here, including the engine's, must ignore the
@@ -278,15 +230,19 @@ fn main() -> anyhow::Result<()> {
     if std::env::var_os("ZERON_FIXTURE_PROJECT_TERMINALS").is_some() || std::env::var_os("ZERON_FIXTURE_WORKTREES").is_some() {
         std::fs::create_dir(repo.join("backend"))?;
         std::fs::create_dir(repo.join("frontend"))?;
+        let mut fixture_services = vec![
+            ("backend", "Backend", "backend"),
+            ("frontend", "Frontend", "frontend"),
+            ("cloudflared", "Cloudflared", "."),
+        ];
+        if std::env::var_os("ZERON_FIXTURE_DATABASE").is_some() {
+            fixture_services.insert(0, ("database", "Database", "."));
+        }
         core.project_actions.project_terminals.save(
             "fixture-space",
             &repo,
             zeron_proto::ProjectTerminalConfig {
-                services: [
-                    ("backend", "Backend", "backend"),
-                    ("frontend", "Frontend", "frontend"),
-                    ("cloudflared", "Cloudflared", "."),
-                ]
+                services: fixture_services
                 .into_iter()
                 .map(
                     |(id, name, directory)| zeron_proto::ProjectTerminalService {
@@ -294,8 +250,10 @@ fn main() -> anyhow::Result<()> {
                         name: name.into(),
                         directory: directory.into(),
                         restart_on_failure: false,
-                        setup_prerequisite: None,
-                        command: format!("printf '%s\\n' '{name} fixture ready'; exec sleep 600"),
+                        setup_prerequisite: (id == "database").then(|| zeron_proto::ProjectServiceReadiness {
+                            command: "true".into(), timeout_seconds: 30,
+                        }),
+                        command: format!("printf '%s\\n' '{name} fixture ready'; printf '%s\\n' \"$$\" > '{}'; exec sleep 3600", temp.path().join(format!("service-{id}.pid")).display()),
                     },
                 )
                 .collect(),
@@ -328,8 +286,9 @@ fn main() -> anyhow::Result<()> {
         .rename_chat("source-control-fixture", "Test source control")?;
     let listener = runtime.block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))?;
     let port = listener.local_addr()?.port();
-    let data = temp.path().join("ui");
-    std::fs::create_dir(&data)?;
+    let data = std::env::var_os("ZERON_FIXTURE_UI_DATA").map(PathBuf::from).unwrap_or_else(|| temp.path().join("ui"));
+    std::fs::create_dir_all(&data)?;
+    std::fs::write(output.join("settings-path.txt"), data.to_string_lossy().as_bytes())?;
     let token = zeron_rpc::ipc_auth::issue_token(&data)?;
     let _ipc = runtime.spawn(zeron_rpc::serve_ws_listener(listener, core.rpc_service(), token));
     let boot = EngineBootConfig {
@@ -353,7 +312,9 @@ fn main() -> anyhow::Result<()> {
     gpui_platform::application().with_assets(icons::Assets).run(move |cx| {
         gpui_tokio::init(cx); gpui_base::init(cx);
         gpui::profiler::set_frame_trace_enabled(true);
-        let prefs = settings::UiSettings::default(); settings::init(prefs.clone(), data.clone(), cx);
+        let mut prefs = settings::UiSettings::load(&data);
+        prefs.onboarding_completed = true;
+        settings::init(prefs.clone(), data.clone(), cx);
         motion::init(prefs.reduce_motion, prefs.pause_animations_in_background, cx);
         let fonts = typography::register_fonts(cx);
         typography::init(prefs.ui_font_family.clone(), prefs.ui_font_size, prefs.terminal_font_family.clone(), prefs.terminal_font_size, prefs.code_font_family.clone(), prefs.code_font_size, fonts, cx);
@@ -375,7 +336,7 @@ fn main() -> anyhow::Result<()> {
             pause(cx, 1500).await;
             window.update(cx, |view, window, cx| view.fixture_open_source_control(window, cx)).unwrap();
             pause(cx, 2500).await;
-            capture(&output.join("initial.png"));
+            capture(window, cx, &output.join("initial.png")).await;
             std::fs::write(output.join("ready"), "ready").unwrap();
             let mut frame_timings = gpui::profiler::FrameTimingCollector::new();
             loop {
@@ -394,6 +355,15 @@ fn main() -> anyhow::Result<()> {
                     pause(cx, 100).await;
                     cx.update(|cx| cx.quit());
                     break;
+                }
+                if action == "plugins" {
+                    window.update(cx, |view, _, cx| view.fixture_plugins_settings(cx)).unwrap();
+                }
+                if action == "chat" {
+                    window.update(cx, |view, _, cx| view.fixture_plugin_chat(cx)).unwrap();
+                }
+                if action == "source-control" {
+                    window.update(cx, |view, window, cx| view.fixture_open_source_control(window, cx)).unwrap();
                 }
                 if action == "worktree-settings" {
                     window.update(cx, |view, _, cx| view.fixture_open_worktree_settings(cx)).unwrap();
@@ -441,7 +411,9 @@ fn main() -> anyhow::Result<()> {
                         } else { motion::ReduceMotion::Off }, cx),
                         "key" => {
                             for key in command["keys"].as_array().unwrap() {
-                                w.dispatch_keystroke(gpui::Keystroke::parse(key.as_str().unwrap()).unwrap(), cx);
+                                let keystroke = gpui::Keystroke::parse(key.as_str().unwrap()).unwrap();
+                                w.dispatch_keystroke(keystroke.clone(), cx);
+                                w.dispatch_event(gpui::PlatformInput::KeyUp(gpui::KeyUpEvent { keystroke }), cx);
                                 if command["forceDraw"].as_bool().unwrap_or(true) {
                                     w.draw(cx).clear();
                                 }
@@ -461,7 +433,7 @@ fn main() -> anyhow::Result<()> {
                         }
                         "resize" => w.resize(size(px(command["width"].as_f64().unwrap() as f32), px(900.0))),
                         "capture" => (),
-                        "worktree-settings" | "project-terminals" | "agent" | "new-chat" | "worktree-send" => (),
+                        "worktree-settings" | "project-terminals" | "agent" | "new-chat" | "worktree-send" | "plugins" | "chat" | "source-control" => (),
                         _ => panic!("Unknown fixture command"),
                     }
                 }).unwrap();
@@ -470,11 +442,11 @@ fn main() -> anyhow::Result<()> {
                 let services = window.update(cx, |view, _, cx| view.fixture_project_terminal_state(cx)).unwrap();
                 std::fs::write(output.join(format!("{name}-services.json")), serde_json::to_vec_pretty(&services).unwrap()).unwrap();
                 if command["screenshot"].as_bool().unwrap_or(true) {
-                    capture(&output.join(format!("{name}.png")));
+                    capture(window, cx, &output.join(format!("{name}.png"))).await;
                 }
                 let workbench = window.update(cx, |s, _, cx| s.fixture_workbench_state(cx)).unwrap();
                 let frame_ms: Vec<_> = frame_timings.collect_unseen().iter().map(|frame| frame.draw_duration().as_secs_f64() * 1000.0).collect();
-                std::fs::write(output.join(format!("{name}.json")), serde_json::to_vec(&serde_json::json!({ "workbench": workbench, "performance": { "commandMs": command_start.elapsed().as_secs_f64() * 1000.0, "drawMs": frame_ms }, "status": git(&repo, &["status", "--porcelain=v1"]), "head": git(&repo, &["rev-parse", "HEAD"]), "headMessage": git(&repo, &["log", "-1", "--format=%B"]), "committedMain": git(&repo, &["show", "HEAD:src/main.rs"]), "typescript": std::fs::read_to_string(repo.join("src/example.ts")).unwrap(), "submoduleStatus": git(&repo.join("apps/device-apps"), &["status", "--porcelain=v1"]), "submoduleHead": git(&repo.join("apps/device-apps"), &["rev-parse", "HEAD"]), "submoduleMessage": git(&repo.join("apps/device-apps"), &["log", "-1", "--format=%B"]) })).unwrap()).unwrap();
+                std::fs::write(output.join(format!("{name}.json")), serde_json::to_vec(&serde_json::json!({ "workbench": workbench, "engineServices": core.project_actions.project_terminals.checkout_snapshot("fixture-space", &repo, &repo, &Default::default()).ok(), "performance": { "commandMs": command_start.elapsed().as_secs_f64() * 1000.0, "drawMs": frame_ms }, "status": git(&repo, &["status", "--porcelain=v1"]), "head": git(&repo, &["rev-parse", "HEAD"]), "headMessage": git(&repo, &["log", "-1", "--format=%B"]), "committedMain": git(&repo, &["show", "HEAD:src/main.rs"]), "typescript": std::fs::read_to_string(repo.join("src/example.ts")).unwrap(), "submoduleStatus": git(&repo.join("apps/device-apps"), &["status", "--porcelain=v1"]), "submoduleHead": git(&repo.join("apps/device-apps"), &["rev-parse", "HEAD"]), "submoduleMessage": git(&repo.join("apps/device-apps"), &["log", "-1", "--format=%B"]) })).unwrap()).unwrap();
             }
         }).detach();
     });

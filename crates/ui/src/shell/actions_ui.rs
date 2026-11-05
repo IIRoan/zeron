@@ -49,9 +49,10 @@ impl Shell {
         let selected = self.active_chat == chat_id;
         self.panels
             .update(&chat_id, |panels| panels.terminal_open = true);
+        if cfg!(target_os = "linux") {
+            self.show_shell_tab_for_chat(&chat_id, tab, cx);
+        }
         if selected {
-            self.project_terminals.mode = project_terminals_ui::TerminalMode::Shells;
-            self.project_terminals.drawer = false;
             self.terminal_tween = None;
             self.terminal_tween_task = None;
             panel.update(cx, |panel, cx| panel.set_open(true, cx));
@@ -428,8 +429,7 @@ impl Shell {
         });
         self.panels
             .update(&context.chat_id, |panels| panels.terminal_open = true);
-        self.project_terminals.mode = project_terminals_ui::TerminalMode::Shells;
-        self.project_terminals.drawer = false;
+        if cfg!(target_os = "linux") { self.show_shell_tab_for_chat(&context.chat_id, tab, cx); }
         self.terminal_tween = None;
         self.terminal_tween_task = None;
         panel.update(cx, |panel, cx| {

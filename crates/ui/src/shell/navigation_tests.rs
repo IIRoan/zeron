@@ -408,7 +408,8 @@ fn terminal_entrypoint_and_browser_respect_navigation_regions(cx: &mut TestAppCo
         let shell = shell.read(cx);
         let terminal = if cfg!(target_os = "linux") {
             assert!(shell.terminal_open(cx));
-            assert!(!shell.right_tabs.values().flatten().any(|surface| matches!(surface, RightSurface::Terminal(_))));
+            assert!(matches!(shell.resolved_right_active(cx), RightSurface::Terminal(_)));
+            assert_eq!(shell.right_tabs.values().flatten().filter(|surface| matches!(surface, RightSurface::Terminal(_))).count(), 1);
             shell.terminal.as_ref().unwrap().read(cx)
         } else {
             shell.right_terminal.as_ref().unwrap().read(cx)
@@ -416,14 +417,9 @@ fn terminal_entrypoint_and_browser_respect_navigation_regions(cx: &mut TestAppCo
         assert!(terminal.focus_handle().is_focused(window));
     });
     press(cx, true);
-    if cfg!(target_os = "linux") {
-        shell.read_with(cx, |shell, cx| {
-            assert_eq!(shell.state.read(cx).selected_chat.as_deref(), Some("other"));
-        });
-        shell.update(cx, |shell, cx| shell.open_chat("parent".into(), cx));
-    } else {
-        assert_surface(&shell, cx, RightSurface::Subagent(1));
-    }
+    // Terminals now share the tools region on Linux, so the shortcut cycles
+    // surface tabs and retains the current conversation.
+    assert_surface(&shell, cx, RightSurface::Subagent(1));
     cx.update(|window, cx| {
         shell.update(cx, |shell, cx| {
             shell.add_browser_surface(None, window, cx);
@@ -446,7 +442,7 @@ fn terminal_entrypoint_and_browser_respect_navigation_regions(cx: &mut TestAppCo
 }
 
 #[gpui::test]
-fn bottom_terminal_keeps_session_navigation(cx: &mut TestAppContext) {
+fn terminal_navigation_matches_its_sidebar_or_bottom_dock(cx: &mut TestAppContext) {
     let (shell, cx) = setup(cx);
     cx.update(|window, cx| {
         shell.update(cx, |shell, cx| {
@@ -470,9 +466,13 @@ fn bottom_terminal_keeps_session_navigation(cx: &mut TestAppContext) {
         );
     });
     press(cx, true);
-    shell.read_with(cx, |shell, cx| {
-        assert_eq!(shell.state.read(cx).selected_chat.as_deref(), Some("other"));
-    });
+    if cfg!(target_os = "linux") {
+        assert_surface(&shell, cx, RightSurface::Subagent(1));
+    } else {
+        shell.read_with(cx, |shell, cx| {
+            assert_eq!(shell.state.read(cx).selected_chat.as_deref(), Some("other"));
+        });
+    }
 }
 
 #[gpui::test]

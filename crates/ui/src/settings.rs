@@ -28,6 +28,7 @@ pub mod devices;
 pub mod files;
 pub mod harnesses;
 pub mod notifications;
+pub mod plugins;
 pub(crate) mod project_icons;
 pub mod search;
 pub mod shortcuts;
@@ -564,6 +565,16 @@ pub fn current(cx: &App) -> UiSettings {
         .unwrap_or_default()
 }
 
+pub fn plugin_enabled(id: crate::plugins::PluginId, cx: &App) -> bool {
+    cx.try_global::<SettingsStore>().is_none_or(|store| store.current.plugins.enabled(id))
+}
+
+pub fn plugin_preferences(cx: &App) -> crate::plugins::Preferences {
+    cx.try_global::<SettingsStore>()
+        .map(|store| store.current.plugins.clone())
+        .unwrap_or_default()
+}
+
 /// Read the picker preference without cloning the full settings for each model row.
 pub fn compact_model_picker(cx: &App) -> bool {
     cx.try_global::<SettingsStore>()
@@ -1059,6 +1070,7 @@ pub const SKILL_COMPLETION_HARNESSES: [(zeron_proto::HarnessId, &str); 10] = [
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiSettings {
+    pub plugins: crate::plugins::Preferences,
     pub dictation_enabled: bool,
     /// Dictation microphone as a `zeron_voice::InputDevice` id; `None`
     /// follows the system default.
@@ -1292,6 +1304,7 @@ pub struct UiSettings {
 impl Default for UiSettings {
     fn default() -> Self {
         Self {
+            plugins: crate::plugins::Preferences::default(),
             dictation_enabled: false,
             dictation_input: None,
             window_geometry: None,
@@ -2142,6 +2155,7 @@ impl UiSettings {
             }};
         }
         merge!(
+            plugins,
             dictation_enabled,
             dictation_input,
             window_geometry,
@@ -3313,6 +3327,7 @@ mod tests {
     fn round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let settings = UiSettings {
+            plugins: crate::plugins::Preferences::default(),
             dictation_enabled: false,
             dictation_input: Some("coreaudio:usb-mic".into()),
             window_geometry: None,
