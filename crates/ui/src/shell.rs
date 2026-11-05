@@ -1634,12 +1634,12 @@ enum SplashPhase {
 /// a renamed row into view.
 const CHAT_RENAME_REVEAL_GRACE: std::time::Duration = std::time::Duration::from_millis(150);
 
-/// Which list draws a chat's inline title editor: the sidebar's session row,
-/// or the side-chat branch in the session card's lanes.
+/// Where a chat's inline title editor appears: the sidebar's session row,
+/// or a side chat's tab (Linux) / session-card lane (other platforms).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChatRenameSurface {
     Sidebar,
-    SessionCard,
+    SideChat,
 }
 
 /// A chat title edited in place on its row (double-click, or Rename in the
@@ -6454,7 +6454,7 @@ impl Shell {
     }
 
     /// Start editing `chat_id`'s title in place on its row: the sidebar's
-    /// session row, or — for a side chat — its branch in the session card.
+    /// session row, or a side chat's visible tab or session-card branch.
     fn open_rename_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.close_chat_menu(cx);
         if self.chat_rename.is_some() {
@@ -6476,27 +6476,25 @@ impl Shell {
         else {
             return;
         };
-        // The sidebar lists only top-level chats; side chats ride the
-        // session card's lanes. Either way the row must be on screen first:
+        // The sidebar lists only top-level chats. Side chats use their tab
+        // on Linux and the session card elsewhere. Reveal the editor first:
         // a field on a hidden row would take keystrokes unseen.
         let surface = if parent.is_some() {
-            ChatRenameSurface::SessionCard
+            ChatRenameSurface::SideChat
         } else {
             ChatRenameSurface::Sidebar
         };
         let revealed = match surface {
             ChatRenameSurface::Sidebar => self.reveal_sidebar_chat(&chat_id, cx),
-            // The lanes list the open chat's live side chats: show the card
-            // and page its lane to the branch.
-            ChatRenameSurface::SessionCard => {
+            ChatRenameSurface::SideChat => {
                 !archived
                     && parent.as_deref() == Some(self.active_chat.as_str())
-                    && self.reveal_session_lane_chat(&chat_id, cx)
+                    && self.reveal_side_chat_rename(&chat_id, cx)
             }
         };
         if !revealed {
             // The sidebar explains its own refusals.
-            if surface == ChatRenameSurface::SessionCard {
+            if surface == ChatRenameSurface::SideChat {
                 self.show_notice(crate::toast::ToastKind::Error, "Open this side chat's parent to rename it", cx);
             }
             cx.notify();
@@ -6537,6 +6535,27 @@ impl Shell {
             _blur: None,
         });
         cx.notify();
+    }
+
+    fn reveal_side_chat_rename(&mut self, chat_id: &str, cx: &mut Context<Self>) -> bool {
+        if !cfg!(target_os = "linux") {
+            return self.reveal_session_lane_chat(chat_id, cx);
+        }
+        let Some(chat) = self
+            .state
+            .read(cx)
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .cloned()
+        else {
+            return false;
+        };
+        if self.right_pane_expanded {
+            self.toggle_right_pane_expand(cx);
+        }
+        self.open_side_chat(chat, self.panel_key(cx), cx);
+        true
     }
 
     /// Focus a just-opened inline rename and arm its commit-on-blur.
@@ -13171,6 +13190,17 @@ impl Shell {
             }));
         for (ix, (surface, title, dirty, detail)) in rows.into_iter().enumerate() {
             let is_active = surface == active;
+            let rename_input = match surface {
+                RightSurface::SideChat(id) if cfg!(target_os = "linux") => self
+                    .side_chats
+                    .get(&id)
+                    .and_then(|tab| tab.state.read(cx).selected_chat.as_deref())
+                    .and_then(|chat_id| self.rename_input_for(chat_id, ChatRenameSurface::SideChat)),
+                _ => None,
+            };
+            if rename_input.is_some() && self.chat_rename_revealing() {
+                self.right_tab_scroll.scroll_to_item(ix);
+            }
             let file_identity_path = detail.as_ref().cloned().unwrap_or_else(|| title.clone());
             let harness_icon = match surface {
                 RightSurface::SideChat(id) => self.side_chats.get(&id).and_then(|tab| {
@@ -13280,7 +13310,11 @@ impl Shell {
                     close_id: "right-surface-close",
                     ix,
                     active: is_active,
-                    title,
+                    title: if rename_input.is_some() {
+                        "".into()
+                    } else {
+                        title
+                    },
                     dirty,
                     leading,
                 },
@@ -13289,6 +13323,23 @@ impl Shell {
                     this.close_right_surface(surface, window, cx);
                 }),
             )
+            .relative()
+            .when_some(rename_input, |chip, input| {
+                chip.child(
+                    div()
+                        .absolute()
+                        .left(px(25.0))
+                        .right(px(25.0))
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .child(chat_title_editor(
+                            "side-chat-tab-title-editor".into(),
+                            input,
+                            &theme,
+                        )),
+                )
+            })
             .aria_label(accessible_label)
             .when_some(detail, |chip, detail| {
                 chip.tooltip(move |_, cx| {

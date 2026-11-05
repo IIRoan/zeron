@@ -9782,7 +9782,12 @@ impl Composer {
                 // Cloud: the chat gets its own Cloud machine; its host and
                 // cwd come back from createChat.
                 let mut on_cloud = false;
-                if is_new && space_path.is_some() {
+                // An explicitly reused checkout also supplies the cwd for a
+                // projectless session; it must not fall back to the home folder.
+                if is_new
+                    && (space_path.is_some()
+                        || matches!(&plan, crate::pickers::CheckoutPlan::ReuseCheckout { .. }))
+                {
                     match &plan {
                         crate::pickers::CheckoutPlan::CurrentCheckout { branch } => {
                             chat_branch = branch.clone();

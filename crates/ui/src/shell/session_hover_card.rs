@@ -663,7 +663,16 @@ mod tests {
     ) -> (Entity<Shell>, &mut VisualTestContext, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         init_test(cx, dir.path(), false);
-        let (shell, cx) = cx.add_window_view(|_, cx| test_shell(dir.path(), cx));
+        let (shell, cx) = cx.add_window_view(|_, cx| {
+            let mut shell = test_shell(dir.path(), cx);
+            // Linux's new-chat canvas hides the sidebar until a chat is open.
+            shell.state.update(cx, |state, _| {
+                state.selected_chat = Some("next".into());
+            });
+            shell.active_chat = "next".into();
+            shell.splash = SplashPhase::Gone;
+            shell
+        });
         cx.simulate_resize(gpui::size(px(1400.0), px(800.0)));
         redraw(cx);
         (shell, cx, dir)

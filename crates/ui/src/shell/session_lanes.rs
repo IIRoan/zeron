@@ -430,7 +430,7 @@ impl Shell {
     ) -> gpui::Stateful<gpui::Div> {
         let key = format!("session-lanes-chat-{}", row.chat_id);
         let mark = status_mark(key.clone(), row.status, view, theme, cx);
-        let rename_input = self.rename_input_for(&row.chat_id, ChatRenameSurface::SessionCard);
+        let rename_input = self.rename_input_for(&row.chat_id, ChatRenameSurface::SideChat);
         let revealing = rename_input.is_some() && self.chat_rename_revealing();
         let title = match rename_input {
             Some(input) => chat_title_editor(format!("{key}-title-editor").into(), input, theme),

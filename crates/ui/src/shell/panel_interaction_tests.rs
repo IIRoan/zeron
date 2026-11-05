@@ -598,9 +598,39 @@ fn panels_share_space_and_keep_rendered_geometry_through_their_lifecycle(cx: &mu
     }
 }
 
+/// Side-chat tabs belong to an engine connection; connectionless shell
+/// updates intentionally discard them. Keep the RPC transport alive in tests.
+fn connect_rename_engine(
+    shell: &Entity<Shell>,
+    cx: &mut VisualTestContext,
+) -> (
+    tokio::runtime::Runtime,
+    tokio::sync::mpsc::Receiver<String>,
+    tokio::sync::mpsc::Sender<String>,
+) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (out, requests) = tokio::sync::mpsc::channel(256);
+    let (replies, inbound) = tokio::sync::mpsc::channel(256);
+    let engine = {
+        let _guard = runtime.enter();
+        crate::state::EngineHandle::from_test_client(zeron_rpc::RpcClient::new(out, inbound))
+    };
+    shell.update(cx, |shell, cx| {
+        shell
+            .state
+            .update(cx, |state, _| state.set_test_engine(engine));
+    });
+    (runtime, requests, replies)
+}
+
 #[gpui::test]
 fn side_chat_menu_rename_keeps_the_editor_visible_without_opening_files(cx: &mut TestAppContext) {
     let (_dir, shell, cx) = setup(cx);
+    let (runtime, _requests, _replies) = connect_rename_engine(&shell, cx);
+    let _guard = runtime.enter();
     change(&shell, cx, |shell, _, cx| {
         shell.state.update(cx, |state, cx| {
             state.chats.push(
@@ -631,17 +661,154 @@ fn side_chat_menu_rename_keeps_the_editor_visible_without_opening_files(cx: &mut
             !shell.files_panel_open(cx),
             "Rename must not open the explorer"
         );
-        assert!(shell.session_info_visible(cx));
+        assert_eq!(shell.session_info_visible(cx), !cfg!(target_os = "linux"));
         assert_eq!(shell.chat_rename.as_ref().unwrap().chat_id, "side");
     });
-    let field = cx.debug_bounds("session-lanes-chat-side-title-editor").unwrap();
-    let card = cx.debug_bounds("session-lanes").unwrap();
-    assert!(field.top() >= card.top() && field.bottom() <= card.bottom());
+    assert_side_chat_rename_visible(&shell, cx, "session-lanes-chat-side-title-editor");
+}
+
+#[cfg(target_os = "linux")]
+#[gpui::test]
+fn side_chat_tab_rename_keeps_focus_and_handles_save_cancel_and_blur(cx: &mut TestAppContext) {
+    let (_dir, shell, cx) = setup(cx);
+    let (runtime, mut requests, _replies) = connect_rename_engine(&shell, cx);
+    let _guard = runtime.enter();
+    let renames = |requests: &mut tokio::sync::mpsc::Receiver<String>| {
+        std::iter::from_fn(|| requests.try_recv().ok())
+            .map(|frame| serde_json::from_str::<serde_json::Value>(&frame).unwrap())
+            .filter(|frame| {
+                frame["method"] == methods::MUTATE && frame["params"]["op"] == "renameChat"
+            })
+            .map(|frame| frame["params"].clone())
+            .collect::<Vec<_>>()
+    };
+    cx.update(|window, cx| {
+        window.activate_window();
+        apply_keymap(
+            cx,
+            &KeymapConfig::default(),
+            ComposerSendBehavior::default(),
+        );
+    });
+    change(&shell, cx, |shell, _, cx| {
+        shell.state.update(cx, |state, cx| {
+            state.chats.push(
+                serde_json::from_value(serde_json::json!({
+                    "id": "side", "title": "Side chat", "parentChatId": "a",
+                    "deviceId": "local", "archived": false, "createdAt": Utc::now(),
+                }))
+                .unwrap(),
+            );
+            cx.notify();
+        });
+        shell.open_rename_chat("side".into(), cx);
+    });
+    settled(&shell, cx);
+    let field = assert_side_chat_rename_visible(&shell, cx, "session-lanes-chat-side-title-editor");
+    cx.simulate_click(field.center(), Default::default());
+    settled(&shell, cx);
+    cx.update(|window, cx| {
+        shell.read_with(cx, |shell, cx| {
+            assert!(
+                shell
+                    .chat_rename
+                    .as_ref()
+                    .unwrap()
+                    .input
+                    .focus_handle(cx)
+                    .is_focused(window)
+            );
+        });
+    });
+    cx.simulate_input("Cancelled");
+    cx.simulate_keystrokes("escape");
+    settled(&shell, cx);
+    shell.read_with(cx, |shell, _| {
+        assert!(shell.chat_rename.is_none());
+    });
+    assert!(
+        renames(&mut requests).is_empty(),
+        "Escape must not send a rename"
+    );
+
+    for blur in [false, true] {
+        change(&shell, cx, |shell, _, cx| {
+            shell.open_rename_chat("side".into(), cx);
+        });
+        settled(&shell, cx);
+        cx.simulate_input("Renamed side chat");
+        cx.update(|window, cx| {
+            shell.read_with(cx, |shell, cx| {
+                let input = &shell.chat_rename.as_ref().unwrap().input;
+                assert!(
+                    input.focus_handle(cx).is_focused(window),
+                    "rename must have focus (blur={blur})"
+                );
+                assert_eq!(input.read(cx).text(), "Renamed side chat");
+            });
+        });
+        if blur {
+            cx.update(|window, _| window.blur());
+        } else {
+            cx.simulate_keystrokes("enter");
+        }
+        settled(&shell, cx);
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                shell.chat_rename.is_none(),
+                "rename must close (blur={blur})"
+            );
+        });
+        assert_eq!(
+            renames(&mut requests),
+            vec![serde_json::json!({
+                "op": "renameChat", "chatId": "side", "title": "Renamed side chat",
+            })],
+            "the title must be sent (blur={blur})"
+        );
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.chat_rename.is_none());
+            assert_eq!(shell.side_chats.len(), 1, "rename reuses its existing tab");
+        });
+    }
+}
+
+#[track_caller]
+fn assert_side_chat_rename_visible(
+    shell: &Entity<Shell>,
+    cx: &mut VisualTestContext,
+    lane_selector: &'static str,
+) -> Bounds<Pixels> {
+    // A newly opened surface mounts after the panel's deferred content reveal.
+    cx.run_until_parked();
+    draw(shell, cx, 100);
+    let (field, viewport) = if cfg!(target_os = "linux") {
+        (
+            cx.debug_bounds("side-chat-tab-title-editor").unwrap(),
+            shell.read_with(cx, |shell, _| shell.right_tab_scroll.bounds()),
+        )
+    } else {
+        (
+            cx.debug_bounds(lane_selector).unwrap(),
+            cx.debug_bounds("session-lanes").unwrap(),
+        )
+    };
+    assert!(
+        field.left() >= viewport.left()
+            && field.right() <= viewport.right()
+            && field.top() >= viewport.top()
+            && field.bottom() <= viewport.bottom(),
+        "the rename editor {field:?} is outside its viewport {viewport:?}"
+    );
+    field
 }
 
 #[gpui::test]
 fn side_chat_rename_leaves_takeover_to_show_its_editor(cx: &mut TestAppContext) {
     let (_dir, shell, cx) = setup(cx);
+    let (runtime, _requests, _replies) = connect_rename_engine(&shell, cx);
+    let _guard = runtime.enter();
     change(&shell, cx, |shell, _, cx| {
         shell.state.update(cx, |state, cx| {
             state.chats.push(
@@ -663,13 +830,13 @@ fn side_chat_rename_leaves_takeover_to_show_its_editor(cx: &mut TestAppContext) 
     let frame = settled(&shell, cx);
     assert!(!shell.read_with(cx, |s, _| s.right_pane_expanded));
     assert!(frame.widths[3] > 0.0, "the transcript column must return");
-    let field = cx.debug_bounds("session-lanes-chat-side-title-editor").unwrap();
-    let card = cx.debug_bounds("session-lanes").unwrap();
-    assert!(field.top() >= card.top() && field.bottom() <= card.bottom());
+    assert_side_chat_rename_visible(&shell, cx, "session-lanes-chat-side-title-editor");
 }
 
 fn check_side_chat_rename_scroll(cx: &mut TestAppContext, width: f32, reduced_motion: bool) {
     let (_dir, shell, cx) = setup(cx);
+    let (runtime, _requests, _replies) = connect_rename_engine(&shell, cx);
+    let _guard = runtime.enter();
     cx.simulate_resize(gpui::size(px(width), px(900.0)));
     cx.update(|_, cx| motion::set_reduced_motion(cx, reduced_motion));
     change(&shell, cx, |shell, _, cx| {
@@ -687,12 +854,27 @@ fn check_side_chat_rename_scroll(cx: &mut TestAppContext, width: f32, reduced_mo
             }
             cx.notify();
         });
+        if cfg!(target_os = "linux") {
+            // The Linux editor lives in a tab. Fill the strip so both ends
+            // really are outside its horizontal viewport before revealing them.
+            let chats: Vec<_> = shell
+                .state
+                .read(cx)
+                .chats
+                .iter()
+                .filter(|chat| chat.parent_chat_id.as_deref() == Some("a"))
+                .cloned()
+                .collect();
+            for chat in chats {
+                shell.open_side_chat(chat, shell.panel_key(cx), cx);
+            }
+        }
     });
     settled(&shell, cx);
     assert!(cx.debug_bounds("session-lanes").is_none());
 
-    // Reveal a paged-out row from a hidden card, then a row above the new
-    // scroll position. Both directions must leave the whole editor visible.
+    // Reveal a row/tab outside the viewport, then the one at the other end.
+    // Both directions must leave the whole editor visible.
     for (chat, selector) in [
         ("side-39", "session-lanes-chat-side-39-title-editor"),
         ("side-0", "session-lanes-chat-side-0-title-editor"),
@@ -705,12 +887,7 @@ fn check_side_chat_rename_scroll(cx: &mut TestAppContext, width: f32, reduced_mo
             cx.run_until_parked();
             draw(&shell, cx, 100);
         }
-        let field = cx.debug_bounds(selector).unwrap();
-        let card = cx.debug_bounds("session-lanes").unwrap();
-        assert!(
-            field.top() >= card.top() && field.bottom() <= card.bottom(),
-            "{chat}'s editor {field:?} is outside the card {card:?}"
-        );
+        assert_side_chat_rename_visible(&shell, cx, selector);
         cx.update(|window, cx| {
             shell.read_with(cx, |shell, cx| {
                 let rename = shell.chat_rename.as_ref().unwrap();
@@ -722,15 +899,18 @@ fn check_side_chat_rename_scroll(cx: &mut TestAppContext, width: f32, reduced_mo
 }
 
 #[gpui::test]
-fn side_chat_rename_scrolls_to_its_row_in_a_docked_card(cx: &mut TestAppContext) {
+fn side_chat_rename_scrolls_into_view_in_a_wide_window(cx: &mut TestAppContext) {
     check_side_chat_rename_scroll(cx, 1600.0, false);
 }
 
 #[gpui::test]
-fn side_chat_rename_scrolls_to_its_row_in_a_floating_card_without_motion(cx: &mut TestAppContext) {
+fn side_chat_rename_scrolls_into_view_in_a_narrow_window_without_motion(cx: &mut TestAppContext) {
     check_side_chat_rename_scroll(cx, 1000.0, true);
 }
 
+// The Linux workbench has no session card. Its absence and layout are covered
+// by workbench_never_shows_the_session_card_or_reserves_its_space above.
+#[cfg(not(target_os = "linux"))]
 #[gpui::test]
 fn the_session_card_lands_with_a_chat_switch_and_eases_on_its_toggle(cx: &mut TestAppContext) {
     let (_dir, shell, cx) = setup(cx);

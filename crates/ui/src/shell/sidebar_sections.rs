@@ -1222,6 +1222,12 @@ mod tests {
         window
             .update(cx, |shell, _, cx| {
                 prepare(shell, cx);
+                // Exercise the session sidebar, not Linux's new-chat canvas.
+                shell.state.update(cx, |state, _| {
+                    state.selected_chat = Some("regular".into());
+                });
+                shell.active_chat = "regular".into();
+                shell.splash = SplashPhase::Gone;
                 shell
                     .settings
                     .sidebar_sections_by_profile
