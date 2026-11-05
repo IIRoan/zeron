@@ -16,8 +16,8 @@ mod appshots_page;
 use crate::settings::search::{SearchAnchor, SettingId};
 use crate::settings::widgets;
 use crate::settings::{
-    ComposerSendBehavior, KeyEquivalents, KeymapConfig, PullRequestDestination, SavePolicy,
-    ShortcutId, canonical_key, combo_from_keystroke, display_combo, key_equivalents,
+    ComposerSendBehavior, KeyEquivalents, KeymapConfig, ShortcutId, canonical_key,
+    combo_from_keystroke, display_combo, key_equivalents,
 };
 use crate::state::AppState;
 use crate::theme::Theme;
@@ -94,7 +94,7 @@ pub struct ShortcutsPage {
     appshot_destination: AppshotDestination,
     appshot_capabilities: AppshotCapabilities,
     send_select: widgets::SelectState,
-    pull_request_destination_select: widgets::SelectState,
+
     destination_select: widgets::SelectState,
     capture_access_prompted: bool,
     semantic_access_prompted: bool,
@@ -137,7 +137,7 @@ impl ShortcutsPage {
             appshot_destination,
             appshot_capabilities: crate::appshots::capabilities(),
             send_select: widgets::SelectState::default(),
-            pull_request_destination_select: widgets::SelectState::default(),
+
             destination_select: widgets::SelectState::default(),
             capture_access_prompted: false,
             semantic_access_prompted: false,
@@ -917,47 +917,6 @@ impl Render for ShortcutsPage {
             )
             .search_anchor(SettingId::EscapeStopsAgent);
         if self.general_page {
-            let pull_request_destination = crate::settings::current(cx).pull_request_destination;
-            let pull_request_destination_control = widgets::select(
-                "pull-request-destination",
-                "Open pull requests in",
-                &theme,
-                |page: &mut Self| &mut page.pull_request_destination_select,
-            )
-            .options(
-                PullRequestDestination::ALL
-                    .into_iter()
-                    .map(|destination| widgets::SelectOption::new(destination.label())),
-                PullRequestDestination::ALL
-                    .into_iter()
-                    .position(|destination| destination == pull_request_destination)
-                    .unwrap_or_default(),
-            )
-            .width(160.0)
-            .on_select(|_, ix, _, cx| {
-                crate::settings::update(SavePolicy::Immediate, cx, |settings| {
-                    settings.pull_request_destination = PullRequestDestination::ALL[ix];
-                });
-                cx.refresh_windows();
-            })
-            .render(&self.pull_request_destination_select, cx);
-            let pull_request_destination_row = widgets::card_row(&theme, true)
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(160.0))
-                        .child(widgets::row_title(&theme, "Open pull requests in"))
-                        .child(widgets::meta_line(
-                            &theme,
-                            vec![
-                                div()
-                                    .child(pull_request_destination.description())
-                                    .into_any_element(),
-                            ],
-                        )),
-                )
-                .child(pull_request_destination_control)
-                .search_anchor(SettingId::PullRequestDestination);
             let scrollbar = self.render_scrollbar(&theme, cx);
             return div()
                 .id("general-settings-page-host")
@@ -984,13 +943,6 @@ impl Render for ShortcutsPage {
                                             .child(compact_model_picker_row)
                                             .child(escape_behavior_row),
                                     )
-                                    .child(widgets::section(
-                                        &theme,
-                                        "Links",
-                                        widgets::section_card(&theme)
-                                            .mt_0()
-                                            .child(pull_request_destination_row),
-                                    ))
                                     .child(self.thread_naming.clone())
                                     .child(self.worktrees.clone()),
                             ),
@@ -1270,74 +1222,6 @@ mod tests {
         assert!(
             cx.debug_bounds("escape-stops-active-agent-toggle")
                 .is_none()
-        );
-    }
-
-    #[gpui::test]
-    fn pull_request_destination_menu_saves_each_destination(cx: &mut gpui::TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        cx.update(|cx| {
-            gpui_base::init(cx);
-            cx.set_global(Theme::default());
-            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
-        });
-        let (page, cx) = cx.add_window_view(|_, cx| {
-            let state = cx.new(|_| AppState::new());
-            let mut page = ShortcutsPage::new(
-                state,
-                KeymapConfig::default(),
-                false,
-                ComposerSendBehavior::Enter,
-                false,
-                false,
-                AppshotDestination::Automatic,
-                cx,
-            );
-            page.show_section(false, true);
-            page
-        });
-        // The menu lists the pull request view, the in-app browser and the
-        // default browser, in that order.
-        for (option, destination) in [
-            (
-                "pull-request-destination-option-2",
-                PullRequestDestination::External,
-            ),
-            (
-                "pull-request-destination-option-0",
-                PullRequestDestination::Native,
-            ),
-            (
-                "pull-request-destination-option-1",
-                PullRequestDestination::Browser,
-            ),
-        ] {
-            cx.update(|window, cx| window.draw(cx).clear());
-            let trigger = cx.debug_bounds("pull-request-destination").unwrap();
-            cx.simulate_click(trigger.center(), gpui::Modifiers::default());
-            cx.update(|window, cx| window.draw(cx).clear());
-            let row = cx.debug_bounds(option).unwrap();
-            cx.simulate_click(row.center(), gpui::Modifiers::default());
-            page.update(cx, |page, cx| {
-                assert!(!page.pull_request_destination_select.is_open());
-                assert_eq!(
-                    crate::settings::current(cx).pull_request_destination,
-                    destination
-                );
-            });
-            // Let the menu's exit animation finish before opening it again.
-            std::thread::sleep(
-                crate::motion::MENU_OUT
-                    .total()
-                    .mul_f32(crate::motion::speed_scale()),
-            );
-            cx.executor()
-                .advance_clock(std::time::Duration::from_secs(1));
-            cx.run_until_parked();
-        }
-        assert_eq!(
-            crate::settings::UiSettings::load(dir.path()).pull_request_destination,
-            PullRequestDestination::Browser
         );
     }
 

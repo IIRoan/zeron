@@ -18,7 +18,6 @@ compact-picker-fixture = ["gpui_platform/test-support"]
 browser-fixture = ["gpui/bench"]
 windows-render-fixture = []
 appshots-fixture = ["gpui_platform/test-support"]
-pull-request-fixture = ["gpui_platform/test-support"]
 resource-profile = ["gpui/bench", "gpui_platform/test-support"]
 
 [[example]]
@@ -64,14 +63,6 @@ required-features = ["appshots-fixture"]
 [[example]]
 name = "reply-images-fixture"
 required-features = ["appshots-fixture", "resource-profile"]
-
-[[example]]
-name = "pull-request-fixture"
-required-features = ["pull-request-fixture"]
-
-[[example]]
-name = "pull-request-destination-fixture"
-required-features = ["pull-request-fixture", "browser-fixture"]
 
 [[example]]
 name = "browser-annotation-fixture"
@@ -154,7 +145,6 @@ serde_json.workspace = true
 pulldown-cmark.workspace = true
 zeron-markdown.workspace = true
 zatex = { workspace = true, features = ["bundled"] }
-html5ever = "0.39"
 alacritty_terminal.workspace = true
 zeron-term.workspace = true
 base64 = "0.22"

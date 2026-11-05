@@ -31,14 +31,10 @@ use crate::comments::ReviewComment;
 use zeron_doc::{SessionMessageEntry, TranscriptDesync, TranscriptFrame};
 use zeron_engine::{EngineConfig, EngineRuntime, InstanceLock};
 use zeron_proto::{
-    AuthState, ChangeRequestSummary, Chat, ChatIndicator, CheckoutChangeRequestStatus, Device,
-    EngineInfo, HarnessId, Session, SidebarPreferencesState, Space, WorkspaceScope,
+    AuthState, Chat, ChatIndicator, Device, EngineInfo, HarnessId, Session,
+    SidebarPreferencesState, Space, WorkspaceScope,
 };
 use zeron_rpc::{RpcClient, RpcError, RpcService, memory_client, methods};
-
-use crate::change_requests::{
-    ChangeRequestClientState, ChangeRequestWatchKey, desired_watch_targets, watch_params,
-};
 
 // Recently viewed transcripts stay renderable while a fresh watch opens. Move
 // ownership on navigation; never clone whale payloads or retain live watches.
@@ -1095,10 +1091,9 @@ pub struct AppState {
     viewport_focused: bool,
     focus_task: Option<Task<()>>,
     transcript_task: Option<Task<()>>,
-    change_requests: ChangeRequestClientState,
-    change_request_tasks: HashMap<ChangeRequestWatchKey, Task<()>>,
+
     queue_task: Option<Task<()>>,
-    change_requests_visible: bool,
+
     /// SUBAGENT transcripts keyed by subagent doc id (the right pane's
     /// subagent tabs read these). Independent of `selected_chat`: a tab's
     /// feed must survive chat switches — the tab itself is what scopes it.
@@ -1221,10 +1216,9 @@ impl AppState {
             viewport_focused: false,
             focus_task: None,
             transcript_task: None,
-            change_requests: ChangeRequestClientState::default(),
-            change_request_tasks: HashMap::new(),
+
             queue_task: None,
-            change_requests_visible: true,
+
             sub_transcripts: HashMap::new(),
             sub_watch_tasks: HashMap::new(),
             auto_selected: false,
@@ -1813,10 +1807,7 @@ impl AppState {
         {
             device.name = "Local".to_string();
         }
-        for device in &devices {
-            self.change_requests
-                .clear_unsupported_on_version_change(&device.id, device.version.as_deref());
-        }
+
         let presentation = device_presentation_at(&devices, now);
         let session_presence = session_presence_at(&self.sessions, now);
         let changed = self.device_presentation.as_ref() != Some(&presentation)
@@ -3517,12 +3508,6 @@ impl AppState {
             .map(|chat| chat.id.as_str())
     }
 
-    /// Latest valid PR for a chat, rechecked against device, checkout, cwd and branch.
-    pub fn change_request_for_chat(&self, chat: &Chat) -> Option<&ChangeRequestSummary> {
-        self.change_requests
-            .change_request_for_chat(chat, &self.spaces)
-    }
-
     pub fn gate(&self) -> GatePhase {
         gate_phase(&self.connection, self.workspace_scope, self.auth.as_ref())
     }
@@ -3543,8 +3528,7 @@ impl AppState {
         self.engine = None;
         self.watch_tasks.clear();
         self.transcript_task = None;
-        self.change_request_tasks.clear();
-        self.change_requests = ChangeRequestClientState::default();
+
         self.connection = ConnectionStatus::Connecting;
         self.workspace_scope = None;
         self.auth = None;
@@ -3761,7 +3745,7 @@ impl AppState {
         self.watch_tasks.clear();
         self.transcript_task = None;
         self.queue_task = None;
-        self.change_request_tasks.clear();
+
         self.focus_task = None;
         let Some(delay) = respawn else {
             let log = config.data_dir.join("logs").join("zeron-engine.log");
@@ -3999,7 +3983,7 @@ impl AppState {
             }
         }));
         self.watch_tasks = watch_tasks;
-        self.reconcile_change_request_watches(cx);
+
         // EngineInfo is part of the attachment boundary: views must know which
         // data profile they reached before they are allowed to render Ready.
         self.connection = ConnectionStatus::Ready;
@@ -4116,45 +4100,6 @@ impl AppState {
             .as_ref()?
             .iter()
             .find(|repo| repo.full_name.eq_ignore_ascii_case(name))
-    }
-
-    fn reconcile_change_request_watches(&mut self, cx: &mut Context<Self>) {
-        let Some(handle) = self.engine.clone() else {
-            self.change_request_tasks.clear();
-            return;
-        };
-        let targets = if self.change_requests_visible {
-            desired_watch_targets(&self.chats, &self.spaces, |device| {
-                !self.change_requests.is_supported(device)
-            })
-        } else {
-            HashSet::new()
-        };
-
-        self.change_request_tasks
-            .retain(|target, _| targets.contains(target));
-        self.change_requests.retain_targets(&targets);
-
-        let local_device_id = self.local_device_id.clone();
-        for target in targets {
-            if self.change_request_tasks.contains_key(&target) {
-                continue;
-            }
-            let task = spawn_change_request_watch(
-                cx,
-                handle.clone(),
-                target.clone(),
-                local_device_id.clone(),
-            );
-            self.change_request_tasks.insert(target, task);
-        }
-    }
-
-    pub fn set_change_requests_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
-        if self.change_requests_visible != visible {
-            self.change_requests_visible = visible;
-            self.reconcile_change_request_watches(cx);
-        }
     }
 
     pub fn open_deep_link(&mut self, url: &str, cx: &mut Context<Self>) {
@@ -4534,9 +4479,7 @@ fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<(
                     // watch reconciliation and a whole-shell re-render.
                     let changed = state.apply_chats(parsed);
                     let linked = state.apply_pending_deep_link(cx);
-                    if changed {
-                        state.reconcile_change_request_watches(cx);
-                    }
+
                     if changed || linked {
                         cx.notify();
                     }
@@ -4555,104 +4498,6 @@ fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<(
 }
 
 pub use zeron_proto::version_triple;
-
-fn spawn_change_request_watch(
-    cx: &mut Context<AppState>,
-    handle: EngineHandle,
-    target: ChangeRequestWatchKey,
-    local_device_id: Option<String>,
-) -> Task<()> {
-    cx.spawn(async move |this, cx| {
-        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
-        // A host that rejects the checkout (a removed worktree, a folder it
-        // no longer knows) keeps rejecting it, so failed subscribes back off.
-        const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
-        let mut retry_delay = RETRY_DELAY;
-        loop {
-            let params = watch_params(&target, local_device_id.as_deref());
-
-            let mut subscription = match handle
-                .client()
-                .subscribe_checked(methods::WATCH_CHECKOUT_CHANGE_REQUEST, params)
-                .await
-            {
-                Ok(subscription) => {
-                    retry_delay = RETRY_DELAY;
-                    subscription
-                }
-                Err(RpcError::UnknownMethod(_)) => {
-                    tracing::debug!(
-                        device = %target.device_id,
-                        "checkout change requests unsupported on device"
-                    );
-                    this.update(cx, |state, cx| {
-                        let engine_version = state
-                            .devices
-                            .iter()
-                            .find(|device| device.id == target.device_id)
-                            .and_then(|device| device.version.clone());
-                        state
-                            .change_requests
-                            .mark_unsupported(target.device_id.clone(), engine_version);
-                        cx.notify();
-                    })
-                    .ok();
-                    return;
-                }
-                Err(err) => {
-                    tracing::debug!(
-                        device = %target.device_id,
-                        cwd = %target.cwd,
-                        error = %err,
-                        "checkout change request watch unavailable; retrying"
-                    );
-                    if this.update(cx, |_, _| {}).is_err() {
-                        return;
-                    }
-                    cx.background_executor().timer(retry_delay).await;
-                    retry_delay = (retry_delay * 2).min(MAX_RETRY_DELAY);
-                    continue;
-                }
-            };
-
-            while let Some(value) = subscription.recv().await {
-                let snapshot: CheckoutChangeRequestStatus = match serde_json::from_value(value) {
-                    Ok(snapshot) => snapshot,
-                    Err(err) => {
-                        tracing::warn!(
-                            device = %target.device_id,
-                            cwd = %target.cwd,
-                            error = %err,
-                            "dropping malformed checkout change request frame"
-                        );
-                        continue;
-                    }
-                };
-                if this
-                    .update(cx, |state, cx| {
-                        if state.change_requests.store(target.clone(), snapshot) {
-                            cx.notify();
-                        }
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-            }
-
-            // Preserve the latest successful snapshot during a transport gap.
-            tracing::debug!(
-                device = %target.device_id,
-                cwd = %target.cwd,
-                "checkout change request stream ended; resubscribing"
-            );
-            if this.update(cx, |_, _| {}).is_err() {
-                return;
-            }
-            cx.background_executor().timer(RETRY_DELAY).await;
-        }
-    })
-}
 
 fn spawn_watch<T: DeserializeOwned + 'static>(
     cx: &mut Context<AppState>,
@@ -4694,9 +4539,7 @@ fn spawn_watch<T: DeserializeOwned + 'static>(
                 let alive = this.update(cx, |state, cx| {
                     let changed = apply(state, parsed);
                     let linked = state.apply_pending_deep_link(cx);
-                    if changed && matches!(method, methods::WATCH_SPACES | methods::WATCH_DEVICES) {
-                        state.reconcile_change_request_watches(cx);
-                    }
+
                     if changed || linked {
                         cx.notify();
                     }
@@ -4736,10 +4579,6 @@ fn spawn_local_device_probe(cx: &mut Context<AppState>, handle: EngineHandle) ->
                 state.local_device_id = Some(id);
                 state.link_roots_revision = state.link_roots_revision.wrapping_add(1);
                 state.apply_pending_deep_link(cx);
-                // Watches opened before this probe conservatively route through
-                // targetDeviceId. Recreate them now that local routing is known.
-                state.change_request_tasks.clear();
-                state.reconcile_change_request_watches(cx);
                 cx.notify();
             })
             .ok();
@@ -6060,23 +5899,6 @@ mod tests {
 
         state.apply_devices(vec![device("local", "José's MacBook Pro")]);
         assert_eq!(state.device_name("local"), Some("José's MacBook Pro"));
-    }
-
-    #[test]
-    fn device_version_change_reenables_change_request_capability() {
-        let mut state = AppState::new();
-        state
-            .change_requests
-            .mark_unsupported("remote".into(), Some("0.2.2".into()));
-        let mut old = device("remote", "Remote");
-        old.version = Some("0.2.2".into());
-        state.apply_devices(vec![old]);
-        assert!(!state.change_requests.is_supported("remote"));
-
-        let mut upgraded = device("remote", "Remote");
-        upgraded.version = Some("0.2.3".into());
-        state.apply_devices(vec![upgraded]);
-        assert!(state.change_requests.is_supported("remote"));
     }
 
     #[test]
@@ -8904,7 +8726,6 @@ mod tests {
 #[cfg(any(
     feature = "appshots-fixture",
     feature = "source-control-fixture",
-    feature = "pull-request-fixture",
     feature = "project-path-fixture"
 ))]
 impl AppState {
@@ -8914,20 +8735,11 @@ impl AppState {
     }
 }
 
-#[cfg(any(test, feature = "project-palette-fixture"))]
-impl AppState {
-    /// Seed provider metadata for the isolated native sidebar review fixture
-    /// and for tests that click a sidebar badge.
-    pub fn fixture_sidebar_change_request(
-        &mut self,
-        snapshot: zeron_proto::CheckoutChangeRequestStatus,
-    ) {
-        let key = crate::change_requests::ChangeRequestWatchKey {
-            device_id: snapshot.device_id.clone(),
-            cwd: snapshot.cwd.clone(),
-            branch: snapshot.branch.clone(),
-            checkout_id: Some(snapshot.checkout_id.clone()),
-        };
-        self.change_requests.store(key, snapshot);
-    }
+/// A branch stamped by the engine for this conversation's current checkout.
+/// Older scalar metadata can refer to a previous worktree and is not shown.
+pub(crate) fn conversation_branch<'a>(chat: &'a Chat, _spaces: &'a [Space]) -> Option<&'a str> {
+    chat.source_context
+        .as_ref()
+        .map(|source| source.branch.as_str())
+        .filter(|branch| !branch.trim().is_empty())
 }

@@ -1095,7 +1095,7 @@ impl CloudPage {
                 .gap(px(12.0))
                 // Under the header's tile, so the list reads as its children.
                 .pl(px(8.0))
-                .child(crate::pull_request_media::avatar(
+                .child(crate::account_avatar::avatar(
                     owner,
                     SharedString::from(format!("cloud-repo-avatar-{ix}")),
                     20.0,

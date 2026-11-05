@@ -9,7 +9,6 @@ const TITLE: u32 = 100;
 const PROJECT: u32 = 40;
 const BRANCH: u32 = 30;
 const DEVICE: u32 = 20;
-const PULL_REQUEST: u32 = 20;
 
 /// The searchable text of one thread.
 #[derive(Debug, Default, Clone, Copy)]
@@ -18,8 +17,7 @@ pub(super) struct ThreadFields<'a> {
     pub project: &'a str,
     pub branch: &'a str,
     pub device: &'a str,
-    /// Number, title and refs of the thread's pull request.
-    pub pull_request: &'a str,
+
     pub archived: bool,
 }
 
@@ -38,7 +36,6 @@ pub(super) fn score_thread(fields: &ThreadFields, terms: &[String]) -> Option<u3
         (fields.project.to_lowercase(), PROJECT),
         (fields.branch.to_lowercase(), BRANCH),
         (fields.device.to_lowercase(), DEVICE),
-        (fields.pull_request.to_lowercase(), PULL_REQUEST),
     ];
     let mut total = 0;
     for term in terms {
@@ -118,15 +115,15 @@ mod tests {
             &terms,
         )
         .unwrap();
-        let in_pr = score_thread(
+        let in_device = score_thread(
             &ThreadFields {
-                pull_request: "#12 search",
+                device: "search",
                 ..Default::default()
             },
             &terms,
         )
         .unwrap();
-        assert!(in_title > in_project && in_project > in_branch && in_branch > in_pr);
+        assert!(in_title > in_project && in_project > in_branch && in_branch > in_device);
     }
 
     #[test]

@@ -451,7 +451,7 @@ impl Shell {
                 let to = self.files_settled_width(cx);
                 self.transition_files(before.files, before.files_content, to);
             }
-            PaneResizeKind::Right | PaneResizeKind::Terminal | PaneResizeKind::PullRequests => {}
+            PaneResizeKind::Right | PaneResizeKind::Terminal => {}
         }
         self.right_edge_bounce = None;
         // An explicit seam reset may replace the saved workbench width too.

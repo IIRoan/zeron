@@ -1,8 +1,7 @@
 //! Isolated native sidebar review fixture. ZERON_SIDEBAR_COMPACT / ZERON_SIDEBAR_HIDE_LABEL select layout;
 //! ZERON_SIDEBAR_BY_PROJECT groups by project, with a remote clone of the local repository.
 //! ZERON_SIDEBAR_CAPTURE=<dir> saves the window as sidebar.png there and quits (needs the
-//! appshots-fixture feature for render_to_image); its rows' pull requests are open, merged
-//! and closed, for comparing badges.
+//! appshots-fixture feature for render_to_image).
 use gpui::{AppContext, Bounds, WindowBounds, WindowOptions, px, size};
 use zeron_ui::*;
 
@@ -74,14 +73,7 @@ fn main() -> anyhow::Result<()> {
                 s.chats[ix].device_id = "remote".into();
                 s.chats[ix].space_id = Some("backend".into());
             }
-            for ix in [1, 2, 4, 8] {
-                let chat = s.chats[ix].clone();
-                let source = chat.source_context.as_ref().unwrap();
-                s.fixture_sidebar_change_request(zeron_proto::CheckoutChangeRequestStatus {
-                    checkout_id: source.checkout_id.clone(), device_id: chat.device_id.clone(), cwd: source.repo_root.clone(), branch: source.branch.clone(), updated_at: chrono::Utc::now(),
-                    change_request: Some(zeron_proto::ChangeRequestSummary { provider: "github".into(), number: 412 + ix as u64, title: chat.title.clone().unwrap(), url: "https://github.com/zeronsh/zeron/pull/412".into(), state: match ix { 2 => zeron_proto::ChangeRequestState::Merged, 4 => zeron_proto::ChangeRequestState::Closed, _ => zeron_proto::ChangeRequestState::Open }, base_ref: "main".into(), head_ref: source.branch.clone(), signals: None }),
-                });
-            }
+
             if by_project || all_projects {
                 s.spaces[0].repository_id = Some("github.com/zeronsh/fieldnotes".into());
                 s.spaces.push(serde_json::from_value(serde_json::json!({"id":"fieldnotes-remote","deviceId":"remote","path":"/projects/fieldnotes","repositoryId":"github.com/zeronsh/fieldnotes","createdAt":chrono::Utc::now()})).unwrap());

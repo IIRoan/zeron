@@ -73,8 +73,6 @@ settings_index! {
         "effort reasoning slider model list"),
     (EscapeStopsAgent, General, None, "Stop agent with Escape",
         "esc interrupt cancel halt run keyboard"),
-    (PullRequestDestination, General, Some("Links"), "Open pull requests in",
-        "pr pull request badges board browser github"),
     (ThreadNaming, General, None, "Thread naming",
         "titles rename sessions model"),
     (GitPlugin, Plugins, None, "Git",

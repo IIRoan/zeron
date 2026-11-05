@@ -105,7 +105,7 @@ fn preview_link_outcome(activation: &render::LinkActivation) -> render::LinkOutc
     {
         render::LinkOutcome::External(target.clone())
     } else {
-        activation.web_outcome(false)
+        activation.web_outcome()
     }
 }
 

@@ -1,6 +1,6 @@
 //! The session hover card: dwell on a sidebar row and a frosted card floats
 //! out beside it with what the row has no room for — the whole title, the
-//! device and project, the branch, and the pull request.
+//! device, project, and branch.
 //! Compact rows drop all of that, so the card is where it lives on.
 //!
 //! The card waits out a short dwell so sweeping the pointer down the list
@@ -9,8 +9,6 @@
 use std::time::Instant;
 
 use super::*;
-
-use crate::change_requests::ChangeRequestBadgeModel;
 
 /// How long the pointer rests on a row before its card shows.
 const DWELL: Duration = Duration::from_millis(550);
@@ -225,20 +223,18 @@ impl Shell {
     ) -> Option<AnyElement> {
         let theme = Theme::of(cx).for_popup();
         let now = Utc::now();
-        let (title, project, local, online, branch, change_request) = {
+        let (title, project, local, online, branch) = {
             let state = self.state.read(cx);
             let chat = state.chats.iter().find(|chat| chat.id == chat_id)?;
             let space = state.space_for_chat(chat);
             let project = space.map(|space| SharedString::from(space.display_name().to_owned()));
             let local = state.local_device_id.as_deref() == Some(chat.device_id.as_str());
             let online = state.device_online(&chat.device_id, now);
-            let branch = crate::change_requests::conversation_branch(chat, &state.spaces)
+            let branch = crate::state::conversation_branch(chat, &state.spaces)
                 .map(str::trim)
                 .filter(|branch| !branch.is_empty())
                 .map(|branch| SharedString::from(branch.to_owned()));
-            let change_request = state
-                .change_request_for_chat(chat)
-                .map(ChangeRequestBadgeModel::from_summary);
+
             let title = SharedString::from(
                 chat.title
                     .as_deref()
@@ -246,14 +242,7 @@ impl Shell {
                     .filter(|title| !title.is_empty())
                     .unwrap_or_else(|| "New session".to_owned()),
             );
-            (
-                title,
-                project,
-                local,
-                online,
-                branch,
-                change_request,
-            )
+            (title, project, local, online, branch)
         };
 
         let muted = theme.text_muted;
@@ -344,26 +333,6 @@ impl Shell {
             project.clone().unwrap_or_else(|| "No project".into()),
         )
         .text_color(theme.text);
-        // ── The pull request as one more row under the branch: its state
-        // lives in the glyph's and number's color (the badge's).
-        let pull_request = change_request.map(|model| {
-            let tone = model.tone.color(&theme);
-            meta_row(
-                icon(icons::PULL_REQUEST)
-                    .size(px(13.0))
-                    .text_color(tone.opacity(0.9))
-                    .into_any_element(),
-                model.title,
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .font_family(theme.font_mono.clone())
-                    .text_size(crate::typography::ui_rems(11.0))
-                    .text_color(tone.opacity(0.85))
-                    .child(SharedString::from(format!("#{}", model.number))),
-            )
-        });
         let location = div()
             .flex()
             .flex_col()
@@ -371,8 +340,7 @@ impl Shell {
             .text_size(crate::typography::ui_rems(12.0))
             .text_color(muted)
             .child(project_row)
-            .children(branch.map(|branch| meta_row(glyph(icons::GIT_BRANCH), branch)))
-            .children(pull_request);
+            .children(branch.map(|branch| meta_row(glyph(icons::GIT_BRANCH), branch)));
 
         let card = div()
             .w(px(CARD_WIDTH))
@@ -530,16 +498,6 @@ mod tests {
                     "now".into(),
                     "Project".into(),
                     None,
-                    Some(zeron_proto::ChangeRequestSummary {
-                        provider: "github".into(),
-                        number: 90,
-                        title: "Pull request title".into(),
-                        url: "https://github.com/acme/zeron/pull/90".into(),
-                        state: zeron_proto::ChangeRequestState::Open,
-                        base_ref: "main".into(),
-                        head_ref: "feature/pr".into(),
-                        signals: None,
-                    }),
                     None,
                     zeron_proto::ChatIndicator::Idle,
                     false,
@@ -633,36 +591,6 @@ mod tests {
                 assert!(cx.debug_bounds("session-hover-card-hover-test").is_none());
             }
         }
-    }
-
-    #[gpui::test]
-    fn palette_pr_badge_keeps_its_tooltip_without_a_session_card(cx: &mut TestAppContext) {
-        let (shell, cx) = row_setup(cx, false, true);
-        let badge = cx
-            .debug_bounds("pull-request-badge-palette-chat-hover-test-pr")
-            .unwrap()
-            .center();
-        cx.simulate_mouse_move(badge, None, gpui::Modifiers::default());
-        redraw(cx);
-        wait_for_card(cx);
-        assert!(cx.debug_bounds("change-request-tooltip").is_some());
-        shell.read_with(cx, |shell, _| {
-            assert_eq!(shell.session_hover_card.target(), None)
-        });
-    }
-
-    #[gpui::test]
-    fn sidebar_pr_badge_uses_the_session_card_instead_of_a_second_tooltip(cx: &mut TestAppContext) {
-        let (_, cx) = row_setup(cx, false, false);
-        let badge = cx
-            .debug_bounds("pull-request-badge-chat-hover-test-pr")
-            .unwrap()
-            .center();
-        cx.simulate_mouse_move(badge, None, gpui::Modifiers::default());
-        redraw(cx);
-        wait_for_card(cx);
-        assert!(cx.debug_bounds("session-hover-card-hover-test").is_some());
-        assert!(cx.debug_bounds("change-request-tooltip").is_none());
     }
 
     #[gpui::test]

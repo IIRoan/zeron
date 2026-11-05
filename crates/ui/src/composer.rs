@@ -2297,15 +2297,6 @@ impl ComposerInput {
         self
     }
 
-    /// Keep compact fields on one row and reveal the caret horizontally.
-    /// Bound a standalone multiline composer while preserving caret scrolling.
-    pub(crate) fn with_viewport_height(mut self, height: f32) -> Self {
-        let height = height.max(self.configured_line_height);
-        self.viewport_height = Some(height);
-        self.settled_viewport_height = Some(height);
-        self
-    }
-
     pub fn with_single_line(mut self) -> Self {
         self.single_line = true;
         self

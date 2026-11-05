@@ -16,10 +16,9 @@ impl LinkTarget {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LinkAction {
-    /// Normal click or keyboard activation; the user's persisted preference
-    /// decides whether this routes internally or externally.
+    /// Normal click or keyboard activation opens a web URL in the default browser.
     Primary,
-    /// Explicit "Open in Zeron" context-menu action.
+    /// Open a resolved workspace file in the editor. Web URLs still open externally.
     Internal,
     External,
     Copy,
@@ -37,9 +36,11 @@ pub struct LinkActivation {
     pub source_session: Option<String>,
 }
 impl LinkActivation {
-    pub fn web_outcome(&self, embedded: bool) -> LinkOutcome {
+    pub fn web_outcome(&self) -> LinkOutcome {
+        if self.action == LinkAction::Copy {
+            return LinkOutcome::Rejected;
+        }
         match &self.target.navigation {
-            Ok(_) if embedded && self.action == LinkAction::Internal => LinkOutcome::Internal,
             Ok(url) => LinkOutcome::External(url.clone()),
             Err(_) => LinkOutcome::Rejected,
         }
@@ -48,30 +49,29 @@ impl LinkActivation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    fn internal_external_and_unsupported_platform_routes() {
-        let mut a = LinkActivation {
-            target: LinkTarget::new("label", "https://example.com"),
-            action: LinkAction::Internal,
-            source_session: Some("owner".into()),
-        };
-        assert_eq!(a.web_outcome(true), LinkOutcome::Internal);
-        assert_eq!(
-            a.web_outcome(false),
-            LinkOutcome::External("https://example.com/".into())
-        );
-        a.action = LinkAction::External;
-        assert_eq!(
-            a.web_outcome(true),
-            LinkOutcome::External("https://example.com/".into())
-        );
-        a.action = LinkAction::Primary;
-        assert_eq!(
-            a.web_outcome(true),
-            LinkOutcome::External("https://example.com/".into()),
-            "Primary must be resolved by the owning surface"
-        );
+    fn every_web_activation_leaves_through_the_external_opener() {
+        for url in [
+            "https://github.com/acme/repo/pull/12",
+            "https://example.com/docs",
+            "http://localhost:3000/",
+        ] {
+            for action in [
+                LinkAction::Primary,
+                LinkAction::Internal,
+                LinkAction::External,
+            ] {
+                let activation = LinkActivation {
+                    target: LinkTarget::new("link", url),
+                    action,
+                    source_session: None,
+                };
+                assert_eq!(activation.web_outcome(), LinkOutcome::External(url.into()));
+            }
+        }
     }
+
     #[test]
     fn rejected_targets_never_fall_back() {
         for url in [
@@ -91,8 +91,7 @@ mod tests {
                 action: LinkAction::Internal,
                 source_session: Some("chat".into()),
             };
-            assert_eq!(a.web_outcome(false), LinkOutcome::Rejected, "{url}");
-            assert_eq!(a.web_outcome(true), LinkOutcome::Rejected, "{url}");
+            assert_eq!(a.web_outcome(), LinkOutcome::Rejected, "{url}");
         }
     }
     #[test]

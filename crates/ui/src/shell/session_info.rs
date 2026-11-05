@@ -495,7 +495,7 @@ impl Shell {
                         SharedString::from(space.path.clone()),
                     )
                 });
-            let branch = crate::change_requests::conversation_branch(&chat, &state.spaces)
+            let branch = crate::state::conversation_branch(&chat, &state.spaces)
                 .map(str::trim)
                 .filter(|branch| !branch.is_empty())
                 .map(|branch| SharedString::from(branch.to_owned()));
@@ -974,7 +974,7 @@ impl Shell {
     }
 }
 
-/// The pull-request badge's pill, in frosted grey: a sleeping Cloud machine.
+/// A frosted grey pill for a sleeping Cloud machine.
 fn asleep_badge(theme: &Theme) -> impl IntoElement {
     crate::frost::frosted(
         6.0,
