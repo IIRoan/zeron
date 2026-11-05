@@ -270,6 +270,9 @@ pub mod methods {
     pub const GET_PROJECT_TERMINALS: &str = "GetProjectTerminals";
     pub const SAVE_PROJECT_TERMINALS: &str = "SaveProjectTerminals";
     pub const CONTROL_PROJECT_TERMINALS: &str = "ControlProjectTerminals";
+    /// Agent surface: configured services in the calling chat's checkout only.
+    pub const GET_CHAT_SERVICES: &str = "GetChatServices";
+    pub const CONTROL_CHAT_SERVICE: &str = "ControlChatService";
     pub const GET_WORKTREE_SETTINGS: &str = "GetWorktreeSettings";
     pub const SAVE_WORKTREE_SETTINGS: &str = "SaveWorktreeSettings";
     pub const PREPARE_WORKTREE: &str = "PrepareWorktree";
@@ -741,6 +744,9 @@ pub fn agent_allowed(method: &str) -> bool {
             // Publishing or replying as that viewport stays app-only.
             | methods::LIST_BROWSER_TABS
             | methods::CONTROL_BROWSER
+            // Configured services only; no profile editing or terminal access.
+            | methods::GET_CHAT_SERVICES
+            | methods::CONTROL_CHAT_SERVICE
             // Plugins: authoring, installing (lands waiting for the person),
             // checking for updates, and their tools.
             | methods::LIST_PLUGINS
@@ -1362,6 +1368,10 @@ mod tests {
             methods::SET_BUILTIN_PLUGINS,
             methods::OPEN_TERMINAL,
             methods::WRITE_TERMINAL,
+            methods::GET_PROJECT_TERMINALS,
+            methods::SAVE_PROJECT_TERMINALS,
+            methods::CONTROL_PROJECT_TERMINALS,
+            methods::SAVE_WORKTREE_SETTINGS,
             methods::WRITE_WORKSPACE_FILE,
             methods::EXPORT_PLUGIN,
             // The window's own watch of the theme files.
@@ -1387,7 +1397,7 @@ mod tests {
         }
 
         let app = connect_ws(&url, Some(&tokens.full)).await.unwrap();
-        for method in [methods::LIST_BROWSER_TABS, methods::CONTROL_BROWSER] {
+        for method in [methods::LIST_BROWSER_TABS, methods::CONTROL_BROWSER, methods::GET_CHAT_SERVICES, methods::CONTROL_CHAT_SERVICE] {
             assert!(agent_allowed(method), "{method}");
             let asked = agent.call(method, serde_json::json!({})).await.unwrap();
             assert!(asked.as_str().unwrap().starts_with("Agent"), "{method}: {asked}");

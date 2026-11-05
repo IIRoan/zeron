@@ -754,6 +754,7 @@ impl Tools {
         let in_chat = self.zeron.origin().chat_id.is_some();
         let mut catalog = catalog();
         if in_chat { catalog.extend(crate::browser::catalog()); }
+        if in_chat { catalog.extend(crate::services::catalog()); }
         catalog
             .into_iter()
             .filter(|tool| in_chat || ![SHOW_VISUAL, SHOW_IMAGE].contains(&tool.name))
@@ -767,6 +768,9 @@ impl Tools {
     /// `Ok` is the tool's structured result; `Err` is a message the model
     /// should read (surfaced as `isError`, never as a protocol error).
     pub async fn call(&self, name: &str, args: Value) -> Result<Value, String> {
+        if crate::services::NAMES.contains(&name) {
+            return crate::services::call(&self.zeron, name, args).await.map_err(|error| format!("{error:#}"));
+        }
         if name.starts_with("browser_") {
             return crate::browser::call(&self.zeron, name, args).await.map_err(|error| format!("{error:#}"));
         }

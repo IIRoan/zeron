@@ -29,6 +29,13 @@ browser_snapshot for current element refs, browser_wait after navigation, and \
 browser_screenshot to inspect the rendered page. Refresh a snapshot after a stale \
 ref error. A timeout can occur after an action took effect; inspect before retrying.\n\
 \n\
+When service tools are available, call service_list to find configured services \
+and databases in your chat's project and checkout. Use their ids with service_status, \
+service_start, service_restart and service_stop. You can control these directly. \
+Databases are shared across project checkouts; app services respect the project's \
+checkout mode. Check status and database readiness after an action; after a timeout \
+or lost connection inspect status before retrying.\n\
+\n\
 Zeron runs coding agents in chats, each hosted on a device, optionally in a project \
 (a folder on that specific device). These tools operate the local Zeron engine: \
 discover devices/projects/chats, create chats with a chosen harness and \

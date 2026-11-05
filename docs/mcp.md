@@ -144,6 +144,23 @@ and opens either in the right pane.
 On Linux, agents can also control explicitly enabled browser tabs in their own
 chat. See [Browser automation](browser-automation.md) for tools, consent,
 platform support, and validation.
+
+Agents also have `service_list`, `service_status`, `service_start`,
+`service_restart`, and `service_stop`. They use the desktop's service manager
+for the calling chat's project and checkout, including its configured databases.
+These controls are available directly; no browser consent toggle is required.
+`service_list {}` returns ids, names, process status, database readiness, exit
+codes and restart counts. The other tools take `{"serviceId":"<listed id>"}`.
+Status reads never activate a checkout. Starting a service runs the usual setup
+and readiness checks and respects the project's Follow active / Parallel mode.
+Databases have `scope: "project"`: stopping or restarting one affects every
+checkout sharing it. App services have `scope: "checkout"`. Use `service_status`
+to check readiness after an action. A service with no run is reported as stopped.
+Only configured entries can be controlled; these tools do not edit commands or
+settings, expose shell/environment configuration, or take arbitrary paths.
+A chat without a project receives an explanatory error. An older daemon asks
+the agent to update Zeron rather than claiming the action succeeded.
+
 Chat status uses the same shared derivation as the sidebar, including OSC 7501
 reports from chat-owned terminals. `status` is `working`, `awaitingInput`,
 `completed` (an unseen result), `errored`, or `idle`; `sessionStatus` retains the
@@ -176,6 +193,8 @@ name (default: the local engine's device).
 | `archive_chat`     | `Mutate setChatArchived`                                  |
 | `show_visual`      | `PublishVisual {chatId, title, script, assets}` (origin chat only; assets base64 by name, read by the MCP server from the agent's cwd) |
 | `show_image`       | `PublishImage {chatId, name, data}` (origin chat only; the file base64, read by the MCP server from the agent's cwd) |
+| `service_list`, `service_status` | `GetChatServices {chatId}` (origin chat only) |
+| `service_start`, `service_restart`, `service_stop` | `ControlChatService {chatId, serviceId, action}` (origin chat only; mutations are not replayed on reconnect) |
 
 Watch streams are the engine's only read surface (there is no one-shot "get
 transcript" RPC); a snapshot is "subscribe, take the first item, drop" — drop

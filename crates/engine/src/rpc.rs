@@ -60,6 +60,7 @@
 //! whose checkout always lives on the routed target device.
 
 mod agent_gate;
+mod services;
 mod direct;
 mod voice_chat;
 mod voice_remote;
@@ -5152,8 +5153,15 @@ impl RpcService for EngineRpc {
             }
             methods::GET_PROJECT_TERMINALS
             | methods::SAVE_PROJECT_TERMINALS
-            | methods::CONTROL_PROJECT_TERMINALS => {
-                let mut p: ProjectTerminalsParams = parse_params(params)?;
+            | methods::CONTROL_PROJECT_TERMINALS
+            | methods::GET_CHAT_SERVICES
+            | methods::CONTROL_CHAT_SERVICE => {
+                let chat_services = matches!(method, methods::GET_CHAT_SERVICES | methods::CONTROL_CHAT_SERVICE);
+                let mut p: ProjectTerminalsParams = if chat_services {
+                    self.chat_services_params(method, params)?
+                } else {
+                    parse_params(params)?
+                };
                 let space = self.local_project_action_space(&p.space_id)?;
                 let root = std::path::PathBuf::from(&space.path);
                 if let Some(chat_id) = &p.chat_id {
@@ -5215,7 +5223,8 @@ impl RpcService for EngineRpc {
                             .map_err(|e| RpcError::Failed(e.to_string()))?,
                     }
                 }
-                let snapshot = if method == methods::CONTROL_PROJECT_TERMINALS {
+                let project_id = space.id.clone();
+                let snapshot = if matches!(method, methods::CONTROL_PROJECT_TERMINALS | methods::CONTROL_CHAT_SERVICE) {
                     profiles
                         .control_checkout(
                             &self.terminals,
@@ -5241,7 +5250,11 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?
                     .map_err(|e| RpcError::Failed(e.to_string()))?
                 };
-                RpcReply::value(&snapshot)
+                if chat_services {
+                    Ok(RpcReply::Value(services::snapshot(&project_id, snapshot)))
+                } else {
+                    RpcReply::value(&snapshot)
+                }
             }
             methods::RUN_PROJECT_ACTION => {
                 let p: RunProjectActionParams = parse_params(params)?;

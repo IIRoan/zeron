@@ -1056,6 +1056,12 @@ impl ProjectTerminals {
         let config = self
             .checkout_snapshot(space, root, checkout, &settings)?
             .config;
+        // Reject stale ids before preparing a checkout or handing off processes.
+        if let Some(id) = service_id
+            && !config.services.iter().any(|service| service.id == id)
+        {
+            return Err(EngineError::Other(format!("Unknown service id: {id}")));
+        }
         let shared: HashSet<_> = config
             .services
             .iter()

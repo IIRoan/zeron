@@ -18,6 +18,7 @@
 
 mod jsonrpc;
 mod browser;
+mod services;
 mod tools;
 mod transcript;
 mod zeron;
