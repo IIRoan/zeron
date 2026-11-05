@@ -1,0 +1,22 @@
+{
+  "id": "zeron-git",
+  "name": "Zeron Git (Fork)",
+  "version": "1.1.0",
+  "description": "Source control with staged and unstaged groups, shared syntax highlighting, branch and stash commands, and recoverable discard using the Linux fork's Git implementation.",
+  "icon": "icon.svg",
+  "entry": "init.luau",
+  "service": "service.luau",
+  "permissions": [
+    "ui.add",
+    "sessions.read",
+    "files.read",
+    "panel.tabs",
+    "service",
+    "commands",
+    "clipboard",
+    "compose"
+  ],
+  "commands": [
+    "git"
+  ]
+}

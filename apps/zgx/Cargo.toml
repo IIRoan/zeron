@@ -24,6 +24,8 @@ path = "src/main.rs"
 # staging's built in) and Zeron.app's own engine (the bundle's `Zeron Engine`,
 # ~/.zeron, port 27654), managed as Zeron.app manages it. Without it, the app
 # stays on staging (src/auth.rs, src/engine/manager.rs).
+# On Linux the beta has its own app id, profile and engine port, and uses
+# scripts/install-zgx-beta.py for separate, manually installed releases.
 beta = []
 
 [dependencies]
@@ -86,6 +88,7 @@ zatex = { path = "../../crates/zatex", features = ["bundled"] }
 # Imported VS Code themes (src/themes.rs): the shipping app's theme crate,
 # its importer, library file and error words.
 zeron-theme = { path = "../../crates/theme" }
+zeron-syntax = { path = "../../crates/syntax" }
 # (A preview's process label and redacted command line, one copy with the
 # engine that advertises them; no dependencies.)
 zeron-preview-label = { path = "../../crates/preview-label" }

@@ -1168,6 +1168,7 @@ impl Plugins {
     /// own for its off switch). Under the scan lock, which installs hold
     /// while they swap a folder.
     fn prune_state(&self) {
+        let builtin = lock(&self.inner.builtin_dir).clone();
         let names = |dir: &Path| -> Vec<String> {
             scan::plugin_dirs(dir)
                 .iter()
@@ -1175,8 +1176,17 @@ impl Plugins {
                 .collect()
         };
         let mut present: std::collections::BTreeSet<String> = names(&self.inner.plugins_dir).into_iter().collect();
-        if let Some(dir) = lock(&self.inner.builtin_dir).clone() {
-            present.extend(names(&dir));
+        if let Some(builtin) = builtin {
+            present.extend(names(&builtin));
+        } else {
+            // The desktop registers bundled plugins after connecting.
+            // Keep their off switches until it does. Still prune missing
+            // own ids immediately: retaining those could adopt a stranger's
+            // replacement folder as the user's own plugin.
+            let state = lock(&self.inner.state);
+            present.extend(state.decisions.iter().filter(|(id, decision)| {
+                !state.own.contains(*id) && decision.off && decision.author_key.is_none()
+            }).map(|(id, _)| id.clone()));
         }
         let pruned = {
             let mut state = lock(&self.inner.state);

@@ -56,6 +56,46 @@ const STAGING_PORT: u16 = 27871;
 const STAGING_DATA: &str = ".zeron-staging";
 
 const BETA: bool = cfg!(feature = "beta");
+pub const LINUX_BETA: bool = cfg!(all(feature = "beta", target_os = "linux"));
+pub const LINUX_BETA_PORT: u16 = 27946;
+pub fn linux_beta_data(home: &Path) -> PathBuf {
+    home.join(".local/share/zeron-beta/profile/engine")
+}
+
+// Resolve existing ancestors too: a new child of a symlink into regular
+// Zeron must not escape the side-by-side profile boundary.
+fn resolved(path: &Path) -> PathBuf {
+    let mut clean=PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::CurDir => {},
+            std::path::Component::ParentDir => { clean.pop(); },
+            other => clean.push(other.as_os_str()),
+        }
+    }
+    let mut tail=Vec::new();let mut parent=clean.as_path();
+    while !parent.exists() {
+        if let Some(name)=parent.file_name() { tail.push(name.to_owned()); }
+        let Some(next)=parent.parent() else { return clean };
+        parent=next;
+    }
+    let mut result=std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    for part in tail.into_iter().rev() { result.push(part); }
+    result
+}
+
+fn beta_profile(port: u16, data: &Path, home: &Path) -> Result<(),Refusal> {
+    if [0,zeron_cli::DEFAULT_IPC_PORT,STAGING_PORT,27936].contains(&port) {
+        return Err(format!("port {port} belongs to another Zeron installation"));
+    }
+    if !data.is_absolute() { return Err("Zeron Beta needs an absolute data directory".into()); }
+    let data=resolved(data);
+    for root in [home.join(".zeron"),home.join(".comet-native"),home.join(STAGING_DATA),home.join(".local/share/zeron-zgx-demo")] {
+        let root=resolved(&root);
+        if data.starts_with(&root) || root.starts_with(&data) { return Err("Zeron Beta needs a profile separate from regular Zeron and the demo".into()); }
+    }
+    Ok(())
+}
 
 /// The soonest a second engine is started after the first.
 const SPAWN_SPACING: Duration = Duration::from_secs(10);
@@ -155,11 +195,15 @@ impl Config {
         if (edge, client, callback_port) != (production.edge.as_str(), production.client.as_str(), production.port) {
             return Err(format!("{edge} isn't production's edge and sign-in"));
         }
-        let port = zeron_cli::ipc_port_from(var("ZERON_IPC_PORT").as_deref());
+        let port = if LINUX_BETA {
+            var("ZERON_IPC_PORT").map(|s| s.parse::<u16>().map_err(|_| "Invalid Zeron Beta IPC port".to_string())).transpose()?.unwrap_or(LINUX_BETA_PORT)
+        } else { zeron_cli::ipc_port_from(var("ZERON_IPC_PORT").as_deref()) };
         let data_dir = zeron_cli::paths::resolve_data_dir(|key| match key {
             "HOME" => Some(home.as_os_str().to_owned()),
+            "ZERON_DATA_DIR" if LINUX_BETA => Some(var(key).map(PathBuf::from).unwrap_or_else(|| linux_beta_data(home)).into_os_string()),
             key => var(key).map(Into::into),
         });
+        if LINUX_BETA { beta_profile(port,&data_dir,home)?; }
         if port == STAGING_PORT {
             return Err(format!("port {STAGING_PORT} is the staging engine's"));
         }
@@ -170,12 +214,12 @@ impl Config {
             port,
             data_dir,
             bin: exe.and_then(zeron_launch::engine_executable),
-            home: None,
+            home: if LINUX_BETA { var("ZERON_ZGX_ENGINE_HOME").map(|p| expand(&p,home)) } else { None },
             spawn: true,
             edge: edge.into(),
             client: client.into(),
             callback_port,
-            managed: true,
+            managed: !LINUX_BETA,
         })
     }
 
@@ -419,14 +463,15 @@ mod tests {
         let macos = dir.join("Zeron.app/Contents/MacOS");
         std::fs::create_dir_all(&macos).unwrap();
         let exe = macos.join("zeron");
-        std::fs::write(macos.join("Zeron Engine"), "").unwrap();
+        let helper=macos.join(zeron_launch::ENGINE_EXECUTABLES[0]);
+        std::fs::write(&helper, "").unwrap();
         let home = Path::new("/Users/someone");
         let prod = crate::auth::production();
         let beta = config_of(&[], home, Some(&exe), &prod.edge).unwrap();
-        assert_eq!((beta.port, beta.data_dir.clone()), (27654, home.join(".zeron")));
-        assert_eq!(beta.startable(), Some(macos.join("Zeron Engine").as_path()));
+        assert_eq!((beta.port, beta.data_dir.clone()), if LINUX_BETA { (LINUX_BETA_PORT,linux_beta_data(home)) } else { (27654, home.join(".zeron")) });
+        assert_eq!(beta.startable(), Some(helper.as_path()));
         assert_eq!((beta.edge.as_str(), beta.client.as_str(), beta.callback_port), (prod.edge.as_str(), prod.client.as_str(), 27641));
-        assert!(beta.follows_bundle());
+        assert_eq!(beta.follows_bundle(), !LINUX_BETA);
         // As Zeron.app: ZERON_DATA_DIR and ZERON_IPC_PORT move it; the
         // development variables don't.
         let moved = config_of(&[("ZERON_DATA_DIR", "/tmp/z"), ("ZERON_IPC_PORT", "27700"), ("ZERON_ZGX_ENGINE_PORT", "1")], home, Some(&exe), &prod.edge).unwrap();
@@ -436,6 +481,30 @@ mod tests {
         assert!(config_of(&[("ZERON_DATA_DIR", "/Users/someone/.zeron-staging")], home, Some(&exe), &prod.edge).is_err());
         assert!(config_of(&[], home, Some(&exe), "https://staging.zeron.sh").is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(all(feature="beta",target_os="linux"))]
+    #[test]
+    fn linux_beta_refuses_other_profiles_and_ports() {
+        let home=std::env::temp_dir().join(format!("zgx-beta-profile-{}",std::process::id()));
+        std::fs::create_dir_all(home.join(".zeron")).unwrap();
+        let prod=crate::auth::production();
+        for port in ["0","27654","27871","27936","invalid"] {
+            assert!(config_of(&[("ZERON_IPC_PORT",port)],&home,None,&prod.edge).is_err(),"{port}");
+        }
+        for root in [".zeron/profiles/local",".zeron-staging/child",".comet-native",".local/share/zeron-zgx-demo/profile/engine","."] {
+            let dir=home.join(root).to_string_lossy().into_owned();
+            assert!(config_of(&[("ZERON_DATA_DIR",&dir)],&home,None,&prod.edge).is_err(),"{root}");
+        }
+        let alias=home.join("alias");
+        std::os::unix::fs::symlink(home.join(".zeron"),&alias).unwrap();
+        let linked=alias.join("new-child").to_string_lossy().into_owned();
+        assert!(config_of(&[("ZERON_DATA_DIR",&linked)],&home,None,&prod.edge).is_err());
+        assert!(config_of(&[("ZERON_DATA_DIR","relative/path")],&home,None,&prod.edge).is_err());
+        let beta=config_of(&[],&home,None,&prod.edge).unwrap();
+        assert_eq!(beta.data_dir,linux_beta_data(&home));
+        assert!(!beta.follows_bundle());
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]

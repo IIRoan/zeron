@@ -1,0 +1,19 @@
+{
+  "id": "project-services",
+  "name": "Project Services",
+  "version": "1.1.0",
+  "description": "Manage services in a tool sidebar, with shared databases, live output, and checkout-specific project settings.",
+  "icon": "icon.svg",
+  "entry": "init.luau",
+  "permissions": [
+    "ui.add",
+    "sessions.read",
+    "files.read",
+    "panel.tabs",
+    "pages.add",
+    "commands"
+  ],
+  "commands": [
+    "sh"
+  ]
+}

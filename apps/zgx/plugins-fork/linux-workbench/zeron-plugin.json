@@ -1,0 +1,21 @@
+{
+  "id": "linux-workbench",
+  "name": "Linux Workbench",
+  "version": "1.1.0",
+  "description": "Linux workbench with tools and services on the left, project chats on the right, directory navigation, workspace search, and an optional shell terminal dock.",
+  "entry": "init.luau",
+  "permissions": [
+    "ui.replace"
+  ],
+  "ui": {
+    "replace": [
+      "@app/screens/shell",
+      "@app/screens/shell/page",
+      "@app/screens/shell/sidebar",
+      "@app/screens/panel",
+      "@app/screens/files",
+      "@app/screens/shell/project_look",
+      "@app/screens/settings/about"
+    ]
+  }
+}

@@ -402,6 +402,7 @@ impl Sessions {
                     ("name", Value::from(project_name(p["name"].as_str(), path))),
                     ("device", Value::from(p["deviceId"].as_str().unwrap_or_default())),
                     ("path", Value::from(path)),
+                    ("identity", Value::from(p["repositoryId"].as_str().filter(|v| !v.is_empty()).unwrap_or(id))),
                     ("git", Value::Bool(p["gitDetected"].as_bool().unwrap_or(false))),
                     // Its GitHub repository (`owner/name`), the one a Cloud
                     // chat of it clones.
@@ -849,6 +850,7 @@ struct Live {
     /// Its subagents streaming now (the session row's `runningSubagents`),
     /// none once the row has gone quiet.
     subagents: u32,
+    background: bool,
 }
 
 /// When the next live state that shows (not idle, not yet stale) goes
@@ -858,7 +860,7 @@ fn next_stale(value: &Json, now: i64) -> Option<i64> {
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|row| row["status"].as_str().is_some_and(|s| s != "idle"))
+        .filter(|row| row["status"].as_str().is_some_and(|s| s != "idle") || has_background(row) || row["runningSubagents"].as_u64().unwrap_or(0) > 0)
         .filter_map(|row| row["updatedAt"].as_str().and_then(unix_seconds))
         .map(|updated| updated + STALE_SECS + 1)
         .filter(|&at| at > now)
@@ -891,13 +893,20 @@ fn live_states(value: &Json, now: i64) -> HashMap<String, Live> {
         }
         let interrupted = row["lastTurnOutcome"]["status"].as_str() == Some("interrupted");
         let subagents = if now - updated > STALE_SECS { 0 } else { row["runningSubagents"].as_u64().unwrap_or(0) as u32 };
-        let entry = out.entry(chat.to_owned()).or_insert(Live { status: "idle".into(), interrupted, subagents: 0 });
+        let background = now - updated <= STALE_SECS && has_background(row);
+        let entry = out.entry(chat.to_owned()).or_insert(Live { status: "idle".into(), interrupted, subagents: 0, background: false });
         entry.subagents = entry.subagents.max(subagents);
+        entry.background |= background;
         if entry.status == "idle" {
-            *entry = Live { status, interrupted, subagents: entry.subagents };
+            *entry = Live { status, interrupted, subagents: entry.subagents, background: entry.background };
         }
     }
     out
+}
+
+fn has_background(row: &Json) -> bool {
+    row["runningBackgroundTasks"].as_u64().unwrap_or(0) > 0
+        || row["backgroundTasks"].as_array().is_some_and(|tasks| !tasks.is_empty())
 }
 
 /// The sidebar's state for a chat (proto's `chat_indicator`): working,
@@ -915,6 +924,7 @@ fn status(chat: &Json, live: Option<&Live>) -> Option<&'static str> {
         Some("working") => Some("working"),
         Some("awaitingInput") => Some("input"),
         Some("errored") if unseen => Some("failed"),
+        _ if live.is_some_and(|l| l.background || l.subagents > 0) => Some("working"),
         _ if unseen && !live.is_some_and(|l| l.interrupted) => Some("done"),
         _ => None,
     }
@@ -1331,6 +1341,22 @@ mod tests {
         assert_eq!(id.len(), 36);
         assert_eq!(&id[14..15], "4");
         assert_ne!(id, new_id());
+    }
+
+    #[test]
+    fn idle_background_work_uses_the_working_indicator_and_expires() {
+        let now=unix_seconds("2026-11-01T10:00:00Z").unwrap();
+        let chat=json!({"lastMessageAt":"2026-11-01T10:00:00Z","lastSeenAt":"2026-11-01T10:00:00Z"});
+        for extra in [json!({"runningBackgroundTasks":1}),json!({"backgroundTasks":[{"id":"server"}]}),json!({"runningSubagents":1})] {
+            let mut row=json!({"chatId":"chat","status":"idle","updatedAt":"2026-11-01T10:00:00Z"});
+            for (k,v) in extra.as_object().unwrap() {row[k]=v.clone();}
+            let rows=json!([row]);
+            let active=live_states(&rows,now);
+            assert_eq!(status(&chat,active.get("chat")),Some("working"));
+            assert_eq!(next_stale(&rows,now),Some(now+STALE_SECS+1));
+            let stale=live_states(&rows,now+STALE_SECS+1);
+            assert_eq!(status(&chat,stale.get("chat")),None);
+        }
     }
 
     /// Chats (a parent, two side chats, one working, one archived) and

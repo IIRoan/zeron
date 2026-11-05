@@ -43,6 +43,9 @@ pub const SHARED_READ: &[(&str, Option<&str>)] = &[
     // work no one would see waits for it.
     ("zgx.window.shown", None),
     ("zgx.window.active", None),
+    // A boolean only, so project settings can guard worktree removal without
+    // revealing file paths or editor contents to plugins.
+    ("zeron.unsaved_editors", None),
 ];
 
 /// What plugins may change of the app's own shared state, and the grant
@@ -66,7 +69,7 @@ pub const ACTIONS: &[(&str, &str)] = &[
 pub const NEVER_REPLACED: &[&str] = &["@app/screens/plugins", "@app/screens/shell/settings"];
 
 /// Each plugin's own actions (`plugin.<id>.<name>`).
-pub const OWN_ACTIONS: &[&str] = &["result", "ack", "send", "menus", "toast", "problem", "open_tab", "add_page", "github_watch", "github_call", "store_set", "setting_status", "open_url", "notify", "cost", "run", "db", "service_call", "menu_run", "compose_comment", "file", "block"];
+pub const OWN_ACTIONS: &[&str] = &["result", "ack", "send", "menus", "toast", "problem", "open_tab", "add_page", "github_watch", "github_call", "store_set", "setting_status", "open_url", "notify", "cost", "run", "db", "service_call", "menu_run", "compose_comment", "file", "block", "workbench"];
 /// Each plugin's own shared state, to read (`plugin.<id>.<name>`).
 pub const OWN_SHARED: &[&str] = &["calls", "inbox", "records", "github", "store", "settings", "locales", "menu_items", "composed"];
 

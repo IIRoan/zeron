@@ -340,6 +340,7 @@ pub fn install(cx: &mut WindowContext, host: &ScriptHost) {
     host.async_action("about.apply", move |_| {
         let a = a.clone();
         async move {
+            if crate::engine::manager::LINUX_BETA { return Err("unmanaged".to_string()); }
             let desktop = a.desktop.borrow().clone();
             if let Some(desktop) = desktop {
                 if let Some(why) = desktop.status.borrow().as_ref().and_then(|s| s.held.clone()) {
@@ -485,7 +486,9 @@ impl About {
         let mut fields = vec![
             ("app_version", Value::from(APP_VERSION)),
             ("app_build", Value::from(app_build().as_str())),
-            ("available", Value::Bool(self.available())),
+            ("available", Value::Bool(!crate::engine::manager::LINUX_BETA && self.available())),
+            ("manual_updates", Value::Bool(crate::engine::manager::LINUX_BETA)),
+            ("app_name", Value::from(if crate::engine::manager::LINUX_BETA { "Zeron Beta" } else { "Zeron" })),
             ("self_updating", Value::Bool(false)),
             ("channels", Value::Bool(false)),
             ("switch", Value::Bool(false)),

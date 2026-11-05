@@ -53,6 +53,8 @@ pub mod preview;
 pub mod host_bar;
 pub mod locales;
 pub mod plugin_menus;
+pub mod workbench;
+pub mod highlight;
 
 use std::{
     cell::{Cell, RefCell},
@@ -153,15 +155,16 @@ impl Item {
             return None;
         }
         let ui = &self.json["ui"];
+        let mut granted = grants::capabilities(
+            self.id(), &self.permissions(), &self.list(&ui["change"]), &self.list(&ui["replace"]),
+        );
+        // An approved shell already has native process authority. Services
+        // use zgx's terminal only to attach to their existing engine PTY.
+        if workbench::shell_allowed(self) { granted.push(Capability::Terminals); }
         Some(Plugin {
             name: self.id().into(),
             entry: snapshot.join(entry),
-            grants: grants::capabilities(
-                self.id(),
-                &self.permissions(),
-                &self.list(&ui["change"]),
-                &self.list(&ui["replace"]),
-            ),
+            grants: granted,
         })
     }
 }
@@ -2127,6 +2130,32 @@ impl Bridge {
                     let asked = value_json(&asked);
                     let ran = off_thread(move || commands::run(&asked, &allowed)).await.ok_or("The program couldn't be run")??;
                     Ok(json_value(&ran))
+                }
+            }
+        });
+        host.async_action(format!("plugin.{id}.workbench"), {
+            let (me, plugin) = (me.clone(), plugin.clone());
+            move |asked| {
+                let (me, plugin) = (me.clone(), plugin.clone());
+                async move {
+                    let bridge = me.upgrade().ok_or("The window closed")?;
+                    let item = bridge.item(&plugin).ok_or("This plugin isn't on")?;
+                    let records = bridge.sources(false).sessions;
+                    let request = workbench::prepare(&item, &records, &value_json(&asked))?;
+                    let reply = if request.method == "HighlightGitDiff" {
+                        off_thread(move || highlight::diff(&request.params)).await.ok_or("The highlighter stopped")??
+                    } else { call(&request.method, request.params).await? };
+                    // Revoking/removing the plugin while an action runs must
+                    // not lend its reply to a replacement of the same id.
+                    if !bridge.item(&plugin).is_some_and(|now| now.status()=="on" && now.hash()==item.hash()) {
+                        return Err("This plugin changed while the request was running".into());
+                    }
+                    if request.kind == workbench::Kind::ServiceTerminal {
+                        let terminal = workbench::terminal(&reply, request.service.as_deref().unwrap_or_default())?;
+                        let device = crate::files::route_to(Some(request.device)).await;
+                        let command = crate::terminal::command(json_value(&json!({"id":terminal})), device)?;
+                        Ok(Value::record([("id", Value::from(terminal.as_str())), ("command", command)]))
+                    } else { Ok(json_value(&reply)) }
                 }
             }
         });

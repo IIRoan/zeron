@@ -232,7 +232,7 @@ fn quote(word: &str) -> String {
 
 /// The bridge's command line for terminal `arg.id` (on `device`, another
 /// device's, routed there).
-fn command(arg: Value, device: Option<String>) -> Result<Value, String> {
+pub(crate) fn command(arg: Value, device: Option<String>) -> Result<Value, String> {
     let (port, data) = engine::get().ipc_endpoint().ok_or("Zeron isn't available here")?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let id = text(arg.field("id"));

@@ -908,6 +908,12 @@ impl Files {
         params.insert("query".into(), Json::String(text(arg.field("query"))));
         params.insert("limit".into(), json!(cap("limit", 100, 500)));
         params.insert("perFileLimit".into(), json!(cap("per_file", 3, 50)));
+        if let Some(options) = arg.field("options") {
+            let value = crate::plugins::value_json(options);
+            if !value.is_object() { return Err("Search options must be an object".into()); }
+            // The engine validates its typed search options, alongside the target.
+            params.insert("options".into(), value);
+        }
         let found = self.call("SearchWorkspaceContent", params).await?;
         if self.content_searches.get() != mine {
             return Err("superseded".into());

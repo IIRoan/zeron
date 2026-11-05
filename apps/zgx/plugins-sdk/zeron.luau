@@ -1213,6 +1213,23 @@ return function(id: string): any
 		ui.invoke(`{prefix}.toast`, text)
 	end
 
+	-- The fork's project tools, implemented by the same engine as its
+	-- original desktop UI. The host derives device/folder from these ids,
+	-- permits only named Git/Services operations and checks the plugin's
+	-- grants on every call. Capture scope when opening a form or menu so a
+	-- later checkout switch refuses its stale actions.
+	-- Git needs commands("git"), sessions.read and files.read; Services
+	-- needs commands("sh"), sessions.read and files.read.
+	function M.workbench(method: string, context: any, params: any?): any
+		return ui.call(`{prefix}.workbench`, {
+			method = method,
+			session = context.session or ui.null,
+			project = context.project or ui.null,
+			scope = context.scope or ui.null,
+			params = params or {},
+		})
+	end
+
 	made[id] = M
 	return M
 end

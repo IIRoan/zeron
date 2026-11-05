@@ -1066,6 +1066,30 @@ async fn plugins_zeron_s_own_are_allowed_what_they_ask_turn_off_and_never_go() {
 }
 
 #[tokio::test]
+async fn bundled_plugin_off_choice_survives_engine_restart_before_app_registration() {
+    let f = fixture();
+    let shipped = f.data.join("app-plugins");
+    std::fs::create_dir_all(&shipped).unwrap();
+    write_plugin(&shipped, "git", serde_json::json!({ "permissions": ["ui.add"] }), None);
+    call(&f.plugins, methods::SET_BUILTIN_PLUGINS, serde_json::json!({ "dir": shipped })).await.unwrap();
+    call(&f.plugins, methods::SET_PLUGIN_OFF, serde_json::json!({ "id": "git", "off": true })).await.unwrap();
+    call(&f.plugins, methods::NEW_PLUGIN, serde_json::json!({ "id": "removed-own", "name": "Mine" })).await.unwrap();
+    std::fs::remove_dir_all(f.plugins.plugins_dir().join("removed-own")).unwrap();
+
+    let restarted = Plugins::new(&f.data, "dev-1");
+    // A scan/watch can run before the desktop supplies its app directory.
+    assert!(call(&restarted, methods::LIST_PLUGINS, serde_json::json!({})).await.unwrap()["plugins"].as_array().unwrap().is_empty());
+    assert!(!lock(&restarted.inner.state).own.contains("removed-own"));
+    call(&restarted, methods::SET_BUILTIN_PLUGINS, serde_json::json!({ "dir": shipped })).await.unwrap();
+    assert_eq!(item(&restarted, "git").await["status"], "off");
+
+    // Once registration is complete, genuinely removed choices still go.
+    std::fs::remove_dir_all(shipped.join("git")).unwrap();
+    restarted.rescan().await;
+    assert!(!lock(&restarted.inner.state).decisions.contains_key("git"));
+}
+
+#[tokio::test]
 async fn plugins_zeron_s_own_load_from_the_app_s_folder_with_none_of_yours_beside_it() {
     // (The test above has a folder of yours by the same name, which hid that
     // the snapshot was copied from `<data>/plugins/<id>`: Zeron's own never

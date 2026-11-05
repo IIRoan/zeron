@@ -11,9 +11,9 @@
 //!   update, a file written by hand), the account's signing keys (one added
 //!   on another device, this device's revoked), and the default interface
 //!   at launch because the template crashed Zeron (safe mode);
-//! - on Linux and Windows, which have no system menu bar, the app's menu
-//!   bar (zgx's `app_menu_bar`): View → Use Zeron v3 is always in
-//!   it, the host's own item.
+//! - on Windows, the app's fallback menu bar (zgx's `app_menu_bar`). Linux
+//!   keeps the full window for the workbench; commands and shortcuts are
+//!   still registered independently by `menu_bar`.
 //!
 //! The toasts look like the app's own (ds/toast.luau: its width, corner,
 //! padding and type) and share their corner, the window's bottom right,
@@ -176,11 +176,13 @@ fn dismiss(signal: &zgx::reactive::Signal<Vec<Shown>>, id: u64) {
     }
 }
 
-/// The toasts, and the menu bar where there's no system one: above the
-/// scripts' view.
+/// The host's toasts and, outside Linux, the fallback menu bar.
 pub fn view(cx: &mut WindowContext) -> View {
     let toasts = toasts(&cx.ui.runtime);
-    column().child(toasts).children((!zgx_desktop::has_native_app_menu()).then(|| cx.app_menu_bar()))
+    column().child(toasts).children(
+        (!cfg!(target_os = "linux") && !zgx_desktop::has_native_app_menu())
+            .then(|| cx.app_menu_bar()),
+    )
 }
 
 /// Development (debug builds): `ZERON_ZGX_HOST_TOASTS=1` lays the toasts

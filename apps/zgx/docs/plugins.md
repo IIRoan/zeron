@@ -4,6 +4,19 @@ A plugin is a folder: `zeron-plugin.json` (its manifest), `init.luau` (its code)
 
 ## Manifest
 
+The Linux fork also exposes `zeron.workbench(method, context, params)` for
+project tools. `context` identifies a known `session` or `project`; an
+optional captured `scope = { device, project, cwd }` rejects a checkout
+change while a menu or request is pending. The host resolves routing from
+its own records and checks the plugin's current grants and content hash.
+This is a bounded list of Services/worktree and Git methods, with no IPC
+token or general engine RPC access. Services requires `sessions.read`,
+`files.read`, and approved `commands: ["sh"]`; Git requires the same grants
+with `commands: ["git"]`. `ProjectServiceTerminal` only attaches to a PTY
+belonging to a configured service in that project. See
+`plugins-fork/project-services` and `plugins-fork/zeron-git` for callers;
+the stock Git and GitHub plugin implementations stay unchanged.
+
 ```json
 {
   "id": "focus-timer",
