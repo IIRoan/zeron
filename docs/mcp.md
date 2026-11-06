@@ -150,14 +150,32 @@ Agents also have `service_list`, `service_status`, `service_start`,
 for the calling chat's project and checkout, including its configured databases.
 These controls are available directly; no browser consent toggle is required.
 `service_list {}` returns ids, names, process status, database readiness, exit
-codes and restart counts. The other tools take `{"serviceId":"<listed id>"}`.
+codes and restart counts. The status/control tools take `{"serviceId":"<listed id>"}`.
 Status reads never activate a checkout. Starting a service runs the usual setup
 and readiness checks and respects the project's Follow active / Parallel mode.
 Databases have `scope: "project"`: stopping or restarting one affects every
 checkout sharing it. App services have `scope: "checkout"`. Use `service_status`
 to check readiness after an action. A service with no run is reported as stopped.
-Only configured entries can be controlled; these tools do not edit commands or
-settings, expose shell/environment configuration, or take arbitrary paths.
+`service_list {"includeConfig":true}` also returns each entry's `configuration`
+(name, command, directory, restart policy, and database readiness check).
+`service_add` creates one entry and returns its generated id; `service_update`
+takes a listed `serviceId` and only the fields to change. Both merge into the
+latest configuration without replacing other entries or environment/setup settings.
+App edits from a worktree create an override for that checkout; edits from the
+main folder change project defaults. Database edits always change the project's
+shared entry. Readiness checks cannot be removed from databases or added to app
+services to change their kind. Commands and relative directories follow the UI's
+validation rules. Saving starts nothing and leaves running processes unchanged;
+call `service_start` for a new entry or `service_restart` to apply an edited command.
+Editing shell commands requires full access outside read-only/plan mode.
+
+For example, add an app with `service_add {"name":"API","command":"bun run dev",
+"directory":"apps/api"}`, then pass its returned id to `service_start`.
+Add a database with `{"kind":"database","name":"Postgres","command":"…",
+"readinessCommand":"pg_isready","readinessTimeoutSeconds":120}`. Update just its
+check with `service_update {"serviceId":"<listed id>","readinessCommand":"…"}`.
+
+These tools never take arbitrary project or checkout paths.
 A chat without a project receives an explanatory error. An older daemon asks
 the agent to update Zeron rather than claiming the action succeeded.
 
@@ -195,6 +213,7 @@ name (default: the local engine's device).
 | `show_image`       | `PublishImage {chatId, name, data}` (origin chat only; the file base64, read by the MCP server from the agent's cwd) |
 | `service_list`, `service_status` | `GetChatServices {chatId}` (origin chat only) |
 | `service_start`, `service_restart`, `service_stop` | `ControlChatService {chatId, serviceId, action}` (origin chat only; mutations are not replayed on reconnect) |
+| `service_add`, `service_update` | `EditChatService {chatId, edit}` (origin chat only; one entry, no reconnect replay) |
 
 Watch streams are the engine's only read surface (there is no one-shot "get
 transcript" RPC); a snapshot is "subscribe, take the first item, drop" — drop

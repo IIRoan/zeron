@@ -805,6 +805,72 @@ impl ProjectTerminals {
             .clone()
     }
 
+    /// Merge one agent edit while holding the same project lock as the UI.
+    /// Saving never starts or restarts a process. Worktree apps become an
+    /// override; databases always update the project's shared list.
+    pub async fn edit_checkout_service(
+        &self,
+        environments: &crate::worktree_settings::WorktreeSettingsStore,
+        space: &str,
+        root: &Path,
+        checkout: &Path,
+        edit: zeron_proto::ProjectServiceEdit,
+    ) -> Result<(ProjectTerminalsSnapshot, String), EngineError> {
+        let operation = self.managed_operation(space);
+        let _guard = operation.lock().await;
+        let this = self.clone();
+        let environments = environments.clone();
+        let space = space.to_owned();
+        let root = root.to_path_buf();
+        let checkout = checkout.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let settings = environments.effective(&root, &checkout)?;
+            let mut config = this
+                .checkout_snapshot(&space, &root, &checkout, &settings)?
+                .config;
+            let service = edited_service(&config, edit)?;
+            let id = service.id.clone();
+            if let Some(existing) = config.services.iter_mut().find(|s| s.id == id) {
+                *existing = service.clone();
+            } else {
+                config.services.push(service.clone());
+            }
+            // Validate the complete visible list before touching either store.
+            let config = normalize_config(config)?;
+            if service.is_database() {
+                let mut project = this.snapshot(&space, &root)?.config;
+                let normalized = config.services.iter().find(|s| s.id == id).unwrap().clone();
+                if let Some(existing) = project.services.iter_mut().find(|s| s.id == id) {
+                    *existing = normalized;
+                } else {
+                    project.services.push(normalized);
+                }
+                this.save(&space, &root, normalize_config(project)?)?;
+            } else if root.canonicalize()? == checkout.canonicalize()? {
+                this.reconcile_configs(&environments, &space, &root, config)?;
+            } else {
+                let apps = ProjectTerminalConfig {
+                    services: config
+                        .services
+                        .into_iter()
+                        .filter(|s| !s.is_database())
+                        .collect(),
+                };
+                environments.save_services(&root, &checkout, Some(apps.clone()))?;
+                this.save_checkout(&space, &root, &checkout, apps)?;
+            }
+            let snapshot = this.checkout_snapshot(
+                &space,
+                &root,
+                &checkout,
+                &environments.effective(&root, &checkout)?,
+            )?;
+            Ok((snapshot, id))
+        })
+        .await
+        .map_err(|e| EngineError::Other(e.to_string()))?
+    }
+
     /// Saves a Project settings page. Its service lists are ignored: app
     /// services are saved only by the services editor, and `databases`, when
     /// given, replaces only the project's databases.
@@ -1509,10 +1575,102 @@ fn check_root(project: &Project, root: &str) -> Result<(), EngineError> {
     Ok(())
 }
 
+/// Apply a single-entry change to the latest saved configuration.
+fn edited_service(
+    config: &ProjectTerminalConfig,
+    edit: zeron_proto::ProjectServiceEdit,
+) -> Result<ProjectTerminalService, EngineError> {
+    use zeron_proto::{
+        ProjectServiceEdit as Edit, ProjectServiceKind as Kind, ProjectServiceReadiness,
+    };
+    match edit {
+        Edit::Add {
+            kind,
+            name,
+            command,
+            directory,
+            restart_on_failure,
+            readiness_command,
+            readiness_timeout_seconds,
+        } => {
+            let setup_prerequisite = match kind {
+                Kind::Database => Some(ProjectServiceReadiness {
+                    command: readiness_command.ok_or_else(|| {
+                        EngineError::Other("Databases require a readinessCommand.".into())
+                    })?,
+                    timeout_seconds: readiness_timeout_seconds.unwrap_or(120),
+                }),
+                Kind::Service => {
+                    if readiness_command.is_some() || readiness_timeout_seconds.is_some() {
+                        return Err(EngineError::Other(
+                            "Readiness checks apply to databases; use kind: database.".into(),
+                        ));
+                    }
+                    None
+                }
+            };
+            Ok(ProjectTerminalService {
+                id: uuid::Uuid::new_v4().to_string(),
+                name,
+                command,
+                directory,
+                restart_on_failure,
+                setup_prerequisite,
+            })
+        }
+        Edit::Update {
+            service_id,
+            changes,
+        } => {
+            let mut service = config
+                .services
+                .iter()
+                .find(|s| s.id == service_id)
+                .cloned()
+                .ok_or_else(|| EngineError::Other(format!("Unknown service id: {service_id}")))?;
+            if changes.name.is_none()
+                && changes.command.is_none()
+                && changes.directory.is_none()
+                && changes.restart_on_failure.is_none()
+                && changes.readiness_command.is_none()
+                && changes.readiness_timeout_seconds.is_none()
+            {
+                return Err(EngineError::Other(
+                    "Provide at least one service field to update.".into(),
+                ));
+            }
+            if let Some(value) = changes.name {
+                service.name = value;
+            }
+            if let Some(value) = changes.command {
+                service.command = value;
+            }
+            if let Some(value) = changes.directory {
+                service.directory = value;
+            }
+            if let Some(value) = changes.restart_on_failure {
+                service.restart_on_failure = value;
+            }
+            if changes.readiness_command.is_some() || changes.readiness_timeout_seconds.is_some() {
+                let readiness = service.setup_prerequisite.as_mut().ok_or_else(|| {
+                    EngineError::Other(
+                        "Readiness checks apply to databases; add a database instead.".into(),
+                    )
+                })?;
+                if let Some(value) = changes.readiness_command {
+                    readiness.command = value;
+                }
+                if let Some(value) = changes.readiness_timeout_seconds {
+                    readiness.timeout_seconds = value;
+                }
+            }
+            Ok(service)
+        }
+    }
+}
+
 /// The project's saved databases plus `apps` from an app-service editor.
-/// Entries matching a saved database by id (including copies from clients
-/// that cannot see the database flag) never replace or remove it, and new
-/// databases can only be added through [`ProjectTerminals::save_databases`].
+/// Entries matching a saved database by id never replace or remove it.
 fn with_apps(
     current: &ProjectTerminalConfig,
     apps: ProjectTerminalConfig,

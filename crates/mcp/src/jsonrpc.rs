@@ -32,6 +32,10 @@ ref error. A timeout can occur after an action took effect; inspect before retry
 When service tools are available, call service_list to find configured services \
 and databases in your chat's project and checkout. Use their ids with service_status, \
 service_start, service_restart and service_stop. You can control these directly. \
+Use service_add to add a service or database, or service_update with a listed id \
+and only the fields to change. service_list with includeConfig:true shows editable \
+configuration. Saving does not start or restart anything; service_restart applies \
+new settings to a running process. \
 Databases are shared across project checkouts; app services respect the project's \
 checkout mode. Check status and database readiness after an action; after a timeout \
 or lost connection inspect status before retrying.\n\

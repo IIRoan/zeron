@@ -349,6 +349,8 @@ struct RunProjectActionParams {
 struct ProjectTerminalsParams {
     space_id: String,
     #[serde(default)]
+    include_service_config: bool,
+    #[serde(default)]
     chat_id: Option<String>,
     #[serde(default)]
     config: Option<zeron_proto::ProjectTerminalConfig>,
@@ -5151,6 +5153,7 @@ impl RpcService for EngineRpc {
                 };
                 RpcReply::value(&snapshot)
             }
+            methods::EDIT_CHAT_SERVICE => self.edit_chat_service(params).await,
             methods::GET_PROJECT_TERMINALS
             | methods::SAVE_PROJECT_TERMINALS
             | methods::CONTROL_PROJECT_TERMINALS
@@ -5251,7 +5254,7 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?
                 };
                 if chat_services {
-                    Ok(RpcReply::Value(services::snapshot(&project_id, snapshot)))
+                    Ok(RpcReply::Value(services::snapshot(&project_id, snapshot, p.include_service_config)))
                 } else {
                     RpcReply::value(&snapshot)
                 }

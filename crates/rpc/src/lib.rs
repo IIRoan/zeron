@@ -273,6 +273,7 @@ pub mod methods {
     /// Agent surface: configured services in the calling chat's checkout only.
     pub const GET_CHAT_SERVICES: &str = "GetChatServices";
     pub const CONTROL_CHAT_SERVICE: &str = "ControlChatService";
+    pub const EDIT_CHAT_SERVICE: &str = "EditChatService";
     pub const GET_WORKTREE_SETTINGS: &str = "GetWorktreeSettings";
     pub const SAVE_WORKTREE_SETTINGS: &str = "SaveWorktreeSettings";
     pub const PREPARE_WORKTREE: &str = "PrepareWorktree";
@@ -744,9 +745,11 @@ pub fn agent_allowed(method: &str) -> bool {
             // Publishing or replying as that viewport stays app-only.
             | methods::LIST_BROWSER_TABS
             | methods::CONTROL_BROWSER
-            // Configured services only; no profile editing or terminal access.
+            // Chat-scoped service controls and single-entry configuration edits.
+            // The engine checks the editing chat's access before saving commands.
             | methods::GET_CHAT_SERVICES
             | methods::CONTROL_CHAT_SERVICE
+            | methods::EDIT_CHAT_SERVICE
             // Plugins: authoring, installing (lands waiting for the person),
             // checking for updates, and their tools.
             | methods::LIST_PLUGINS
@@ -1397,7 +1400,7 @@ mod tests {
         }
 
         let app = connect_ws(&url, Some(&tokens.full)).await.unwrap();
-        for method in [methods::LIST_BROWSER_TABS, methods::CONTROL_BROWSER, methods::GET_CHAT_SERVICES, methods::CONTROL_CHAT_SERVICE] {
+        for method in [methods::LIST_BROWSER_TABS, methods::CONTROL_BROWSER, methods::GET_CHAT_SERVICES, methods::CONTROL_CHAT_SERVICE, methods::EDIT_CHAT_SERVICE] {
             assert!(agent_allowed(method), "{method}");
             let asked = agent.call(method, serde_json::json!({})).await.unwrap();
             assert!(asked.as_str().unwrap().starts_with("Agent"), "{method}: {asked}");

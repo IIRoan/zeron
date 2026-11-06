@@ -42,6 +42,56 @@ pub struct ProjectTerminalConfig {
     pub services: Vec<ProjectTerminalService>,
 }
 
+/// A single-entry edit. Omitted update fields keep their saved values.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProjectServicePatch {
+    pub name: Option<String>,
+    pub command: Option<String>,
+    pub directory: Option<String>,
+    pub restart_on_failure: Option<bool>,
+    pub readiness_command: Option<String>,
+    pub readiness_timeout_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProjectServiceKind {
+    #[default]
+    Service,
+    Database,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(
+    tag = "op",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum ProjectServiceEdit {
+    Add {
+        #[serde(default)]
+        kind: ProjectServiceKind,
+        name: String,
+        command: String,
+        #[serde(default = "default_service_directory")]
+        directory: String,
+        #[serde(default)]
+        restart_on_failure: bool,
+        readiness_command: Option<String>,
+        readiness_timeout_seconds: Option<u64>,
+    },
+    Update {
+        service_id: String,
+        changes: ProjectServicePatch,
+    },
+}
+
+fn default_service_directory() -> String {
+    ".".into()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ProjectTerminalStatus {

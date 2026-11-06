@@ -419,3 +419,387 @@ async fn database_readiness_failures_are_visible_and_prevent_app_start() {
     assert!(!f.a.join("api.pid").exists());
     f.core.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agents_add_and_patch_entries_without_replacing_other_entries_or_settings() {
+    let f = Fixture::new(false).await;
+    let agent = tools(&f.core, "agent");
+    let peer = tools(&f.core, "peer");
+    let before = f
+        .core
+        .repos
+        .worktree_settings()
+        .effective(&f.root, &f.a)
+        .unwrap();
+    let listed = agent
+        .call("service_list", json!({"includeConfig":true}))
+        .await
+        .unwrap();
+    assert_eq!(
+        listed["services"][0]["configuration"]["readinessTimeoutSeconds"],
+        3
+    );
+    let added = agent
+        .call(
+            "service_add",
+            json!({"name":"Worker","command":"echo $$ > worker.pid; exec sleep 120"}),
+        )
+        .await
+        .unwrap();
+    let id = added["service"]["id"].as_str().unwrap();
+    assert_eq!(added["saved"], true);
+    assert_eq!(added["service"]["status"], "stopped");
+    assert_eq!(added["service"]["configuration"]["directory"], ".");
+    assert!(
+        !f.a.join("worker.pid").exists(),
+        "saving must not run commands"
+    );
+    assert_eq!(f.snapshot("peer").await.config.services.len(), 3);
+    agent
+        .call(
+            "service_update",
+            json!({"serviceId":id,"name":"Jobs","restartOnFailure":true}),
+        )
+        .await
+        .unwrap();
+    let configs = agent
+        .call("service_list", json!({"includeConfig":true}))
+        .await
+        .unwrap();
+    let worker = configs["services"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == id)
+        .unwrap();
+    assert_eq!(worker["configuration"]["name"], "Jobs");
+    assert_eq!(
+        worker["configuration"]["command"],
+        "echo $$ > worker.pid; exec sleep 120"
+    );
+    assert_eq!(worker["configuration"]["restartOnFailure"], true);
+    assert_eq!(configs["services"].as_array().unwrap().len(), 4);
+
+    let db = agent.call("service_add", json!({"kind":"database","name":"Cache","command":"echo $$ > cache.pid; exec sleep 120","readinessCommand":"test -f cache.pid"})).await.unwrap();
+    let db_id = db["service"]["id"].as_str().unwrap();
+    assert_eq!(db["service"]["scope"], "project");
+    assert_eq!(
+        db["service"]["configuration"]["readinessTimeoutSeconds"],
+        120
+    );
+    peer.call(
+        "service_update",
+        json!({"serviceId":db_id,"readinessTimeoutSeconds":7}),
+    )
+    .await
+    .unwrap();
+    let peer_db = peer
+        .call("service_list", json!({"includeConfig":true}))
+        .await
+        .unwrap();
+    assert!(
+        peer_db["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["id"] == db_id && s["configuration"]["readinessTimeoutSeconds"] == 7)
+    );
+    assert_eq!(f.snapshot("agent").await.config.services.len(), 5);
+    assert_eq!(f.snapshot("peer").await.config.services.len(), 4);
+    let after = f
+        .core
+        .repos
+        .worktree_settings()
+        .effective(&f.root, &f.a)
+        .unwrap();
+    assert_eq!(before.dependencies, after.dependencies);
+    assert_eq!(before.variables, after.variables);
+    assert_eq!(before.env_files, after.env_files);
+    assert_eq!(before.setup_command, after.setup_command);
+    assert_eq!(before.service_mode, after.service_mode);
+    assert!(
+        !f.core
+            .repos
+            .worktree_settings()
+            .is_prepared(&f.root, &f.a)
+            .unwrap()
+    );
+
+    agent
+        .call("service_start", json!({"serviceId":id}))
+        .await
+        .unwrap();
+    let original_pid = pid(&f.a, "worker", None).await;
+    let original = f.snapshot("agent").await;
+    agent.call("service_update", json!({"serviceId":id,"command":"touch changed-command; echo $$ > worker.pid; exec sleep 120"})).await.unwrap();
+    assert_eq!(
+        terminal(&original, id),
+        terminal(&f.snapshot("agent").await, id)
+    );
+    assert!(!f.a.join("changed-command").exists());
+    agent
+        .call("service_restart", json!({"serviceId":id}))
+        .await
+        .unwrap();
+    pid(&f.a, "worker", Some(&original_pid)).await;
+    assert!(f.a.join("changed-command").exists());
+    assert_eq!(
+        terminal(&original, "db"),
+        terminal(&f.snapshot("agent").await, "db")
+    );
+    f.core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_configuration_edits_leave_saved_lists_and_workflow_settings_unchanged() {
+    let f = Fixture::new(false).await;
+    let agent = tools(&f.core, "agent");
+    let before = f.snapshot("agent").await;
+    for (name, args) in [
+        ("service_add", json!({"name":"api","command":"true"})),
+        (
+            "service_add",
+            json!({"name":"New","command":"true","directory":"../escape"}),
+        ),
+        (
+            "service_add",
+            json!({"name":"New","command":"true","directory":"/tmp"}),
+        ),
+        (
+            "service_add",
+            json!({"kind":"database","name":"New","command":"true"}),
+        ),
+        (
+            "service_add",
+            json!({"kind":"database","name":"New","command":"true","readinessCommand":"true","readinessTimeoutSeconds":0}),
+        ),
+        (
+            "service_add",
+            json!({"name":"New","command":"true","readinessCommand":"true"}),
+        ),
+        (
+            "service_update",
+            json!({"serviceId":"db","readinessCommand":" "}),
+        ),
+        (
+            "service_update",
+            json!({"serviceId":"api","readinessCommand":"true"}),
+        ),
+        ("service_update", json!({"serviceId":"api","name":"DB"})),
+        ("service_update", json!({"serviceId":"api","command":" "})),
+        (
+            "service_update",
+            json!({"serviceId":"missing","name":"New"}),
+        ),
+        ("service_update", json!({"serviceId":"api"})),
+    ] {
+        assert!(
+            agent.call(name, args.clone()).await.is_err(),
+            "{name}: {args}"
+        );
+        assert_eq!(f.snapshot("agent").await, before);
+    }
+    assert!(
+        f.core
+            .repos
+            .worktree_settings()
+            .effective(&f.root, &f.a)
+            .unwrap()
+            .services
+            .is_none()
+    );
+    assert!(
+        !f.core
+            .repos
+            .worktree_settings()
+            .is_prepared(&f.root, &f.a)
+            .unwrap()
+    );
+    f.core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_adds_and_partial_updates_keep_both_agents_changes() {
+    let f = Fixture::new(false).await;
+    let agent = tools(&f.core, "agent");
+    let (first, second) = tokio::join!(
+        agent.call("service_add", json!({"name":"First","command":"true"})),
+        agent.call("service_add", json!({"name":"Second","command":"false"})),
+    );
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_ne!(first["service"]["id"], second["service"]["id"]);
+    let (name, command) = tokio::join!(
+        agent.call("service_update", json!({"serviceId":"api","name":"Server"})),
+        agent.call(
+            "service_update",
+            json!({"serviceId":"api","command":"exec sleep 30"})
+        ),
+    );
+    name.unwrap();
+    command.unwrap();
+    let saved = f.snapshot("agent").await;
+    assert_eq!(saved.config.services.len(), 5);
+    let api = saved
+        .config
+        .services
+        .iter()
+        .find(|s| s.id == "api")
+        .unwrap();
+    assert_eq!(api.name, "Server");
+    assert_eq!(api.command, "exec sleep 30");
+    f.core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn main_folder_edits_update_defaults_and_database_edits_preserve_checkout_overrides() {
+    let f = Fixture::new(false).await;
+    f.core
+        .workspace
+        .create_chat(
+            "main",
+            Some("project"),
+            Some(&f.core.device_id),
+            None,
+            Some(f.root.to_string_lossy().into_owned()),
+        )
+        .unwrap();
+    let main = tools(&f.core, "main");
+    let agent = tools(&f.core, "agent");
+    agent
+        .call(
+            "service_update",
+            json!({"serviceId":"api","command":"checkout command"}),
+        )
+        .await
+        .unwrap();
+    main.call(
+        "service_update",
+        json!({"serviceId":"api","name":"Default API","command":"project command"}),
+    )
+    .await
+    .unwrap();
+    agent
+        .call(
+            "service_update",
+            json!({"serviceId":"db","name":"Shared database"}),
+        )
+        .await
+        .unwrap();
+    for (chat, command) in [
+        ("agent", "checkout command"),
+        ("peer", "project command"),
+        ("main", "project command"),
+    ] {
+        let snapshot = f.snapshot(chat).await;
+        assert_eq!(
+            snapshot
+                .config
+                .services
+                .iter()
+                .find(|s| s.id == "api")
+                .unwrap()
+                .command,
+            command
+        );
+        assert_eq!(
+            snapshot
+                .config
+                .services
+                .iter()
+                .find(|s| s.id == "db")
+                .unwrap()
+                .name,
+            "Shared database"
+        );
+    }
+    let added = main
+        .call(
+            "service_add",
+            json!({"name":"Main worker","command":"true"}),
+        )
+        .await
+        .unwrap();
+    let id = added["service"]["id"].as_str().unwrap();
+    assert!(
+        f.snapshot("peer")
+            .await
+            .config
+            .services
+            .iter()
+            .any(|s| s.id == id)
+    );
+    assert!(
+        !f.snapshot("agent")
+            .await
+            .config
+            .services
+            .iter()
+            .any(|s| s.id == id)
+    );
+    f.core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn service_authoring_cannot_override_chat_scope_or_bypass_access_modes() {
+    let f = Fixture::new(false).await;
+    let client = agent_client(&f.core, Some("agent"));
+    let add = json!({"op":"add","name":"Escape","command":"true"});
+    for params in [
+        json!({"chatId":"peer","edit":add}),
+        json!({"chatId":"agent","checkoutPath":f.b,"edit":add}),
+        json!({"chatId":"agent","spaceId":"project","edit":add}),
+    ] {
+        assert!(
+            client
+                .call(methods::EDIT_CHAT_SERVICE, params)
+                .await
+                .is_err()
+        );
+    }
+    for (access, sandbox, plan) in [
+        (AccessMode::Supervised, SandboxLevel::WorkspaceWrite, false),
+        (
+            AccessMode::AutoAcceptEdits,
+            SandboxLevel::WorkspaceWrite,
+            false,
+        ),
+        (AccessMode::FullAccess, SandboxLevel::ReadOnly, false),
+        (AccessMode::FullAccess, SandboxLevel::WorkspaceWrite, true),
+    ] {
+        f.core
+            .workspace
+            .set_chat_config(
+                "agent",
+                &ChatConfig {
+                    harness: HarnessId::Mock,
+                    model: None,
+                    reasoning: None,
+                    model_options: Default::default(),
+                    sandbox,
+                    access,
+                    plan,
+                },
+            )
+            .unwrap();
+        assert!(
+            tools(&f.core, "agent")
+                .call("service_add", json!({"name":"New","command":"true"}))
+                .await
+                .unwrap_err()
+                .contains("full access")
+        );
+        assert!(
+            tools(&f.core, "agent")
+                .call(
+                    "service_update",
+                    json!({"serviceId":"db","command":"false"})
+                )
+                .await
+                .unwrap_err()
+                .contains("full access")
+        );
+    }
+    assert_eq!(f.snapshot("agent").await.config.services.len(), 3);
+    f.core.shutdown().await;
+}
