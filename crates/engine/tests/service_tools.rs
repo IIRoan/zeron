@@ -45,6 +45,7 @@ fn tools(core: &EngineCore, chat: &str) -> Tools {
             chat_id: Some(chat.into()),
             device_id: Some(core.device_id.clone()),
             side_chats_only: false,
+            waits_on_background: false,
         },
     )))
 }

@@ -4,6 +4,34 @@
   "fork_repository": "IIRoan/zeron",
   "releases": [
     {
+      "version": "0.2.138",
+      "upstream_commit": "7f8273ad1faf86669dd0e231d7a31c27fed5c9d8",
+      "upstream_url": "https://github.com/zeronsh/zeron/releases/tag/v0.2.138",
+      "published_at": "2026-11-07T04:52:06Z",
+      "notes_source": "github_release",
+      "upstream_notes": "## What's Changed\n* fix(zgx): close the visible right pane tab with Cmd+W by @jsgrrchg in https://github.com/zeronsh/zeron/pull/1242\n* zgx: subagents in the composer's Running tray by @wingleeio in https://github.com/zeronsh/zeron/pull/1250\n* New chats in a plain folder don't ask for a worktree by @wingleeio in https://github.com/zeronsh/zeron/pull/1263\n* fix(engine): close git stdout before waiting when a diff capture truncates by @piebom in https://github.com/zeronsh/zeron/pull/1220\n* Limit background Git scans to viewed chats by @xzebra in https://github.com/zeronsh/zeron/pull/1264\n* zgx: Activity sidebar, with Waiting and Sleep in the engine by @wingleeio in https://github.com/zeronsh/zeron/pull/1262\n* Zeron 0.2.138 by @wingleeio in https://github.com/zeronsh/zeron/pull/1271\n\n## New Contributors\n* @piebom made their first contribution in https://github.com/zeronsh/zeron/pull/1220\n* @xzebra made their first contribution in https://github.com/zeronsh/zeron/pull/1264\n\n**Full Changelog**: https://github.com/zeronsh/zeron/compare/v0.2.137...v0.2.138",
+      "fork_changes": [
+        "Let agents add and update project services and databases",
+        "Add agent controls for project services and databases",
+        "Fix Linux checkout and side-chat rename UI regressions",
+        "Fix Codex workspace identity checks for usage and reset credits",
+        "Remove desktop PR integration and open chat links externally",
+        "Add native Git and Services plugins with sidebar tools",
+        "Fix browser MCP and CI compatibility after upstream merge"
+      ],
+      "fork_through_commit": "718ca29be82c82fc8875ca2747f5a6a1137fdbee"
+    },
+    {
+      "version": "0.2.137",
+      "upstream_commit": "1b86c41c8fe3a4314fa1035aae4bfe099c0a1f3b",
+      "upstream_url": "https://github.com/zeronsh/zeron/releases/tag/v0.2.137",
+      "published_at": "2026-11-06T10:04:21Z",
+      "notes_source": "github_release",
+      "upstream_notes": "## What's Changed\n* zgx v3: the page reflows live as the panel slides or an edge is dragged by @wingleeio in https://github.com/zeronsh/zeron/pull/1207\n* zgx: bump zgx to a264a40b; title bar controls slide in full screen; terminal wears the theme's colours by @wingleeio in https://github.com/zeronsh/zeron/pull/1205\n* zgx file tree: row washes run edge to edge by @wingleeio in https://github.com/zeronsh/zeron/pull/1208\n* zgx: bump zgx to e46ff6fc (ui.list virtualize = \"ancestor\") by @wingleeio in https://github.com/zeronsh/zeron/pull/1209\n* zgx settings: Archived builds only the rows the page shows by @wingleeio in https://github.com/zeronsh/zeron/pull/1210\n* zgx v3: the panel's Expand mirrors the title bar's left cluster by @wingleeio in https://github.com/zeronsh/zeron/pull/1211\n* zgx v3: Expand's arrows draw smaller beside the panel toggle by @wingleeio in https://github.com/zeronsh/zeron/pull/1213\n* zgx: bump to 7cd25fc1; the panel home builds only the rows it shows by @wingleeio in https://github.com/zeronsh/zeron/pull/1214\n* zgx: the plugin and template permission windows can be dragged by their top by @wingleeio in https://github.com/zeronsh/zeron/pull/1215\n* zgx v3: a split pane's × shows only for its head by @wingleeio in https://github.com/zeronsh/zeron/pull/1216\n* zgx: plugin notices keep their Review button and stay until dealt with by @wingleeio in https://github.com/zeronsh/zeron/pull/1217\n* zgx on Windows: one title bar beside the caption buttons, no menu bar, glass that respects the system by @wingleeio in https://github.com/zeronsh/zeron/pull/1212\n* zgx app: tint the window's glass for the blur Hyprland gives it by @katulevskiy in https://github.com/zeronsh/zeron/pull/1174\n* zgx: Settings → Appearance: interface and code fonts by @katulevskiy in https://github.com/zeronsh/zeron/pull/1173\n* zgx: Mermaid diagrams in replies by @katulevskiy in https://github.com/zeronsh/zeron/pull/1162\n* Panel home: Side chats / Subagents section menu (Working first, Mark all done as read) by @katulevskiy in https://github.com/zeronsh/zeron/pull/1149\n* The new app icon on iOS and Android by @wingleeio in https://github.com/zeronsh/zeron/pull/1239\n* iOS: version 1.0.1, since Apple has closed 1.0 by @wingleeio in https://github.com/zeronsh/zeron/pull/1240\n* Updates that can't strand a device, on every platform, from any device by @wingleeio in https://github.com/zeronsh/zeron/pull/1241\n* TestFlight: wait longer for Apple, and never reuse a build number by @wingleeio in https://github.com/zeronsh/zeron/pull/1243\n* Website: the new logo, following the system's light or dark by @wingleeio in https://github.com/zeronsh/zeron/pull/1244\n* providers: update a WinGet OpenCode with WinGet by @wingleeio in https://github.com/zeronsh/zeron/pull/1246\n* Honor the external browser preference before internal link handlers by @SinaKhalili in https://github.com/zeronsh/zeron/pull/1248\n* Keep new chat messages when switching conversations during startup by @SinaKhalili in https://github.com/zeronsh/zeron/pull/1249\n* Zeron 0.2.137 by @wingleeio in https://github.com/zeronsh/zeron/pull/1247\n\n\n**Full Changelog**: https://github.com/zeronsh/zeron/compare/v0.2.136...v0.2.137",
+      "fork_changes": [],
+      "fork_through_commit": "718ca29be82c82fc8875ca2747f5a6a1137fdbee"
+    },
+    {
       "version": "0.2.136",
       "upstream_commit": "35561ead75bc754f8355634fafc1f63fe38fbb53",
       "upstream_url": "https://github.com/zeronsh/zeron/releases/tag/v0.2.136",

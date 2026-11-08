@@ -13450,6 +13450,7 @@ mod tests {
                 running_subagents: 0,
                 running_background_tasks: 0,
                 background_tasks: Vec::new(),
+                waiting: None,
             }];
             state.selected_chat = Some("c".into());
             state.watch_clock_transitions(cx);

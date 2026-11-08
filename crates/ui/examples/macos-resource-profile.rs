@@ -153,6 +153,7 @@ fn main() -> anyhow::Result<()> {
                             running_subagents: 0,
                             running_background_tasks: 0,
                             background_tasks: Vec::new(),
+                            waiting: None,
                             chat_id: "profile".into(),
                             device_id: "local".into(),
                             status: if streaming {

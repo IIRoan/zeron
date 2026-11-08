@@ -261,6 +261,7 @@ mod tests {
                 chat_id: Some("origin".into()),
                 device_id: None,
                 side_chats_only: false,
+                waits_on_background: false,
             },
         ));
         let tools = Tools::new(zeron);
