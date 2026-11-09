@@ -40,7 +40,6 @@ type Handler = Box<dyn FnMut(&Req) -> (u16, Value) + Send>;
 struct Stub {
     port: u16,
     requests: Arc<Mutex<Vec<Req>>>,
-    handler: Arc<Mutex<Handler>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -56,7 +55,7 @@ impl Stub {
         let port = listener.local_addr().unwrap().port();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let handler: Arc<Mutex<Handler>> = Arc::new(Mutex::new(Box::new(handler)));
-        let (reqs, h) = (requests.clone(), handler.clone());
+        let (reqs, h) = (requests.clone(), handler);
         let task = tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
@@ -82,17 +81,12 @@ impl Stub {
         Stub {
             port,
             requests,
-            handler,
             task,
         }
     }
 
     fn url(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
-    }
-
-    fn set(&self, handler: impl FnMut(&Req) -> (u16, Value) + Send + 'static) {
-        *self.handler.lock().unwrap() = Box::new(handler);
     }
 
     fn requests(&self, path_prefix: &str) -> Vec<Req> {

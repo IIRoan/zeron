@@ -133,6 +133,7 @@ struct MacRig {
     incoming: PathBuf,
 }
 
+#[cfg(target_os = "macos")]
 fn write_bundle(bundle: &Path, version: &str, behavior: &str) {
     let dir = bundle.join("Contents/MacOS");
     std::fs::create_dir_all(&dir).unwrap();
@@ -185,6 +186,7 @@ impl Rig {
     }
 
     /// The same, as a macOS app: the installed bundle, and the new one beside it.
+    #[cfg(target_os = "macos")]
     fn new_mac(behavior: &str) -> Self {
         let mut rig = Self::new(behavior);
         let applications = rig.data.parent().unwrap().join("Applications");

@@ -777,7 +777,6 @@ mod tests {
     }
 
     use crate::state::AppState;
-    use gpui::AppContext as _;
 
     fn window(
         cx: &mut gpui::TestAppContext,
