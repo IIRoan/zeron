@@ -138,9 +138,7 @@ pub async fn list(root: &Path) -> Result<CheckoutChanges, EngineError> {
                 continue;
             }
             let child = tokio::fs::canonicalize(child).await?;
-            // A sandboxed project's submodules aren't run on this machine
-            // (`sandbox::git_env`); their gitlinks still show in the parent.
-            if !child.starts_with(&root) || crate::sandbox::git_env(&child).is_err() {
+            if !child.starts_with(&root) {
                 continue;
             }
             if repositories.len() + pending.len() + 1 >= MAX_REPOSITORIES {

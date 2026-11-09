@@ -63,17 +63,24 @@ pub fn run_engine_command(command: EngineCommand) -> anyhow::Result<()> {
                     publish_ports,
                     read_only,
                     worktrees,
-                } => sandbox::enable(
-                    sandbox::Sandbox {
-                        worktrees: worktrees.unwrap_or_else(|| sandbox::default_worktrees(&path)),
-                        root: path,
-                        config,
-                        host_ports,
-                        publish_ports,
-                        read_only,
-                    },
-                    false,
-                )
+                } => {
+                    let ports = |list: Vec<String>| sandbox::parse_ports(&list.join(","));
+                    let (host_ports, publish_ports) = (
+                        ports(host_ports).map_err(|e| anyhow::anyhow!("--host-port: {e}"))?,
+                        ports(publish_ports).map_err(|e| anyhow::anyhow!("--publish: {e}"))?,
+                    );
+                    sandbox::enable(
+                        sandbox::Sandbox {
+                            worktrees: worktrees.unwrap_or_else(|| sandbox::default_worktrees(&path)),
+                            root: path,
+                            config,
+                            host_ports,
+                            publish_ports,
+                            read_only,
+                        },
+                        false,
+                    )
+                }
                 .map(|status| {
                     println!("Sandboxed {} in container {}.", status.sandbox.root.display(), status.container);
                     println!("{}", sandbox::LOGIN_NOTE);
@@ -94,8 +101,8 @@ pub fn run_engine_command(command: EngineCommand) -> anyhow::Result<()> {
                             s.state,
                             if s.image_built { "" } else { ", image not built" },
                             s.sandbox.worktrees.display(),
-                            s.sandbox.host_ports,
-                            s.sandbox.publish_ports,
+                            sandbox::port_ranges(&s.sandbox.host_ports),
+                            sandbox::port_ranges(&s.sandbox.publish_ports),
                             s.sandbox.read_only,
                         );
                     }

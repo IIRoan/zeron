@@ -79,6 +79,59 @@ pub fn mcp_records(records: &[String]) -> String {
     records.join(&RECORD.to_string())
 }
 
+/// `ports` as pasta takes them: runs of consecutive ports as `a-b`.
+pub fn port_ranges(ports: &[u16]) -> Vec<String> {
+    let mut sorted = ports.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut ranges: Vec<(u16, u16)> = Vec::new();
+    for port in sorted {
+        match ranges.last_mut() {
+            Some((_, end)) if end.checked_add(1) == Some(port) => *end = port,
+            _ => ranges.push((port, port)),
+        }
+    }
+    ranges
+        .into_iter()
+        .map(|(a, b)| {
+            if a == b {
+                a.to_string()
+            } else {
+                format!("{a}-{b}")
+            }
+        })
+        .collect()
+}
+
+/// Ports written as numbers or `a-b` ranges, separated by commas or spaces.
+pub fn parse_ports(text: &str) -> Result<Vec<u16>, String> {
+    let mut ports = Vec::new();
+    for part in text
+        .split([',', ' ', '\n'])
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        let number = |p: &str| {
+            p.trim()
+                .parse::<u16>()
+                .ok()
+                .filter(|p| *p > 0)
+                .ok_or_else(|| format!("{part} isn't a port or a range of ports"))
+        };
+        match part.split_once('-') {
+            Some((a, b)) => {
+                let (a, b) = (number(a)?, number(b)?);
+                if a > b {
+                    return Err(format!("{part} isn't a port range"));
+                }
+                ports.extend(a..=b);
+            }
+            None => ports.push(number(part)?),
+        }
+    }
+    Ok(ports)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,6 +173,21 @@ mod tests {
         assert_eq!(
             mcp_record("/s", "zeron", &["mcp".into()], &env),
             "/s\u{1f}zeron\u{1f}1\u{1f}mcp\u{1f}K=v"
+        );
+    }
+
+    #[test]
+    fn ports_read_and_print_as_ranges() {
+        assert_eq!(
+            parse_ports("3000, 3300-3302\n6006 3001").unwrap(),
+            vec![3000, 3300, 3301, 3302, 6006, 3001]
+        );
+        assert!(parse_ports("3000, http").unwrap_err().contains("http"));
+        assert!(parse_ports("3302-3300").is_err());
+        assert!(parse_ports("0").is_err());
+        assert_eq!(
+            port_ranges(&[3001, 3300, 3301, 3000, 3302, 6006, 3000]),
+            vec!["3000-3001", "3300-3302", "6006"]
         );
     }
 }

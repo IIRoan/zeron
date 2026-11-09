@@ -129,21 +129,92 @@ async fn a_sandboxed_project_never_runs_on_the_host_and_its_agents_stay_inside()
     let env: HashMap<_, _> = sandbox::git_env(&worktree).unwrap().into_iter().collect();
     assert_eq!(env["GIT_DIR"], root.join(".git/worktrees/wt"));
     assert_eq!(env["GIT_COMMON_DIR"], root.join(".git"));
+    // A host-side commit is pinned to the project's own git folder, past
+    // the planted one, with submodule recursion off.
+    let mut commit = tokio::process::Command::new("git");
+    commit.arg("-C").arg(&worktree).args([
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@example.invalid",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "--no-gpg-sign",
+        "-m",
+        "pinned",
+    ]);
+    sandbox::pin_git(&mut commit, &worktree);
+    let committed = commit.output().await.unwrap();
+    assert!(committed.status.success(), "{committed:?}");
+    assert_eq!(
+        commit
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| *k == "GIT_CONFIG_COUNT")
+            .and_then(|(_, v)| v),
+        Some(std::ffi::OsStr::new("6"))
+    );
+    // Everything else is jailed: what the planted config runs reaches
+    // nothing of this machine's.
     let mut status = tokio::process::Command::new("git");
     status.arg("-C").arg(&worktree).args(["status", "--short"]);
     sandbox::pin_git(&mut status, &worktree);
-    assert!(status.output().await.unwrap().status.success());
-    assert!(!planted.exists(), "pinned host git ran a planted fsmonitor");
+    assert_eq!(status.as_std().get_program(), "bwrap");
+    status.output().await.unwrap();
+    assert!(!planted.exists(), "host git ran a planted fsmonitor");
     assert!(sandbox::git_env(&other).unwrap().is_empty());
-    // A submodule's git folder is the agents' to name: host git stays out,
-    // in the project and its worktrees alike.
+    // A submodule's git folder is the agents' to name: host-side git stays
+    // out of it, and jailed git in it reaches nothing of this machine's.
     for checkout in [&root, &worktree] {
         let module = checkout.join("apps/module");
         std::fs::create_dir_all(module.join("src")).unwrap();
-        std::fs::write(module.join(".git"), "gitdir: ../../.git/modules/module\n").unwrap();
+        std::fs::write(module.join(".git"), format!("gitdir: {}\n", evil.display())).unwrap();
         assert!(sandbox::git_env(&module.join("src")).is_err());
         assert!(sandbox::git_env(&checkout.join("apps")).is_ok());
+        let mut status = tokio::process::Command::new("git");
+        status.arg("-C").arg(&module).args(["status", "--short"]);
+        sandbox::pin_git(&mut status, &module);
+        status.output().await.unwrap();
+        assert!(
+            !planted.exists(),
+            "host git ran a submodule's planted fsmonitor"
+        );
     }
+    // Source Control lists a sandboxed checkout's submodules and their
+    // changes (it used to fail: "Invalid checkout-relative path").
+    let library = base.join("library");
+    std::fs::create_dir_all(&library).unwrap();
+    git(&library, &["init", "-q", "-b", "main"]);
+    git(
+        &library,
+        &["commit", "-q", "--allow-empty", "-m", "library"],
+    );
+    git(
+        &root,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            library.to_str().unwrap(),
+            "libs/library",
+        ],
+    );
+    git(&root, &["commit", "-q", "-m", "add library"]);
+    std::fs::write(root.join("libs/library/new.txt"), "changed").unwrap();
+    let changes = zeron_engine::checkout_changes::list(&root).await.unwrap();
+    let library = changes
+        .repositories
+        .iter()
+        .find(|r| r.path == "libs/library")
+        .expect("the submodule is listed");
+    assert!(
+        library.files.iter().any(|f| f.path == "new.txt"),
+        "{changes:?}"
+    );
+    assert!(!planted.exists());
 
     // Terminals and services fail closed; databases and other projects run here.
     let terminals = Terminals::new();

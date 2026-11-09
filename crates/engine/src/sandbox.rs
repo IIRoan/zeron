@@ -22,6 +22,7 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeron_proto::sandbox::{GUARD, MCP_ENV, SPEC_ENV, Spec, mcp_record, mcp_records};
+pub use zeron_proto::sandbox::{parse_ports, port_ranges};
 use zeron_proto::{HarnessId, RunRequest};
 
 use crate::EngineError;
@@ -228,17 +229,10 @@ impl Sandbox {
     }
 
     fn run_args(&self, helper: &Path, image: &str) -> Result<Vec<String>, EngineError> {
-        let ports: Vec<String> = self
-            .host_ports
-            .iter()
-            .map(|p| format!("-T,{p}"))
-            .chain(self.publish_ports.iter().map(|p| format!("-t,{p}")))
-            .collect();
-        let network = if ports.is_empty() {
-            "pasta".to_owned()
-        } else {
-            format!("pasta:{}", ports.join(","))
-        };
+        // Its ports are pasta's options ([`Self::pasta_options`]), given
+        // through a containers.conf ([`ensure`]): podman splits the
+        // `pasta:` ones on the commas pasta's port lists need.
+        let network = "pasta".to_owned();
         let container = self.container();
         let path = |p: &Path| p.to_string_lossy().into_owned();
         // This machine's user, whatever the image says (devcontainer images
@@ -263,8 +257,19 @@ impl Sandbox {
             "label=disable",
             "--network",
             network.as_str(),
+            // IPv4 only, so a server on `localhost` listens where the
+            // published loopback port reaches (pasta's ::1 forwards reset
+            // connections to IPv4-only servers).
+            "--sysctl",
+            "net.ipv6.conf.all.disable_ipv6=1",
+            "--sysctl",
+            "net.ipv6.conf.default.disable_ipv6=1",
             "-e",
             "HOME=/home/zeron",
+            // What a project's own tooling can check to adapt (no ssh keys,
+            // no daemon).
+            "-e",
+            "ZERON_SANDBOX=1",
         ]
         .map(String::from)
         .into();
@@ -348,7 +353,9 @@ pub fn ensure(sandbox: &Sandbox) -> Result<Spec, EngineError> {
         ))
     })?;
     let mut args = sandbox.run_args(&helper, &image)?;
-    let hash: String = Sha256::digest(args.join("\0").as_bytes())
+    let conf = sandbox.run_dir().join("containers.conf");
+    let pasta = sandbox.pasta_conf();
+    let hash: String = Sha256::digest(format!("{}\0{pasta}", args.join("\0")).as_bytes())
         .iter()
         .take(8)
         .map(|b| format!("{b:02x}"))
@@ -377,8 +384,87 @@ pub fn ensure(sandbox: &Sandbox) -> Result<Spec, EngineError> {
         2..2,
         ["--label".to_owned(), format!("zeron.sandbox={hash}")],
     );
-    podman(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
+    std::fs::write(&conf, pasta)?;
+    let output = Command::new("podman")
+        .args(&args)
+        .env("CONTAINERS_CONF_OVERRIDE", &conf)
+        .output()
+        .map_err(|e| EngineError::Other(format!("podman: {e}")))?;
+    if !output.status.success() {
+        return Err(EngineError::Other(format!(
+            "podman run: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
     Ok(spec)
+}
+
+/// Ports this machine keeps for itself: a server in a sandbox never takes
+/// them here, even while they're free. On Zeron's IPC port it would answer
+/// the app as the engine; on a login's fixed callback port (ChatGPT's 1455),
+/// the browser; on a host port, the container's own clients.
+fn reserved_ports(host_ports: &[u16]) -> Vec<u16> {
+    let ipc = std::env::var("ZERON_IPC_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(27654);
+    let mut reserved = vec![ipc, 1455];
+    reserved.extend(host_ports);
+    reserved
+}
+
+impl Sandbox {
+    /// pasta's options: every port a server in the container opens (or
+    /// only the `publish_ports`, when given) is published on this machine's
+    /// loopback while it's open, never on other interfaces, and delivered to
+    /// the container's loopback; the container reaches only the `host_ports`
+    /// here; no UDP either way.
+    fn pasta_options(&self) -> Vec<String> {
+        let reserved = reserved_ports(&self.host_ports);
+        let publish: Vec<u16> = if self.publish_ports.is_empty() {
+            (1024..=u16::MAX).collect()
+        } else {
+            self.publish_ports.clone()
+        }
+        .into_iter()
+        .filter(|p| !reserved.contains(p))
+        .collect();
+        // IPv4 only, like the container (its IPv6 is off: configuring it
+        // there fails).
+        let mut options = vec![
+            "-4".into(),
+            "-u".into(),
+            "none".into(),
+            "-U".into(),
+            "none".into(),
+        ];
+        options.push("-T".into());
+        options.push(match port_ranges(&self.host_ports) {
+            ranges if ranges.is_empty() => "none".into(),
+            ranges => ranges.join(","),
+        });
+        if !publish.is_empty() {
+            options.push("-t".into());
+            options.push(format!(
+                "127.0.0.1/{},auto",
+                port_ranges(&publish).join(",")
+            ));
+            options.push("--host-lo-to-ns-lo".into());
+        } else {
+            options.extend(["-t".into(), "none".into()]);
+        }
+        options
+    }
+
+    /// [`Self::pasta_options`] as the containers.conf podman reads them from.
+    fn pasta_conf(&self) -> String {
+        let quoted: Vec<String> = self
+            .pasta_options()
+            .iter()
+            .map(|o| format!("\"{o}\""))
+            .collect();
+        format!("[network]\npasta_options = [{}]\n", quoted.join(", "))
+    }
 }
 
 /// A terminal or service shell in the container: the image's login shell,
@@ -461,7 +547,7 @@ pub fn git_env(dir: &Path) -> Result<Vec<(&'static str, PathBuf)>, EngineError> 
     // Not in a submodule (or other nested repository): which git folder it
     // uses is the agents' to say (its `.git` file, `.gitmodules`), and a
     // worktree's submodule git folders, or one initialized after the
-    // container started, aren't read-only. Its git runs in the container.
+    // container started, aren't read-only. Its git runs jailed ([`pin_git`]).
     let mut at = work_tree.clone();
     for part in dir
         .strip_prefix(&work_tree)
@@ -483,19 +569,227 @@ pub fn git_env(dir: &Path) -> Result<Vec<(&'static str, PathBuf)>, EngineError> 
     ])
 }
 
-/// [`git_env`] on a host git `cmd` in `dir`. A sandboxed checkout it can't
-/// vouch for gets a git folder that doesn't exist, so git fails rather than
-/// read one an agent chose.
-pub fn pin_git(cmd: &mut tokio::process::Command, dir: &Path) {
-    match git_env(dir) {
-        Ok(env) => {
-            cmd.envs(env);
-        }
-        Err(error) => {
-            tracing::warn!(%error, dir = %dir.display(), "sandbox: refusing host git");
-            cmd.env("GIT_DIR", "/nonexistent/zeron-sandbox-refused");
+/// Git commands that need this machine itself: its network and credentials
+/// (ssh, the gh helper) or its signing key. For a sandboxed checkout they run
+/// here pinned ([`git_env`]) with submodule recursion off; every other git
+/// command runs jailed ([`jail`]).
+const HOST_GIT: &[&str] = &[
+    "push",
+    "fetch",
+    "pull",
+    "ls-remote",
+    "remote",
+    "commit",
+    "tag",
+    "merge",
+    "rebase",
+    "cherry-pick",
+    "revert",
+    "am",
+];
+
+/// Config for a host-side git of a sandboxed checkout: git never starts a
+/// child in a submodule, whose git folder and config are the agents'.
+const NO_SUBMODULE_RECURSION: &[(&str, &str)] = &[
+    ("diff.ignoreSubmodules", "dirty"),
+    ("status.submoduleSummary", "false"),
+    ("submodule.recurse", "false"),
+    ("fetch.recurseSubmodules", "false"),
+    ("push.recurseSubmodules", "no"),
+];
+
+/// The git subcommand in `args` (after `-C dir`, `-c key=value` and other
+/// global options).
+fn git_subcommand<'a>(mut args: impl Iterator<Item = &'a std::ffi::OsStr>) -> Option<&'a str> {
+    while let Some(arg) = args.next() {
+        let arg = arg.to_str()?;
+        match arg {
+            "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--exec-path" => {
+                args.next();
+            }
+            _ if arg.starts_with('-') => {}
+            _ => return Some(arg),
         }
     }
+    None
+}
+
+/// Makes host git `cmd` in `dir` safe for a sandboxed checkout, whose
+/// repositories agents shape (`.git` files, submodule git folders and their
+/// config, attributes). Call it last, once the command's arguments and
+/// environment are set. A command it can't make safe fails instead.
+///
+/// - [`HOST_GIT`] and `gh` run here, pinned to the project's own git folder
+///   (read-only to agents) with [`NO_SUBMODULE_RECURSION`]; never inside a
+///   nested repository.
+/// - Everything else runs in a jail ([`jail`]) with no network and none of
+///   this machine's files but the system's and the project's, so whatever an
+///   agent's config makes git run there reaches nothing agents can't.
+pub fn pin_git(cmd: &mut tokio::process::Command, dir: &Path) {
+    let sandbox = match for_path(dir) {
+        Ok(Some(sandbox)) => sandbox,
+        Ok(None) => return,
+        Err(error) => return refuse_git(cmd, dir, &error),
+    };
+    let std = cmd.as_std();
+    let git = Path::new(std.get_program()).file_name() == Some(std::ffi::OsStr::new("git"));
+    let host = !git || git_subcommand(std.get_args()).is_some_and(|s| HOST_GIT.contains(&s));
+    if !host {
+        match jail(&sandbox, cmd) {
+            Ok(jailed) => *cmd = jailed,
+            Err(error) => refuse_git(cmd, dir, &error),
+        }
+        return;
+    }
+    match git_env(dir) {
+        Ok(env) => {
+            // Hooks only from the project's own (read-only) hooks folder,
+            // never a `core.hooksPath` in the work tree, which agents edit.
+            let hooks = env
+                .iter()
+                .find(|(k, _)| *k == "GIT_COMMON_DIR")
+                .map(|(_, common)| common.join("hooks"));
+            cmd.envs(env);
+            let count = std::env::var("GIT_CONFIG_COUNT")
+                .ok()
+                .and_then(|n| n.parse::<usize>().ok())
+                .unwrap_or(0);
+            let count = cmd
+                .as_std()
+                .get_envs()
+                .find(|(k, _)| *k == "GIT_CONFIG_COUNT")
+                .and_then(|(_, v)| v?.to_str()?.parse().ok())
+                .unwrap_or(count);
+            let hooks = hooks.map(|h| h.to_string_lossy().into_owned());
+            let config = NO_SUBMODULE_RECURSION
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .chain(hooks.as_deref().map(|h| ("core.hooksPath", h)));
+            let mut added = 0;
+            for (i, (key, value)) in config.enumerate() {
+                cmd.env(format!("GIT_CONFIG_KEY_{}", count + i), key)
+                    .env(format!("GIT_CONFIG_VALUE_{}", count + i), value);
+                added += 1;
+            }
+            cmd.env("GIT_CONFIG_COUNT", (count + added).to_string());
+        }
+        Err(error) => refuse_git(cmd, dir, &error),
+    }
+}
+
+/// A git folder that doesn't exist: git fails rather than read one an agent
+/// chose.
+fn refuse_git(cmd: &mut tokio::process::Command, dir: &Path, error: &EngineError) {
+    tracing::warn!(%error, dir = %dir.display(), "sandbox: refusing host git");
+    cmd.env("GIT_DIR", "/nonexistent/zeron-sandbox-refused");
+}
+
+/// `cmd` (git) in bubblewrap: no network, a fresh /tmp, the system's files
+/// read-only, the project and its worktrees writable but for what this
+/// machine reads or runs from them (the container's read-only paths), any
+/// index or object store the command names, and this machine's git config
+/// read-only (identity, ignores). Nothing else of this machine: no home, no
+/// ssh or gpg agent, and only the environment git needs.
+fn jail(
+    sandbox: &Sandbox,
+    cmd: &tokio::process::Command,
+) -> Result<tokio::process::Command, EngineError> {
+    let std = cmd.as_std();
+    let git = which("git").ok_or_else(|| EngineError::Other("git isn't installed".into()))?;
+    let mut jail = tokio::process::Command::new("bwrap");
+    jail.args([
+        "--unshare-all",
+        "--die-with-parent",
+        "--new-session",
+        "--ro-bind",
+        "/usr",
+        "/usr",
+        "--ro-bind",
+        "/etc",
+        "/etc",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--tmpfs",
+        "/tmp",
+    ]);
+    for top in ["/bin", "/lib", "/lib64", "/sbin"] {
+        let top = Path::new(top);
+        match std::fs::read_link(top) {
+            Ok(target) => jail.arg("--symlink").arg(target).arg(top),
+            Err(_) if top.is_dir() => jail.arg("--ro-bind").arg(top).arg(top),
+            Err(_) => continue,
+        };
+    }
+    // A git outside /usr (Homebrew) brings its prefix.
+    if let Some(prefix) = git.parent().and_then(Path::parent)
+        && !git.starts_with("/usr")
+    {
+        jail.arg("--ro-bind").arg(prefix).arg(prefix);
+    }
+    for dir in [&sandbox.root, &sandbox.worktrees] {
+        jail.arg("--bind").arg(dir).arg(dir);
+    }
+    for protected in sandbox.protected()? {
+        jail.arg("--ro-bind").arg(&protected).arg(&protected);
+    }
+    let env = |name: &str| {
+        std.get_envs()
+            .find(|(k, _)| *k == name)
+            .and_then(|(_, v)| v.map(std::ffi::OsStr::to_os_string))
+    };
+    let mut stores = Vec::new();
+    if let Some(index) = env("GIT_INDEX_FILE") {
+        stores.extend(Path::new(&index).parent().map(Path::to_path_buf));
+    }
+    if let Some(objects) = env("GIT_OBJECT_DIRECTORY") {
+        stores.push(PathBuf::from(objects));
+    }
+    if let Some(alternates) = env("GIT_ALTERNATE_OBJECT_DIRECTORIES") {
+        stores.extend(std::env::split_paths(&alternates));
+    }
+    for store in stores.into_iter().filter(|s| s.is_absolute() && s.is_dir()) {
+        if !store.starts_with(&sandbox.root) && !store.starts_with(&sandbox.worktrees) {
+            jail.arg("--bind").arg(&store).arg(&store);
+        }
+    }
+    let home = crate::repos::home_dir();
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+    for file in [home.join(".gitconfig"), config.join("git")] {
+        jail.arg("--ro-bind-try").arg(&file).arg(&file);
+    }
+    if let Some(cwd) = std.get_current_dir() {
+        jail.arg("--chdir").arg(cwd);
+        jail.current_dir(cwd);
+    }
+    jail.arg("--").arg(&git).args(std.get_args());
+    // Only what git needs, then the command's own (never the engine's
+    // environment: its tokens would be the jail's to read).
+    jail.env_clear()
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config);
+    for name in ["LANG", "LC_ALL", "LC_CTYPE", "TZ"] {
+        if let Some(value) = std::env::var_os(name) {
+            jail.env(name, value);
+        }
+    }
+    for (key, value) in std.get_envs() {
+        if let Some(value) = value {
+            jail.env(key, value);
+        }
+    }
+    Ok(jail)
+}
+
+/// `program` on this process's PATH.
+fn which(program: &str) -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(program))
+        .find(|candidate| candidate.is_file())
 }
 
 /// For a sandboxed run: start the container, give it this machine's login
@@ -524,6 +818,12 @@ pub async fn stamp_run(
     if let Some(accounts) = accounts {
         sync_login(accounts, &spec.container, harness).await;
         keep_logins_fresh(accounts);
+        let container = spec.container.clone();
+        if let Ok(Err(error)) =
+            tokio::task::spawn_blocking(move || install_git_identity(&container)).await
+        {
+            tracing::warn!(%error, "sandbox: couldn't hand over the git identity");
+        }
     }
     let mut records = Vec::new();
     for server in request.mcp.iter_mut().chain(request.extra_mcp.iter_mut()) {
@@ -605,6 +905,35 @@ fn install_login(container: &str, path: &str, contents: &str) -> Result<(), Engi
         )));
     }
     Ok(())
+}
+
+/// This machine's git identity (`user.name`, `user.email`) for the commits
+/// agents make in the container, so they're authored as here. Not its
+/// signing key: those commits are unsigned.
+fn install_git_identity(container: &str) -> Result<(), EngineError> {
+    let get = |key: &str| {
+        Command::new("git")
+            .args(["config", "--global", "--get", key])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+            .filter(|v| !v.is_empty())
+    };
+    let (Some(name), Some(email)) = (get("user.name"), get("user.email")) else {
+        return Ok(());
+    };
+    podman(&[
+        "exec",
+        container,
+        "sh",
+        "-c",
+        r#"git config --global user.name "$1" && git config --global user.email "$2""#,
+        "sh",
+        &name,
+        &email,
+    ])
+    .map(|_| ())
 }
 
 /// Every minute, the logins in each running sandbox are handed over again,
@@ -876,7 +1205,7 @@ mod tests {
         );
         for expected in [
             pinned.as_str(),
-            "--network pasta:-T,5432,-t,3000",
+            "--network pasta --sysctl net.ipv6.conf.all.disable_ipv6=1",
             &format!("{0}/.git/config:{0}/.git/config:ro", s.root.display()),
             &format!("{0}/.git/hooks:{0}/.git/hooks:ro", s.root.display()),
             &format!(
@@ -893,6 +1222,28 @@ mod tests {
         assert!(
             s.run_args(Path::new("/h"), "img").is_err(),
             "a repo config include is refused"
+        );
+        // Ports: the listed ones (or every one a server opens), on loopback
+        // only, never this machine's own; host ports explicit; no UDP.
+        let options = s.pasta_options().join(" ");
+        assert!(options.contains("-T 5432"), "{options}");
+        assert!(
+            options.contains("-t 127.0.0.1/3000,auto --host-lo-to-ns-lo"),
+            "{options}"
+        );
+        assert!(options.contains("-u none -U none"), "{options}");
+        let open = Sandbox {
+            publish_ports: Vec::new(),
+            ..s.clone()
+        };
+        let options = open.pasta_options().join(" ");
+        assert!(
+            options.contains("-t 127.0.0.1/1024-1454,1456-5431,5433-27653,27655-65535,auto"),
+            "{options}"
+        );
+        assert!(
+            open.pasta_conf()
+                .starts_with("[network]\npasta_options = [\"-4\", \"-u\", \"none\"")
         );
     }
 

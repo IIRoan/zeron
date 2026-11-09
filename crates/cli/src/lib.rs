@@ -185,14 +185,14 @@ pub enum SandboxCommand {
         /// mounted read-only), or one outside every sandboxed project.
         #[arg(long)]
         config: std::path::PathBuf,
-        /// A port on this machine the container reaches on its localhost (a
-        /// database). Repeat for more.
-        #[arg(long = "host-port", value_name = "PORT")]
-        host_ports: Vec<u16>,
-        /// A container port this machine reaches on its localhost (a dev
-        /// server). Repeat for more.
-        #[arg(long = "publish", value_name = "PORT")]
-        publish_ports: Vec<u16>,
+        /// A port (or `a-b` range) on this machine the container reaches on
+        /// its localhost (a database). Repeat for more.
+        #[arg(long = "host-port", value_name = "PORT[-PORT]")]
+        host_ports: Vec<String>,
+        /// A container port (or `a-b` range) this machine reaches on its
+        /// localhost (dev servers). Repeat for more.
+        #[arg(long = "publish", value_name = "PORT[-PORT]")]
+        publish_ports: Vec<String>,
         /// A path in the project this machine reads (a database's compose
         /// file), mounted read-only so agents can't change it. Repeat for more.
         #[arg(long = "read-only", value_name = "PATH")]

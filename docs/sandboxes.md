@@ -8,7 +8,7 @@ worktree of it. Shared databases stay on this machine.
 ```sh
 zeron sandbox enable ~/Documents/muute-monorepo \
   --config ~/Documents/muute-monorepo/.devcontainer/devcontainer.json \
-  --host-port 5432 --host-port 6379 --publish 3000 --publish 6006 \
+  --host-port 5432 --host-port 6379 --publish 3000 --publish 3300-3399 \
   --read-only compose.devcontainer.yaml --read-only compose.db-only.yaml \
   --read-only bunfig.toml
 zeron sandbox status
@@ -27,8 +27,10 @@ zeron sandbox disable ~/Documents/muute-monorepo
   the config's run settings (`mounts`, `runArgs`, `remoteEnv`, users).
 - `--host-port`: a port on this machine (a database) that the container
   reaches on its own `localhost`. `--publish`: a container port (a dev server)
-  this machine reaches on `localhost`. Nothing else crosses, including Zeron's
-  IPC port.
+  this machine reaches on `localhost`; publish the ranges worktrees take their
+  ports from too (`3300-3399`). Both take `a-b` ranges. Nothing else crosses,
+  including Zeron's IPC port. A server a chat or service starts there shows as
+  that chat's preview on its published port.
 - `--read-only`: files in the project that this machine reads, such as a
   database service's compose file, or a `bunfig.toml` a readiness check loads.
   `.git/config` and `.git/hooks` (submodules' too) are always read-only.
@@ -40,6 +42,10 @@ zeron sandbox disable ~/Documents/muute-monorepo
   refreshed first, under Claude Code's own lock; Codex's is refreshed by
   Codex runs here (its tokens last days). The files are written from inside
   the container, so nothing an agent plants in its home reaches this machine.
+- The container's environment has `ZERON_SANDBOX=1`, for a project's own
+  tooling to adapt (no ssh keys there, no container daemon).
+- Agents' commits there are authored with this machine's `user.name` and
+  `user.email`, unsigned (the signing key stays here).
 - Edit the config and run `enable` again to rebuild. `disable` keeps the image
   and the home volume.
 
@@ -52,13 +58,31 @@ container (minutes; it carries on if the page closes), and Turn off removes
 it. Agents never reach these settings (`GetProjectSandbox` /
 `SetProjectSandbox` are app-only).
 
-## Submodules
+## Git on this machine
 
-Host git never runs inside a submodule or other nested repository of a
-sandboxed checkout: which git folder it uses is the agents' to say (its
-`.git` file), and a worktree's submodule git folders aren't read-only. Source
-Control lists the checkout's own changes, submodule pointers included, but not
-a submodule's contents; git inside the container sees them all.
+Zeron's own git for a sandboxed checkout (Source Control, diffs, turn
+snapshots, worktrees) never runs on this machine against what agents shape:
+`.git` files, submodule git folders and their config, attributes.
+
+- Local commands (status, diff, add, restore, stash, checkout, worktree,
+  submodules, …) run in a bubblewrap jail (`bwrap` is required): no network,
+  a fresh `/tmp`, the system's files read-only, the project and its worktrees
+  writable except the container's read-only paths, any index or object store
+  the command names, and this machine's git config read-only. Nothing else of
+  this machine: no home, no ssh or gpg agent, no inherited environment.
+  Whatever an agent's config makes git run there reaches only what agents can
+  already change. Submodules work in full.
+- Commands that need this machine itself (commit, tag, merge, rebase, pull,
+  push, fetch, `gh`) run here, pinned to the project's own git folder (read-only
+  to agents), with submodule recursion off and hooks only from `.git/hooks`.
+  They're refused inside a submodule.
+
+## Worktrees
+
+Worktrees are created and removed by Zeron (jailed git), and their setup and
+cleanup commands run in the container, like everything else of the checkout.
+Each is its own checkout and branch; the container sees new ones at once (the
+worktrees folder is mounted).
 
 ## From an agent (Zeron MCP)
 

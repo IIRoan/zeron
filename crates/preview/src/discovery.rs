@@ -329,8 +329,9 @@ pub fn listeners(origins: &mut Origins) -> Option<Vec<Listener>> {
     if tables == 0 {
         return None;
     }
-    let (boot, ticks) = linux_clock();
     let uid = unsafe { libc::geteuid() };
+    container_listeners(&mut sockets, uid);
+    let (boot, ticks) = linux_clock();
     let mut result = Vec::new();
     let mut processes = HashMap::new();
     for process in fs::read_dir("/proc").ok()?.flatten() {
@@ -394,12 +395,67 @@ pub fn listeners(origins: &mut Origins) -> Option<Vec<Listener>> {
             });
         }
     }
+    // A published container port listens here whether or not anything
+    // serves it there: that's the forwarder (pasta), never a server. The
+    // container's own listener (above) stands in for it when there is one.
+    result.retain(|l| {
+        !l.args.first().is_some_and(|program| {
+            let name = Path::new(program).file_name().unwrap_or_default();
+            name.to_string_lossy().starts_with("pasta")
+                || name == "slirp4netns"
+                || name == "rootlessport"
+        })
+    });
     origins.attribute(&mut result, &processes, |pid| {
         fs::read(format!("/proc/{pid}/environ")).ok()
     });
     result.sort_by_key(|l| (l.address, l.pid));
     result.dedup_by_key(|l| (l.address, l.pid));
     Some(result)
+}
+
+/// Servers in this user's containers (a project sandbox): listeners in
+/// other network namespaces whose port is forwarded to this machine's
+/// loopback (published), added to `sockets` at that loopback address so
+/// they're attributed like any other.
+#[cfg(target_os = "linux")]
+fn container_listeners(sockets: &mut HashMap<String, SocketAddr>, uid: u32) {
+    use std::{fs, os::unix::fs::MetadataExt};
+    let here = fs::read_link("/proc/self/ns/net").ok();
+    let local: HashSet<u16> = sockets.values().map(SocketAddr::port).collect();
+    let mut namespaces = HashSet::new();
+    for process in fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let path = process.path();
+        if !fs::metadata(&path).is_ok_and(|m| m.uid() == uid) {
+            continue;
+        }
+        let Ok(namespace) = fs::read_link(path.join("ns/net")) else {
+            continue;
+        };
+        if Some(&namespace) == here.as_ref() || !namespaces.insert(namespace) {
+            continue;
+        }
+        for (file, ipv6) in [("net/tcp", false), ("net/tcp6", true)] {
+            let Ok(text) = fs::read_to_string(path.join(file)) else {
+                continue;
+            };
+            for line in text.lines().skip(1) {
+                let parts: Vec<_> = line.split_whitespace().collect();
+                if parts.len() <= 9 || parts[3] != "0A" {
+                    continue;
+                }
+                let Some(port) = proc_address(parts[1], ipv6).map(|a| a.port()) else {
+                    continue;
+                };
+                if local.contains(&port) {
+                    sockets.insert(
+                        parts[9].to_string(),
+                        SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]

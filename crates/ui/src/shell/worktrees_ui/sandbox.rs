@@ -63,16 +63,9 @@ fn list(text: &str) -> Vec<&str> {
         .collect()
 }
 
+/// Ports and `a-b` ranges, as the engine stores them (one by one).
 fn ports(text: &str, what: &str) -> Result<Vec<u16>, String> {
-    list(text)
-        .into_iter()
-        .map(|p| {
-            p.parse::<u16>()
-                .ok()
-                .filter(|p| *p > 0)
-                .ok_or_else(|| format!("{what}: {p} isn't a port number"))
-        })
-        .collect()
+    zeron_proto::sandbox::parse_ports(text).map_err(|e| format!("{what}: {e}"))
 }
 
 /// The inputs as `SetProjectSandbox` takes them, into `params`.
@@ -173,8 +166,8 @@ impl Shell {
                         let (config, host, publish, read_only) = match &view.sandbox {
                             Some(s) => (
                                 s.config.clone(),
-                                joined(&s.host_ports),
-                                joined(&s.publish_ports),
+                                joined(&zeron_proto::sandbox::port_ranges(&s.host_ports)),
+                                joined(&zeron_proto::sandbox::port_ranges(&s.publish_ports)),
                                 joined(&s.read_only),
                             ),
                             None => (
@@ -294,7 +287,7 @@ impl Shell {
                         theme,
                         false,
                         "Published ports",
-                        "Container ports this machine reaches on localhost, such as dev servers.",
+                        "Container ports this machine reaches on localhost, such as dev servers. Ranges like 3300-3399 cover worktrees' ports.",
                         &panel.publish_ports,
                     ))
                     .child(command_row(
@@ -332,8 +325,8 @@ mod tests {
     #[test]
     fn ports_and_paths_read_from_any_separator() {
         assert_eq!(
-            ports("5432, 6379\n1025 8025", "x"),
-            Ok(vec![5432, 6379, 1025, 8025])
+            ports("5432, 6379\n1025 8025 3300-3301", "x"),
+            Ok(vec![5432, 6379, 1025, 8025, 3300, 3301])
         );
         assert!(
             ports("5432, http", "Host ports")

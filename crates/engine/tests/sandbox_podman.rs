@@ -244,6 +244,42 @@ async fn a_sandboxed_service_runs_in_the_container_and_ends_with_it() {
         ]),
         "600"
     );
+    // A dev server a chat starts there shows as that chat's preview, on the
+    // published port, rather than as the port forwarder's.
+    podman(&[
+        "exec",
+        "-d",
+        "-e",
+        &format!(
+            "{}={}",
+            zeron_proto::ORIGIN_ENV,
+            zeron_proto::chat_origin("chat-in-sandbox")
+        ),
+        &second.container(),
+        "nc",
+        "-l",
+        "-p",
+        "3999",
+    ]);
+    let mut origins = zeron_preview::discovery::Origins::default();
+    let mut found = None;
+    for _ in 0..50 {
+        found = zeron_preview::discovery::listeners(&mut origins)
+            .unwrap()
+            .into_iter()
+            .find(|l| l.address.port() == 3999);
+        if found.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let server = found.expect("the sandboxed server is discovered");
+    assert_eq!(
+        server.origin.as_deref(),
+        Some("chat:chat-in-sandbox"),
+        "{:?}",
+        server.args
+    );
     sandbox::disable(&project).unwrap();
     core.shutdown().await;
     for args in [

@@ -373,9 +373,10 @@ async fn snapshot_git(
         cmd.as_std_mut().creation_flags(0x08000000);
     }
     cmd.arg("-C").arg(root).args(args);
-    crate::sandbox::pin_git(&mut cmd, root);
     cmd.env("GIT_INDEX_FILE", index);
     store.apply_to(&mut cmd);
+    // Last: a sandboxed checkout's git is jailed with this index and store.
+    crate::sandbox::pin_git(&mut cmd, root);
     cmd.stdin(if stdin.is_some() {
         std::process::Stdio::piped()
     } else {

@@ -284,11 +284,11 @@ impl Repos {
             // Let Git handle long native paths without persisting user config.
             cmd.args(["-c", "core.longpaths=true"]);
         }
+        cmd.args(args);
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
             crate::sandbox::pin_git(&mut cmd, cwd);
         }
-        cmd.args(args);
         cmd.stdin(std::process::Stdio::null());
         let output = cmd.output().await.map_err(|e| {
             EngineError::Other(format!("git {args:?} in {cwd:?} failed to start: {e}"))

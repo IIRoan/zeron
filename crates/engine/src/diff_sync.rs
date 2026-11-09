@@ -1133,10 +1133,11 @@ async fn capture_git_in<S: AsRef<OsStr>>(
         cmd.as_std_mut().creation_flags(0x08000000);
     }
     cmd.arg("-C").arg(cwd).args(args);
-    crate::sandbox::pin_git(&mut cmd, cwd);
     if let Some(snapshot) = snapshot {
         snapshot.apply_to(&mut cmd);
     }
+    // Last: a sandboxed checkout's git is jailed with what it names.
+    crate::sandbox::pin_git(&mut cmd, cwd);
     // Read-only commands: a caller that gives up (a timed-out snapshot, a
     // dropped request) takes its git child down with it.
     cmd.kill_on_drop(true);
@@ -1841,10 +1842,10 @@ async fn run_git_for_path_batch(
         .arg("--literal-pathspecs")
         .args(fixed_args)
         .arg("--");
-    crate::sandbox::pin_git(&mut command, root);
     for path in paths {
         command.arg(path_argument(path));
     }
+    crate::sandbox::pin_git(&mut command, root);
     command.stdin(std::process::Stdio::null());
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::piped());
