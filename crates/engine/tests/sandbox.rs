@@ -155,6 +155,19 @@ async fn a_sandboxed_project_never_runs_on_the_host_and_its_agents_stay_inside()
             .and_then(|(_, v)| v),
         Some(std::ffi::OsStr::new("6"))
     );
+    // Commands that write the project's .git/config (read-only in the jail)
+    // run here too: a branch rename after an auto-title used to fail there.
+    for args in [
+        &["config", "branch.wt.description", "probe"][..],
+        &["branch", "--move", "wt", "wt-renamed"][..],
+    ] {
+        let mut cmd = tokio::process::Command::new("git");
+        cmd.arg("-C").arg(&worktree).args(args);
+        sandbox::pin_git(&mut cmd, &worktree);
+        assert_eq!(cmd.as_std().get_program(), "git", "{args:?}");
+        let out = cmd.output().await.unwrap();
+        assert!(out.status.success(), "{args:?}: {out:?}");
+    }
     // Everything else is jailed: what the planted config runs reaches
     // nothing of this machine's.
     let mut status = tokio::process::Command::new("git");

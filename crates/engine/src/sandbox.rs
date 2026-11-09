@@ -667,8 +667,11 @@ pub fn git_env(dir: &Path) -> Result<Vec<(&'static str, PathBuf)>, EngineError> 
 }
 
 /// Git commands that need this machine itself: its network and credentials
-/// (ssh, the gh helper) or its signing key. For a sandboxed checkout they run
-/// here pinned ([`git_env`]) with submodule recursion off; every other git
+/// (ssh, the gh helper), its signing key, or the project's `.git/config`
+/// (read-only in the jail: branch tracking, renames, worktrees) and the real
+/// list of its worktrees (a jailed `worktree prune` would miss those outside
+/// it). For a sandboxed checkout they run here pinned ([`git_env`]) with
+/// submodule recursion off and hooks from `.git/hooks`; every other git
 /// command runs jailed ([`jail`]).
 const HOST_GIT: &[&str] = &[
     "push",
@@ -683,6 +686,11 @@ const HOST_GIT: &[&str] = &[
     "cherry-pick",
     "revert",
     "am",
+    "branch",
+    "config",
+    "switch",
+    "checkout",
+    "worktree",
 ];
 
 /// Config for a host-side git of a sandboxed checkout: git never starts a

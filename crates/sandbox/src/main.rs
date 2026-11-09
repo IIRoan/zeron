@@ -230,15 +230,13 @@ fn splice_server(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()?;
-    let mut to_child = child.stdin.take().expect("piped stdin");
-    let mut from_child = child.stdout.take().expect("piped stdout");
-    let mut reader = stream.try_clone()?;
-    let mut writer = stream;
-    let inbound = thread::spawn(move || {
-        let _ = io::copy(&mut reader, &mut to_child);
-    });
-    let _ = io::copy(&mut from_child, &mut writer);
-    let _ = writer.shutdown(std::net::Shutdown::Both);
+    let to_child = child.stdin.take().expect("piped stdin");
+    let from_child = child.stdout.take().expect("piped stdout");
+    let reader = stream.try_clone()?;
+    let writer = stream.try_clone()?;
+    let inbound = thread::spawn(move || pump(reader, to_child));
+    pump(from_child, writer);
+    let _ = stream.shutdown(std::net::Shutdown::Both);
     let _ = inbound.join();
     let _ = child.kill();
     child.wait().map(|_| ())
@@ -341,34 +339,34 @@ fn relay(args: &[String]) -> i32 {
         Ok(stream) => stream,
         Err(error) => return fail(format!("{socket}: {error}")),
     };
-    let mut writer = match stream.try_clone() {
+    let writer = match stream.try_clone() {
         Ok(writer) => writer,
         Err(error) => return fail(error),
     };
     thread::spawn(move || {
-        let mut input = io::stdin();
-        let mut buffer = [0u8; 16 * 1024];
-        while let Ok(read) = input.read(&mut buffer) {
-            if read == 0 || writer.write_all(&buffer[..read]).is_err() {
-                break;
-            }
-        }
+        pump(io::stdin(), &writer);
         let _ = writer.shutdown(std::net::Shutdown::Write);
     });
-    let mut reader = stream;
-    let mut output = io::stdout();
+    pump(stream, io::stdout());
+    0
+}
+
+/// Copies `from` to `to` as data arrives, until either end closes. Not
+/// `io::copy`: between a unix socket and a pipe it splices, and that holds
+/// what it read until the socket's EOF, so an MCP request sat unanswered
+/// while its client kept the connection open.
+fn pump(mut from: impl Read, mut to: impl Write) {
     let mut buffer = [0u8; 16 * 1024];
-    while let Ok(read) = reader.read(&mut buffer) {
+    while let Ok(read) = from.read(&mut buffer) {
         if read == 0
-            || output
+            || to
                 .write_all(&buffer[..read])
-                .and_then(|_| output.flush())
+                .and_then(|_| to.flush())
                 .is_err()
         {
             break;
         }
     }
-    0
 }
 
 fn code_of(status: ExitStatus) -> i32 {
@@ -383,6 +381,22 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_relayed_server_answers_while_its_client_keeps_the_connection_open() {
+        let (client, server) = UnixStream::pair().unwrap();
+        thread::spawn(move || splice_server(server, "cat", &[], &[]));
+        let mut writer = client.try_clone().unwrap();
+        writer.write_all(b"{\"id\":1}\n").unwrap();
+        // No EOF: an MCP client waits for the reply first.
+        let mut reader = client;
+        reader
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reply = [0u8; 9];
+        reader.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"{\"id\":1}\n");
     }
 
     #[test]

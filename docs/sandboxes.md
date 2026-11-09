@@ -64,8 +64,8 @@ Zeron's own git for a sandboxed checkout (Source Control, diffs, turn
 snapshots, worktrees) never runs on this machine against what agents shape:
 `.git` files, submodule git folders and their config, attributes.
 
-- Local commands (status, diff, add, restore, stash, checkout, worktree,
-  submodules, …) run in a bubblewrap jail (`bwrap` is required): no network,
+- Local commands (status, diff, log, add, restore, reset, stash, submodules,
+  …) run in a bubblewrap jail (`bwrap` is required): no network,
   a fresh `/tmp`, the system's files read-only, the project and its worktrees
   writable except the container's read-only paths, any index or object store
   the command names, and this machine's git config read-only. Nothing else of
@@ -73,9 +73,12 @@ snapshots, worktrees) never runs on this machine against what agents shape:
   Whatever an agent's config makes git run there reaches only what agents can
   already change. Submodules work in full.
 - Commands that need this machine itself (commit, tag, merge, rebase, pull,
-  push, fetch, `gh`) run here, pinned to the project's own git folder (read-only
-  to agents), with submodule recursion off and hooks only from `.git/hooks`.
-  They're refused inside a submodule.
+  push, fetch, `gh`) or write the project's `.git/config` (branch, config,
+  switch, checkout, worktree) run here, pinned to the project's own git folder
+  (read-only to agents), with submodule recursion off and hooks only from
+  `.git/hooks`. They're refused inside a submodule.
+- MCP servers reach agents in the container through the helper's relay
+  (a unix socket in the run folder): Zeron's own tools work there.
 
 ## Worktrees
 
