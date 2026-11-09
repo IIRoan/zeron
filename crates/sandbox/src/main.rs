@@ -38,6 +38,9 @@ const SIG_DFL: usize = 0;
 const SIG_IGN: usize = 1;
 /// Exit status when the host side is gone before or while the command runs.
 const HOST_GONE: i32 = 125;
+/// How long `exec` waits for the guard to end its command. The engine stops a
+/// service within 3 s, and the guard's escalation (`end_group`) fits in that.
+const GUARD_WAIT: Duration = Duration::from_secs(10);
 /// MCP servers the host side serves for this run, set by Zeron.
 const MCP_ENV: &str = "ZERON_SANDBOX_MCP";
 const FIELD: char = '\u{1f}';
@@ -137,6 +140,10 @@ fn host_exec(args: &[String]) -> i32 {
     if unsafe { flock(lease.as_raw_fd(), LOCK_EX) } != 0 {
         return fail(format!("could not lock {}", lease_path.display()));
     }
+    let held = guard_path(&lease_path);
+    if let Err(error) = File::create(&held) {
+        return fail(format!("{}: {error}", held.display()));
+    }
     let sockets = match serve_mcp(std::env::var(MCP_ENV).unwrap_or_default()) {
         Ok(sockets) => sockets,
         Err(message) => return fail(message),
@@ -163,8 +170,14 @@ fn host_exec(args: &[String]) -> i32 {
         Ok(status) => code_of(status),
         Err(error) => fail(format!("{}: {error}", options.engine)),
     };
+    // Killing the podman client leaves the command running until the guard
+    // sees the lease free. Wait for it, so whoever stopped this process knows
+    // the command, and the ports it held, are gone (a service handing over to
+    // another checkout starts its replacement right after).
     drop(lease);
+    wait_for_guard(&held);
     let _ = fs::remove_file(&lease_path);
+    let _ = fs::remove_file(&held);
     for socket in sockets {
         let _ = fs::remove_file(socket);
     }
@@ -252,7 +265,15 @@ fn guard(args: &[String]) -> i32 {
     let Ok(lease) = File::open(lease_path) else {
         return fail("the host session is gone");
     };
-    if host_gone(&lease) {
+    // Held until this process exits, so `exec` waits for the command to end.
+    // Taken before the lease check: once `exec` has the lock, it no longer
+    // waits, so nothing may start. (An older `exec` makes no such file.)
+    let held = File::open(guard_path(Path::new(lease_path))).ok();
+    if held
+        .as_ref()
+        .is_some_and(|file| unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0)
+        || host_gone(&lease)
+    {
         return fail("the host session is gone");
     }
     let mut child = login_command(command);
@@ -284,7 +305,7 @@ fn guard(args: &[String]) -> i32 {
             end_group(group, &mut child);
             return HOST_GONE;
         }
-        thread::sleep(Duration::from_millis(300));
+        thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -293,11 +314,28 @@ fn host_gone(lease: &File) -> bool {
     unsafe { flock(lease.as_raw_fd(), LOCK_EX | LOCK_NB) == 0 }
 }
 
-/// Hang up first (an interactive shell passes it to its jobs), then escalate.
+/// What the guard holds while its command runs, beside the lease.
+fn guard_path(lease: &Path) -> PathBuf {
+    lease.with_extension("guard")
+}
+
+/// Returns once no guard holds `path`, or after [`GUARD_WAIT`].
+fn wait_for_guard(path: &Path) {
+    let Ok(file) = File::open(path) else { return };
+    let started = std::time::Instant::now();
+    while unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0
+        && started.elapsed() < GUARD_WAIT
+    {
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Hang up first (an interactive shell passes it to its jobs), then escalate,
+/// all within the 3 s the engine gives a stopping service.
 fn end_group(group: i32, child: &mut std::process::Child) {
-    for (signal, wait) in [(SIGHUP, 1), (SIGTERM, 3), (SIGKILL, 0)] {
+    for (signal, tenths) in [(SIGHUP, 10), (SIGTERM, 15), (SIGKILL, 0)] {
         unsafe { kill(-group, signal) };
-        for _ in 0..wait * 10 {
+        for _ in 0..tenths {
             if matches!(child.try_wait(), Ok(Some(_))) {
                 return;
             }
@@ -452,6 +490,32 @@ mod tests {
         drop(holder);
         assert_eq!(worker.join().unwrap(), HOST_GONE);
         assert!(started.elapsed() < Duration::from_secs(10));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn exec_waits_until_the_guard_has_ended_its_command() {
+        let dir = std::env::temp_dir().join(format!("zeron-sandbox-wait-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lease");
+        let holder = File::create(&path).unwrap();
+        unsafe { flock(holder.as_raw_fd(), LOCK_EX) };
+        File::create(guard_path(&path)).unwrap();
+        let lease = path.to_string_lossy().into_owned();
+        // Ignores the hang-up, so it ends only at the SIGTERM a second later.
+        let worker = thread::spawn(move || {
+            guard(&args(&[&lease, "--", "sh", "-c", "trap '' HUP; sleep 30"]))
+        });
+        thread::sleep(Duration::from_millis(500));
+        let freed = std::time::Instant::now();
+        drop(holder);
+        wait_for_guard(&guard_path(&path));
+        assert!(
+            freed.elapsed() >= Duration::from_secs(1),
+            "{:?}",
+            freed.elapsed()
+        );
+        assert_eq!(worker.join().unwrap(), HOST_GONE);
         fs::remove_dir_all(dir).unwrap();
     }
 }
