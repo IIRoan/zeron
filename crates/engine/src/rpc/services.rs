@@ -49,6 +49,31 @@ struct SandboxEditParams {
     read_only: Vec<std::path::PathBuf>,
 }
 
+/// What a sandbox is set up with (`Sandbox` without its derived folders).
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct SandboxSettings {
+    #[serde(default)]
+    config: Option<std::path::PathBuf>,
+    #[serde(default)]
+    host_ports: Vec<u16>,
+    #[serde(default)]
+    publish_ports: Vec<u16>,
+    #[serde(default)]
+    read_only: Vec<std::path::PathBuf>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectSandboxParams {
+    space_id: String,
+    /// `SetProjectSandbox`: build and start it, or remove it.
+    #[serde(default)]
+    enabled: bool,
+    #[serde(flatten)]
+    settings: SandboxSettings,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ControlParams {
@@ -311,34 +336,18 @@ impl EngineRpc {
                 .ok_or_else(|| RpcError::Failed("Choose a project: this chat has none".into()))?;
             let root = std::path::PathBuf::from(&space.path);
             if edit.enabled {
-                let config = edit.config.filter(|c| c.is_absolute()).ok_or_else(|| {
-                    RpcError::BadParams("config: the absolute path of a devcontainer.json".into())
-                })?;
-                let worktrees = std::path::PathBuf::from(
-                    self.repos.worktree_location_settings().effective_directory,
-                )
-                .join(root.file_name().unwrap_or_default());
-                let sandbox = crate::sandbox::Sandbox {
-                    root,
-                    worktrees,
-                    config,
+                note = Some(crate::sandbox::LOGIN_NOTE);
+            }
+            self.apply_sandbox(
+                root,
+                edit.enabled.then_some(SandboxSettings {
+                    config: edit.config,
                     host_ports: edit.host_ports,
                     publish_ports: edit.publish_ports,
                     read_only: edit.read_only,
-                };
-                // Blocking and possibly minutes long (an image build); it
-                // finishes even if the caller stops waiting.
-                tokio::task::spawn_blocking(move || crate::sandbox::enable(sandbox, true))
-                    .await
-                    .map_err(|e| RpcError::Failed(e.to_string()))?
-                    .map_err(failed)?;
-                note = Some(crate::sandbox::LOGIN_NOTE);
-            } else {
-                tokio::task::spawn_blocking(move || crate::sandbox::disable(&root))
-                    .await
-                    .map_err(|e| RpcError::Failed(e.to_string()))?
-                    .map_err(failed)?;
-            }
+                }),
+            )
+            .await?;
         }
         let projects = tokio::task::spawn_blocking(crate::sandbox::statuses)
             .await
@@ -356,6 +365,80 @@ impl EngineRpc {
             result["note"] = json!(note);
         }
         Ok(RpcReply::Value(result))
+    }
+
+    /// Builds and starts `root`'s sandbox with `settings`, or removes it
+    /// (`None`). Blocking and possibly minutes long (an image build); it
+    /// finishes even if the caller stops waiting.
+    async fn apply_sandbox(
+        &self,
+        root: std::path::PathBuf,
+        settings: Option<SandboxSettings>,
+    ) -> Result<(), RpcError> {
+        let done = match settings {
+            Some(settings) => {
+                let config = settings.config.filter(|c| c.is_absolute()).ok_or_else(|| {
+                    RpcError::BadParams("config: the absolute path of a devcontainer.json".into())
+                })?;
+                let worktrees = std::path::PathBuf::from(
+                    self.repos.worktree_location_settings().effective_directory,
+                )
+                .join(root.file_name().unwrap_or_default());
+                let sandbox = crate::sandbox::Sandbox {
+                    root,
+                    worktrees,
+                    config,
+                    host_ports: settings.host_ports,
+                    publish_ports: settings.publish_ports,
+                    read_only: settings.read_only,
+                };
+                tokio::task::spawn_blocking(move || {
+                    crate::sandbox::enable(sandbox, true).map(|_| ())
+                })
+                .await
+            }
+            None => tokio::task::spawn_blocking(move || crate::sandbox::disable(&root)).await,
+        };
+        done.map_err(|e| RpcError::Failed(e.to_string()))?
+            .map_err(|e| RpcError::Failed(e.to_string()))
+    }
+
+    /// The app's view of one project's sandbox: its settings and container,
+    /// whether sandboxes work on this device, and the project's own
+    /// devcontainer config to suggest. Setting one up is the person's: agents
+    /// are refused here (they have `SetSandbox`, with its own checks).
+    pub(super) async fn project_sandbox(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<RpcReply, RpcError> {
+        if matches!(zeron_rpc::caller(), Caller::Agent { .. }) {
+            return Err(RpcError::Failed(
+                "Project sandbox settings are changed in Zeron's project settings".into(),
+            ));
+        }
+        let p: ProjectSandboxParams = parse_params(params)?;
+        let space = self.local_project_action_space(&p.space_id)?;
+        let root = std::path::PathBuf::from(&space.path);
+        if method == methods::SET_PROJECT_SANDBOX {
+            if !cfg!(target_os = "linux") {
+                return Err(RpcError::Failed(
+                    "Project sandboxes need Linux (rootless podman)".into(),
+                ));
+            }
+            self.apply_sandbox(root.clone(), p.enabled.then_some(p.settings))
+                .await?;
+        }
+        let suggested = root.join(".devcontainer/devcontainer.json");
+        let status = tokio::task::spawn_blocking(move || crate::sandbox::status_of(&root))
+            .await
+            .map_err(|e| RpcError::Failed(e.to_string()))?
+            .map_err(|e| RpcError::Failed(e.to_string()))?;
+        Ok(RpcReply::Value(json!({
+            "available": cfg!(target_os = "linux"),
+            "sandbox": status,
+            "suggestedConfig": suggested.is_file().then_some(suggested),
+        })))
     }
 
     /// Authoring a shell command must not bypass a chat's approval or

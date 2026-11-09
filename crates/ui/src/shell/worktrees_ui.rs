@@ -11,6 +11,7 @@ use zeron_proto::{
 
 mod environment;
 mod removal;
+mod sandbox;
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum SettingsPage {
@@ -67,6 +68,8 @@ pub(super) struct WorktreeSettingsUi {
     navigation_focus: Option<[gpui::FocusHandle; 5]>,
     removal: popover::Popup<removal::Removal>,
     pub(super) discard: popover::Popup<DiscardPrompt>,
+    /// The open project's sandbox (Environment page, project defaults).
+    sandbox: Option<sandbox::Panel>,
 }
 
 pub(super) struct Editor {
@@ -300,6 +303,7 @@ impl Shell {
         self.worktree_settings.editor.open(Editor::new(project));
         self.worktree_settings.poll = None;
         self.poll_worktree_settings(cx);
+        self.load_project_sandbox(cx);
         cx.notify();
     }
 
@@ -1103,7 +1107,16 @@ impl Shell {
                     let id =
                         SharedString::from(format!("project-settings-open-{}", destination.key()));
                     let focus = navigation_focus[destination as usize].clone();
-                    let summary = settings_summary(destination, editor, fields, cx);
+                    let mut summary = settings_summary(destination, editor, fields, cx);
+                    if destination == SettingsPage::Environment
+                        && self
+                            .worktree_settings
+                            .sandbox
+                            .as_ref()
+                            .is_some_and(|s| s.is_on())
+                    {
+                        summary.push_str(" · Sandboxed");
+                    }
                     sections = sections.child(
                         widgets::card_row(&theme, index == 0).py_0().child(
                             div()
@@ -1172,6 +1185,11 @@ impl Shell {
             }
             if page == SettingsPage::Environment {
                 panel = panel.child(self.render_environment_settings(fields, &theme, window, cx));
+                if editor.checkout.is_none()
+                    && let Some(sandbox) = self.render_project_sandbox(&theme, cx)
+                {
+                    panel = panel.child(sandbox);
+                }
             }
             if page == SettingsPage::Workflow {
                 if editor

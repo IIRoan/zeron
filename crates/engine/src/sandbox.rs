@@ -458,6 +458,24 @@ pub fn git_env(dir: &Path) -> Result<Vec<(&'static str, PathBuf)>, EngineError> 
             })?;
         (admin, checkout)
     };
+    // Not in a submodule (or other nested repository): which git folder it
+    // uses is the agents' to say (its `.git` file, `.gitmodules`), and a
+    // worktree's submodule git folders, or one initialized after the
+    // container started, aren't read-only. Its git runs in the container.
+    let mut at = work_tree.clone();
+    for part in dir
+        .strip_prefix(&work_tree)
+        .unwrap_or(Path::new(""))
+        .components()
+    {
+        at.push(part);
+        if at.join(".git").exists() {
+            return Err(EngineError::Other(format!(
+                "{} is a nested repository of a sandboxed project; its git runs only in the container",
+                at.display()
+            )));
+        }
+    }
     Ok(vec![
         ("GIT_DIR", git_dir),
         ("GIT_COMMON_DIR", common),
@@ -738,6 +756,12 @@ impl Sandbox {
 /// Every registered project, with its container's state.
 pub fn statuses() -> Result<Vec<Status>, EngineError> {
     Ok(load()?.iter().map(Sandbox::status).collect())
+}
+
+/// The project at `root` (exactly, not a project around it), if sandboxed.
+pub fn status_of(root: &Path) -> Result<Option<Status>, EngineError> {
+    let root = resolve(root);
+    Ok(load()?.iter().find(|s| s.root == root).map(Sandbox::status))
 }
 
 /// Build the image, register the project and start its container. The

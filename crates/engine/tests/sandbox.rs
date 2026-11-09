@@ -135,6 +135,15 @@ async fn a_sandboxed_project_never_runs_on_the_host_and_its_agents_stay_inside()
     assert!(status.output().await.unwrap().status.success());
     assert!(!planted.exists(), "pinned host git ran a planted fsmonitor");
     assert!(sandbox::git_env(&other).unwrap().is_empty());
+    // A submodule's git folder is the agents' to name: host git stays out,
+    // in the project and its worktrees alike.
+    for checkout in [&root, &worktree] {
+        let module = checkout.join("apps/module");
+        std::fs::create_dir_all(module.join("src")).unwrap();
+        std::fs::write(module.join(".git"), "gitdir: ../../.git/modules/module\n").unwrap();
+        assert!(sandbox::git_env(&module.join("src")).is_err());
+        assert!(sandbox::git_env(&checkout.join("apps")).is_ok());
+    }
 
     // Terminals and services fail closed; databases and other projects run here.
     let terminals = Terminals::new();

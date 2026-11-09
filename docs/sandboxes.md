@@ -43,6 +43,23 @@ zeron sandbox disable ~/Documents/muute-monorepo
 - Edit the config and run `enable` again to rebuild. `disable` keeps the image
   and the home volume.
 
+## In the app
+
+Project settings → Environment (project defaults) has a Sandbox group with
+the same settings: devcontainer config, host ports, published ports and
+read-only files. Turn on / Apply and rebuild builds the image and starts the
+container (minutes; it carries on if the page closes), and Turn off removes
+it. Agents never reach these settings (`GetProjectSandbox` /
+`SetProjectSandbox` are app-only).
+
+## Submodules
+
+Host git never runs inside a submodule or other nested repository of a
+sandboxed checkout: which git folder it uses is the agents' to say (its
+`.git` file), and a worktree's submodule git folders aren't read-only. Source
+Control lists the checkout's own changes, submodule pointers included, but not
+a submodule's contents; git inside the container sees them all.
+
 ## From an agent (Zeron MCP)
 
 The same, from a chat: `sandbox_status` lists every sandboxed project with its

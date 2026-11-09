@@ -282,6 +282,11 @@ pub mod methods {
     /// or removes it, only from a full-access chat outside every sandbox.
     pub const GET_SANDBOXES: &str = "GetSandboxes";
     pub const SET_SANDBOX: &str = "SetSandbox";
+    /// One project's sandbox in the app's project settings: `{spaceId}`
+    /// reads it; `{spaceId, enabled, config?, hostPorts, publishPorts,
+    /// readOnly}` builds and starts it, or removes it. Never for agents.
+    pub const GET_PROJECT_SANDBOX: &str = "GetProjectSandbox";
+    pub const SET_PROJECT_SANDBOX: &str = "SetProjectSandbox";
     pub const GET_WORKTREE_SETTINGS: &str = "GetWorktreeSettings";
     pub const SAVE_WORKTREE_SETTINGS: &str = "SaveWorktreeSettings";
     pub const PREPARE_WORKTREE: &str = "PrepareWorktree";

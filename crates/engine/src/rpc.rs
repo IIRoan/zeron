@@ -2503,6 +2503,9 @@ fn forwardable(method: &str) -> bool {
             | methods::CONTROL_PROJECT_TERMINALS
             | methods::GET_WORKTREE_SETTINGS
             | methods::SAVE_WORKTREE_SETTINGS
+            // A project's sandbox runs on the device holding the project.
+            | methods::GET_PROJECT_SANDBOX
+            | methods::SET_PROJECT_SANDBOX
             | methods::PREPARE_WORKTREE
             | methods::CANCEL_WORKTREE_SETUP
             | methods::GET_WORKTREE_SETUP_LOG
@@ -5352,6 +5355,9 @@ impl RpcService for EngineRpc {
             methods::EDIT_CHAT_SERVICE => self.edit_chat_service(params).await,
             methods::GET_SANDBOXES | methods::SET_SANDBOX => {
                 self.chat_sandboxes(method, params).await
+            }
+            methods::GET_PROJECT_SANDBOX | methods::SET_PROJECT_SANDBOX => {
+                self.project_sandbox(method, params).await
             }
             methods::GET_CHAT_WORKTREE_SETTINGS | methods::EDIT_CHAT_WORKTREE_SETTINGS => {
                 self.chat_worktree_settings(method, params).await
