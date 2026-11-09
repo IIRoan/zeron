@@ -97,7 +97,7 @@ impl Shell {
             view: None,
             config: input("/path/to/.devcontainer/devcontainer.json", cx),
             host_ports: input("5432, 6379", cx),
-            publish_ports: input("3000, 3001", cx),
+            publish_ports: input("Automatic", cx),
             read_only: input("compose.yaml, bunfig.toml", cx),
             busy: None,
             error: None,
@@ -287,7 +287,7 @@ impl Shell {
                         theme,
                         false,
                         "Published ports",
-                        "Container ports this machine reaches on localhost, such as dev servers. Ranges like 3300-3399 cover worktrees' ports.",
+                        "Leave empty to publish every port a server in the container opens, on this machine's localhost only. List ports or ranges (3300-3399) to publish just those.",
                         &panel.publish_ports,
                     ))
                     .child(command_row(
