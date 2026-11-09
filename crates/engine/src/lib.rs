@@ -429,6 +429,7 @@ impl EngineCore {
         registry.set_account_environment(Arc::new(agent_accounts::MuseRunEnvironment(
             agent_accounts.clone(),
         )));
+        sessions.set_agent_accounts(agent_accounts.clone());
         // Agents added from the ACP registry (this engine's own, under its
         // data dir): harnesses before the update coordinator lists them.
         acp_registry::start(data_dir, &registry);

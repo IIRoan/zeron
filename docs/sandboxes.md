@@ -32,9 +32,14 @@ zeron sandbox disable ~/Documents/muute-monorepo
 - `--read-only`: files in the project that this machine reads, such as a
   database service's compose file, or a `bunfig.toml` a readiness check loads.
   `.git/config` and `.git/hooks` (submodules' too) are always read-only.
-- Agents log in once inside the container. Open a terminal for the project in
-  Zeron (it opens in the container), then run `claude` and `codex login`. The
-  logins live in the container's home volume and survive restarts.
+- Agents use this machine's Claude Code and Codex logins. Zeron writes each
+  CLI's own credential file into the container's home when a run starts, and
+  every minute while the container runs, with the access token only: refresh
+  tokens are single-use, so a copy that refreshed would sign this machine out.
+  This machine stays the only refresher. A Claude login near expiry is
+  refreshed first, under Claude Code's own lock; Codex's is refreshed by
+  Codex runs here (its tokens last days). The files are written from inside
+  the container, so nothing an agent plants in its home reaches this machine.
 - Edit the config and run `enable` again to rebuild. `disable` keeps the image
   and the home volume.
 
@@ -81,6 +86,8 @@ Read-only paths must be relative and inside the project.
 
 - All agents of a project share one container and one user, so they aren't
   isolated from each other.
+- Agents there can read the access tokens they're handed (as with any login
+  of theirs), though never a refresh token.
 - Plugins approved to run programs other than git (in the engine) still run
   them on the host, in the folders they name. The zgx beta interface's
   window-side plugin runner isn't pinned.

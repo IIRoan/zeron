@@ -480,10 +480,15 @@ pub fn pin_git(cmd: &mut tokio::process::Command, dir: &Path) {
     }
 }
 
-/// For a sandboxed run: start the container, point its MCP servers at
-/// sockets the host side serves, and tell the harness to wrap its CLI.
-/// Only Claude Code and Codex know how; any other harness is refused.
-pub async fn stamp_run(harness: HarnessId, request: &mut RunRequest) -> Result<(), String> {
+/// For a sandboxed run: start the container, give it this machine's login
+/// for the CLI (`accounts`), point its MCP servers at sockets the host side
+/// serves, and tell the harness to wrap its CLI. Only Claude Code and Codex
+/// know how; any other harness is refused.
+pub async fn stamp_run(
+    harness: HarnessId,
+    request: &mut RunRequest,
+    accounts: Option<&crate::AgentAccounts>,
+) -> Result<(), String> {
     let cwd = PathBuf::from(&request.cwd);
     let Some(sandbox) = for_path(&cwd).map_err(|e| e.to_string())? else {
         return Ok(());
@@ -498,6 +503,10 @@ pub async fn stamp_run(harness: HarnessId, request: &mut RunRequest) -> Result<(
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| format!("Couldn't start the project's sandbox: {e}"))?;
+    if let Some(accounts) = accounts {
+        sync_login(accounts, &spec.container, harness).await;
+        keep_logins_fresh(accounts);
+    }
     let mut records = Vec::new();
     for server in request.mcp.iter_mut().chain(request.extra_mcp.iter_mut()) {
         let socket = format!(
@@ -522,6 +531,100 @@ pub async fn stamp_run(harness: HarnessId, request: &mut RunRequest) -> Result<(
     Ok(())
 }
 
+/// Puts this machine's `harness` login in the container's home
+/// ([`crate::AgentAccounts::sandbox_login`]). A failure is logged, not
+/// fatal: the CLI then says it isn't signed in.
+async fn sync_login(accounts: &crate::AgentAccounts, container: &str, harness: HarnessId) {
+    let login = match accounts.sandbox_login(harness).await {
+        Ok(Some(login)) => login,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(%error, ?harness, "sandbox: no login to hand over");
+            return;
+        }
+    };
+    let container = container.to_owned();
+    let written = tokio::task::spawn_blocking(move || install_login(&container, login.0, &login.1))
+        .await
+        .map_err(|e| EngineError::Other(e.to_string()))
+        .and_then(|r| r);
+    if let Err(error) = written {
+        tracing::warn!(%error, ?harness, "sandbox: couldn't hand over the login");
+    }
+}
+
+/// Writes `contents` to `path` under the container's home from inside it,
+/// as its user: a link an agent planted in the home volume can only point
+/// within the container. Owner-only, atomic, and left alone when unchanged.
+fn install_login(container: &str, path: &str, contents: &str) -> Result<(), EngineError> {
+    use std::io::Write;
+    let mut child = Command::new("podman")
+        .args([
+            "exec",
+            "-i",
+            container,
+            "sh",
+            "-c",
+            r#"cd && umask 077 && mkdir -p "$(dirname "$1")" && cat > "$1.zeron" && { cmp -s "$1.zeron" "$1" && rm -f "$1.zeron" || mv -f "$1.zeron" "$1"; }"#,
+            "sh",
+            path,
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| EngineError::Other(format!("podman: {e}")))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| EngineError::Other("podman exec has no stdin".into()))?
+        .write_all(contents.as_bytes())?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(EngineError::Other(format!(
+            "podman exec: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+/// Every minute, the logins in each running sandbox are handed over again,
+/// so a parked session (whose CLI re-reads its file before its token runs
+/// out) never meets an expired one. Started by the first sandboxed run.
+fn keep_logins_fresh(accounts: &crate::AgentAccounts) {
+    static STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if STARTED.set(()).is_err() {
+        return;
+    }
+    let accounts = accounts.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let running = tokio::task::spawn_blocking(|| {
+                load()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(Sandbox::container)
+                    .filter(|c| {
+                        podman(&["container", "inspect", "--format", "{{.State.Running}}", c])
+                            .is_ok_and(|state| state == "true")
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap_or_default();
+            for container in running {
+                for harness in [HarnessId::ClaudeCode, HarnessId::Codex] {
+                    sync_login(&accounts, &container, harness).await;
+                }
+            }
+        }
+    });
+}
+
 // ── `zeron sandbox` ────────────────────────────────────────────────────────
 
 /// Where Zeron creates `root`'s worktrees by default (`Repos::create_worktree`).
@@ -535,7 +638,7 @@ pub fn default_worktrees(root: &Path) -> PathBuf {
 }
 
 /// What agents do inside a sandbox once it's up.
-pub const LOGIN_NOTE: &str = "Agents log in once inside the container: open a terminal for this project in Zeron (it opens there) and run `claude`, then `codex login`.";
+pub const LOGIN_NOTE: &str = "Agents there use this machine's Claude Code and Codex logins (access tokens only; this machine keeps refreshing them), handed over when they start.";
 
 /// A registered project and its container, as `status` and the MCP tools show it.
 #[derive(Debug, Clone, Serialize)]

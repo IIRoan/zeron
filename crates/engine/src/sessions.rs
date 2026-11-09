@@ -325,6 +325,9 @@ struct Inner {
     turn_listener: OnceLock<TurnListener>,
     /// Plugins whose native MCP servers local runs get (absent in bare tests).
     plugins: OnceLock<crate::plugins::Plugins>,
+    /// This machine's agent logins, handed to sandboxed runs (absent in bare
+    /// tests).
+    agent_accounts: OnceLock<crate::AgentAccounts>,
 }
 
 /// Turn-start hook: called with `(chat_id, cwd)`.
@@ -375,6 +378,7 @@ impl SessionsEngine {
                 scratch_root: OnceLock::new(),
                 turn_listener: OnceLock::new(),
                 plugins: OnceLock::new(),
+                agent_accounts: OnceLock::new(),
             }),
         }
     }
@@ -402,6 +406,10 @@ impl SessionsEngine {
     /// Wire the plugins service: local runs get its native MCP servers.
     pub fn set_plugins(&self, plugins: crate::plugins::Plugins) {
         let _ = self.inner.plugins.set(plugins);
+    }
+
+    pub fn set_agent_accounts(&self, accounts: crate::AgentAccounts) {
+        let _ = self.inner.agent_accounts.set(accounts);
     }
 
     /// Wire the doc host (called once at engine assembly; the two services are mutually
@@ -4054,7 +4062,14 @@ async fn drive_run(
                     .prepare_run(harness_id, &mut wire_request)
                     .await
                 {
-                    Ok(()) => crate::sandbox::stamp_run(harness_id, &mut wire_request).await,
+                    Ok(()) => {
+                        crate::sandbox::stamp_run(
+                            harness_id,
+                            &mut wire_request,
+                            inner.agent_accounts.get(),
+                        )
+                        .await
+                    }
                     error => error,
                 };
                 match prepared {

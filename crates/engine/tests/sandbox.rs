@@ -155,14 +155,14 @@ async fn a_sandboxed_project_never_runs_on_the_host_and_its_agents_stay_inside()
         .unwrap();
 
     // Agent runs: only Claude Code and Codex, only inside.
-    let refused = sandbox::stamp_run(HarnessId::Cursor, &mut request(&root))
+    let refused = sandbox::stamp_run(HarnessId::Cursor, &mut request(&root), None)
         .await
         .unwrap_err();
     assert!(
         refused.contains("supports Claude Code and Codex"),
         "{refused}"
     );
-    let refused = sandbox::stamp_run(HarnessId::ClaudeCode, &mut request(&worktree))
+    let refused = sandbox::stamp_run(HarnessId::ClaudeCode, &mut request(&worktree), None)
         .await
         .unwrap_err();
     assert!(
@@ -170,7 +170,7 @@ async fn a_sandboxed_project_never_runs_on_the_host_and_its_agents_stay_inside()
         "{refused}"
     );
     let mut outside = request(&other);
-    sandbox::stamp_run(HarnessId::ClaudeCode, &mut outside)
+    sandbox::stamp_run(HarnessId::ClaudeCode, &mut outside, None)
         .await
         .unwrap();
     assert!(outside.env.is_empty() && outside.mcp.unwrap().command == "/usr/bin/zeron");

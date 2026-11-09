@@ -203,6 +203,47 @@ async fn a_sandboxed_service_runs_in_the_container_and_ends_with_it() {
         !touched.status.success(),
         "the config's folder is read-only inside"
     );
+    // A run there gets this machine's login, without its refresh token,
+    // owner-only in the container's home.
+    let logins = base.join("logins");
+    std::fs::create_dir_all(logins.join("claude")).unwrap();
+    std::fs::write(
+        logins.join("claude/.credentials.json"),
+        json!({"claudeAiOauth": {"accessToken": "at", "refreshToken": "rt", "expiresAt": 4102444800000_i64}})
+            .to_string(),
+    )
+    .unwrap();
+    let accounts =
+        zeron_engine::AgentAccounts::new(zeron_engine::AgentAccountsConfig::isolated(&logins));
+    let mut run: zeron_proto::RunRequest = serde_json::from_value(
+        json!({"prompt": "hi", "cwd": project, "sandbox": "workspace-write"}),
+    )
+    .unwrap();
+    sandbox::stamp_run(HarnessId::ClaudeCode, &mut run, Some(&accounts))
+        .await
+        .unwrap();
+    let inside: Value = serde_json::from_str(&podman(&[
+        "exec",
+        &second.container(),
+        "sh",
+        "-c",
+        "cat ~/.claude/.credentials.json",
+    ]))
+    .unwrap();
+    assert_eq!(
+        inside,
+        json!({"claudeAiOauth": {"accessToken": "at", "refreshToken": "", "expiresAt": 4102444800000_i64}})
+    );
+    assert_eq!(
+        podman(&[
+            "exec",
+            &second.container(),
+            "sh",
+            "-c",
+            "stat -c %a ~/.claude/.credentials.json"
+        ]),
+        "600"
+    );
     sandbox::disable(&project).unwrap();
     core.shutdown().await;
     for args in [

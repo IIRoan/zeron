@@ -3464,15 +3464,36 @@ impl AgentAccounts {
     }
 
     async fn refresh_claude_slot_once(&self, slot: &Slot) -> Result<String, ProbeError> {
-        let missing = ProbeError::NoCredentials {
-            why: NoCredentials::Missing,
-        };
         let oauth = slot
             .credentials
             .get("claudeAiOauth")
-            .ok_or(missing.clone())?
+            .ok_or(ProbeError::NoCredentials {
+                why: NoCredentials::Missing,
+            })?
             .clone();
-        let refresh_token = str_field(&oauth, "refreshToken").ok_or(missing)?;
+        let updated = self.refreshed_claude_oauth(oauth).await?;
+        let access_token = str_field(&updated, "accessToken").unwrap_or_default();
+        let mut refreshed = slot.clone();
+        // Keep sibling keys (mcpOAuth, pluginSecrets, …) — rewriting the blob
+        // as oauth-only would drop them, and a later activate of this slot
+        // would have nothing to merge if live credentials were also empty.
+        refreshed.credentials = with_claude_ai_oauth(&slot.credentials, updated);
+        refreshed.saved_at = now_ms();
+        if let Err(err) = self.write_slot(&refreshed) {
+            tracing::warn!(slot = %slot.id, error = %err, "refreshed slot write failed");
+        }
+        Ok(access_token)
+    }
+
+    /// `claudeAiOauth` with its token pair refreshed (the refresh token is
+    /// single-use: the caller must save the result, or the login is lost).
+    async fn refreshed_claude_oauth(
+        &self,
+        oauth: serde_json::Value,
+    ) -> Result<serde_json::Value, ProbeError> {
+        let refresh_token = str_field(&oauth, "refreshToken").ok_or(ProbeError::NoCredentials {
+            why: NoCredentials::Missing,
+        })?;
         let body = probe_json(
             "claude-code",
             "refresh",
@@ -3528,17 +3549,86 @@ impl AgentAccounts {
                 }
             }
         }
-        let mut refreshed = slot.clone();
-        // Keep sibling keys (mcpOAuth, pluginSecrets, …) — rewriting the blob
-        // as oauth-only would drop them, and a later activate of this slot
-        // would have nothing to merge if live credentials were also empty.
-        refreshed.credentials = with_claude_ai_oauth(&slot.credentials, updated);
-        refreshed.saved_at = now_ms();
-        if let Err(err) = self.write_slot(&refreshed) {
-            tracing::warn!(slot = %slot.id, error = %err, "refreshed slot write failed");
-        }
-        Ok(access_token)
+        Ok(updated)
     }
+
+    /// This machine's login for a CLI in a project sandbox: its credential
+    /// file (relative to the container's home) holding the access token
+    /// alone. Refresh tokens are single-use, so a copy that refreshed would
+    /// sign this machine out; only this machine refreshes. A Claude login
+    /// close to expiry is refreshed here first, under the CLI's own lock and
+    /// re-read inside it, as another Claude process would. `None`: no login.
+    pub async fn sandbox_login(
+        &self,
+        harness: HarnessId,
+    ) -> Result<Option<(&'static str, String)>, EngineError> {
+        match harness {
+            HarnessId::ClaudeCode => {
+                let expiring = |creds: &Option<serde_json::Value>| {
+                    creds
+                        .as_ref()
+                        .and_then(|c| c.get("claudeAiOauth")?.get("expiresAt")?.as_i64())
+                        .is_some_and(|at| at - now_ms() < SANDBOX_LOGIN_SLACK_MS)
+                };
+                let (mut creds, _) = self.read_claude_credentials().await;
+                if expiring(&creds) {
+                    let _lock = self.claude_refresh_lock().await?;
+                    creds = self.read_claude_credentials().await.0;
+                    if let Some(live) = creds.as_ref().filter(|_| expiring(&creds)) {
+                        let oauth = self
+                            .refreshed_claude_oauth(live["claudeAiOauth"].clone())
+                            .await
+                            .map_err(|e| {
+                                EngineError::Other(format!(
+                                    "Couldn't refresh Claude's login: {e:?}"
+                                ))
+                            })?;
+                        let live = with_claude_ai_oauth(live, oauth);
+                        self.write_claude_credentials(&live).await?;
+                        *lock(&self.inner.claude_credentials) = None;
+                        creds = Some(live);
+                    }
+                }
+                Ok(creds
+                    .as_ref()
+                    .and_then(|c| sandbox_copy(HarnessId::ClaudeCode, c))
+                    .map(|copy| (".claude/.credentials.json", copy.to_string())))
+            }
+            HarnessId::Codex => Ok(read_json(&self.inner.config.codex_auth_file())
+                .and_then(|auth| sandbox_copy(HarnessId::Codex, &auth))
+                .map(|copy| (".codex/auth.json", copy.to_string()))),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// A Claude login with less than this left is refreshed before a sandbox
+/// gets it (the CLI there can't refresh; it re-reads its file instead).
+const SANDBOX_LOGIN_SLACK_MS: i64 = 15 * 60_000;
+
+/// A login's credential file as a sandbox gets it: the access token without
+/// the refresh token (emptied, not removed: the CLIs reject a file without
+/// one), and only the account login (Claude's MCP tokens stay here).
+fn sandbox_copy(harness: HarnessId, creds: &serde_json::Value) -> Option<serde_json::Value> {
+    let mut copy = match harness {
+        HarnessId::ClaudeCode => {
+            serde_json::json!({ "claudeAiOauth": creds.get("claudeAiOauth")?.clone() })
+        }
+        _ => creds.clone(),
+    };
+    let token = match harness {
+        HarnessId::ClaudeCode => copy.get_mut("claudeAiOauth"),
+        _ => copy.get_mut("tokens"),
+    };
+    if let Some(token) = token.and_then(|t| t.as_object_mut()) {
+        let key = match harness {
+            HarnessId::ClaudeCode => "refreshToken",
+            _ => "refresh_token",
+        };
+        token.insert(key.into(), serde_json::json!(""));
+        token.remove("refreshTokenExpiresAt");
+    }
+    Some(copy)
 }
 
 // ── macOS Keychain (documented here; compiled only on macOS) ────────────────
@@ -6314,6 +6404,70 @@ mod login_tests {
         assert_eq!(oauth["accessToken"], "fresh");
         assert_eq!(oauth["refreshToken"], "rt2");
         assert!(oauth["refreshTokenExpiresAt"].as_i64().unwrap() > now_ms() + 80_000_000);
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_gets_the_live_logins_without_their_refresh_tokens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (token_url, _server) = fixed_server(
+            "200 OK",
+            r#"{"access_token":"fresh","refresh_token":"rt2","expires_in":3600}"#,
+        )
+        .await;
+        let endpoints = ProbeEndpoints {
+            claude_token: token_url,
+            ..Default::default()
+        };
+        let cfg = config(tmp.path());
+        let accounts = AgentAccounts::with_endpoints(cfg.clone(), endpoints, Default::default());
+        std::fs::create_dir_all(&cfg.claude_config_dir).unwrap();
+        std::fs::create_dir_all(&cfg.codex_home).unwrap();
+        // Minutes left: refreshed (and saved) here before the sandbox gets it.
+        std::fs::write(
+            cfg.claude_creds_file(),
+            serde_json::json!({
+                "claudeAiOauth": {"accessToken": "old", "refreshToken": "rt1",
+                    "expiresAt": now_ms() + 60_000, "refreshTokenExpiresAt": 1},
+                "mcpOAuth": {"server": "keep"},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            cfg.codex_auth_file(),
+            r#"{"tokens":{"access_token":"at","refresh_token":"rt","id_token":"id"},"last_refresh":"then"}"#,
+        )
+        .unwrap();
+
+        let (path, copy) = accounts
+            .sandbox_login(HarnessId::ClaudeCode)
+            .await
+            .unwrap()
+            .unwrap();
+        let copy: serde_json::Value = serde_json::from_str(&copy).unwrap();
+        assert_eq!(path, ".claude/.credentials.json");
+        assert_eq!(copy["claudeAiOauth"]["accessToken"], "fresh");
+        assert_eq!(copy["claudeAiOauth"]["refreshToken"], "");
+        assert!(copy["claudeAiOauth"].get("refreshTokenExpiresAt").is_none());
+        assert!(copy.get("mcpOAuth").is_none(), "MCP tokens stay here");
+        let live = read_json(&cfg.claude_creds_file()).unwrap();
+        assert_eq!(live["claudeAiOauth"]["refreshToken"], "rt2");
+        assert_eq!(live["mcpOAuth"]["server"], "keep");
+
+        let (path, copy) = accounts
+            .sandbox_login(HarnessId::Codex)
+            .await
+            .unwrap()
+            .unwrap();
+        let copy: serde_json::Value = serde_json::from_str(&copy).unwrap();
+        assert_eq!(path, ".codex/auth.json");
+        assert_eq!(copy["tokens"]["access_token"], "at");
+        assert_eq!(copy["tokens"]["refresh_token"], "");
+        assert_eq!(copy["last_refresh"], "then");
+        assert_eq!(
+            read_json(&cfg.codex_auth_file()).unwrap()["tokens"]["refresh_token"],
+            "rt"
+        );
     }
 
     #[tokio::test]
