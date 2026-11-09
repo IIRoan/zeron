@@ -3462,6 +3462,8 @@ impl Shell {
             self.terminal_tween = None;
             self.fit_exits = [None; 3];
             let key = self.panel_key(cx);
+            // The destination's own panel sizes (or the latest set anywhere).
+            self.apply_chat_panel_sizes(cx);
             // Entering the new-chat canvas always lands with the terminal
             // hidden (user request) — a previously opened canvas drawer must
             // not pop open on a fresh canvas. The source chat's flag stays in
@@ -5421,6 +5423,7 @@ impl Shell {
             .min(viewport_h * TERMINAL_MAX_VH);
         let min = TERMINAL_MIN_HEIGHT.min(max);
         self.settings.terminal_height = clamp_terminal_height(requested.min(max), viewport_h);
+        self.remember_panel_size(PaneResizeKind::Terminal, cx);
         self.pane_resize_dragging = Some(PaneResizeKind::Terminal);
         self.pane_resize_active =
             (requested > min && requested < max).then_some(PaneResizeKind::Terminal);
@@ -5529,6 +5532,7 @@ impl Shell {
             }
         };
         self.settings.right_pane_width = sample.width;
+        self.remember_panel_size(PaneResizeKind::Right, cx);
         self.pane_resize_dragging = Some(PaneResizeKind::Right);
         if sample.starts_bounce {
             self.right_edge_bounce = sample.edge.map(motion::ResizeEdgeBounce::new);

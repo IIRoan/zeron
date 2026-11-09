@@ -459,6 +459,7 @@ impl Shell {
             self.split_panel_widths(cx);
         }
         self.resplit_panels(before, None, cx);
+        self.remember_panel_size(seam, cx);
     }
 
     /// A panel the window fit hides is open but off screen. Asking for it
@@ -654,5 +655,44 @@ impl Shell {
             self.split_panel_widths(cx);
             self.split_viewport = Some(viewport);
         }
+    }
+
+    /// Put the active chat's panel sizes on the live widths: its own, else
+    /// the latest set in any chat, else what's on screen now.
+    pub(super) fn apply_chat_panel_sizes(&mut self, cx: &App) {
+        let sizes = self.settings.panel_sizes_for(&self.panel_key(cx));
+        if let Some(width) = sizes.files {
+            self.settings.files_panel_width = width;
+        }
+        if let Some(width) = sizes.right {
+            self.settings.right_pane_width = width;
+        }
+        if let Some(height) = sizes.terminal {
+            self.settings.terminal_height = height;
+        }
+    }
+
+    /// Keep the size a resize of `seam` just set for the active chat, and as
+    /// the latest one (what chats without their own open with). The chat
+    /// list's width stays one for every chat.
+    pub(super) fn remember_panel_size(&mut self, seam: PaneResizeKind, cx: &App) {
+        let size = match seam {
+            PaneResizeKind::Files => self.settings.files_panel_width,
+            PaneResizeKind::Right => self.settings.right_pane_width,
+            PaneResizeKind::Terminal => self.settings.terminal_height,
+            PaneResizeKind::Sidebar => return,
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let key = self.panel_key(cx);
+        self.settings
+            .remember_panel_size(key, now, |sizes| match seam {
+                PaneResizeKind::Files => sizes.files = Some(size),
+                PaneResizeKind::Right => sizes.right = Some(size),
+                PaneResizeKind::Terminal => sizes.terminal = Some(size),
+                PaneResizeKind::Sidebar => {}
+            });
     }
 }

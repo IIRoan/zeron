@@ -992,6 +992,78 @@ pub const SKILL_COMPLETION_HARNESSES: [(zeron_proto::HarnessId, &str); 10] = [
     (zeron_proto::HarnessId::Opencode, "OpenCode"),
 ];
 
+/// One chat's panel sizes (see [`UiSettings::chat_panel_sizes`]); `None`
+/// keeps the latest size set anywhere.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PanelSizes {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub right: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<f32>,
+    /// When it was last resized (Unix seconds): the oldest go first past
+    /// [`PANEL_SIZES_KEPT`].
+    pub resized_at: u64,
+}
+
+/// Chats whose panel sizes are kept.
+// ponytail: deleted chats' sizes stay until they're the oldest of this many;
+// prune against the chat list if that ever matters.
+pub const PANEL_SIZES_KEPT: usize = 300;
+
+impl UiSettings {
+    /// The chat `key`'s panel sizes, each falling back to the latest one.
+    pub fn panel_sizes_for(&self, key: &str) -> PanelSizes {
+        let own = self.chat_panel_sizes.get(key).copied().unwrap_or_default();
+        let latest = self.latest_panel_sizes;
+        PanelSizes {
+            files: own.files.or(latest.files),
+            right: own.right.or(latest.right),
+            terminal: own.terminal.or(latest.terminal),
+            resized_at: own.resized_at,
+        }
+    }
+
+    /// Keep a resize (`set` on the sizes) for the chat `key` and as the
+    /// latest one, dropping the longest-unresized chat past
+    /// [`PANEL_SIZES_KEPT`].
+    pub fn remember_panel_size(&mut self, key: String, now: u64, set: impl Fn(&mut PanelSizes)) {
+        for sizes in [
+            self.chat_panel_sizes.entry(key).or_default(),
+            &mut self.latest_panel_sizes,
+        ] {
+            set(sizes);
+            sizes.resized_at = now;
+        }
+        if self.chat_panel_sizes.len() > PANEL_SIZES_KEPT
+            && let Some(oldest) = self
+                .chat_panel_sizes
+                .iter()
+                .min_by_key(|(_, sizes)| sizes.resized_at)
+                .map(|(key, _)| key.clone())
+        {
+            self.chat_panel_sizes.remove(&oldest);
+        }
+    }
+}
+
+impl PanelSizes {
+    /// Each size in its legal range; one that isn't a number is dropped.
+    fn clamped(self) -> Self {
+        let legal = |value: Option<f32>, min: f32, max: f32| {
+            value.filter(|v| v.is_finite()).map(|v| v.clamp(min, max))
+        };
+        Self {
+            files: legal(self.files, FILES_PANEL_MIN, FILES_PANEL_MAX),
+            right: legal(self.right, RIGHT_PANE_MIN, f32::MAX),
+            terminal: legal(self.terminal, TERMINAL_MIN_HEIGHT, TERMINAL_ABS_MAX_HEIGHT),
+            resized_at: self.resized_at,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiSettings {
@@ -1097,6 +1169,14 @@ pub struct UiSettings {
     pub terminal_height: f32,
     /// Legacy — see [`Self::right_pane_open`].
     pub terminal_open: bool,
+    /// Panel sizes a chat keeps (the files panel, the right pane, the
+    /// terminal), keyed like the session panels: a chat id, or the new-chat
+    /// canvas key. Set by resizing a panel in that chat.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub chat_panel_sizes: std::collections::BTreeMap<String, PanelSizes>,
+    /// The sizes last set by a resize in any chat: what a chat without its
+    /// own opens with.
+    pub latest_panel_sizes: PanelSizes,
     /// Customizable shortcut combos (feature-inventory §1.4).
     pub keymap: KeymapConfig,
     /// macOS viewer-side Appshot capture. Device-local because the shortcut
@@ -1254,6 +1334,8 @@ impl Default for UiSettings {
             right_pane_open: false,
             terminal_height: TERMINAL_DEFAULT_HEIGHT,
             terminal_open: false,
+            chat_panel_sizes: Default::default(),
+            latest_panel_sizes: PanelSizes::default(),
             keymap: KeymapConfig::default(),
             escape_stops_active_agent: false,
             settings_section: crate::shell::SettingsSection::default(),
@@ -2104,6 +2186,8 @@ impl UiSettings {
             right_pane_open,
             terminal_height,
             terminal_open,
+            chat_panel_sizes,
+            latest_panel_sizes,
             keymap,
             appshots_enabled,
             appshot_sound_enabled,
@@ -2181,6 +2265,13 @@ impl UiSettings {
             TERMINAL_ABS_MAX_HEIGHT,
             TERMINAL_DEFAULT_HEIGHT,
         );
+        for sizes in self
+            .chat_panel_sizes
+            .values_mut()
+            .chain(std::iter::once(&mut self.latest_panel_sizes))
+        {
+            *sizes = sizes.clamped();
+        }
         self.files_autosave_delay_ms = self
             .files_autosave_delay_ms
             .clamp(FILES_AUTOSAVE_DELAY_MIN_MS, FILES_AUTOSAVE_DELAY_MAX_MS);
@@ -2369,6 +2460,52 @@ pub use zeron_proto::SidebarSection;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_chat_keeps_its_panel_sizes_and_others_open_with_the_latest() {
+        let mut settings = UiSettings::default();
+        assert_eq!(
+            settings.panel_sizes_for("new").files,
+            None,
+            "nothing kept yet"
+        );
+        settings.remember_panel_size("a".into(), 1, |sizes| sizes.files = Some(300.0));
+        settings.remember_panel_size("b".into(), 2, |sizes| sizes.files = Some(400.0));
+        settings.remember_panel_size("b".into(), 3, |sizes| sizes.right = Some(700.0));
+        assert_eq!(settings.panel_sizes_for("a").files, Some(300.0));
+        assert_eq!(settings.panel_sizes_for("a").right, Some(700.0), "latest");
+        assert_eq!(settings.panel_sizes_for("b").files, Some(400.0));
+        assert_eq!(settings.panel_sizes_for("new").files, Some(400.0), "latest");
+
+        let saved = serde_json::to_string(&settings).unwrap();
+        let loaded = serde_json::from_str::<UiSettings>(&saved)
+            .unwrap()
+            .clamped();
+        assert_eq!(loaded.panel_sizes_for("a").files, Some(300.0));
+        let wild: UiSettings =
+            serde_json::from_str(r#"{"chatPanelSizes":{"x":{"files":99999,"terminal":-1}}}"#)
+                .unwrap();
+        let wild = wild.clamped().panel_sizes_for("x");
+        assert_eq!(wild.files, Some(FILES_PANEL_MAX));
+        assert_eq!(wild.terminal, Some(TERMINAL_MIN_HEIGHT));
+
+        for i in 0..PANEL_SIZES_KEPT + 2 {
+            settings.remember_panel_size(format!("c{i}"), 10 + i as u64, |sizes| {
+                sizes.terminal = Some(300.0)
+            });
+        }
+        // 304 chats for 300 places: the four resized longest ago go.
+        assert_eq!(settings.chat_panel_sizes.len(), PANEL_SIZES_KEPT);
+        for gone in ["a", "b", "c0", "c1"] {
+            assert!(!settings.chat_panel_sizes.contains_key(gone), "{gone}");
+        }
+        assert!(settings.chat_panel_sizes.contains_key("c2"));
+        assert!(
+            settings
+                .chat_panel_sizes
+                .contains_key(&format!("c{}", PANEL_SIZES_KEPT + 1))
+        );
+    }
 
     #[test]
     fn skill_completion_defaults_overrides_and_persistence_are_per_harness() {
@@ -3195,6 +3332,22 @@ mod tests {
             right_pane_open: true,
             terminal_height: 320.0,
             terminal_open: true,
+            chat_panel_sizes: [(
+                "chat-1".to_string(),
+                PanelSizes {
+                    files: Some(300.0),
+                    right: None,
+                    terminal: Some(240.0),
+                    resized_at: 7,
+                },
+            )]
+            .into(),
+            latest_panel_sizes: PanelSizes {
+                files: Some(300.0),
+                right: Some(640.0),
+                terminal: Some(240.0),
+                resized_at: 7,
+            },
             keymap: KeymapConfig {
                 toggle_sidebar: "mod-shift-s".into(),
                 ..KeymapConfig::default()
