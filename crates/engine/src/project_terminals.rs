@@ -913,6 +913,38 @@ impl ProjectTerminals {
         .map_err(|e| EngineError::Other(e.to_string()))?
     }
 
+    /// Applies an agent's change to the latest settings (the project
+    /// defaults, or what `checkout` uses now) under the UI's project lock,
+    /// so concurrent edits never drop each other's fields. `None` from
+    /// `edit` removes the checkout's override.
+    pub async fn edit_environment(
+        &self,
+        environments: &crate::worktree_settings::WorktreeSettingsStore,
+        space: &str,
+        root: &Path,
+        checkout: Option<&Path>,
+        edit: impl FnOnce(
+            zeron_proto::WorktreeSettings,
+        ) -> Result<Option<zeron_proto::WorktreeSettings>, EngineError>
+        + Send
+        + 'static,
+    ) -> Result<(), EngineError> {
+        let operation = self.managed_operation(space);
+        let _guard = operation.lock().await;
+        let environments = environments.clone();
+        let root = root.to_path_buf();
+        let checkout = checkout.map(Path::to_path_buf);
+        tokio::task::spawn_blocking(move || {
+            let current = match &checkout {
+                Some(checkout) => environments.effective(&root, checkout)?,
+                None => environments.defaults(&root)?,
+            };
+            environments.save(&root, checkout.as_deref(), edit(current)?)
+        })
+        .await
+        .map_err(|e| EngineError::Other(e.to_string()))?
+    }
+
     pub(crate) fn has_setup_services(&self, root: &Path) -> Result<bool, EngineError> {
         let root = canonical_root(root)?;
         Ok(self

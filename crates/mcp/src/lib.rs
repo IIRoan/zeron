@@ -21,6 +21,7 @@ mod browser;
 mod services;
 mod tools;
 mod transcript;
+mod worktrees;
 mod zeron;
 
 pub use jsonrpc::serve_stdio;

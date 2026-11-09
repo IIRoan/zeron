@@ -175,6 +175,20 @@ Add a database with `{"kind":"database","name":"Postgres","command":"…",
 "readinessCommand":"pg_isready","readinessTimeoutSeconds":120}`. Update just its
 check with `service_update {"serviceId":"<listed id>","readinessCommand":"…"}`.
 
+`worktree_settings_get {}` returns the calling chat's project worktree settings:
+the project `defaults`, the `settings` its checkout uses (`hasOverrides` when it
+has its own), detected env files, dependency folders and install command, every
+worktree's setup state, and the folder new worktrees go in. `mainFolder` is true
+in the project's main folder. `worktree_settings_update` takes a required
+`scope` (`project` for the defaults, `checkout` for this chat's worktree) plus
+only the fields to change, merged into the latest saved settings under the same
+lock as the settings page. Lists and maps (`envFiles`, `dependencyPaths`,
+`variables`) replace the saved ones. `{"scope":"checkout","reset":true}` drops a
+worktree's own settings. `serviceMode` is project-only, and services and
+databases stay with the service tools. Saving runs nothing. Because workflow
+commands run outside the agent sandbox, editing requires full access outside
+read-only/plan mode.
+
 These tools never take arbitrary project or checkout paths.
 A chat without a project receives an explanatory error. An older daemon asks
 the agent to update Zeron rather than claiming the action succeeded.
@@ -214,6 +228,8 @@ name (default: the local engine's device).
 | `service_list`, `service_status` | `GetChatServices {chatId}` (origin chat only) |
 | `service_start`, `service_restart`, `service_stop` | `ControlChatService {chatId, serviceId, action}` (origin chat only; mutations are not replayed on reconnect) |
 | `service_add`, `service_update` | `EditChatService {chatId, edit}` (origin chat only; one entry, no reconnect replay) |
+| `worktree_settings_get` | `GetChatWorktreeSettings {chatId}` (origin chat only) |
+| `worktree_settings_update` | `EditChatWorktreeSettings {chatId, scope, changes, reset}` (origin chat only; named fields only, no reconnect replay) |
 
 Watch streams are the engine's only read surface (there is no one-shot "get
 transcript" RPC); a snapshot is "subscribe, take the first item, drop" — drop

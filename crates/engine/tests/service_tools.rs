@@ -804,3 +804,140 @@ async fn service_authoring_cannot_override_chat_scope_or_bypass_access_modes() {
     assert_eq!(f.snapshot("agent").await.config.services.len(), 3);
     f.core.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agents_read_and_merge_worktree_settings_without_touching_services_or_other_checkouts() {
+    let f = Fixture::new(false).await;
+    f.core
+        .workspace
+        .create_chat_hosted(
+            "main",
+            Some("project"),
+            Some(&f.core.device_id),
+            Some(&f.core.device_id),
+            None,
+            Some(f.root.to_string_lossy().into_owned()),
+            None,
+            None,
+        )
+        .unwrap();
+    let agent = tools(&f.core, "agent");
+    let peer = tools(&f.core, "peer");
+    async fn get(tools: &Tools) -> Value {
+        tools
+            .call("worktree_settings_get", json!({}))
+            .await
+            .unwrap()
+    }
+    let read = get(&agent).await;
+    assert_eq!(read["mainFolder"], false);
+    assert_eq!(
+        read["checkout"],
+        f.a.canonicalize().unwrap().to_str().unwrap()
+    );
+    assert_eq!(read["defaults"]["dependencies"], "skip");
+    assert!(read.get("databases").is_none() && read["defaults"].get("services").is_none());
+
+    // Project scope merges one field into the defaults.
+    agent
+        .call(
+            "worktree_settings_update",
+            json!({"scope":"project","branchPrefix":"team"}),
+        )
+        .await
+        .unwrap();
+    let read = get(&peer).await;
+    assert_eq!(read["defaults"]["branchPrefix"], "team/");
+    assert_eq!(read["defaults"]["dependencies"], "skip");
+    assert_eq!(read["defaults"]["serviceMode"], "parallel");
+
+    // Checkout scope only changes the calling chat's worktree.
+    let saved = agent
+        .call(
+            "worktree_settings_update",
+            json!({"scope":"checkout","setupCommand":"echo ready"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(saved["saved"], true);
+    assert_eq!(saved["hasOverrides"], true);
+    assert_eq!(saved["settings"]["setupCommand"], "echo ready");
+    assert_eq!(saved["settings"]["branchPrefix"], "team/");
+    let other = get(&peer).await;
+    assert_eq!(other["hasOverrides"], false);
+    assert_eq!(other["settings"]["setupCommand"], "");
+
+    // Rejected edits change nothing.
+    for (chat, args) in [
+        (
+            "agent",
+            json!({"scope":"checkout","serviceMode":"followActive"}),
+        ),
+        (
+            "agent",
+            json!({"scope":"project","services":{"services":[]}}),
+        ),
+        (
+            "agent",
+            json!({"scope":"project","commandTimeoutSeconds":0}),
+        ),
+        ("agent", json!({"scope":"project","reset":true})),
+        (
+            "agent",
+            json!({"scope":"checkout","reset":true,"setupCommand":"x"}),
+        ),
+        ("main", json!({"scope":"checkout","setupCommand":"x"})),
+    ] {
+        assert!(
+            tools(&f.core, chat)
+                .call("worktree_settings_update", args.clone())
+                .await
+                .is_err(),
+            "{args}"
+        );
+    }
+    assert_eq!(get(&tools(&f.core, "main")).await["mainFolder"], true);
+    let read = get(&agent).await;
+    assert_eq!(read["settings"]["setupCommand"], "echo ready");
+    assert_eq!(read["defaults"]["commandTimeoutSeconds"], 900);
+    assert_eq!(f.snapshot("agent").await.config.services.len(), 3);
+
+    agent
+        .call(
+            "worktree_settings_update",
+            json!({"scope":"checkout","reset":true}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(get(&agent).await["hasOverrides"], false);
+
+    // Workflow commands run unsandboxed: reading stays open, editing needs full access.
+    f.core
+        .workspace
+        .set_chat_config(
+            "agent",
+            &ChatConfig {
+                harness: HarnessId::Mock,
+                model: None,
+                reasoning: None,
+                model_options: Default::default(),
+                sandbox: SandboxLevel::ReadOnly,
+                access: AccessMode::FullAccess,
+                plan: false,
+            },
+        )
+        .unwrap();
+    get(&agent).await;
+    assert!(
+        agent
+            .call(
+                "worktree_settings_update",
+                json!({"scope":"project","setupCommand":"touch escaped"}),
+            )
+            .await
+            .unwrap_err()
+            .contains("full access")
+    );
+    assert_eq!(get(&agent).await["defaults"]["setupCommand"], "");
+    f.core.shutdown().await;
+}

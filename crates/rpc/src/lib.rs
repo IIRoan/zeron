@@ -274,6 +274,9 @@ pub mod methods {
     pub const GET_CHAT_SERVICES: &str = "GetChatServices";
     pub const CONTROL_CHAT_SERVICE: &str = "ControlChatService";
     pub const EDIT_CHAT_SERVICE: &str = "EditChatService";
+    /// Agent surface: worktree settings of the calling chat's project only.
+    pub const GET_CHAT_WORKTREE_SETTINGS: &str = "GetChatWorktreeSettings";
+    pub const EDIT_CHAT_WORKTREE_SETTINGS: &str = "EditChatWorktreeSettings";
     pub const GET_WORKTREE_SETTINGS: &str = "GetWorktreeSettings";
     pub const SAVE_WORKTREE_SETTINGS: &str = "SaveWorktreeSettings";
     pub const PREPARE_WORKTREE: &str = "PrepareWorktree";
@@ -761,6 +764,10 @@ pub fn agent_allowed(method: &str) -> bool {
             | methods::GET_CHAT_SERVICES
             | methods::CONTROL_CHAT_SERVICE
             | methods::EDIT_CHAT_SERVICE
+            // The calling chat's project worktree settings; the engine
+            // checks the chat's access before saving workflow commands.
+            | methods::GET_CHAT_WORKTREE_SETTINGS
+            | methods::EDIT_CHAT_WORKTREE_SETTINGS
             // Saying what the calling chat's agent waits on.
             | methods::AWAIT_BACKGROUND
             // Plugins: authoring, installing (lands waiting for the person),
@@ -1413,7 +1420,7 @@ mod tests {
         }
 
         let app = connect_ws(&url, Some(&tokens.full)).await.unwrap();
-        for method in [methods::LIST_BROWSER_TABS, methods::CONTROL_BROWSER, methods::GET_CHAT_SERVICES, methods::CONTROL_CHAT_SERVICE, methods::EDIT_CHAT_SERVICE] {
+        for method in [methods::LIST_BROWSER_TABS, methods::CONTROL_BROWSER, methods::GET_CHAT_SERVICES, methods::CONTROL_CHAT_SERVICE, methods::EDIT_CHAT_SERVICE, methods::GET_CHAT_WORKTREE_SETTINGS, methods::EDIT_CHAT_WORKTREE_SETTINGS] {
             assert!(agent_allowed(method), "{method}");
             let asked = agent.call(method, serde_json::json!({})).await.unwrap();
             assert!(asked.as_str().unwrap().starts_with("Agent"), "{method}: {asked}");

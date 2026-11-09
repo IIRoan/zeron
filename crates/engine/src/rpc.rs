@@ -5336,6 +5336,9 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&snapshot)
             }
             methods::EDIT_CHAT_SERVICE => self.edit_chat_service(params).await,
+            methods::GET_CHAT_WORKTREE_SETTINGS | methods::EDIT_CHAT_WORKTREE_SETTINGS => {
+                self.chat_worktree_settings(method, params).await
+            }
             methods::GET_PROJECT_TERMINALS
             | methods::SAVE_PROJECT_TERMINALS
             | methods::CONTROL_PROJECT_TERMINALS

@@ -1,5 +1,6 @@
-//! A narrow service surface: the chat selects its project and checkout, never
-//! caller-supplied project or checkout paths. Edits merge one entry at a time.
+//! A narrow service and worktree-settings surface: the chat selects its
+//! project and checkout, never caller-supplied project or checkout paths.
+//! Service edits merge one entry at a time; worktree edits only named fields.
 use serde::Deserialize;
 use serde_json::{Value, json};
 use zeron_proto::{
@@ -40,6 +41,50 @@ enum Action {
     Stop,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorktreeReadParams {
+    chat_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorktreeEditParams {
+    chat_id: String,
+    scope: WorktreeScope,
+    #[serde(default)]
+    changes: serde_json::Map<String, Value>,
+    #[serde(default)]
+    reset: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum WorktreeScope {
+    Project,
+    Checkout,
+}
+
+/// The worktree settings page's fields an agent may change. Services and
+/// databases are the service tools' (`EditChatService`).
+const EDITABLE_WORKTREE_FIELDS: &[&str] = &[
+    "branchPrefix",
+    "envFiles",
+    "envProfile",
+    "dependencies",
+    "dependencyPaths",
+    "installCommand",
+    "variables",
+    "createCommand",
+    "setupCommand",
+    "activateCommand",
+    "cleanupCommand",
+    "removeCommand",
+    "commandsInProject",
+    "commandTimeoutSeconds",
+    "serviceMode",
+];
+
 impl EngineRpc {
     pub(super) fn chat_services_params(
         &self,
@@ -79,7 +124,7 @@ impl EngineRpc {
             && chat.as_deref() != Some(&chat_id)
         {
             return Err(RpcError::Failed(
-                "Service tools can only control the calling chat's project".into(),
+                "Project tools can only act on the calling chat's project".into(),
             ));
         }
         let chat = self
@@ -89,12 +134,12 @@ impl EngineRpc {
             .ok_or_else(|| RpcError::Failed("Project chat not found".into()))?;
         if chat.device_id != self.doc_host.device_id() {
             return Err(RpcError::Failed(
-                "Service tools require a chat on this device".into(),
+                "Project tools require a chat on this device".into(),
             ));
         }
         let space_id = chat.space_id.ok_or_else(|| {
             RpcError::Failed(
-                "This chat has no project; choose a project to use service tools".into(),
+                "This chat has no project; choose a project to use project tools".into(),
             )
         })?;
         Ok(ProjectTerminalsParams {
@@ -112,20 +157,7 @@ impl EngineRpc {
     pub(super) async fn edit_chat_service(&self, params: Value) -> Result<RpcReply, RpcError> {
         let p: EditParams = parse_params(params)?;
         let target = self.chat_service_target(p.chat_id.clone())?;
-        // Authoring a shell command must not bypass a chat's approval or
-        // read-only/plan settings through the unsandboxed service manager.
-        if matches!(zeron_rpc::caller(), Caller::Agent { .. }) {
-            let chat = self
-                .workspace
-                .chat(&p.chat_id)
-                .map_err(|e| RpcError::Failed(e.to_string()))?
-                .ok_or_else(|| RpcError::Failed("Project chat not found".into()))?;
-            if chat.config.as_ref().is_some_and(|c| {
-                c.access != AccessMode::FullAccess || c.sandbox == SandboxLevel::ReadOnly || c.plan
-            }) {
-                return Err(RpcError::Failed("Editing service commands requires a chat with full access outside read-only or plan mode.".into()));
-            }
-        }
+        self.require_full_access(&p.chat_id, "Editing service commands")?;
         let space = self.local_project_action_space(&target.space_id)?;
         let root = std::path::PathBuf::from(&space.path);
         let checkout = self
@@ -159,6 +191,161 @@ impl EngineRpc {
         result["note"] = json!(
             "Configuration saved. Running processes keep their current configuration; use service_restart to apply changes to them."
         );
+        Ok(RpcReply::Value(result))
+    }
+
+    /// Authoring a shell command must not bypass a chat's approval or
+    /// read-only/plan settings through Zeron's unsandboxed runners.
+    fn require_full_access(&self, chat_id: &str, what: &str) -> Result<(), RpcError> {
+        if !matches!(zeron_rpc::caller(), Caller::Agent { .. }) {
+            return Ok(());
+        }
+        let chat = self
+            .workspace
+            .chat(chat_id)
+            .map_err(|e| RpcError::Failed(e.to_string()))?
+            .ok_or_else(|| RpcError::Failed("Project chat not found".into()))?;
+        if chat.config.as_ref().is_some_and(|c| {
+            c.access != AccessMode::FullAccess || c.sandbox == SandboxLevel::ReadOnly || c.plan
+        }) {
+            return Err(RpcError::Failed(format!(
+                "{what} requires a chat with full access outside read-only or plan mode."
+            )));
+        }
+        Ok(())
+    }
+
+    /// The calling chat's worktree settings: the project defaults and, from
+    /// a worktree, what that checkout uses. An edit merges only the fields
+    /// it names into the latest saved settings of its scope.
+    pub(super) async fn chat_worktree_settings(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<RpcReply, RpcError> {
+        let (chat_id, edit) = if method == methods::EDIT_CHAT_WORKTREE_SETTINGS {
+            let p: WorktreeEditParams = parse_params(params)?;
+            (p.chat_id.clone(), Some(p))
+        } else {
+            let p: WorktreeReadParams = parse_params(params)?;
+            (p.chat_id, None)
+        };
+        let target = self.chat_service_target(chat_id.clone())?;
+        if let Some(edit) = &edit {
+            // Exactly one of: changes, or reset.
+            if edit.reset != edit.changes.is_empty() {
+                return Err(RpcError::BadParams(
+                    "Pass the changes to make, or reset alone".into(),
+                ));
+            }
+            if let Some(key) = edit
+                .changes
+                .keys()
+                .find(|key| !EDITABLE_WORKTREE_FIELDS.contains(&key.as_str()))
+            {
+                return Err(RpcError::BadParams(if key == "services" {
+                    "Services and databases are edited with the service tools".into()
+                } else {
+                    format!("Unknown worktree setting: {key}")
+                }));
+            }
+            // Workflow commands run unsandboxed when Zeron creates, prepares
+            // or removes a worktree.
+            self.require_full_access(&chat_id, "Editing worktree settings")?;
+        }
+        let space = self.local_project_action_space(&target.space_id)?;
+        let root = std::path::PathBuf::from(&space.path);
+        let resolved = self
+            .workspace_files
+            .resolve_target(&zeron_proto::WorkspaceTarget {
+                space_id: None,
+                chat_id: Some(chat_id),
+                checkout_path: None,
+            })
+            .await
+            .map_err(|e| RpcError::Failed(e.to_string()))?
+            .root;
+        let main = root.canonicalize().ok() == resolved.canonicalize().ok();
+        let checkout = (!main).then_some(resolved);
+        let profiles = self.project_actions.project_terminals.clone();
+        let environments = self.repos.worktree_settings().clone();
+        super::adopt_legacy_services(&profiles, &environments, &space.id, &root).await?;
+        let saved = edit.is_some();
+        if let Some(WorktreeEditParams {
+            scope,
+            changes,
+            reset,
+            ..
+        }) = edit
+        {
+            let scoped = match scope {
+                WorktreeScope::Project if reset => {
+                    return Err(RpcError::Failed(
+                        "Project defaults can't be reset; pass the changes to make".into(),
+                    ));
+                }
+                WorktreeScope::Project => None,
+                WorktreeScope::Checkout if changes.contains_key("serviceMode") => {
+                    return Err(RpcError::Failed(
+                        "serviceMode applies to the whole project: use scope project".into(),
+                    ));
+                }
+                WorktreeScope::Checkout => Some(checkout.clone().ok_or_else(|| {
+                    RpcError::Failed(
+                        "This chat is in the project's main folder, which uses the project defaults: use scope project".into(),
+                    )
+                })?),
+            };
+            profiles
+                .edit_environment(
+                    &environments,
+                    &space.id,
+                    &root,
+                    scoped.as_deref(),
+                    move |current| {
+                        if reset {
+                            return Ok(None);
+                        }
+                        let mut value = serde_json::to_value(current)
+                            .map_err(|e| crate::EngineError::Other(e.to_string()))?;
+                        for (key, change) in changes {
+                            value[key.as_str()] = change;
+                        }
+                        serde_json::from_value(value).map(Some).map_err(|e| {
+                            crate::EngineError::Other(format!("Invalid worktree settings: {e}"))
+                        })
+                    },
+                )
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
+        }
+        let snapshot = self
+            .repos
+            .worktree_settings_snapshot(&root, checkout.as_deref())
+            .await
+            .map_err(|e| RpcError::Failed(e.to_string()))?;
+        let mut result =
+            serde_json::to_value(snapshot).map_err(|e| RpcError::Failed(e.to_string()))?;
+        // Services and databases are the service tools' to show.
+        if let Some(map) = result.as_object_mut() {
+            map.remove("databases");
+            map.remove("appServices");
+            for page in ["defaults", "settings"] {
+                if let Some(settings) = map.get_mut(page).and_then(Value::as_object_mut) {
+                    settings.remove("services");
+                }
+            }
+        }
+        result["projectId"] = json!(space.id);
+        result["mainFolder"] = json!(main);
+        result["worktreeFolder"] =
+            json!(self.repos.worktree_location_settings().effective_directory);
+        if saved {
+            result["saved"] = json!(true);
+            result["note"] = json!(
+                "Saved. Nothing ran; Zeron uses these settings the next time it creates, prepares, activates or removes a worktree."
+            );
+        }
         Ok(RpcReply::Value(result))
     }
 }

@@ -805,6 +805,7 @@ impl Tools {
         let mut catalog = catalog();
         if in_chat { catalog.extend(crate::browser::catalog()); }
         if in_chat { catalog.extend(crate::services::catalog()); }
+        if in_chat { catalog.extend(crate::worktrees::catalog()); }
         catalog
             .into_iter()
             .filter(|tool| match tool.name {
@@ -827,6 +828,9 @@ impl Tools {
         }
         if name.starts_with("browser_") {
             return crate::browser::call(&self.zeron, name, args).await.map_err(|error| format!("{error:#}"));
+        }
+        if matches!(name, crate::worktrees::GET | crate::worktrees::UPDATE) {
+            return crate::worktrees::call(&self.zeron, name, args).await.map_err(|error| format!("{error:#}"));
         }
         let result = match name {
             "whoami" => self.whoami().await,
