@@ -63,16 +63,43 @@ pub fn run_engine_command(command: EngineCommand) -> anyhow::Result<()> {
                     publish_ports,
                     read_only,
                     worktrees,
-                } => sandbox::enable(sandbox::Sandbox {
-                    worktrees: worktrees.unwrap_or_else(|| sandbox::default_worktrees(&path)),
-                    root: path,
-                    config,
-                    host_ports,
-                    publish_ports,
-                    read_only,
+                } => sandbox::enable(
+                    sandbox::Sandbox {
+                        worktrees: worktrees.unwrap_or_else(|| sandbox::default_worktrees(&path)),
+                        root: path,
+                        config,
+                        host_ports,
+                        publish_ports,
+                        read_only,
+                    },
+                    false,
+                )
+                .map(|status| {
+                    println!("Sandboxed {} in container {}.", status.sandbox.root.display(), status.container);
+                    println!("{}", sandbox::LOGIN_NOTE);
                 }),
-                zeron_cli::SandboxCommand::Disable { path } => sandbox::disable(&path),
-                zeron_cli::SandboxCommand::Status => sandbox::status(),
+                zeron_cli::SandboxCommand::Disable { path } => sandbox::disable(&path).map(|()| {
+                    println!("{} runs on this machine again. Its image and home volume were kept.", path.display());
+                }),
+                zeron_cli::SandboxCommand::Status => sandbox::statuses().map(|statuses| {
+                    if statuses.is_empty() {
+                        println!("No sandboxed projects.");
+                    }
+                    for s in statuses {
+                        println!(
+                            "{}\n  config: {}\n  container: {} ({}{})\n  worktrees: {}\n  host ports: {:?}, published: {:?}, read-only: {:?}",
+                            s.sandbox.root.display(),
+                            s.sandbox.config.display(),
+                            s.container,
+                            s.state,
+                            if s.image_built { "" } else { ", image not built" },
+                            s.sandbox.worktrees.display(),
+                            s.sandbox.host_ports,
+                            s.sandbox.publish_ports,
+                            s.sandbox.read_only,
+                        );
+                    }
+                }),
             }
             .map_err(|error| anyhow::anyhow!("{error}"))
         }

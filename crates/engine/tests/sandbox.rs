@@ -65,6 +65,7 @@ async fn a_sandboxed_project_never_runs_on_the_host_and_its_agents_stay_inside()
     // SAFETY: this binary's only test, before any thread reads them.
     unsafe {
         std::env::set_var("ZERON_DATA_DIR", base.join("data"));
+        std::env::set_var("ZERON_WORKTREES_DIR", base.join("worktrees"));
         // A helper that exists, for an image that doesn't: the container
         // can't start, which is what must never fall back to the host.
         std::env::set_var("ZERON_SANDBOX_HELPER", "/bin/true");
@@ -269,5 +270,105 @@ async fn a_sandboxed_project_never_runs_on_the_host_and_its_agents_stay_inside()
         .await
         .unwrap();
     assert_eq!(commands, json!([]));
+
+    // Sandboxes over RPC (the MCP sandbox tools): any agent reads them; only
+    // a full-access chat outside every sandbox sets one up or removes it.
+    let seen = agent
+        .call(methods::GET_SANDBOXES, json!({"chatId": "inside"}))
+        .await
+        .unwrap();
+    assert_eq!(seen["chat"]["inSandbox"], true);
+    assert_eq!(seen["projects"][0]["root"], json!(root));
+    assert_eq!(seen["projects"][0]["imageBuilt"], false);
+    let refused = agent
+        .call(
+            methods::SET_SANDBOX,
+            json!({"chatId": "inside", "enabled": false}),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("runs in a project sandbox"), "{refused}");
+    let host = zeron_rpc::memory_client(Arc::new(Agent {
+        service: core.rpc_service(),
+        chat: "outside".into(),
+    }));
+    let config_outside = base.join("devcontainer.json");
+    for (params, why) in [
+        (
+            json!({"spaceId": "elsewhere", "config": root.join("devcontainer.json")}),
+            "outside this project and any sandboxed one",
+        ),
+        (
+            json!({"spaceId": "elsewhere", "config": "relative/devcontainer.json"}),
+            "absolute path",
+        ),
+        (
+            json!({"spaceId": "elsewhere", "config": config_outside, "readOnly": ["/home/me/.ssh"]}),
+            "relative to the project",
+        ),
+        (
+            json!({"spaceId": "elsewhere", "config": config_outside, "readOnly": ["../repo/.env"]}),
+            "relative to the project",
+        ),
+    ] {
+        std::fs::write(root.join("devcontainer.json"), "{}").unwrap();
+        std::fs::write(&config_outside, "{}").unwrap();
+        let mut params = params;
+        params["chatId"] = json!("outside");
+        params["enabled"] = json!(true);
+        let refused = host
+            .call(methods::SET_SANDBOX, params.clone())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains(why), "{params}: {refused}");
+    }
+    core.workspace
+        .set_chat_config(
+            "outside",
+            &zeron_proto::ChatConfig {
+                harness: HarnessId::Mock,
+                model: None,
+                reasoning: None,
+                model_options: Default::default(),
+                sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+                access: zeron_proto::AccessMode::Supervised,
+                plan: false,
+            },
+        )
+        .unwrap();
+    let refused = host
+        .call(
+            methods::SET_SANDBOX,
+            json!({"chatId": "outside", "spaceId": "project", "enabled": false}),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("full access"), "{refused}");
+    core.workspace
+        .set_chat_config(
+            "outside",
+            &zeron_proto::ChatConfig {
+                harness: HarnessId::Mock,
+                model: None,
+                reasoning: None,
+                model_options: Default::default(),
+                sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+                access: zeron_proto::AccessMode::FullAccess,
+                plan: false,
+            },
+        )
+        .unwrap();
+    let after = host
+        .call(
+            methods::SET_SANDBOX,
+            json!({"chatId": "outside", "spaceId": "project", "enabled": false}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(after["projects"], json!([]));
+    assert!(sandbox::for_path(&root).unwrap().is_none());
     core.shutdown().await;
 }

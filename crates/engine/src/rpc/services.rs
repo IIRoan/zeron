@@ -27,6 +27,30 @@ struct EditParams {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SandboxReadParams {
+    chat_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SandboxEditParams {
+    chat_id: String,
+    /// Defaults to the calling chat's project.
+    #[serde(default)]
+    space_id: Option<String>,
+    enabled: bool,
+    #[serde(default)]
+    config: Option<std::path::PathBuf>,
+    #[serde(default)]
+    host_ports: Vec<u16>,
+    #[serde(default)]
+    publish_ports: Vec<u16>,
+    #[serde(default)]
+    read_only: Vec<std::path::PathBuf>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ControlParams {
     chat_id: String,
     service_id: String,
@@ -221,6 +245,119 @@ impl EngineRpc {
         result["note"] = json!(
             "Configuration saved. Running processes keep their current configuration; use service_restart to apply changes to them."
         );
+        Ok(RpcReply::Value(result))
+    }
+
+    /// Project sandboxes (`crate::sandbox`) for the calling chat. Any agent
+    /// reads them. Setting one up or removing it is for a full-access chat
+    /// outside every sandbox (which could run `zeron sandbox` itself), never
+    /// one inside: that would let it loosen or drop its own.
+    pub(super) async fn chat_sandboxes(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<RpcReply, RpcError> {
+        let (chat_id, edit) = if method == methods::SET_SANDBOX {
+            let p: SandboxEditParams = parse_params(params)?;
+            (p.chat_id.clone(), Some(p))
+        } else {
+            let p: SandboxReadParams = parse_params(params)?;
+            (p.chat_id, None)
+        };
+        if let Caller::Agent { chat } = zeron_rpc::caller()
+            && chat.as_deref() != Some(&chat_id)
+        {
+            return Err(RpcError::Failed(
+                "Sandbox tools act for the calling chat only".into(),
+            ));
+        }
+        let chat = self
+            .workspace
+            .chat(&chat_id)
+            .map_err(|e| RpcError::Failed(e.to_string()))?
+            .ok_or_else(|| RpcError::Failed("Chat not found".into()))?;
+        if chat.device_id != self.doc_host.device_id() {
+            return Err(RpcError::Failed(
+                "Sandbox tools require a chat on this device".into(),
+            ));
+        }
+        let failed = |e: crate::EngineError| RpcError::Failed(e.to_string());
+        let inside = |rpc: &Self| -> Result<bool, RpcError> {
+            match rpc.chat_folder(&chat) {
+                Some(folder) => Ok(crate::sandbox::for_path(std::path::Path::new(&folder))
+                    .map_err(failed)?
+                    .is_some()),
+                None => Ok(false),
+            }
+        };
+        let space_id = edit
+            .as_ref()
+            .and_then(|e| e.space_id.clone())
+            .or_else(|| chat.space_id.clone());
+        let space = space_id
+            .map(|id| self.local_project_action_space(&id))
+            .transpose()?;
+        let mut note = None;
+        if let Some(edit) = edit {
+            if matches!(zeron_rpc::caller(), Caller::Agent { .. }) && inside(self)? {
+                return Err(RpcError::Failed(
+                    "This chat runs in a project sandbox, so it can't set up or change sandboxes: the person does, with zeron sandbox".into(),
+                ));
+            }
+            // `enable` runs the devcontainer CLI and podman on this machine.
+            self.require_full_access(&chat_id, "Setting up a project sandbox")?;
+            let space = space
+                .as_ref()
+                .ok_or_else(|| RpcError::Failed("Choose a project: this chat has none".into()))?;
+            let root = std::path::PathBuf::from(&space.path);
+            if edit.enabled {
+                let config = edit.config.filter(|c| c.is_absolute()).ok_or_else(|| {
+                    RpcError::BadParams(
+                        "config: the absolute path of a devcontainer.json outside the project"
+                            .into(),
+                    )
+                })?;
+                let worktrees = std::path::PathBuf::from(
+                    self.repos.worktree_location_settings().effective_directory,
+                )
+                .join(root.file_name().unwrap_or_default());
+                let sandbox = crate::sandbox::Sandbox {
+                    root,
+                    worktrees,
+                    config,
+                    host_ports: edit.host_ports,
+                    publish_ports: edit.publish_ports,
+                    read_only: edit.read_only,
+                };
+                // Blocking and possibly minutes long (an image build); it
+                // finishes even if the caller stops waiting.
+                tokio::task::spawn_blocking(move || crate::sandbox::enable(sandbox, true))
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .map_err(failed)?;
+                note = Some(crate::sandbox::LOGIN_NOTE);
+            } else {
+                tokio::task::spawn_blocking(move || crate::sandbox::disable(&root))
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .map_err(failed)?;
+            }
+        }
+        let projects = tokio::task::spawn_blocking(crate::sandbox::statuses)
+            .await
+            .map_err(|e| RpcError::Failed(e.to_string()))?
+            .map_err(failed)?;
+        let mut result = json!({
+            "projects": projects,
+            "chat": {
+                "projectId": space.as_ref().map(|s| &s.id),
+                "projectPath": space.as_ref().map(|s| &s.path),
+                "inSandbox": inside(self)?,
+            },
+        });
+        if let Some(note) = note {
+            result["note"] = json!(note);
+        }
         Ok(RpcReply::Value(result))
     }
 

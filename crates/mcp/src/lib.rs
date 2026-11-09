@@ -20,6 +20,7 @@ mod jsonrpc;
 mod browser;
 mod services;
 mod tools;
+mod sandboxes;
 mod transcript;
 mod worktrees;
 mod zeron;

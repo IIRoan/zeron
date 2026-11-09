@@ -194,6 +194,18 @@ impl Sandbox {
         }
         modules(&git.join("modules"), &mut paths);
         for path in &self.read_only {
+            // Inside the project: anything else would show the container a
+            // file of this machine's.
+            if path.is_absolute()
+                || path
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err(EngineError::Other(format!(
+                    "Read-only path {} must be relative to the project, inside it",
+                    path.display()
+                )));
+            }
             let path = self.root.join(path);
             if !path.exists() {
                 return Err(EngineError::Other(format!(
@@ -494,8 +506,56 @@ pub fn default_worktrees(root: &Path) -> PathBuf {
     base.join(resolve(root).file_name().unwrap_or_default())
 }
 
-/// Build the image, register the project and start its container.
-pub fn enable(mut sandbox: Sandbox) -> Result<(), EngineError> {
+/// What agents do inside a sandbox once it's up.
+pub const LOGIN_NOTE: &str = "Agents log in once inside the container: open a terminal for this project in Zeron (it opens there) and run `claude`, then `codex login`.";
+
+/// A registered project and its container, as `status` and the MCP tools show it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Status {
+    #[serde(flatten)]
+    pub sandbox: Sandbox,
+    pub container: String,
+    /// podman's state (`running`, `exited`, …), or `not created`.
+    pub state: String,
+    pub image_built: bool,
+    /// The last image build's output, when Zeron ran it.
+    pub build_log: Option<PathBuf>,
+}
+
+impl Sandbox {
+    fn build_log(&self) -> PathBuf {
+        self.run_dir().join("build.log")
+    }
+
+    pub fn status(&self) -> Status {
+        let container = self.container();
+        Status {
+            state: podman(&[
+                "container",
+                "inspect",
+                "--format",
+                "{{.State.Status}}",
+                &container,
+            ])
+            .unwrap_or_else(|_| "not created".into()),
+            image_built: podman(&["image", "exists", &self.image()]).is_ok(),
+            build_log: Some(self.build_log()).filter(|log| log.is_file()),
+            container,
+            sandbox: self.clone(),
+        }
+    }
+}
+
+/// Every registered project, with its container's state.
+pub fn statuses() -> Result<Vec<Status>, EngineError> {
+    Ok(load()?.iter().map(Sandbox::status).collect())
+}
+
+/// Build the image, register the project and start its container. The
+/// build's output goes to the terminal, or with `log_to_file`, to the
+/// project's build log (an error ends with its tail).
+pub fn enable(mut sandbox: Sandbox, log_to_file: bool) -> Result<Status, EngineError> {
     let real = |path: &Path, what: &str| {
         path.canonicalize()
             .map_err(|e| EngineError::Other(format!("{what} {}: {e}", path.display())))
@@ -504,41 +564,62 @@ pub fn enable(mut sandbox: Sandbox) -> Result<(), EngineError> {
     sandbox.config = real(&sandbox.config, "Devcontainer config")?;
     std::fs::create_dir_all(&sandbox.worktrees)?;
     sandbox.worktrees = real(&sandbox.worktrees, "Worktrees folder")?;
-    if sandbox.config.starts_with(&sandbox.root) || sandbox.config.starts_with(&sandbox.worktrees) {
+    // Inside this project, or any sandboxed one, its agents could change
+    // what this image is built from.
+    let projects = load()?;
+    if std::iter::once(&sandbox)
+        .chain(&projects)
+        .any(|s| sandbox.config.starts_with(&s.root) || sandbox.config.starts_with(&s.worktrees))
+    {
         return Err(EngineError::Other(
-            "Keep the devcontainer config outside the project, so agents can't change it".into(),
+            "Keep the devcontainer config outside this project and any sandboxed one, so agents can't change it".into(),
         ));
     }
     sandbox.protected()?;
-    let status = Command::new("devcontainer")
+    let mut build = Command::new("devcontainer");
+    build
         .args(["build", "--docker-path", "podman", "--workspace-folder"])
         .arg(&sandbox.root)
         .arg("--config")
         .arg(&sandbox.config)
-        .args(["--image-name", &sandbox.image()])
-        .status()
-        .map_err(|e| {
-            EngineError::Other(format!(
-                "devcontainer CLI: {e} (install @devcontainers/cli)"
-            ))
-        })?;
-    if !status.success() {
-        return Err(EngineError::Other("devcontainer build failed".into()));
+        .args(["--image-name", &sandbox.image()]);
+    // The engine may run without the login shell's PATH (Homebrew, npm).
+    if let Some(path) = zeron_harness::composed_login_shell_path() {
+        build.env("PATH", path);
     }
-    let mut projects = load()?;
+    let log = sandbox.build_log();
+    if log_to_file {
+        std::fs::create_dir_all(sandbox.run_dir())?;
+        let file = std::fs::File::create(&log)?;
+        build
+            .stdout(file.try_clone()?)
+            .stderr(file)
+            .stdin(std::process::Stdio::null());
+    }
+    let status = build.status().map_err(|e| {
+        EngineError::Other(format!(
+            "devcontainer CLI: {e} (install @devcontainers/cli)"
+        ))
+    })?;
+    if !status.success() {
+        let tail = match log_to_file {
+            true => {
+                let text = std::fs::read_to_string(&log).unwrap_or_default();
+                let lines: Vec<&str> = text.lines().collect();
+                format!(":\n{}", lines[lines.len().saturating_sub(15)..].join("\n"))
+            }
+            false => String::new(),
+        };
+        return Err(EngineError::Other(format!(
+            "devcontainer build failed{tail}"
+        )));
+    }
+    let mut projects = projects;
     projects.retain(|s| s.root != sandbox.root);
     projects.push(sandbox.clone());
     save(projects)?;
-    let spec = ensure(&sandbox)?;
-    println!(
-        "Sandboxed {} in container {}.",
-        sandbox.root.display(),
-        spec.container
-    );
-    println!(
-        "Agents log in once inside it: open a terminal for this project in Zeron and run `claude`, then `codex login`."
-    );
-    Ok(())
+    ensure(&sandbox)?;
+    Ok(sandbox.status())
 }
 
 /// Unregister the project and remove its container. Its image and home
@@ -555,41 +636,6 @@ pub fn disable(root: &Path) -> Result<(), EngineError> {
     let sandbox = projects.remove(index);
     save(projects)?;
     let _ = podman(&["rm", "-f", "-t", "1", &sandbox.container()]);
-    println!(
-        "{} runs on this machine again. Its image and home volume were kept.",
-        root.display()
-    );
-    Ok(())
-}
-
-pub fn status() -> Result<(), EngineError> {
-    let projects = load()?;
-    if projects.is_empty() {
-        println!("No sandboxed projects.");
-    }
-    for sandbox in projects {
-        let state = podman(&[
-            "container",
-            "inspect",
-            "--format",
-            "{{.State.Status}}",
-            &sandbox.container(),
-        ])
-        .unwrap_or_else(|_| "not created".into());
-        println!(
-            "{}\n  config: {}\n  container: {} ({state})\n  worktrees: {}",
-            sandbox.root.display(),
-            sandbox.config.display(),
-            sandbox.container(),
-            sandbox.worktrees.display()
-        );
-        if !sandbox.host_ports.is_empty() || !sandbox.publish_ports.is_empty() {
-            println!(
-                "  host ports: {:?}, published: {:?}",
-                sandbox.host_ports, sandbox.publish_ports
-            );
-        }
-    }
     Ok(())
 }
 

@@ -277,6 +277,11 @@ pub mod methods {
     /// Agent surface: worktree settings of the calling chat's project only.
     pub const GET_CHAT_WORKTREE_SETTINGS: &str = "GetChatWorktreeSettings";
     pub const EDIT_CHAT_WORKTREE_SETTINGS: &str = "EditChatWorktreeSettings";
+    /// Project sandboxes (`zeron_engine::sandbox`), for the calling chat:
+    /// `{chatId}` reads; `{chatId, spaceId?, enabled, config?, …}` sets one up
+    /// or removes it, only from a full-access chat outside every sandbox.
+    pub const GET_SANDBOXES: &str = "GetSandboxes";
+    pub const SET_SANDBOX: &str = "SetSandbox";
     pub const GET_WORKTREE_SETTINGS: &str = "GetWorktreeSettings";
     pub const SAVE_WORKTREE_SETTINGS: &str = "SaveWorktreeSettings";
     pub const PREPARE_WORKTREE: &str = "PrepareWorktree";
@@ -768,6 +773,11 @@ pub fn agent_allowed(method: &str) -> bool {
             // checks the chat's access before saving workflow commands.
             | methods::GET_CHAT_WORKTREE_SETTINGS
             | methods::EDIT_CHAT_WORKTREE_SETTINGS
+            // Project sandboxes: read by any agent; set up only by a
+            // full-access chat that isn't in one (it could run
+            // `zeron sandbox` itself), never from inside one.
+            | methods::GET_SANDBOXES
+            | methods::SET_SANDBOX
             // Saying what the calling chat's agent waits on.
             | methods::AWAIT_BACKGROUND
             // Plugins: authoring, installing (lands waiting for the person),
@@ -1420,7 +1430,17 @@ mod tests {
         }
 
         let app = connect_ws(&url, Some(&tokens.full)).await.unwrap();
-        for method in [methods::LIST_BROWSER_TABS, methods::CONTROL_BROWSER, methods::GET_CHAT_SERVICES, methods::CONTROL_CHAT_SERVICE, methods::EDIT_CHAT_SERVICE, methods::GET_CHAT_WORKTREE_SETTINGS, methods::EDIT_CHAT_WORKTREE_SETTINGS] {
+        for method in [
+            methods::LIST_BROWSER_TABS,
+            methods::CONTROL_BROWSER,
+            methods::GET_CHAT_SERVICES,
+            methods::CONTROL_CHAT_SERVICE,
+            methods::EDIT_CHAT_SERVICE,
+            methods::GET_CHAT_WORKTREE_SETTINGS,
+            methods::EDIT_CHAT_WORKTREE_SETTINGS,
+            methods::GET_SANDBOXES,
+            methods::SET_SANDBOX,
+        ] {
             assert!(agent_allowed(method), "{method}");
             let asked = agent.call(method, serde_json::json!({})).await.unwrap();
             assert!(asked.as_str().unwrap().starts_with("Agent"), "{method}: {asked}");

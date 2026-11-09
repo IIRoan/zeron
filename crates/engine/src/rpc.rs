@@ -5350,6 +5350,9 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&snapshot)
             }
             methods::EDIT_CHAT_SERVICE => self.edit_chat_service(params).await,
+            methods::GET_SANDBOXES | methods::SET_SANDBOX => {
+                self.chat_sandboxes(method, params).await
+            }
             methods::GET_CHAT_WORKTREE_SETTINGS | methods::EDIT_CHAT_WORKTREE_SETTINGS => {
                 self.chat_worktree_settings(method, params).await
             }

@@ -806,6 +806,7 @@ impl Tools {
         if in_chat { catalog.extend(crate::browser::catalog()); }
         if in_chat { catalog.extend(crate::services::catalog()); }
         if in_chat { catalog.extend(crate::worktrees::catalog()); }
+        if in_chat { catalog.extend(crate::sandboxes::catalog()); }
         catalog
             .into_iter()
             .filter(|tool| match tool.name {
@@ -831,6 +832,14 @@ impl Tools {
         }
         if matches!(name, crate::worktrees::GET | crate::worktrees::UPDATE) {
             return crate::worktrees::call(&self.zeron, name, args).await.map_err(|error| format!("{error:#}"));
+        }
+        if matches!(
+            name,
+            crate::sandboxes::STATUS | crate::sandboxes::ENABLE | crate::sandboxes::DISABLE
+        ) {
+            return crate::sandboxes::call(&self.zeron, name, args)
+                .await
+                .map_err(|error| format!("{error:#}"));
         }
         let result = match name {
             "whoami" => self.whoami().await,

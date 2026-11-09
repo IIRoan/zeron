@@ -31,10 +31,29 @@ zeron sandbox disable ~/Documents/muute-monorepo
 - Edit the config and run `enable` again to rebuild. `disable` keeps the image
   and the home volume.
 
+## From an agent (Zeron MCP)
+
+The same, from a chat: `sandbox_status` lists every sandboxed project with its
+container's state, whether its image is built, and its last build log.
+`chat.inSandbox` says whether the calling chat runs in one. `sandbox_enable
+{"config": "/abs/devcontainer.json", "hostPorts": […], "publishPorts": […],
+"readOnly": […], "project"?}` builds and starts a sandbox for the chat's
+project, or the named one; calling it again replaces the settings.
+`sandbox_disable {"project"?}` removes one. A build can take minutes. If the
+tool call times out, the build carries on, so check `sandbox_status`.
+
+Changes come only from a chat with full access outside read-only/plan mode
+that isn't in any sandbox, which could run `zeron sandbox` itself. A chat
+inside a sandbox can read sandboxes but never set one up or change one, its
+own included. The config must sit outside the project and outside every
+sandboxed one, so no sandbox's agents can shape an image. Read-only paths must
+be relative and inside the project.
+
 ## What it guarantees
 
-- Only `zeron sandbox` (run by you, on the host) writes the registry,
-  `~/.zeron/sandboxes.json`. No RPC or MCP tool can change it.
+- Only `zeron sandbox` and the MCP tools above write the registry,
+  `~/.zeron/sandboxes.json`, and only for callers already outside every
+  sandbox with full access. Nothing in a sandbox can change it.
 - Membership is by path: the project folder and its worktrees folder.
 - Nothing for a sandboxed checkout falls back to the host. If the container
   can't start, the run, service or terminal fails with the reason. Only Claude

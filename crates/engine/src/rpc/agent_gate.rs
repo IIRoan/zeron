@@ -50,7 +50,7 @@ fn refused(message: impl Into<String>) -> RpcError {
 
 impl EngineRpc {
     /// The folder a chat's agent runs in: its own, or its project's.
-    fn chat_folder(&self, chat: &Chat) -> Option<String> {
+    pub(super) fn chat_folder(&self, chat: &Chat) -> Option<String> {
         chat.cwd.clone().or_else(|| {
             let space = self
                 .workspace

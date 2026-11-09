@@ -230,6 +230,8 @@ name (default: the local engine's device).
 | `service_add`, `service_update` | `EditChatService {chatId, edit}` (origin chat only; one entry, no reconnect replay) |
 | `worktree_settings_get` | `GetChatWorktreeSettings {chatId}` (origin chat only) |
 | `worktree_settings_update` | `EditChatWorktreeSettings {chatId, scope, changes, reset}` (origin chat only; named fields only, no reconnect replay) |
+| `sandbox_status` | `GetSandboxes {chatId}` (origin chat only) |
+| `sandbox_enable`, `sandbox_disable` | `SetSandbox {chatId, spaceId?, enabled, config?, hostPorts?, publishPorts?, readOnly?}` (origin chat only; full access, refused inside a sandbox; no reconnect replay). See [Project sandboxes](sandboxes.md) |
 
 Watch streams are the engine's only read surface (there is no one-shot "get
 transcript" RPC); a snapshot is "subscribe, take the first item, drop" — drop
