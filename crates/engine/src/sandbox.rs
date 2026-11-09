@@ -124,9 +124,29 @@ pub fn for_path(path: &Path) -> Result<Option<Sandbox>, EngineError> {
         return Ok(None);
     }
     let path = resolve(path);
-    Ok(projects
-        .into_iter()
-        .find(|s| path.starts_with(&s.root) || path.starts_with(&s.worktrees)))
+    if let Some(sandbox) = projects
+        .iter()
+        .find(|s| path.starts_with(&s.root) || path.starts_with(&s.worktrees))
+    {
+        return Ok(Some(sandbox.clone()));
+    }
+    // A linked worktree of a sandboxed project outside its folders: not in
+    // the container, so it fails rather than run here. Its `.git` file is
+    // outside every container too, so agents can't make or unmake this.
+    if let Some(checkout) = path.ancestors().find(|dir| dir.join(".git").exists())
+        && let Some(root) = crate::workspace_host::linked_worktree_root(checkout)
+        && let Some(sandbox) = projects
+            .iter()
+            .find(|s| resolve(Path::new(&root)) == s.root)
+    {
+        return Err(EngineError::Other(format!(
+            "{} is a worktree of the sandboxed project {}, outside its worktrees folder {}. Move it there (git worktree move) to use it in Zeron",
+            checkout.display(),
+            sandbox.root.display(),
+            sandbox.worktrees.display()
+        )));
+    }
+    Ok(None)
 }
 
 /// `path` as the container sees it (same-path mounts of resolved folders).
@@ -177,17 +197,23 @@ impl Sandbox {
             .into_iter()
             .filter(|p| p.exists())
             .collect();
+        // Agents shape `.git/modules` and `.git/worktrees`: a symlink there is
+        // skipped, never followed (its target would be mounted).
+        fn real(path: &Path) -> bool {
+            path.symlink_metadata()
+                .is_ok_and(|m| !m.file_type().is_symlink())
+        }
         fn modules(dir: &Path, out: &mut Vec<PathBuf>) {
             for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
                 let path = entry.path();
-                if !path.is_dir() {
+                if !entry.file_type().is_ok_and(|t| t.is_dir()) {
                     continue;
                 }
                 if path.join("HEAD").exists() {
                     out.extend(
                         [path.join("config"), path.join("hooks")]
                             .into_iter()
-                            .filter(|p| p.exists()),
+                            .filter(|p| real(p)),
                     );
                     modules(&path.join("modules"), out);
                 } else {
@@ -197,6 +223,27 @@ impl Sandbox {
             }
         }
         modules(&git.join("modules"), &mut paths);
+        // The git folders of linked worktrees outside the project's folders
+        // (`for_path` refuses those checkouts): the container doesn't have
+        // the checkouts, but a rewritten `commondir` there would point their
+        // host git at a config agents wrote.
+        for admin in std::fs::read_dir(git.join("worktrees"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            if !admin.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let admin = admin.path();
+            let inside = std::fs::read_to_string(admin.join("gitdir")).is_ok_and(|gitdir| {
+                let checkout = resolve(&admin.join(gitdir.trim()));
+                checkout.starts_with(&self.root) || checkout.starts_with(&self.worktrees)
+            });
+            if !inside {
+                paths.push(admin);
+            }
+        }
         if self.config.starts_with(&self.root) {
             paths.push(match self.config.parent() {
                 Some(folder) if folder != self.root => folder.to_path_buf(),
@@ -226,6 +273,55 @@ impl Sandbox {
             paths.push(path);
         }
         Ok(paths)
+    }
+
+    /// [`Self::protected`] as mounts over the project's folder, in order:
+    /// each folder between it and a protected path onto itself (`false`),
+    /// then the protected paths read-only (`true`). A read-only mount holds
+    /// only while the folders above it stay put (`mv .git .git-old` carries
+    /// `.git/config`'s mount away and leaves a `.git` agents write), and a
+    /// mount point can't be renamed.
+    fn mounts(&self) -> Result<Vec<(PathBuf, bool)>, EngineError> {
+        let protected = self.protected()?;
+        // Never through a symlink: what it points at would be mounted
+        // instead (writable, for a folder above a protected path).
+        for path in &protected {
+            let Ok(inside) = path.strip_prefix(&self.root) else {
+                continue;
+            };
+            let mut at = self.root.clone();
+            for part in inside.components() {
+                at.push(part);
+                if at
+                    .symlink_metadata()
+                    .is_ok_and(|m| m.file_type().is_symlink())
+                {
+                    return Err(EngineError::Other(format!(
+                        "{} is a symlink, which the sandbox won't mount through. Replace it with what it points at",
+                        at.display()
+                    )));
+                }
+            }
+        }
+        let mut folders: Vec<PathBuf> = protected
+            .iter()
+            .flat_map(|path| path.ancestors().skip(1))
+            .filter(|folder| {
+                folder.starts_with(&self.root)
+                    && *folder != self.root.as_path()
+                    // In a read-only one, nothing moves anyway.
+                    && !protected.iter().any(|p| folder.starts_with(p))
+            })
+            .map(Path::to_path_buf)
+            .collect();
+        // Parents first.
+        folders.sort();
+        folders.dedup();
+        Ok(folders
+            .into_iter()
+            .map(|folder| (folder, false))
+            .chain(protected.into_iter().map(|path| (path, true)))
+            .collect())
     }
 
     fn run_args(&self, helper: &Path, image: &str) -> Result<Vec<String>, EngineError> {
@@ -279,8 +375,9 @@ impl Sandbox {
         }
         args.extend(["-v".into(), format!("{0}:{0}:ro", path(&self.run_dir()))]);
         args.extend(["-v".into(), format!("{}:{GUARD}:ro", path(helper))]);
-        for protected in self.protected()? {
-            args.extend(["-v".into(), format!("{0}:{0}:ro", path(&protected))]);
+        for (mount, read_only) in self.mounts()? {
+            let ro = if read_only { ":ro" } else { "" };
+            args.extend(["-v".into(), format!("{0}:{0}{ro}", path(&mount))]);
         }
         args.extend([
             "--entrypoint".into(),
@@ -731,8 +828,9 @@ fn jail(
     for dir in [&sandbox.root, &sandbox.worktrees] {
         jail.arg("--bind").arg(dir).arg(dir);
     }
-    for protected in sandbox.protected()? {
-        jail.arg("--ro-bind").arg(&protected).arg(&protected);
+    for (mount, read_only) in sandbox.mounts()? {
+        let bind = if read_only { "--ro-bind" } else { "--bind" };
+        jail.arg(bind).arg(&mount).arg(&mount);
     }
     let env = |name: &str| {
         std.get_envs()
@@ -1286,6 +1384,75 @@ mod tests {
         s.config = s.root.join(".devcontainer.json");
         let protected = s.protected().unwrap();
         assert!(protected.contains(&s.config) && !protected.contains(&s.root));
+    }
+
+    #[test]
+    fn folders_above_what_the_host_reads_stay_put_and_outside_worktrees_are_read_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let s = Sandbox {
+            read_only: Vec::new(),
+            ..sandbox(&base)
+        };
+        let git = s.root.join(".git");
+        std::fs::create_dir_all(git.join("hooks")).unwrap();
+        std::fs::create_dir_all(git.join("modules/apps/ui")).unwrap();
+        std::fs::write(git.join("modules/apps/ui/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(git.join("modules/apps/ui/config"), "").unwrap();
+        std::fs::write(git.join("config"), "[core]\n").unwrap();
+        for (name, checkout) in [
+            ("inside", s.worktrees.join("inside")),
+            ("outside", base.join("elsewhere")),
+        ] {
+            let admin = git.join("worktrees").join(name);
+            std::fs::create_dir_all(&admin).unwrap();
+            std::fs::write(
+                admin.join("gitdir"),
+                format!("{}\n", checkout.join(".git").display()),
+            )
+            .unwrap();
+        }
+        // Symlinks agents plant there are skipped, never mounted through.
+        let elsewhere = base.join("elsewhere-git");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("HEAD"), "").unwrap();
+        std::fs::write(elsewhere.join("config"), "").unwrap();
+        #[cfg(unix)]
+        for link in [
+            "modules/linked",
+            "worktrees/linked",
+            "modules/apps/ui/hooks",
+        ] {
+            std::os::unix::fs::symlink(&elsewhere, git.join(link)).unwrap();
+        }
+        let folder = |rel: &str| (s.root.join(rel), false);
+        let read_only = |rel: &str| (s.root.join(rel), true);
+        assert_eq!(
+            s.mounts().unwrap(),
+            [
+                folder(".git"),
+                folder(".git/modules"),
+                folder(".git/modules/apps"),
+                folder(".git/modules/apps/ui"),
+                folder(".git/worktrees"),
+                read_only(".git/config"),
+                read_only(".git/hooks"),
+                read_only(".git/modules/apps/ui/config"),
+                read_only(".git/worktrees/outside"),
+            ]
+        );
+        // A protected path the person names through a symlink is refused.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(elsewhere.join("config"), s.root.join("compose.yaml"))
+                .unwrap();
+            let linked = Sandbox {
+                read_only: vec!["compose.yaml".into()],
+                ..s.clone()
+            };
+            let refused = linked.mounts().unwrap_err().to_string();
+            assert!(refused.contains("is a symlink"), "{refused}");
+        }
     }
 
     #[test]

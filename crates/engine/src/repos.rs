@@ -1422,14 +1422,22 @@ impl Repos {
         // Snapshot the destination once per creation. Changes never relocate
         // existing worktrees or alter the cwd already stored on a chat.
         let root = self.inner.worktrees.root();
-        let base = root.join(&repo_name);
+        // A sandboxed project's go where its container mounts them, whatever
+        // the location setting says now.
+        let sandboxed = crate::sandbox::for_path(repo_path)?;
+        let base = match &sandboxed {
+            Some(sandbox) => sandbox.worktrees.clone(),
+            None => root.join(&repo_name),
+        };
         // A location that contains the repository (e.g. its parent folder)
         // would nest checkouts inside the primary one, where they show up as
         // untracked embedded repositories.
-        if let (Ok(root), Ok(repo)) = (
-            std::fs::canonicalize(&root),
-            std::fs::canonicalize(repo_path),
-        ) && root.join(&repo_name).starts_with(&repo)
+        if sandboxed.is_none()
+            && let (Ok(root), Ok(repo)) = (
+                std::fs::canonicalize(&root),
+                std::fs::canonicalize(repo_path),
+            )
+            && root.join(&repo_name).starts_with(&repo)
         {
             return Err(EngineError::Other(format!(
                 "Worktrees for {repo_name} would be created inside the repository at {}. Choose a different worktree location in Settings.",

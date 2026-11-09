@@ -351,6 +351,42 @@ async fn a_sandboxed_project_never_runs_on_the_host_and_its_agents_stay_inside()
         .unwrap();
     assert_eq!(commands, json!([]));
 
+    // A worktree of the project outside its worktrees folder isn't in the
+    // container: it fails closed rather than run here.
+    let stray = base.join("stray");
+    git(
+        &root,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "stray",
+            stray.to_str().unwrap(),
+        ],
+    );
+    for path in [&stray, &stray.join("src/new")] {
+        let refused = sandbox::for_path(path).unwrap_err().to_string();
+        assert!(
+            refused.contains("outside its worktrees folder"),
+            "{refused}"
+        );
+    }
+    assert!(sandbox::git_env(&stray).is_err());
+    let refused = sandbox::stamp_run(HarnessId::ClaudeCode, &mut request(&stray), None)
+        .await
+        .unwrap_err();
+    assert!(
+        refused.contains("outside its worktrees folder"),
+        "{refused}"
+    );
+    assert!(
+        terminals
+            .open_service(stray.to_str().unwrap(), &env, "touch ran-on-host")
+            .is_err()
+    );
+    assert!(!stray.join("ran-on-host").exists());
+
     // Sandboxes over RPC (the MCP sandbox tools): any agent reads them; only
     // a full-access chat outside every sandbox sets one up or removes it.
     let seen = agent

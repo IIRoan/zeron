@@ -295,6 +295,31 @@ async fn a_sandboxed_service_runs_in_the_container_and_ends_with_it() {
         let _ = Command::new("podman").args(args).output();
     }
 
+    // What the host's git reads stays put: the folders above it can't be
+    // renamed away (`mv .git` would carry the read-only mounts off and leave
+    // a `.git` agents write), and the rest of `.git` stays writable.
+    std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+    std::fs::write(root.join(".git/config"), "[core]\n").unwrap();
+    sandbox::ensure(&sandbox).unwrap();
+    for (script, allowed) in [
+        ("mv .git .git-old", false),
+        ("rm -rf .git/hooks", false),
+        ("echo x >> .git/config", false),
+        ("touch .git/index", true),
+    ] {
+        let ran = Command::new("podman")
+            .args(["exec", "-w"])
+            .arg(&root)
+            .args([container.as_str(), "sh", "-c", script])
+            .output()
+            .unwrap();
+        assert_eq!(ran.status.success(), allowed, "{script}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(root.join(".git/config")).unwrap(),
+        "[core]\n"
+    );
+
     let _ = Command::new("podman")
         .args(["rm", "-f", "-t", "0", &container])
         .output();
