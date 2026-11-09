@@ -673,6 +673,10 @@ pub fn git_env(dir: &Path) -> Result<Vec<(&'static str, PathBuf)>, EngineError> 
 /// it). For a sandboxed checkout they run here pinned ([`git_env`]) with
 /// submodule recursion off and hooks from `.git/hooks`; every other git
 /// command runs jailed ([`jail`]).
+// ponytail: checkout/switch/worktree/merge here run the global or system
+// config's filter and merge drivers (and git-lfs) on files agents tag with
+// .gitattributes; none are configured on this machine. If one is added, give
+// these GIT_LFS_SKIP_SMUDGE=1 and empty filter overrides via GIT_CONFIG_*.
 const HOST_GIT: &[&str] = &[
     "push",
     "fetch",
