@@ -1133,6 +1133,7 @@ async fn capture_git_in<S: AsRef<OsStr>>(
         cmd.as_std_mut().creation_flags(0x08000000);
     }
     cmd.arg("-C").arg(cwd).args(args);
+    crate::sandbox::pin_git(&mut cmd, cwd);
     if let Some(snapshot) = snapshot {
         snapshot.apply_to(&mut cmd);
     }
@@ -1840,6 +1841,7 @@ async fn run_git_for_path_batch(
         .arg("--literal-pathspecs")
         .args(fixed_args)
         .arg("--");
+    crate::sandbox::pin_git(&mut command, root);
     for path in paths {
         command.arg(path_argument(path));
     }

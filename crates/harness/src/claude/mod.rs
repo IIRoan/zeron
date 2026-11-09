@@ -557,12 +557,13 @@ impl ClaudeHarness {
         request: &RunRequest,
         title_only: bool,
     ) -> Result<Runtime, HarnessError> {
-        let mut child = Self::build_command(exe, request, title_only)
-            .spawn()
-            .map_err(|e| {
-                let cwd = (!request.cwd.is_empty()).then(|| std::path::Path::new(&request.cwd));
-                crate::executable::spawn_error(e, cwd, || crate::executable::binary_hint(exe))
-            })?;
+        let mut child =
+            crate::sandbox::wrap(Self::build_command(exe, request, title_only), &request.env)?
+                .spawn()
+                .map_err(|e| {
+                    let cwd = (!request.cwd.is_empty()).then(|| std::path::Path::new(&request.cwd));
+                    crate::executable::spawn_error(e, cwd, || crate::executable::binary_hint(exe))
+                })?;
         let stdin = child.stdin.take();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();

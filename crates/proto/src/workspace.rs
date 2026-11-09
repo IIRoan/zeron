@@ -166,6 +166,7 @@ mod tests {
                     "project-databases-v1",
                     "project-service-control-v1",
                     "project-service-edit-v1",
+                    "chat-worktree-settings-v1",
                     "projectless-scratch-v1",
                     "sidebar-section-order-v1",
                     "provider-switch-v1",

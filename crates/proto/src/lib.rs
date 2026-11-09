@@ -24,6 +24,7 @@ pub mod projectless;
 pub mod redact;
 pub mod providers;
 pub mod run_errors;
+pub mod sandbox;
 pub mod sidebar_pins;
 pub mod view;
 pub mod voice;

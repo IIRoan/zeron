@@ -4047,11 +4047,17 @@ async fn drive_run(
                 );
                 // Host-resolved spawn env (a Cloud device's credential broker);
                 // `RunRequest::env` is serde-skipped, never persisted.
-                match inner
+                // A sandboxed project's agent runs in its container, or not
+                // at all (`crate::sandbox`).
+                let prepared = match inner
                     .registry
                     .prepare_run(harness_id, &mut wire_request)
                     .await
                 {
+                    Ok(()) => crate::sandbox::stamp_run(harness_id, &mut wire_request).await,
+                    error => error,
+                };
+                match prepared {
                     Ok(()) if resume_state.idle => harness.start_idle(wire_request, controls).await,
                     Ok(()) => harness.run(wire_request, controls).await,
                     Err(message) => Err(zeron_harness::HarnessError::NotSignedIn(message)),

@@ -88,6 +88,12 @@ enum Command {
         #[command(subcommand)]
         command: TemplateCommand,
     },
+    /// Run a project's agents, services and terminals in a container built
+    /// from a devcontainer config (Linux, rootless podman).
+    Sandbox {
+        #[command(subcommand)]
+        command: SandboxCommand,
+    },
     /// Manage `zeron headless` as a background service (launchd / systemd --user).
     Daemon {
         #[command(subcommand)]
@@ -166,6 +172,40 @@ pub enum TemplateCommand {
     Delete { id: String },
 }
 
+#[derive(Subcommand)]
+pub enum SandboxCommand {
+    /// Build the project's image and start its container. Agents (Claude
+    /// Code, Codex), app services, setup commands and terminals of the
+    /// project and its worktrees then run inside it; shared databases stay
+    /// on this machine.
+    Enable {
+        /// The project's folder.
+        path: std::path::PathBuf,
+        /// Its devcontainer.json, kept outside the project.
+        #[arg(long)]
+        config: std::path::PathBuf,
+        /// A port on this machine the container reaches on its localhost (a
+        /// database). Repeat for more.
+        #[arg(long = "host-port", value_name = "PORT")]
+        host_ports: Vec<u16>,
+        /// A container port this machine reaches on its localhost (a dev
+        /// server). Repeat for more.
+        #[arg(long = "publish", value_name = "PORT")]
+        publish_ports: Vec<u16>,
+        /// A path in the project this machine reads (a database's compose
+        /// file), mounted read-only so agents can't change it. Repeat for more.
+        #[arg(long = "read-only", value_name = "PATH")]
+        read_only: Vec<std::path::PathBuf>,
+        /// Where Zeron creates the project's worktrees, if not the default.
+        #[arg(long)]
+        worktrees: Option<std::path::PathBuf>,
+    },
+    /// Run the project on this machine again and remove its container.
+    Disable { path: std::path::PathBuf },
+    /// List sandboxed projects and their containers.
+    Status,
+}
+
 /// A subcommand that runs the engine's own code in this process: what the
 /// engine helper (or a binary linking the engine) does with it.
 pub enum EngineCommand {
@@ -179,6 +219,7 @@ pub enum EngineCommand {
     Mcp,
     Plugin(PluginCommand),
     Template(TemplateCommand),
+    Sandbox(SandboxCommand),
 }
 
 /// Where this binary runs [`EngineCommand`]s.
@@ -257,7 +298,15 @@ pub fn run(version: &'static str, engines: Engines) -> Launch {
         init_logging(
             long_running,
             mode,
-            matches!(&cli.command, Some(Command::Mcp | Command::Plugin { .. } | Command::Template { .. })),
+            matches!(
+                &cli.command,
+                Some(
+                    Command::Mcp
+                        | Command::Plugin { .. }
+                        | Command::Template { .. }
+                        | Command::Sandbox { .. }
+                )
+            ),
         );
     }
     if long_running {
@@ -280,6 +329,7 @@ pub fn run(version: &'static str, engines: Engines) -> Launch {
         Some(Command::Mcp) => engine(EngineCommand::Mcp),
         Some(Command::Plugin { command }) => engine(EngineCommand::Plugin(command)),
         Some(Command::Template { command }) => engine(EngineCommand::Template(command)),
+        Some(Command::Sandbox { command }) => engine(EngineCommand::Sandbox(command)),
         #[cfg(target_os = "linux")]
         Some(Command::Appshot) => Launch::Appshot,
         Some(Command::Update { check }) => Launch::Done(
@@ -315,7 +365,8 @@ impl Command {
             | Self::Quiesce
             | Self::Mcp
             | Self::Plugin { .. }
-            | Self::Template { .. } => true,
+            | Self::Template { .. }
+            | Self::Sandbox { .. } => true,
             #[cfg(target_os = "linux")]
             Self::Appshot => false,
             Self::Update { .. } | Self::UpdateWatchdog | Self::Daemon { .. } => false,
@@ -404,6 +455,7 @@ mod tests {
             &["mcp"],
             &["plugin", "new"],
             &["template", "use"],
+            &["sandbox", "enable"],
             &["daemon", "install"],
             &["update"],
         ] {
@@ -435,6 +487,7 @@ mod tests {
             &["mcp"],
             &["plugin", "list"],
             &["template", "list"],
+            &["sandbox", "status"],
         ] {
             assert!(parse(args).unwrap().runs_engine(), "{args:?}");
         }

@@ -2288,8 +2288,14 @@ impl ProcessRunner for SystemProcessRunner {
         if let Some(cwd) = &request.cwd {
             command.current_dir(cwd);
         }
+        command.envs(request.env);
+        // Over the request's: git, and the git gh starts (`crate::sandbox`).
+        if let Some(cwd) = &request.cwd
+            && matches!(request.program.as_str(), "git" | "gh")
+        {
+            crate::sandbox::pin_git(&mut command, cwd);
+        }
         command
-            .envs(request.env)
             .stdin(if request.stdin.is_some() {
                 Stdio::piped()
             } else {

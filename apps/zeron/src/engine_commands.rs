@@ -53,6 +53,29 @@ pub fn run_engine_command(command: EngineCommand) -> anyhow::Result<()> {
                 &config.data_dir,
             ))
         }
+        EngineCommand::Sandbox(command) => {
+            use zeron_engine::sandbox;
+            match command {
+                zeron_cli::SandboxCommand::Enable {
+                    path,
+                    config,
+                    host_ports,
+                    publish_ports,
+                    read_only,
+                    worktrees,
+                } => sandbox::enable(sandbox::Sandbox {
+                    worktrees: worktrees.unwrap_or_else(|| sandbox::default_worktrees(&path)),
+                    root: path,
+                    config,
+                    host_ports,
+                    publish_ports,
+                    read_only,
+                }),
+                zeron_cli::SandboxCommand::Disable { path } => sandbox::disable(&path),
+                zeron_cli::SandboxCommand::Status => sandbox::status(),
+            }
+            .map_err(|error| anyhow::anyhow!("{error}"))
+        }
         EngineCommand::Engine => crate::background::run(),
     }
 }

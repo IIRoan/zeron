@@ -49,6 +49,75 @@ fn refused(message: impl Into<String>) -> RpcError {
 }
 
 impl EngineRpc {
+    /// The folder a chat's agent runs in: its own, or its project's.
+    fn chat_folder(&self, chat: &Chat) -> Option<String> {
+        chat.cwd.clone().or_else(|| {
+            let space = self
+                .workspace
+                .space(chat.space_id.as_deref()?)
+                .ok()
+                .flatten()?;
+            Some(space.path)
+        })
+    }
+
+    /// An agent in a project sandbox (`crate::sandbox`) can only create or
+    /// run chats in that same sandbox: anywhere else (another project, its
+    /// own folder override, no project, Cloud, another device) its work
+    /// would run outside it.
+    fn keep_in_sandbox(
+        &self,
+        method: &str,
+        params: &Value,
+        chat: Option<&str>,
+        chats: &[Chat],
+    ) -> Result<(), RpcError> {
+        let creating = method == methods::MUTATE && params["op"] == "createChat";
+        if method == methods::MUTATE && !creating {
+            return Ok(());
+        }
+        let sandbox_of = |folder: Option<String>| -> Result<Option<std::path::PathBuf>, RpcError> {
+            let Some(folder) = folder else {
+                return Ok(None);
+            };
+            crate::sandbox::for_path(std::path::Path::new(&folder))
+                .map(|sandbox| sandbox.map(|sandbox| sandbox.root))
+                .map_err(|e| refused(e.to_string()))
+        };
+        let Some(root) = sandbox_of(
+            chat.and_then(|id| chats.iter().find(|c| c.id == id))
+                .and_then(|c| self.chat_folder(c)),
+        )?
+        else {
+            return Ok(());
+        };
+        let target = if creating {
+            match params["cloud"].as_bool() {
+                Some(true) => None,
+                _ => params["cwd"].as_str().map(str::to_owned).or_else(|| {
+                    let space = self
+                        .workspace
+                        .space(params["spaceId"].as_str()?)
+                        .ok()
+                        .flatten()?;
+                    (space.device_id == self.doc_host.device_id()).then_some(space.path)
+                }),
+            }
+        } else {
+            let target = params["chatId"].as_str().unwrap_or_default();
+            chats
+                .iter()
+                .find(|c| c.id == target && c.device_id == self.doc_host.device_id())
+                .and_then(|c| self.chat_folder(c))
+        };
+        if sandbox_of(target)?.as_ref() != Some(&root) {
+            return Err(refused(
+                "This chat runs in its project's sandbox, so it can only create and message chats in that sandbox",
+            ));
+        }
+        Ok(())
+    }
+
     fn calling(&self, chat_id: &str, chats: &[Chat]) -> Calling {
         let chat = chats.iter().find(|c| c.id == chat_id);
         let ceiling = if zeron_proto::voice::is_orchestrator_chat(chat_id) {
@@ -86,6 +155,7 @@ impl EngineRpc {
             return Ok(params);
         }
         let chats = self.workspace.read_chats().unwrap_or_default();
+        self.keep_in_sandbox(method, &params, chat.as_deref(), &chats)?;
         let calling = chat.as_deref().map(|id| self.calling(id, &chats));
         let attributed = |target: &str, text: &str| {
             agent_messages::attributed(

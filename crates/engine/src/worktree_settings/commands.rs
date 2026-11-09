@@ -37,9 +37,21 @@ pub(crate) async fn run(
     in_project: bool,
 ) -> Result<(), EngineError> {
     run_with_refs(
-        root, checkout, settings, command, log, token, in_project, None,
+        root, checkout, settings, command, log, token, in_project, None, false,
     )
     .await
+}
+
+/// [`run`] in the project folder on the host, even in a sandboxed project:
+/// for shared database readiness checks, which agents can't edit.
+pub(crate) async fn run_on_host(
+    root: &Path,
+    settings: &WorktreeSettings,
+    command: &str,
+    log: &Path,
+    token: &CancellationToken,
+) -> Result<(), EngineError> {
+    run_with_refs(root, root, settings, command, log, token, true, None, true).await
 }
 
 /// References are passed as environment variables, never interpolated into shell code.
@@ -54,6 +66,7 @@ pub(super) async fn run_with_refs(
     token: &CancellationToken,
     in_project: bool,
     refs: Option<(&str, &str)>,
+    host: bool,
 ) -> Result<(), EngineError> {
     if token.is_cancelled() {
         return Err(EngineError::Other("Worktree setup was cancelled.".into()));
@@ -114,9 +127,12 @@ pub(super) async fn run_with_refs(
         let cwd = cwd.to_string_lossy().into_owned();
         let command = command.to_string();
         // The first spawn may wait for the user's login shell to report PATH.
-        tokio::task::spawn_blocking(move || terminals.open_service(&cwd, &environment, &command))
-            .await
-            .map_err(|e| EngineError::Other(e.to_string()))??
+        tokio::task::spawn_blocking(move || match host {
+            true => terminals.open_host_service(&cwd, &environment, &command),
+            false => terminals.open_service(&cwd, &environment, &command),
+        })
+        .await
+        .map_err(|e| EngineError::Other(e.to_string()))??
     };
     let mut guard = CommandGuard {
         terminals: terminals.clone(),
@@ -146,9 +162,13 @@ pub(super) async fn run_with_refs(
 }
 
 async fn branch_name(path: &Path) -> String {
+    let Ok(pinned) = crate::sandbox::git_env(path) else {
+        return String::new();
+    };
     tokio::process::Command::new("git")
         .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
         .current_dir(path)
+        .envs(pinned)
         .stdin(std::process::Stdio::null())
         .output()
         .await

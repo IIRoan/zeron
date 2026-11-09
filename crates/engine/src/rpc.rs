@@ -3187,6 +3187,14 @@ impl RpcService for EngineRpc {
                         path: p.path,
                     })
                     .await?;
+                // Discovery starts the CLI on the host, where a sandboxed
+                // checkout's project settings must never run (`crate::sandbox`).
+                if crate::sandbox::for_path(&root)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .is_some()
+                {
+                    return RpcReply::value(&serde_json::json!([]));
+                }
                 let skills = self
                     .registry
                     .discover_skills(p.harness, &root)
@@ -3215,6 +3223,12 @@ impl RpcService for EngineRpc {
                         path: p.path,
                     })
                     .await?;
+                if crate::sandbox::for_path(&root)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .is_some()
+                {
+                    return RpcReply::value(&serde_json::json!([]));
+                }
                 let commands = self
                     .registry
                     .discover_commands(p.harness, &root)

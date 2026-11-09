@@ -455,6 +455,7 @@ mod model_context;
 pub mod opencode;
 pub mod pi;
 pub mod process;
+mod sandbox;
 mod scratch;
 pub mod shell_env;
 pub(crate) mod skills;

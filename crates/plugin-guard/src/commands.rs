@@ -670,8 +670,30 @@ pub fn run_trusting(asked: &Json, allowed: &[String], trusted: &dyn Fn(&Path) ->
     run_on(asked, allowed, user_path(), trusted)
 }
 
+/// [`run_trusting`], with variables the caller (never the plugin) sets on a
+/// git-family run over everything else: for a sandboxed checkout, its own
+/// git folder (`GIT_DIR`, …), so git can't be pointed at one an agent wrote.
+pub fn run_pinned(
+    asked: &Json,
+    allowed: &[String],
+    trusted: &dyn Fn(&Path) -> bool,
+    pinned: &[(String, String)],
+) -> Result<Json, String> {
+    run_with(asked, allowed, user_path(), trusted, pinned)
+}
+
 /// [`run_trusting`], finding programs on `path`.
 pub fn run_on(asked: &Json, allowed: &[String], path: &str, trusted: &dyn Fn(&Path) -> bool) -> Result<Json, String> {
+    run_with(asked, allowed, path, trusted, &[])
+}
+
+fn run_with(
+    asked: &Json,
+    allowed: &[String],
+    path: &str,
+    trusted: &dyn Fn(&Path) -> bool,
+    pinned: &[(String, String)],
+) -> Result<Json, String> {
     let program = asked["program"].as_str().unwrap_or_default();
     if !valid_name(program) || !allowed.iter().any(|a| a == program) {
         return Err(format!("This plugin doesn't run \"{program}\": its manifest's \"commands\" names what it may run"));
@@ -724,7 +746,7 @@ pub fn run_on(asked: &Json, allowed: &[String], path: &str, trusted: &dyn Fn(&Pa
     }
     // (Over the plugin's: git, and the git gh starts, always hardened.)
     if is(Family::Git) || is(Family::GitTool) || is(Family::Gh) {
-        for (key, value) in git_env(hooks) {
+        for (key, value) in git_env(hooks).into_iter().chain(pinned.iter().cloned()) {
             command.env(key, value);
         }
     }

@@ -512,7 +512,23 @@ impl Terminals {
             "Managed project terminals require Unix".into(),
         ));
         #[cfg(unix)]
-        self.open_session_mode(cwd, 100, 28, None, environment, Some(command), true)
+        self.open_session_mode(cwd, 100, 28, None, environment, Some(command), true, false)
+    }
+
+    /// A shared database service and its checks: on the host even in a
+    /// sandboxed project (`crate::sandbox`), whose agents can't edit them.
+    pub fn open_host_service(
+        &self,
+        cwd: &str,
+        environment: &HashMap<String, String>,
+        command: &str,
+    ) -> Result<TerminalSession, EngineError> {
+        #[cfg(not(unix))]
+        return Err(EngineError::Other(
+            "Managed project terminals require Unix".into(),
+        ));
+        #[cfg(unix)]
+        self.open_session_mode(cwd, 100, 28, None, environment, Some(command), true, true)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -525,7 +541,7 @@ impl Terminals {
         environment: &HashMap<String, String>,
         command: Option<&str>,
     ) -> Result<TerminalSession, EngineError> {
-        self.open_session_mode(cwd, cols, rows, shell, environment, command, false)
+        self.open_session_mode(cwd, cols, rows, shell, environment, command, false, false)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -538,6 +554,7 @@ impl Terminals {
         environment: &HashMap<String, String>,
         command: Option<&str>,
         service: bool,
+        host: bool,
     ) -> Result<TerminalSession, EngineError> {
         if lock(&self.inner.sessions).len() >= MAX_TERMINALS {
             return Err(EngineError::Other(format!(
@@ -563,6 +580,16 @@ impl Terminals {
             shell = "/bin/sh".into();
             shell_name = "sh".into();
         }
+        // A sandboxed checkout's shells run in its container, or not at all.
+        let sandbox = match host {
+            true => None,
+            false => crate::sandbox::for_path(std::path::Path::new(cwd))?
+                .map(|sandbox| crate::sandbox::ensure(&sandbox))
+                .transpose()?,
+        };
+        if sandbox.is_some() {
+            shell_name = "sh".into();
+        }
 
         // Named before the shell starts, so everything it runs carries it.
         let id = new_id();
@@ -581,10 +608,15 @@ impl Terminals {
                 "fish" => (".fish", "source \"$ZERON_ACTION_SCRIPT\"\r"),
                 _ => (".sh", ". \"$ZERON_ACTION_SCRIPT\"\r"),
             };
-            let mut script = tempfile::Builder::new()
-                .prefix("zeron-action-")
-                .suffix(suffix)
-                .tempfile()?;
+            let mut builder = tempfile::Builder::new();
+            builder.prefix("zeron-action-").suffix(suffix);
+            // Where the container can read it.
+            let mut script = match &sandbox {
+                Some(spec) => {
+                    builder.tempfile_in(std::path::Path::new(&spec.run_dir).join("scripts"))?
+                }
+                None => builder.tempfile()?,
+            };
             script.write_all(command.as_bytes())?;
             script.flush()?;
             (Some(script), (!service).then(|| source.to_string()))
@@ -634,6 +666,15 @@ impl Terminals {
             }
             if let Some(script) = initial_script.as_ref() {
                 cmd.env("ZERON_ACTION_SCRIPT", script.path());
+            }
+            if let Some(spec) = &sandbox {
+                cmd = crate::sandbox::shell_command(
+                    spec,
+                    cwd,
+                    service,
+                    environment,
+                    initial_script.as_ref().map(|script| script.path()),
+                );
             }
             let child = pair
                 .slave

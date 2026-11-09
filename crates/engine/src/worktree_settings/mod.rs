@@ -1188,7 +1188,7 @@ impl WorktreeSettingsStore {
         let log = self.log_path(&key, &cwd);
         self.state(&key, &cwd, WorktreeSetupPhase::Preparing, step, None)?;
         let result = commands::run_with_refs(
-            root, checkout, settings, command, &log, &token, in_project, refs,
+            root, checkout, settings, command, &log, &token, in_project, refs, false,
         )
         .await;
         self.state(

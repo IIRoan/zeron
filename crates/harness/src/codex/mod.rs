@@ -939,10 +939,12 @@ fn spawn_app_server(exe: &Path, request: &RunRequest) -> Result<AppServer, Harne
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let mut child = cmd.spawn().map_err(|e| {
-        let cwd = (!request.cwd.is_empty()).then(|| Path::new(&request.cwd));
-        crate::executable::spawn_error(e, cwd, || crate::executable::binary_hint(exe))
-    })?;
+    let mut child = crate::sandbox::wrap(cmd, &request.env)?
+        .spawn()
+        .map_err(|e| {
+            let cwd = (!request.cwd.is_empty()).then(|| Path::new(&request.cwd));
+            crate::executable::spawn_error(e, cwd, || crate::executable::binary_hint(exe))
+        })?;
     let stdin = child
         .stdin
         .take()

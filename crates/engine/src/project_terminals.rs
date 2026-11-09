@@ -398,7 +398,13 @@ impl ProjectTerminals {
             ("ZERON_PROJECT_ROOT".into(), canonical_root(root)?),
             ("ZERON_CHECKOUT_ROOT".into(), canonical_root(checkout)?),
         ]);
-        let session = match terminals.open_service(
+        // Shared databases stay on the host in a sandboxed project.
+        let open = match service.is_database() {
+            true => Terminals::open_host_service,
+            false => Terminals::open_service,
+        };
+        let session = match open(
+            terminals,
             &directory.to_string_lossy(),
             &environment,
             &service.command,
@@ -1094,14 +1100,12 @@ impl ProjectTerminals {
                 }
                 let mut check_settings = settings.clone();
                 check_settings.command_timeout_seconds = remaining.as_secs().clamp(1, 5);
-                if crate::worktree_settings::commands::run(
-                    root,
+                if crate::worktree_settings::commands::run_on_host(
                     root,
                     &check_settings,
                     &readiness.command,
                     log,
                     token,
-                    true,
                 )
                 .await
                 .is_ok()
@@ -1526,6 +1530,10 @@ async fn supervise(
             let environment = environment.clone();
             let command = service.command.clone();
             let token = token.clone();
+            let open = match service.is_database() {
+                true => Terminals::open_host_service,
+                false => Terminals::open_service,
+            };
             // Spawning a shell blocks; keep it off the async workers.
             tokio::task::spawn_blocking(move || {
                 warm_login_path();
@@ -1533,7 +1541,12 @@ async fn supervise(
                 if token.is_cancelled() {
                     return None;
                 }
-                match terminals.open_service(&directory.to_string_lossy(), &environment, &command) {
+                match open(
+                    &terminals,
+                    &directory.to_string_lossy(),
+                    &environment,
+                    &command,
+                ) {
                     Ok(next) => {
                         let _ = terminals.close(&failed.id);
                         if let Some(run) = live.get_mut(&key) {

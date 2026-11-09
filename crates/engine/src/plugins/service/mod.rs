@@ -706,8 +706,24 @@ impl Ops for PluginOps {
                     // chats' or projects' folders runs that checkout's hooks
                     // (pre-commit, pre-push), as git does for you; anywhere
                     // else, or reading, none.
-                    let trusted = |dir: &Path| hooks.folders().iter().any(|f| dir.starts_with(f));
-                    done(commands::run_trusting(&args, &allowed, &trusted))
+                    // In a sandboxed project (`crate::sandbox`): the project's
+                    // own git folder, and no hooks, which its agents can reach.
+                    let cwd = args["cwd"].as_str().map(std::path::PathBuf::from);
+                    let pinned = match cwd.as_deref().map(crate::sandbox::git_env).transpose() {
+                        Ok(pinned) => pinned.unwrap_or_default(),
+                        Err(error) => return done(Err(error.to_string())),
+                    };
+                    let sandboxed = !pinned.is_empty();
+                    let pinned: Vec<(String, String)> = pinned
+                        .into_iter()
+                        .map(|(k, v)| (k.to_owned(), v.to_string_lossy().into_owned()))
+                        .collect();
+                    let trusted = |dir: &Path| {
+                        !sandboxed && hooks.folders().iter().any(|f| dir.starts_with(f))
+                    };
+                    done(zeron_plugin_guard::commands::run_pinned(
+                        &args, &allowed, &trusted, &pinned,
+                    ))
                 });
             }
             "fetch" => {

@@ -173,6 +173,36 @@ impl EngineRpc {
         let profiles = self.project_actions.project_terminals.clone();
         let environments = self.repos.worktree_settings().clone();
         super::adopt_legacy_services(&profiles, &environments, &space.id, &root).await?;
+        // A sandboxed project's databases run on the host (`crate::sandbox`):
+        // only the person changes them.
+        if matches!(zeron_rpc::caller(), Caller::Agent { .. })
+            && crate::sandbox::for_path(&root)
+                .map_err(|e| RpcError::Failed(e.to_string()))?
+                .is_some()
+        {
+            let database = match &p.edit {
+                ProjectServiceEdit::Add {
+                    kind,
+                    readiness_command,
+                    ..
+                } => {
+                    matches!(kind, zeron_proto::ProjectServiceKind::Database)
+                        || readiness_command.is_some()
+                }
+                ProjectServiceEdit::Update { service_id, .. } => profiles
+                    .snapshot(&space.id, &root)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .config
+                    .services
+                    .iter()
+                    .any(|s| &s.id == service_id && s.is_database()),
+            };
+            if database {
+                return Err(RpcError::Failed(
+                    "This project is sandboxed and its databases run on this machine, so only you can change them, in Zeron.".into(),
+                ));
+            }
+        }
         let (saved, id) = profiles
             .edit_checkout_service(&environments, &space.id, &root, &checkout, p.edit)
             .await

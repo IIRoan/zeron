@@ -1,0 +1,19 @@
+# Built as a static musl binary (scripts/build-sandbox-helper.sh) so the same
+# file runs on the host and inside any project sandbox image.
+[package]
+name = "zeron-sandbox"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "zeron-sandbox"
+path = "src/main.rs"
+
+# Standalone: no workspace dependencies, so it builds alone inside a container.
+[workspace]
+
+[profile.release]
+strip = true
+opt-level = "s"
