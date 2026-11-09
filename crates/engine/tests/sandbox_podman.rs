@@ -115,14 +115,14 @@ async fn a_sandboxed_service_runs_in_the_container_and_ends_with_it() {
 
     // Set up through the RPC the MCP `sandbox_enable` tool calls: a
     // full-access chat outside every sandbox builds and starts one for its
-    // own project; inside it, the same chat can't change it.
+    // own project, from the project's own config (whose `USER root` doesn't
+    // stick); inside it, the same chat can't change it.
     let project = base.join("project");
-    let config = base.join("config");
-    std::fs::create_dir_all(&project).unwrap();
+    let config = project.join(".devcontainer");
     std::fs::create_dir_all(&config).unwrap();
     std::fs::write(
         config.join("Dockerfile"),
-        "FROM docker.io/library/alpine:3.20\n",
+        "FROM docker.io/library/alpine:3.20\nUSER root\n",
     )
     .unwrap();
     std::fs::write(
@@ -189,6 +189,20 @@ async fn a_sandboxed_service_runs_in_the_container_and_ends_with_it() {
         .to_string();
     assert!(refused.contains("runs in a project sandbox"), "{refused}");
     let second = sandbox::for_path(&project).unwrap().unwrap();
+    let me = Command::new("id").arg("-u").output().unwrap().stdout;
+    assert_eq!(
+        podman(&["exec", &second.container(), "id", "-u"]),
+        String::from_utf8_lossy(&me).trim()
+    );
+    let touched = Command::new("podman")
+        .args(["exec", &second.container(), "touch"])
+        .arg(config.join("x"))
+        .output()
+        .unwrap();
+    assert!(
+        !touched.status.success(),
+        "the config's folder is read-only inside"
+    );
     sandbox::disable(&project).unwrap();
     core.shutdown().await;
     for args in [

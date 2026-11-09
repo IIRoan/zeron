@@ -297,7 +297,7 @@ async fn a_sandboxed_project_never_runs_on_the_host_and_its_agents_stay_inside()
     for (params, why) in [
         (
             json!({"spaceId": "elsewhere", "config": root.join("devcontainer.json")}),
-            "outside this project and any sandboxed one",
+            "agents could change it there",
         ),
         (
             json!({"spaceId": "elsewhere", "config": "relative/devcontainer.json"}),

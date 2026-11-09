@@ -23,12 +23,12 @@ pub fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: ENABLE,
-            description: "Run a project's agents (Claude Code, Codex), app services, worktree setup commands, project actions and terminals in a container built from a devcontainer config (Linux, rootless podman, devcontainer CLI). Its worktrees are included; shared databases stay on this machine. Builds the image and starts the container: it can take minutes. If the call times out, check sandbox_status: the build carries on. Calling it again for a sandboxed project replaces its settings. Write the config (a devcontainer.json with a Dockerfile that installs the agent CLIs and the project's toolchain) outside every project first. Afterwards the person logs the agents in once inside the container, from a Zeron terminal of that project. Refused from a chat inside a sandbox, and without full access outside read-only/plan mode.",
+            description: "Run a project's agents (Claude Code, Codex), app services, worktree setup commands, project actions and terminals in a container built from a devcontainer config (Linux, rootless podman, devcontainer CLI). Its worktrees are included; shared databases stay on this machine. Builds the image and starts the container: it can take minutes. If the call times out, check sandbox_status: the build carries on. Calling it again for a sandboxed project replaces its settings. Use the project's own devcontainer config (its folder is then mounted read-only; list the compose file or Dockerfile it names elsewhere in the project in readOnly), or write one outside every project. Its image must already hold the agent CLIs and the project's toolchain: Zeron runs no lifecycle commands (onCreateCommand and the like). Afterwards the person logs the agents in once inside the container, from a Zeron terminal of that project. Refused from a chat inside a sandbox, and without full access outside read-only/plan mode.",
             input_schema: json!({
                 "type":"object",
                 "properties":{
                     "project": project,
-                    "config":{"type":"string","description":"Absolute path of the devcontainer.json, outside this and every sandboxed project."},
+                    "config":{"type":"string","description":"Absolute path of the devcontainer.json: in this project's main folder, or outside every sandboxed project."},
                     "hostPorts": ports("Ports on this machine the container reaches on its localhost (databases)."),
                     "publishPorts": ports("Container ports this machine reaches on its localhost (dev servers)."),
                     "readOnly":{"type":"array","items":{"type":"string"},"description":"Paths relative to the project that this machine reads (a database's compose file, a bunfig.toml its checks load), mounted read-only so agents can't change them. .git config and hooks always are."}

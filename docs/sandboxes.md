@@ -7,17 +7,24 @@ worktree of it. Shared databases stay on this machine.
 
 ```sh
 zeron sandbox enable ~/Documents/muute-monorepo \
-  --config ~/.config/zeron/sandboxes/muute-monorepo/devcontainer.json \
+  --config ~/Documents/muute-monorepo/.devcontainer/devcontainer.json \
   --host-port 5432 --host-port 6379 --publish 3000 --publish 6006 \
-  --read-only compose.db-only.yaml --read-only bunfig.toml
+  --read-only compose.devcontainer.yaml --read-only compose.db-only.yaml \
+  --read-only bunfig.toml
 zeron sandbox status
 zeron sandbox disable ~/Documents/muute-monorepo
 ```
 
-- `--config` is a devcontainer.json kept **outside** the project, so agents
-  can't change it. `enable` builds its image with the `devcontainer` CLI and
-  podman. Install the agent CLIs (`claude`, `codex`) and the project's
-  toolchain in that image.
+- `--config` is the project's own devcontainer.json, or one outside every
+  sandboxed project. A config in the project has its folder mounted read-only
+  (just the file for a top-level `.devcontainer.json`), and `enable` refuses
+  it until the compose files or Dockerfile it names elsewhere in the project
+  are `--read-only` paths, so agents can't change what the image is built
+  from. Agents still edit those files in worktrees. `enable` builds the image
+  with the `devcontainer` CLI and podman. The image itself must hold the agent
+  CLIs (`claude`, `codex`) and the project's toolchain: Zeron runs no
+  lifecycle commands (`onCreateCommand`, `postStartCommand`, …) and ignores
+  the config's run settings (`mounts`, `runArgs`, `remoteEnv`, users).
 - `--host-port`: a port on this machine (a database) that the container
   reaches on its own `localhost`. `--publish`: a container port (a dev server)
   this machine reaches on `localhost`. Nothing else crosses, including Zeron's
@@ -45,9 +52,10 @@ tool call times out, the build carries on, so check `sandbox_status`.
 Changes come only from a chat with full access outside read-only/plan mode
 that isn't in any sandbox, which could run `zeron sandbox` itself. A chat
 inside a sandbox can read sandboxes but never set one up or change one, its
-own included. The config must sit outside the project and outside every
-sandboxed one, so no sandbox's agents can shape an image. Read-only paths must
-be relative and inside the project.
+own included. The config and the files it builds from must be out of every
+sandbox's reach: read-only in this project, or outside every sandboxed one
+(never in a worktrees folder), so no sandbox's agents can shape an image.
+Read-only paths must be relative and inside the project.
 
 ## What it guarantees
 
@@ -59,8 +67,9 @@ be relative and inside the project.
   can't start, the run, service or terminal fails with the reason. Only Claude
   Code and Codex can run there; other providers are refused.
 - The container runs with Zeron's own flags: rootless podman,
-  `--userns=keep-id`, all capabilities dropped, `no-new-privileges`, and only
-  the project, its worktrees, the helper and a read-only run folder mounted.
+  `--userns=keep-id` as this machine's user (whatever `USER` the image
+  sets), all capabilities dropped, `no-new-privileges`, and only the
+  project, its worktrees, the helper and a read-only run folder mounted.
 - Agents in a sandbox can only create and message chats in the same sandbox,
   and can't add or edit the project's databases, since those run on the host.
 - Zeron's own host-side git for these checkouts is pinned to the project's git
@@ -76,7 +85,9 @@ be relative and inside the project.
   them on the host, in the folders they name. The zgx beta interface's
   window-side plugin runner isn't pinned.
 - A database service's own inputs must be read-only (`--read-only`) or live
-  outside the project. Zeron can't know which files a script reads.
+  outside the project. Zeron can't know which files a script reads. The same
+  goes for files a config's compose file pulls in (`include`, `build`): Zeron
+  checks only the compose files and Dockerfile the config names.
 - Agents can't change `.git/config` from inside, so `git push -u` (which
   writes it) fails there.
 - SELinux labels aren't applied (`label=disable`, for speed on large

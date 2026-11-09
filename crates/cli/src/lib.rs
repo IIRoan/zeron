@@ -181,7 +181,8 @@ pub enum SandboxCommand {
     Enable {
         /// The project's folder.
         path: std::path::PathBuf,
-        /// Its devcontainer.json, kept outside the project.
+        /// Its devcontainer.json: the project's own (its folder is then
+        /// mounted read-only), or one outside every sandboxed project.
         #[arg(long)]
         config: std::path::PathBuf,
         /// A port on this machine the container reaches on its localhost (a

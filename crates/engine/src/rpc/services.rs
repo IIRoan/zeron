@@ -312,10 +312,7 @@ impl EngineRpc {
             let root = std::path::PathBuf::from(&space.path);
             if edit.enabled {
                 let config = edit.config.filter(|c| c.is_absolute()).ok_or_else(|| {
-                    RpcError::BadParams(
-                        "config: the absolute path of a devcontainer.json outside the project"
-                            .into(),
-                    )
+                    RpcError::BadParams("config: the absolute path of a devcontainer.json".into())
                 })?;
                 let worktrees = std::path::PathBuf::from(
                     self.repos.worktree_location_settings().effective_directory,

@@ -33,7 +33,9 @@ pub struct Sandbox {
     pub root: PathBuf,
     /// The folder Zeron creates this project's worktrees in.
     pub worktrees: PathBuf,
-    /// The devcontainer.json the image is built from, outside the project.
+    /// The devcontainer.json the image is built from: outside every
+    /// sandboxed project, or in this one's main folder (its folder is then
+    /// mounted read-only).
     pub config: PathBuf,
     /// Host ports the container reaches on its own localhost (databases).
     #[serde(default)]
@@ -150,7 +152,8 @@ impl Sandbox {
     }
 
     /// What the container mounts read-only: the git config and hooks the
-    /// host's git runs (submodules' too), and the `readOnly` paths.
+    /// host's git runs (submodules' too), a config in the project with its
+    /// folder (the config alone at the top), and the `readOnly` paths.
     fn protected(&self) -> Result<Vec<PathBuf>, EngineError> {
         let git = self.root.join(".git");
         let config = git.join("config");
@@ -193,6 +196,12 @@ impl Sandbox {
             }
         }
         modules(&git.join("modules"), &mut paths);
+        if self.config.starts_with(&self.root) {
+            paths.push(match self.config.parent() {
+                Some(folder) if folder != self.root => folder.to_path_buf(),
+                _ => self.config.clone(),
+            });
+        }
         for path in &self.read_only {
             // Inside the project: anything else would show the container a
             // file of this machine's.
@@ -232,6 +241,10 @@ impl Sandbox {
         };
         let container = self.container();
         let path = |p: &Path| p.to_string_lossy().into_owned();
+        // This machine's user, whatever the image says (devcontainer images
+        // end on `USER root`, and a capability-less root can't read the
+        // checkout). A bare uid keeps the image's groups for it (npm, go).
+        let user = format!("--user={}", unsafe { libc::getuid() });
         let mut args: Vec<String> = [
             "run",
             "-d",
@@ -239,6 +252,7 @@ impl Sandbox {
             container.as_str(),
             "--init",
             "--userns=keep-id",
+            user.as_str(),
             "--cap-drop=ALL",
             "--security-opt",
             "no-new-privileges",
@@ -286,6 +300,20 @@ fn helper() -> Result<PathBuf, EngineError> {
         .ok_or_else(|| {
             EngineError::Other("The zeron-sandbox helper isn't installed beside Zeron".into())
         })
+}
+
+/// `devcontainer <subcommand>` on the project's config, with podman.
+fn devcontainer(sandbox: &Sandbox, subcommand: &str) -> Command {
+    let mut cmd = Command::new("devcontainer");
+    cmd.args([subcommand, "--docker-path", "podman", "--workspace-folder"])
+        .arg(&sandbox.root)
+        .arg("--config")
+        .arg(&sandbox.config);
+    // The engine may run without the login shell's PATH (Homebrew, npm).
+    if let Some(path) = zeron_harness::composed_login_shell_path() {
+        cmd.env("PATH", path);
+    }
+    cmd
 }
 
 fn podman(args: &[&str]) -> Result<String, EngineError> {
@@ -528,6 +556,63 @@ impl Sandbox {
         self.run_dir().join("build.log")
     }
 
+    /// Refuses a file the image is built from that agents could change: in a
+    /// worktrees folder, another sandboxed project, or this one outside its
+    /// read-only paths.
+    fn check_input(
+        &self,
+        input: &Path,
+        projects: &[Sandbox],
+        protected: &[PathBuf],
+    ) -> Result<(), EngineError> {
+        let writable = input.starts_with(&self.worktrees)
+            || (input.starts_with(&self.root) && !protected.iter().any(|p| input.starts_with(p)))
+            || projects.iter().any(|s| {
+                s.root != self.root
+                    && (input.starts_with(&s.root) || input.starts_with(&s.worktrees))
+            });
+        if writable {
+            return Err(EngineError::Other(format!(
+                "{} builds this sandbox's image, but agents could change it there. Keep the config in this project's own folder (that folder is then read-only; list the other files it uses in this project as read-only paths) or outside every sandboxed project",
+                input.display()
+            )));
+        }
+        Ok(())
+    }
+
+    /// The compose files and Dockerfile the config names, as the devcontainer
+    /// CLI reads them. Files those name in turn (a compose `include`) aren't.
+    fn image_inputs(&self) -> Result<Vec<PathBuf>, EngineError> {
+        let output = devcontainer(self, "read-configuration")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| {
+                EngineError::Other(format!(
+                    "devcontainer CLI: {e} (install @devcontainers/cli)"
+                ))
+            })?;
+        if !output.status.success() {
+            return Err(EngineError::Other(format!(
+                "devcontainer read-configuration failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        let read: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .map_err(|e| EngineError::Other(format!("devcontainer read-configuration: {e}")))?;
+        let config = &read["configuration"];
+        let mut names: Vec<&str> = match &config["dockerComposeFile"] {
+            serde_json::Value::Array(files) => files.iter().filter_map(|f| f.as_str()).collect(),
+            file => file.as_str().into_iter().collect(),
+        };
+        names.extend(config["build"]["dockerfile"].as_str());
+        names.extend(config["dockerFile"].as_str());
+        let folder = self.config.parent().unwrap_or(&self.root);
+        Ok(names
+            .into_iter()
+            .map(|name| resolve(&folder.join(name)))
+            .collect())
+    }
+
     pub fn status(&self) -> Status {
         let container = self.container();
         Status {
@@ -564,29 +649,14 @@ pub fn enable(mut sandbox: Sandbox, log_to_file: bool) -> Result<Status, EngineE
     sandbox.config = real(&sandbox.config, "Devcontainer config")?;
     std::fs::create_dir_all(&sandbox.worktrees)?;
     sandbox.worktrees = real(&sandbox.worktrees, "Worktrees folder")?;
-    // Inside this project, or any sandboxed one, its agents could change
-    // what this image is built from.
     let projects = load()?;
-    if std::iter::once(&sandbox)
-        .chain(&projects)
-        .any(|s| sandbox.config.starts_with(&s.root) || sandbox.config.starts_with(&s.worktrees))
-    {
-        return Err(EngineError::Other(
-            "Keep the devcontainer config outside this project and any sandboxed one, so agents can't change it".into(),
-        ));
+    let protected = sandbox.protected()?;
+    sandbox.check_input(&sandbox.config, &projects, &protected)?;
+    for input in sandbox.image_inputs()? {
+        sandbox.check_input(&input, &projects, &protected)?;
     }
-    sandbox.protected()?;
-    let mut build = Command::new("devcontainer");
-    build
-        .args(["build", "--docker-path", "podman", "--workspace-folder"])
-        .arg(&sandbox.root)
-        .arg("--config")
-        .arg(&sandbox.config)
-        .args(["--image-name", &sandbox.image()]);
-    // The engine may run without the login shell's PATH (Homebrew, npm).
-    if let Some(path) = zeron_harness::composed_login_shell_path() {
-        build.env("PATH", path);
-    }
+    let mut build = devcontainer(&sandbox, "build");
+    build.args(["--image-name", &sandbox.image()]);
     let log = sandbox.build_log();
     if log_to_file {
         std::fs::create_dir_all(sandbox.run_dir())?;
@@ -673,8 +743,12 @@ mod tests {
         std::fs::write(s.root.join(".git/config"), "[core]\n").unwrap();
         std::fs::write(s.root.join("compose.yaml"), "").unwrap();
         let args = s.run_args(Path::new("/h"), "img").unwrap().join(" ");
+        let pinned = format!(
+            "--userns=keep-id --user={} --cap-drop=ALL --security-opt no-new-privileges",
+            unsafe { libc::getuid() }
+        );
         for expected in [
-            "--userns=keep-id --cap-drop=ALL --security-opt no-new-privileges",
+            pinned.as_str(),
             "--network pasta:-T,5432,-t,3000",
             &format!("{0}/.git/config:{0}/.git/config:ro", s.root.display()),
             &format!("{0}/.git/hooks:{0}/.git/hooks:ro", s.root.display()),
@@ -693,6 +767,47 @@ mod tests {
             s.run_args(Path::new("/h"), "img").is_err(),
             "a repo config include is refused"
         );
+    }
+
+    #[test]
+    fn a_config_in_the_project_is_read_only_with_what_it_builds_from() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let mut s = sandbox(&base);
+        s.config = s.root.join(".devcontainer/devcontainer.json");
+        let compose = s.root.join("compose.devcontainer.yaml");
+        let other = Sandbox {
+            root: base.join("other"),
+            worktrees: base.join("other-worktrees"),
+            ..sandbox(&base)
+        };
+        std::fs::create_dir_all(s.root.join(".devcontainer")).unwrap();
+        std::fs::write(s.root.join("compose.yaml"), "").unwrap();
+        let protected = s.protected().unwrap();
+        assert!(protected.contains(&s.root.join(".devcontainer")));
+        let projects = [other.clone()];
+        let check = |path: &Path, protected: &[PathBuf]| s.check_input(path, &projects, protected);
+        assert!(check(&s.config, &protected).is_ok());
+        assert!(check(&s.root.join(".devcontainer/Dockerfile"), &protected).is_ok());
+        assert!(check(&base.join("elsewhere/devcontainer.json"), &protected).is_ok());
+        assert!(check(&compose, &protected).is_err(), "not read-only");
+        assert!(
+            check(
+                &s.worktrees.join("wt/.devcontainer/devcontainer.json"),
+                &protected
+            )
+            .is_err()
+        );
+        assert!(check(&other.root.join("devcontainer.json"), &protected).is_err());
+        assert!(check(&other.worktrees.join("devcontainer.json"), &protected).is_err());
+        s.read_only.push("compose.devcontainer.yaml".into());
+        std::fs::write(&compose, "").unwrap();
+        let protected = s.protected().unwrap();
+        assert!(s.check_input(&compose, &projects, &protected).is_ok());
+        // At the top, only the config itself, never the whole project.
+        s.config = s.root.join(".devcontainer.json");
+        let protected = s.protected().unwrap();
+        assert!(protected.contains(&s.config) && !protected.contains(&s.root));
     }
 
     #[test]
