@@ -3229,7 +3229,7 @@ impl AgentAccounts {
         .await?;
         // The reply names the workspace, not our user-plus-workspace slot key.
         if let Some(account_id) = str_field(&body, "account_id")
-            && account_id != provider_account_id
+            && account_id != codex_workspace(&slot.account_key)
         {
             return Err(ProbeError::NoCredentials {
                 why: NoCredentials::Missing,
@@ -4140,6 +4140,14 @@ fn parse_codex_auth(auth: serde_json::Value) -> Option<Detected> {
     })
 }
 
+// account keys put the user id before "::" so team seats sharing a workspace
+// stay distinct (`parse_codex_auth`), but openai only ever reports the workspace
+fn codex_workspace(account_key: &str) -> &str {
+    account_key
+        .rsplit_once("::")
+        .map_or(account_key, |(_, workspace)| workspace)
+}
+
 fn codex_slot_auth(slot: &Slot) -> Result<(&str, &str), EngineError> {
     let detected = parse_codex_auth(slot.credentials.clone())
         .ok_or_else(|| EngineError::Other("This Codex login needs to be refreshed.".into()))?;
@@ -4150,20 +4158,10 @@ fn codex_slot_auth(slot: &Slot) -> Result<(&str, &str), EngineError> {
     let access_token = tokens
         .and_then(|tokens| tokens.get("access_token"))
         .and_then(|v| v.as_str());
-    // The provider's account id is the workspace, while the slot key also
-    // identifies the user occupying that workspace's seat.
-    let workspace_id = tokens
-        .and_then(|tokens| str_field(tokens, "id_token"))
-        .and_then(|token| jwt_claims(&token))
-        .and_then(|claims| {
-            claims
-                .get("https://api.openai.com/auth")
-                .and_then(|auth| str_field(auth, "chatgpt_account_id"))
-        });
     match (account_id, access_token) {
         (Some(account_id), Some(access_token))
             if !access_token.is_empty()
-                && workspace_id.as_deref() == Some(account_id)
+                && account_id == codex_workspace(&slot.account_key)
                 && detected.account_key == slot.account_key =>
         {
             Ok((access_token, account_id))
