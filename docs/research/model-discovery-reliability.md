@@ -7,6 +7,30 @@ The Cursor fallback/cache policy described here is superseded by the
 rate-limit handling, credential-scoped last-good catalogs, session recovery,
 and substantially expanded live and fault-injection evidence.
 
+## Claude automatic discovery follow-up (2026-11-10)
+
+Claude now discovers models through the CLI's initialize response, scoped to
+the executable and credential context. New concrete IDs need no curated catalog
+entry: their reported names, descriptions, effort levels, fast mode and thinking
+support populate the picker. A reported `[1m]` variant adds a context selector
+when its base is also listed. No context-window capability is guessed from a
+model's name. Complete effort reports and explicit capability flags override
+curated fallbacks; omitted fields in older CLIs keep those fallbacks.
+
+Opening the model picker forces discovery through both the model cache and the
+shared initialize cache. Forced requests wait for the fresh response rather
+than returning disk after 100 ms, while the picker keeps its previous rows
+visible until the replacement lands. Provider changes refresh loaded model
+slots too. Non-forced reads can still return disk promptly and finish discovery
+in the background. Transient failures retain same-account last-good catalogs;
+authentication failures and account changes cannot reuse another account's rows.
+
+Discovered native `xhigh` support also controls launch and live reconfiguration
+flags for future model families. The last successful capability snapshot stays
+readable during refresh, without sharing it across credential or binary contexts.
+Discovery does not start a model turn or install/update a provider CLI. The CLI
+must itself expose a newly released model for automatic discovery to find it.
+
 ## Cursor failure and repair
 
 The production shim called `process.exit()` immediately after writing its
@@ -37,7 +61,7 @@ saved SDK login: 40 entries, mapped to 39 picker rows after removing the
 | Devin | Already refreshes its native JSON catalog command and shares overlapping requests. Tests cover refresh, errors, and timeouts. |
 | OpenCode | Read the complete HTTP provider catalog; replace permanent model caching with refresh and overlapping-request sharing. Commands can still share the discovery server. |
 | Codex | Already reads complete JSON-RPC responses and all model-list pages on each discovery. Pagination tests pass. |
-| Claude | Static model catalog; no model-discovery subprocess output or account catalog cache. |
+| Claude | Originally static; superseded by the automatic discovery follow-up above. |
 
 Failed/empty discovery never permanently caches a fallback. Cursor and ACP
 keep their existing per-request fallback behavior; OpenCode and Devin surface

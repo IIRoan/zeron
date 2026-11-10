@@ -153,7 +153,10 @@ async fn list_inner(
             result
         }
     });
-    let result = if disk.is_some() {
+    // Picker opens request a forced refresh and retain their visible rows
+    // while waiting. Returning disk here would pin the old list in the UI
+    // even after the detached probe has persisted a newer catalog.
+    let result = if disk.is_some() && !force {
         tokio::time::timeout(Duration::from_millis(100), &mut refresh)
             .await
             .ok()
@@ -313,7 +316,7 @@ mod tests {
         probe.delay.store(true, SeqCst);
         let gate = Arc::new(tokio::sync::RwLock::new(()));
         let lease = Arc::new(gate.clone().read_owned().await);
-        list_with_lease(dir.path(), probe, true, Some(lease))
+        list_with_lease(dir.path(), probe, false, Some(lease))
             .await
             .unwrap();
         assert!(
@@ -432,6 +435,27 @@ mod tests {
         assert_eq!(list(dir.path(), probe, false).await.unwrap(), old);
         tokio::time::sleep(Duration::from_millis(250)).await;
         assert_eq!(read(&path, &context), Some(models()));
+    }
+
+    #[tokio::test]
+    async fn forced_refresh_waits_for_new_models_instead_of_returning_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = Probe::new();
+        let context = probe.model_context().unwrap().unwrap();
+        let path = location(dir.path(), probe.as_ref(), &context);
+        let mut old = models();
+        old[0].id = "old-live".into();
+        save(&path, &context, &old).unwrap();
+        probe.delay.store(true, SeqCst);
+        assert_eq!(
+            list(dir.path(), probe.clone(), true).await.unwrap(),
+            models()
+        );
+        assert!(probe.forced.load(SeqCst));
+        assert_eq!(read(&path, &context), Some(models()));
+        // Network failure still retains the last successful same-account list.
+        probe.fail.store(true, SeqCst);
+        assert_eq!(list(dir.path(), probe, true).await.unwrap(), models());
     }
     #[tokio::test]
     async fn account_swap_during_probe_never_publishes_or_persists_old_account() {

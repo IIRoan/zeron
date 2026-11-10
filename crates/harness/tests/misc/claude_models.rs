@@ -82,10 +82,66 @@ async fn initialize_is_shared_and_curated_metadata_survives_the_live_union() {
         );
     }
     harness.commands().await.unwrap();
-    harness.model_catalog(true).await.unwrap();
+    harness.model_catalog(false).await.unwrap();
     assert_eq!(
         std::fs::read_to_string(dir.path().join("calls")).unwrap(),
         "initialize\n"
+    );
+}
+
+#[tokio::test]
+async fn forced_refresh_discovers_new_models_and_options_without_cli_or_login_changes() {
+    let response = |id: &str| {
+        json!({"subtype":"success","response":{"models":[{
+            "value":"default", "resolvedModel":id, "displayName":"Nova 7",
+            "supportsEffort":true, "supportedEffortLevels":["low","xhigh","max"],
+            "supportsFastMode":true, "supportsThinkingOff":true
+        }]}})
+    };
+    let (dir, harness) = fixture(response("claude-nova-7"));
+    let first = harness.model_catalog(false).await.unwrap();
+    let nova = first
+        .models
+        .iter()
+        .find(|model| model.id == "claude-nova-7")
+        .unwrap();
+    assert!(nova.default);
+    assert!(nova.options.iter().any(|option| option.id == "fastMode"));
+    assert!(nova.options.iter().any(|option| option.id == "thinking"));
+    assert!(nova.reasoning_levels.contains(&ReasoningLevel::XHigh));
+
+    // The initialize cache is still fresh and the binary and credentials are
+    // unchanged. A normal read stays cached, but picker-open refresh must probe.
+    std::fs::write(
+        dir.path().join("response.json"),
+        response("claude-nova-7-1").to_string(),
+    )
+    .unwrap();
+    assert!(
+        harness
+            .model_catalog(false)
+            .await
+            .unwrap()
+            .models
+            .iter()
+            .any(|model| model.id == "claude-nova-7")
+    );
+    let refreshed = harness.model_catalog(true).await.unwrap();
+    assert!(
+        refreshed
+            .models
+            .iter()
+            .any(|model| model.id == "claude-nova-7-1" && model.default)
+    );
+    assert!(
+        refreshed
+            .models
+            .iter()
+            .all(|model| model.id != "claude-nova-7")
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("calls")).unwrap(),
+        "initialize\ninitialize\n"
     );
 }
 

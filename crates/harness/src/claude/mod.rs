@@ -234,14 +234,36 @@ fn model_arg(request: &RunRequest) -> Option<String> {
 /// `apply_flag_settings` on a live process: `null` drops the override back
 /// to the user's own settings, exactly as a launch without the flag
 /// (verified live on 2.1.286 through `get_settings`).
-fn flag_settings(request: &RunRequest) -> Value {
+fn flag_settings(request: &RunRequest, effort: Option<&str>) -> Value {
     let on = |set: bool| if set { Value::Bool(true) } else { Value::Null };
     serde_json::json!({
-        "effortLevel": to_effort(request.reasoning, request.model.as_deref()),
+        "effortLevel": effort,
         "fastMode": on(option_is_on(&request.model_options, "fastMode")),
         "alwaysThinkingEnabled": on(option_is_on(&request.model_options, "thinking")),
         "ultracode": on(request.reasoning == Some(ReasoningLevel::Ultracode)),
     })
+}
+
+fn discovered_effort(
+    request: &RunRequest,
+    cache: &crate::catalog::Catalog,
+    context: Option<[u8; 32]>,
+) -> Option<&'static str> {
+    if !matches!(
+        request.reasoning,
+        Some(ReasoningLevel::XHigh | ReasoningLevel::Ultracode)
+    ) {
+        return to_effort(request.reasoning, request.model.as_deref());
+    }
+    let discovered = request.model.as_deref().and_then(|id| {
+        let id = id.strip_suffix("[1m]").unwrap_or(id);
+        let models = cache.cached_for(context?)?;
+        models
+            .iter()
+            .find(|model| model.id.strip_suffix("[1m]").unwrap_or(&model.id) == id)
+            .map(|model| model.reasoning_levels.contains(&ReasoningLevel::XHigh))
+    });
+    catalog::to_effort_with_xhigh(request.reasoning, request.model.as_deref(), discovered)
 }
 
 fn option_is_on(options: &serde_json::Map<String, Value>, key: &str) -> bool {
@@ -352,7 +374,7 @@ pub struct ClaudeHarness {
     /// Grace between SIGTERM and SIGKILL.
     kill_grace: Duration,
     initialize: discovery::InitializeCache,
-    models_cache: crate::catalog::Catalog,
+    models_cache: Arc<crate::catalog::Catalog>,
     workspace_commands: crate::skills::CommandDiscovery,
 }
 
@@ -363,7 +385,7 @@ impl Default for ClaudeHarness {
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
             initialize: discovery::InitializeCache::default(),
-            models_cache: crate::catalog::Catalog::default(),
+            models_cache: Arc::new(crate::catalog::Catalog::default()),
             workspace_commands: crate::skills::CommandDiscovery::default(),
         }
     }
@@ -411,7 +433,7 @@ impl ClaudeHarness {
     /// The configuration arguments a run launches with — everything the
     /// process bakes in at spawn except the session to resume. Two requests
     /// with equal arguments (and cwd) are the same runtime.
-    fn launch_args(request: &RunRequest) -> Vec<String> {
+    fn launch_args(request: &RunRequest, effort: Option<&str>) -> Vec<String> {
         let mut args: Vec<String> = [
             "--print",
             "--input-format",
@@ -438,7 +460,7 @@ impl ClaudeHarness {
             args.push("--model".into());
             args.push(model);
         }
-        if let Some(effort) = to_effort(request.reasoning, request.model.as_deref()) {
+        if let Some(effort) = effort {
             args.extend(["--effort".into(), effort.into()]);
         }
         args.extend(["--permission-mode".into(), permission_mode(request).into()]);
@@ -469,7 +491,12 @@ impl ClaudeHarness {
         args
     }
 
-    fn build_command(exe: &std::path::Path, request: &RunRequest, title_only: bool) -> Command {
+    fn build_command(
+        exe: &std::path::Path,
+        request: &RunRequest,
+        title_only: bool,
+        effort: Option<&str>,
+    ) -> Command {
         let mut cmd = Command::new(exe);
         // Its own process group, so teardown reaches the MCP servers and
         // tools it started; and no inherited Claude Code session markers.
@@ -491,7 +518,7 @@ impl ClaudeHarness {
         // from the user's own key, `GH_TOKEN`, …). Never a Claude.ai
         // subscription token: those stay inside the CLI's own login.
         crate::apply_run_env(&mut cmd, &request.env);
-        cmd.args(Self::launch_args(request));
+        cmd.args(Self::launch_args(request, effort));
         if let Some(resume) = &request.resume {
             cmd.arg(format!("--resume={resume}"));
         }
@@ -522,7 +549,11 @@ impl ClaudeHarness {
             // neither reaches the model before it decides to end a turn:
             // live-probed on 2.1.319, Sonnet never called it with those
             // alone, and Sonnet and Opus both did with this note.
-            if request.mcp.as_ref().is_some_and(McpServer::waits_on_background) {
+            if request
+                .mcp
+                .as_ref()
+                .is_some_and(McpServer::waits_on_background)
+            {
                 cmd.args(["--append-system-prompt", WAIT_ON_BACKGROUND_NOTE]);
             }
             // Delegation goes through that server's side chats only. A bare
@@ -556,14 +587,17 @@ impl ClaudeHarness {
         exe: &std::path::Path,
         request: &RunRequest,
         title_only: bool,
+        effort: Option<&str>,
     ) -> Result<Runtime, HarnessError> {
-        let mut child =
-            crate::sandbox::wrap(Self::build_command(exe, request, title_only), &request.env)?
-                .spawn()
-                .map_err(|e| {
-                    let cwd = (!request.cwd.is_empty()).then(|| std::path::Path::new(&request.cwd));
-                    crate::executable::spawn_error(e, cwd, || crate::executable::binary_hint(exe))
-                })?;
+        let mut child = crate::sandbox::wrap(
+            Self::build_command(exe, request, title_only, effort),
+            &request.env,
+        )?
+        .spawn()
+        .map_err(|e| {
+            let cwd = (!request.cwd.is_empty()).then(|| std::path::Path::new(&request.cwd));
+            crate::executable::spawn_error(e, cwd, || crate::executable::binary_hint(exe))
+        })?;
         let stdin = child.stdin.take();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
@@ -590,13 +624,37 @@ impl ClaudeHarness {
 
     /// Share the complete initialize response between model and command discovery.
     /// No user message is written; the short-lived child is retired after initialize.
-    async fn initialize(&self) -> Result<Value, HarnessError> {
+    async fn initialize(&self, force: bool) -> Result<Value, HarnessError> {
         self.initialize
             .get(
+                force,
                 || self.model_context().map(|c| c.unwrap().key()),
                 || self.probe_initialize(None),
             )
             .await
+    }
+
+    fn effort_for(&self, request: &RunRequest) -> Option<&'static str> {
+        if !matches!(
+            request.reasoning,
+            Some(ReasoningLevel::XHigh | ReasoningLevel::Ultracode)
+        ) {
+            return to_effort(request.reasoning, request.model.as_deref());
+        }
+        // New model families need no hardcoded xhigh allowlist. Only trust a
+        // catalog scoped to the current executable and credentials; when cold,
+        // keep the existing compatibility mapping for older Claude models.
+        let context = self
+            .model_context()
+            .ok()
+            .flatten()
+            .map(|context| context.key());
+        discovered_effort(request, &self.models_cache, context)
+    }
+
+    #[cfg(test)]
+    fn flag_settings(&self, request: &RunRequest) -> Value {
+        flag_settings(request, self.effort_for(request))
     }
 
     async fn discover_commands(
@@ -605,7 +663,7 @@ impl ClaudeHarness {
     ) -> Result<Vec<SlashCommand>, HarnessError> {
         let response = match cwd {
             Some(cwd) => self.probe_initialize(Some(cwd)).await?,
-            None => self.initialize().await?,
+            None => self.initialize(false).await?,
         };
         Ok(parse_initialize_commands(&response))
     }
@@ -841,7 +899,8 @@ impl Harness for ClaudeHarness {
     /// alike but answer tool calls differently.
     fn same_runtime(&self, live: &RunRequest, next: &RunRequest) -> bool {
         live.cwd == next.cwd
-            && Self::launch_args(live) == Self::launch_args(next)
+            && Self::launch_args(live, self.effort_for(live))
+                == Self::launch_args(next, self.effort_for(next))
             && access(live) == access(next)
     }
     /// Model, context window, effort, fast mode, thinking, ultracode, the
@@ -870,7 +929,11 @@ impl Harness for ClaudeHarness {
     }
     /// Without the curated rows the installed Claude Code is too old for.
     fn fallback_models(&self) -> Vec<Model> {
-        let cli = self.model_context().ok().flatten().and_then(|c| c.binary_version);
+        let cli = self
+            .model_context()
+            .ok()
+            .flatten()
+            .and_then(|c| c.binary_version);
         catalog::fallback_models(cli.as_deref())
     }
     async fn model_catalog(&self, force: bool) -> Result<crate::ModelCatalog, HarnessError> {
@@ -881,7 +944,7 @@ impl Harness for ClaudeHarness {
                 Duration::from_secs(35),
                 || self.model_context().map(|c| c.unwrap().key()),
                 || async {
-                    let response = self.initialize().await?;
+                    let response = self.initialize(force).await?;
                     let cli = self.model_context()?.and_then(|c| c.binary_version);
                     catalog::with_discovered_models_for(
                         catalog::configured_models(),
@@ -1016,7 +1079,7 @@ impl ClaudeHarness {
             stdout_lines,
             mut stdin,
             stderr_tail,
-        } = Self::launch(&exe, &request, title_only)?;
+        } = Self::launch(&exe, &request, title_only, self.effort_for(&request))?;
 
         let lock_dir = refresh_lock::config_dir_for(&request.env);
         if !title_only {
@@ -1058,6 +1121,12 @@ impl ClaudeHarness {
             kill_grace: self.kill_grace,
             lock_dir,
             stderr_tail,
+            models_cache: self.models_cache.clone(),
+            model_context: self
+                .model_context()
+                .ok()
+                .flatten()
+                .map(|context| context.key()),
         }));
 
         Ok(futures::stream::unfold(event_rx, |mut rx| async move {
@@ -1238,6 +1307,8 @@ async fn stdin_writer(
 }
 
 struct Session {
+    models_cache: Arc<crate::catalog::Catalog>,
+    model_context: Option<[u8; 32]>,
     normalizer: Normalizer,
     title_only: bool,
     /// What the process was launched from, for a fresh relaunch when its
@@ -1267,6 +1338,8 @@ struct Session {
 /// mailbox, the interrupt token, and consumer liveness.
 async fn run_session(session: Session) {
     let Session {
+        models_cache,
+        model_context,
         normalizer: mut norm,
         title_only,
         exe,
@@ -1391,7 +1464,12 @@ async fn run_session(session: Session) {
             turn.set_background_processes(Vec::new());
             let mut fresh = launched.clone();
             fresh.resume = None;
-            match ClaudeHarness::launch(&exe, &fresh, title_only) {
+            match ClaudeHarness::launch(
+                &exe,
+                &fresh,
+                title_only,
+                discovered_effort(&fresh, &models_cache, model_context),
+            ) {
                 Ok(runtime) => {
                     child = runtime.child;
                     stdout_lines = runtime.stdout_lines;
@@ -1707,9 +1785,9 @@ async fn run_session(session: Session) {
                             pending_controls.insert(id, ("model", Value::from(model), deadline));
                             if !stdin.line(line) { break 'main; }
                         }
-                        if resend || flag_settings(&next) != flag_settings(&config) {
+                        let settings = flag_settings(&next, discovered_effort(&next, &models_cache, model_context));
+                        if resend || settings != flag_settings(&config, discovered_effort(&config, &models_cache, model_context)) {
                             let id = format!("zeron_settings_{reconfigures}");
-                            let settings = flag_settings(&next);
                             let line = wire::apply_flag_settings_line(&id, settings.clone());
                             pending_controls.insert(id, ("settings", settings, deadline));
                             if !stdin.line(line) { break 'main; }
@@ -2301,7 +2379,8 @@ mod tests {
             env: Default::default(),
             extra_mcp: Vec::new(),
         };
-        let mut cmd = ClaudeHarness::build_command(std::path::Path::new("claude"), &request, false);
+        let mut cmd =
+            ClaudeHarness::build_command(std::path::Path::new("claude"), &request, false, None);
         let value = cmd
             .as_std_mut()
             .get_envs()
@@ -2331,7 +2410,8 @@ mod tests {
                 env: Default::default(),
                 extra_mcp: Vec::new(),
             };
-            let cmd = ClaudeHarness::build_command(std::path::Path::new("claude"), &request, false);
+            let cmd =
+                ClaudeHarness::build_command(std::path::Path::new("claude"), &request, false, None);
             let args: Vec<String> = cmd
                 .as_std()
                 .get_args()
@@ -2345,7 +2425,10 @@ mod tests {
             name: "zeron".into(),
             command: "zeron-engine".into(),
             args: vec!["mcp".into()],
-            env: env.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect(),
+            env: env
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
         };
         let waits = (McpServer::WAITS_ON_BACKGROUND_ENV, "1");
         assert_eq!(
@@ -2354,7 +2437,10 @@ mod tests {
         );
         // The tool not offered (no chat's server, or not one that waits):
         // nothing is said of it.
-        assert_eq!(appended(Some(server(&[(McpServer::CHAT_ID_ENV, "c1")]))), None);
+        assert_eq!(
+            appended(Some(server(&[(McpServer::CHAT_ID_ENV, "c1")]))),
+            None
+        );
         assert_eq!(appended(Some(server(&[waits]))), None);
         assert_eq!(appended(Some(server(&[]))), None);
         assert_eq!(appended(None), None);
@@ -2389,7 +2475,10 @@ mod access_tests {
 
     /// The permission flags a request launches with.
     fn permission_args(request: &RunRequest) -> Vec<String> {
-        let args = ClaudeHarness::launch_args(request);
+        let args = ClaudeHarness::launch_args(
+            request,
+            to_effort(request.reasoning, request.model.as_deref()),
+        );
         let mut out = Vec::new();
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
@@ -2401,6 +2490,44 @@ mod access_tests {
             }
         }
         out
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn discovered_future_family_uses_native_xhigh_for_launch_and_live_settings() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("claude");
+        std::fs::write(
+            &executable,
+            include_str!("../../tests/fixtures/fake-claude-models.py"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            dir.path().join("response.json"),
+            json!({"subtype":"success","response":{"models":[{
+                "value":"claude-nova-7", "displayName":"Nova 7", "supportsEffort":true,
+                "supportedEffortLevels":["low","xhigh","max"]
+            }]}})
+            .to_string(),
+        )
+        .unwrap();
+        let harness = ClaudeHarness::new().with_executable(&executable);
+        harness.model_catalog(true).await.unwrap();
+        let mut request = request(AccessMode::FullAccess, false, false);
+        request.model = Some("claude-nova-7[1m]".into());
+        request.reasoning = Some(ReasoningLevel::XHigh);
+        assert!(
+            ClaudeHarness::launch_args(&request, harness.effort_for(&request))
+                .windows(2)
+                .any(|args| args == ["--effort", "xhigh"])
+        );
+        assert_eq!(harness.flag_settings(&request)["effortLevel"], "xhigh");
+        // A replaced executable no longer owns the discovered capability.
+        let script = std::fs::read_to_string(&executable).unwrap() + "\n# replaced\n";
+        std::fs::write(&executable, script).unwrap();
+        assert_eq!(harness.effort_for(&request), Some("max"));
     }
 
     #[test]

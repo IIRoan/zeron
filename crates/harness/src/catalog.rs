@@ -10,6 +10,9 @@ use zeron_proto::Model;
 #[derive(Default)]
 pub(crate) struct Catalog {
     pub(crate) state: tokio::sync::Mutex<State>,
+    // A refresh holds `state` across discovery. Runs still need the last
+    // successful capabilities while it is in flight (e.g. native xhigh).
+    snapshot: std::sync::RwLock<Option<([u8; 32], Vec<Model>)>>,
 }
 
 #[derive(Default)]
@@ -39,13 +42,22 @@ impl Catalog {
     }
 
     /// The last successful catalog for `key`, without refreshing or waiting:
-    /// `None` when cold, for another credential, or while a refresh holds it.
+    /// `None` when cold or for another credential. A refresh keeps the last
+    /// successful capabilities readable until it replaces or retires them.
     pub(crate) fn cached_for(&self, key: [u8; 32]) -> Option<Vec<Model>> {
-        let state = self.state.try_lock().ok()?;
-        if state.context != Some(key) {
+        let snapshot = self.snapshot.read().ok()?;
+        let (context, models) = snapshot.as_ref()?;
+        if context != &key {
             return None;
         }
-        state.models.clone()
+        Some(models.clone())
+    }
+
+    fn update_snapshot(&self, state: &State) {
+        *self
+            .snapshot
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = state.context.zip(state.models.clone());
     }
 
     pub(crate) async fn get_with<F, Fut, K>(
@@ -83,6 +95,7 @@ impl Catalog {
                 context: Some(key),
                 ..State::default()
             };
+            self.update_snapshot(&state);
         }
         if state.completed_at.is_some_and(|at| at >= requested_at)
             || (!force && state.retry_at.is_some_and(|at| Instant::now() < at))
@@ -130,6 +143,7 @@ impl Catalog {
         // Never publish a response from a login that changed during the request.
         if context()? != key {
             *state = State::default();
+            self.update_snapshot(&state);
             return Err(HarnessError::Protocol(
                 "Harness credentials changed during model discovery; retry".into(),
             ));
@@ -156,6 +170,7 @@ impl Catalog {
                 state.retry_at = Some(Instant::now() + Duration::from_secs(cooldown));
             }
         }
+        self.update_snapshot(&state);
         cached(&state).map(|models| ModelCatalog { models, source })
     }
 }
@@ -210,6 +225,52 @@ mod tests {
     }
     async fn expire(catalog: &Catalog) {
         catalog.state.lock().await.retry_at = None;
+    }
+
+    #[tokio::test]
+    async fn capabilities_remain_readable_during_refresh_and_retire_on_auth_failure() {
+        let cache = Arc::new(Catalog::default());
+        cache
+            .get_with(false, || Ok([1; 32]), || async { Ok(models("old")) })
+            .await
+            .unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let task = tokio::spawn({
+            let cache = cache.clone();
+            let started = started.clone();
+            let release = release.clone();
+            async move {
+                cache
+                    .get_with(
+                        true,
+                        || Ok([1; 32]),
+                        || async {
+                            started.notify_one();
+                            release.notified().await;
+                            Ok(models("new"))
+                        },
+                    )
+                    .await
+            }
+        });
+        started.notified().await;
+        assert_eq!(cache.cached_for([1; 32]), Some(models("old")));
+        assert_eq!(cache.cached_for([2; 32]), None);
+        release.notify_one();
+        assert_eq!(task.await.unwrap().unwrap().models, models("new"));
+        assert_eq!(cache.cached_for([1; 32]), Some(models("new")));
+        assert!(
+            cache
+                .get_with(
+                    true,
+                    || Ok([1; 32]),
+                    || async { Err(HarnessError::Protocol("authentication required".into())) }
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(cache.cached_for([1; 32]), None);
     }
 
     #[tokio::test]

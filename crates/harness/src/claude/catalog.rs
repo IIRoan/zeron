@@ -3,10 +3,10 @@
 //! picker via t3code's catalog).
 //!
 //! Runtime initialize discovery appends concrete model ids to this curated list
-//! and fills ID-only labels for configured models with discovered display names.
-//! Curated rows retain their labels, effort ladders, and option sets because the
-//! CLI can under-report supported modes. The shared initialize probe also supplies
-//! slash commands and is cached by credential and binary context.
+//! and fills configured models with discovered names and capabilities. Curated
+//! metadata fills gaps in older CLI responses; explicitly reported capabilities
+//! take precedence. The shared initialize probe also supplies slash commands and
+//! is cached by credential and binary context.
 
 use zeron_proto::{Model, ModelOption, ModelOptionChoice, ReasoningLevel};
 
@@ -50,6 +50,14 @@ pub(crate) fn to_effort(
     reasoning: Option<ReasoningLevel>,
     model: Option<&str>,
 ) -> Option<&'static str> {
+    to_effort_with_xhigh(reasoning, model, None)
+}
+
+pub(super) fn to_effort_with_xhigh(
+    reasoning: Option<ReasoningLevel>,
+    model: Option<&str>,
+    discovered_xhigh: Option<bool>,
+) -> Option<&'static str> {
     let base = match reasoning? {
         ReasoningLevel::Ultrathink => return None,
         ReasoningLevel::Minimal | ReasoningLevel::Low => "low",
@@ -58,7 +66,7 @@ pub(crate) fn to_effort(
         ReasoningLevel::XHigh | ReasoningLevel::Ultracode => "xhigh",
         ReasoningLevel::Max | ReasoningLevel::Ultra => "max",
     };
-    if base == "xhigh" && !model.is_some_and(supports_xhigh) {
+    if base == "xhigh" && !discovered_xhigh.unwrap_or_else(|| model.is_some_and(supports_xhigh)) {
         return Some("max");
     }
     Some(base)
@@ -320,14 +328,15 @@ pub(super) fn with_discovered_models(
     with_discovered_models_for(models, response, None)
 }
 
-/// Append new concrete model IDs and fill ID-only labels on existing rows;
-/// curated metadata remains authoritative. A curated row this Claude Code
+/// Append new concrete model IDs and enrich rows with reported capabilities.
+/// Curated metadata fills missing fields. A curated row this Claude Code
 /// (`cli`, its version) is too old for is dropped unless the CLI reports it.
 pub(super) fn with_discovered_models_for(
     mut models: Vec<Model>,
     response: &serde_json::Value,
     cli: Option<&str>,
 ) -> Result<Vec<Model>, crate::HarnessError> {
+    let curated = static_models();
     fn entry_text<'a>(entry: &'a serde_json::Value, key: &str) -> Option<&'a str> {
         entry
             .get(key)
@@ -347,12 +356,15 @@ pub(super) fn with_discovered_models_for(
     // Alias rows can precede the concrete row and carry generic names such as
     // "Default (recommended)". Prefer concrete names regardless of entry order.
     let mut concrete_labels = std::collections::HashMap::new();
+    let mut concrete_entries = std::collections::HashMap::new();
     for entry in entries {
         if let Some(id) = entry_text(entry, "value")
             && entry_text(entry, "resolvedModel").is_none_or(|resolved| resolved == id)
-            && let Some(label) = entry_text(entry, "displayName")
         {
-            concrete_labels.entry(id).or_insert(label);
+            concrete_entries.entry(id).or_insert(entry);
+            if let Some(label) = entry_text(entry, "displayName") {
+                concrete_labels.entry(id).or_insert(label);
+            }
         }
     }
     let mut default = None;
@@ -367,6 +379,10 @@ pub(super) fn with_discovered_models_for(
             .get(id)
             .copied()
             .or_else(|| text("displayName"));
+        let concrete = concrete_entries.get(id).copied();
+        let description = concrete
+            .and_then(|entry| entry_text(entry, "description"))
+            .or_else(|| text("description"));
         // Bare aliases cannot become persisted selections. Prefer resolvedModel.
         if is_alias(id) {
             continue;
@@ -387,39 +403,23 @@ pub(super) fn with_discovered_models_for(
             {
                 model.label = label.into();
             }
+            let is_curated = curated.iter().any(|row| row.id == id);
+            if !is_curated && let Some(description) = description {
+                model.description = Some(description.into());
+            }
+            apply_discovered_capabilities(model, entry, concrete, is_curated);
             continue;
         }
-        let mut ladder = Vec::new();
-        for effort in entry
-            .get("supportedEffortLevels")
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(serde_json::Value::as_str)
-        {
-            let level = match effort {
-                "low" => ReasoningLevel::Low,
-                "medium" => ReasoningLevel::Medium,
-                "high" => ReasoningLevel::High,
-                "xhigh" => ReasoningLevel::XHigh,
-                "max" => ReasoningLevel::Max,
-                _ => continue,
-            };
-            if !ladder.contains(&level) {
-                ladder.push(level);
-            }
-        }
-        if ladder.contains(&ReasoningLevel::XHigh) {
-            ladder.extend([ReasoningLevel::Ultracode, ReasoningLevel::Ultrathink]);
-        }
-        models.push(Model {
+        let mut model = Model {
             default: false,
             id: id.into(),
             label: label.unwrap_or(id).into(),
-            description: text("description").map(str::to_owned),
-            reasoning_levels: ladder,
+            description: description.map(str::to_owned),
+            reasoning_levels: vec![],
             options: vec![],
-        });
+        };
+        apply_discovered_capabilities(&mut model, entry, concrete, false);
+        models.push(model);
     }
     if !valid {
         return Err(crate::HarnessError::Protocol(
@@ -430,6 +430,27 @@ pub(super) fn with_discovered_models_for(
         reported.contains(model.id.strip_suffix("[1m]").unwrap_or(&model.id))
             || !too_old_for(&model.id, cli)
     });
+    // A future model can expose a long-context variant without any curated
+    // entry. Give its listed base the selector before the picker folds the
+    // duplicate variant away. An orphan variant is pinned by the picker.
+    let long_context: Vec<_> = models
+        .iter()
+        .filter_map(|model| model.id.strip_suffix("[1m]").map(str::to_owned))
+        .collect();
+    for base in long_context {
+        if let Some(model) = models.iter_mut().find(|model| model.id == base)
+            && !model
+                .options
+                .iter()
+                .any(|option| option.id == "contextWindow")
+        {
+            let mut option = context_window();
+            if default.as_deref().and_then(|id| id.strip_suffix("[1m]")) == Some(base.as_str()) {
+                option.default_choice = "1m".into();
+            }
+            model.options.push(option);
+        }
+    }
     // The CLI's default is marked, not moved: rows stay best-first and
     // clients preselect the marked row. Pickers fold a long-context row into
     // its listed base, so a `[1m]` default marks that base.
@@ -446,6 +467,68 @@ pub(super) fn with_discovered_models_for(
     }
     sort_best_first(&mut models);
     Ok(models)
+}
+
+fn apply_discovered_capabilities(
+    model: &mut Model,
+    entry: &serde_json::Value,
+    concrete: Option<&serde_json::Value>,
+    curated: bool,
+) {
+    let value = |key: &str| {
+        concrete
+            .and_then(|entry| entry.get(key))
+            .or_else(|| entry.get(key))
+    };
+    let support = |key: &str| value(key).and_then(serde_json::Value::as_bool);
+    let mut ladder = Vec::new();
+    for effort in value("supportedEffortLevels")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+    {
+        let level = match effort {
+            "low" => ReasoningLevel::Low,
+            "medium" => ReasoningLevel::Medium,
+            "high" => ReasoningLevel::High,
+            "xhigh" => ReasoningLevel::XHigh,
+            "max" => ReasoningLevel::Max,
+            _ => continue,
+        };
+        if !ladder.contains(&level) {
+            ladder.push(level);
+        }
+    }
+    if support("supportsEffort") == Some(false) {
+        model.reasoning_levels.clear();
+    } else if !ladder.is_empty() && (!curated || support("supportsEffort") == Some(true)) {
+        // Old CLIs can under-report a curated ladder without the support
+        // flag. A complete live capability report replaces that fallback.
+        // Preserve Zeron's own prompt modes where they remain applicable.
+        let xhigh = ladder.contains(&ReasoningLevel::XHigh);
+        if xhigh && (!curated || model.reasoning_levels.contains(&ReasoningLevel::Ultracode)) {
+            ladder.push(ReasoningLevel::Ultracode);
+        }
+        if (xhigh && !curated)
+            || (curated && model.reasoning_levels.contains(&ReasoningLevel::Ultrathink))
+        {
+            ladder.push(ReasoningLevel::Ultrathink);
+        }
+        model.reasoning_levels = ladder;
+    }
+    for (field, id, label) in [
+        ("supportsFastMode", "fastMode", "Fast Mode"),
+        ("supportsThinkingOff", "thinking", "Thinking"),
+    ] {
+        match support(field) {
+            Some(true) if !model.options.iter().any(|option| option.id == id) => {
+                model.options.push(toggle(id, label));
+            }
+            Some(false) => model.options.retain(|option| option.id != id),
+            _ => {}
+        }
+    }
 }
 
 /// `claude-haiku-4-5-20251001` -> `claude-haiku-4-5`.
@@ -579,6 +662,9 @@ mod tests {
             let mut expected = configured.iter().find(|m| m.id == id).unwrap().clone();
             expected.label = label.into();
             expected.default = id == "gateway/sol";
+            if id == "gateway/sol" {
+                expected.reasoning_levels = vec![ReasoningLevel::Low];
+            }
             assert_eq!(models.iter().find(|m| m.id == id), Some(&expected));
             assert_eq!(models.iter().filter(|m| m.id == id).count(), 1);
         }
@@ -707,6 +793,93 @@ mod tests {
 
     fn ids_of_options(model: &Model) -> Vec<&str> {
         model.options.iter().map(|o| &*o.id).collect()
+    }
+
+    #[test]
+    fn future_models_receive_reported_options_and_long_context_without_curation() {
+        let response = serde_json::json!({"response":{"models":[
+            {"value":"default", "resolvedModel":"claude-nova-7[1m]", "displayName":"Nova 7 (1M context)",
+             "supportsEffort":true, "supportedEffortLevels":["low","xhigh","max"], "supportsFastMode":true},
+            {"value":"claude-nova-7", "displayName":"Nova 7", "description":"A newly released model",
+             "supportsEffort":true, "supportedEffortLevels":["low","xhigh","future","max","xhigh"],
+             "supportsFastMode":true, "supportsThinkingOff":true}
+        ]}});
+        let models = with_discovered_models(static_models(), &response).unwrap();
+        let nova = models
+            .iter()
+            .find(|model| model.id == "claude-nova-7")
+            .unwrap();
+        assert!(nova.default);
+        assert_eq!(nova.label, "Nova 7");
+        assert_eq!(
+            nova.reasoning_levels,
+            [
+                ReasoningLevel::Low,
+                ReasoningLevel::XHigh,
+                ReasoningLevel::Max,
+                ReasoningLevel::Ultracode,
+                ReasoningLevel::Ultrathink
+            ]
+        );
+        assert_eq!(
+            ids_of_options(nova),
+            ["fastMode", "thinking", "contextWindow"]
+        );
+        assert_eq!(
+            nova.options
+                .iter()
+                .find(|option| option.id == "contextWindow")
+                .unwrap()
+                .default_choice,
+            "1m"
+        );
+    }
+
+    #[test]
+    fn explicit_capabilities_update_curated_fallbacks_and_missing_fields_preserve_them() {
+        let response = serde_json::json!({"response":{"models":[{
+            "value":"claude-fable-5-2", "supportsEffort":true, "supportedEffortLevels":["low","high"],
+            "supportsFastMode":false, "supportsThinkingOff":true
+        }]}});
+        let models = with_discovered_models(static_models(), &response).unwrap();
+        let fable = models
+            .iter()
+            .find(|model| model.id == "claude-fable-5-2")
+            .unwrap();
+        assert_eq!(
+            fable.reasoning_levels,
+            [
+                ReasoningLevel::Low,
+                ReasoningLevel::High,
+                ReasoningLevel::Ultrathink
+            ]
+        );
+        assert_eq!(ids_of_options(fable), ["thinking"]);
+        let missing = serde_json::json!({"response":{"models":[{"value":"claude-fable-5-2"}]}});
+        assert_eq!(
+            with_discovered_models(static_models(), &missing).unwrap(),
+            static_models()
+        );
+        let disabled = serde_json::json!({"response":{"models":[{"value":"claude-fable-5-2","supportsEffort":false}]}});
+        assert!(
+            with_discovered_models(static_models(), &disabled).unwrap()[0]
+                .reasoning_levels
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn concrete_capabilities_win_over_aliases_in_either_order_without_duplicate_options() {
+        let alias = serde_json::json!({"value":"default","resolvedModel":"claude-nova-7","supportsFastMode":false});
+        let concrete = serde_json::json!({"value":"claude-nova-7","displayName":"Nova 7","supportsFastMode":true});
+        for entries in [vec![alias.clone(), concrete.clone()], vec![concrete, alias]] {
+            let models =
+                with_discovered_models(vec![], &serde_json::json!({"response":{"models":entries}}))
+                    .unwrap();
+            assert_eq!(models[0].label, "Nova 7");
+            assert_eq!(ids_of_options(&models[0]), ["fastMode"]);
+            assert!(models[0].default);
+        }
     }
 
     #[test]
