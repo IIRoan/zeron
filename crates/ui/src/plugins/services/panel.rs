@@ -41,6 +41,7 @@ pub(super) struct ServiceFields {
     pub(super) command: Entity<ComposerInput>,
     pub(super) directory: Entity<ComposerInput>,
     pub(super) restart: bool,
+    pub(super) depends_on: Option<Vec<String>>,
     pub(super) prerequisite: bool,
     pub(super) readiness: Entity<ComposerInput>,
     pub(super) readiness_timeout: Entity<ComposerInput>,
@@ -54,6 +55,7 @@ pub(super) struct ServiceFields {
 impl ServiceFields {
     pub(super) fn service(&self, cx: &App) -> ProjectTerminalService {
         ProjectTerminalService {
+            depends_on: self.depends_on.clone(),
             id: self.id.clone(),
             name: self.name.read(cx).text().to_string(),
             command: self.command.read(cx).text().to_string(),
@@ -182,6 +184,7 @@ pub(super) struct ProjectTerminalUi {
     /// Individual actions only disable the affected service. Keep the scope
     /// until completion so a checkout handoff waits for every old request.
     service_actions: std::collections::HashMap<(String, String), &'static str>,
+    service_action_epochs: std::collections::HashMap<(String, String), u64>,
     content_started: Option<std::time::Instant>,
     operation_error: Option<String>,
     epoch: u64,
@@ -193,6 +196,31 @@ pub(super) struct ProjectTerminalUi {
 }
 
 impl ProjectTerminalUi {
+    fn service_starting(&self, id: &str) -> bool {
+        self.snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.startups.iter().any(|p| p.service_id == id))
+            || self.context.as_ref().is_some_and(|context| {
+                self.service_actions
+                    .get(&(context.scope(), id.into()))
+                    .is_some_and(|action| matches!(*action, "start" | "restart"))
+            })
+    }
+
+    fn can_stop_service(&self, id: &str) -> bool {
+        self.service_starting(id)
+            && self.context.as_ref().is_some_and(|context| {
+                self.service_actions.get(&(context.scope(), id.into())) != Some(&"stop")
+            })
+    }
+
+    fn action_busy(&self, service: Option<&str>, action: Option<&str>) -> bool {
+        if action == Some("stop") && service.is_some_and(|id| self.can_stop_service(id)) {
+            return false;
+        }
+        self.control_busy(service)
+    }
+
     fn has_pending_actions(&self) -> bool {
         self.busy || !self.service_actions.is_empty()
     }
@@ -215,6 +243,106 @@ impl ProjectTerminalUi {
 }
 
 impl Shell {
+    fn render_startup_requirements(
+        &self,
+        editor: &Editor,
+        service: &ServiceFields,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let mut section = div().mt(px(16.0)).child(field_label(theme, "Start after"));
+        if !self.state.read(cx).device_supports(
+            &editor.project.device,
+            zeron_proto::capabilities::PROJECT_SERVICE_STARTUP_V1,
+        ) {
+            return section.child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme.text_muted)
+                    .child("Update the project’s Zeron engine to configure startup requirements."),
+            );
+        }
+        let selected = service
+            .depends_on
+            .clone()
+            .unwrap_or_else(|| editor.databases.iter().map(|db| db.id.clone()).collect());
+        let mut candidates = editor
+            .databases
+            .iter()
+            .map(|db| (db.id.clone(), db.name.clone()))
+            .chain(
+                editor
+                    .services
+                    .iter()
+                    .filter(|candidate| candidate.id != service.id && !candidate.untouched_seed(cx))
+                    .map(|candidate| {
+                        (
+                            candidate.id.clone(),
+                            candidate.name.read(cx).text().to_string(),
+                        )
+                    }),
+            )
+            .collect::<Vec<_>>();
+        for id in &selected {
+            if !candidates.iter().any(|(candidate, _)| candidate == id) {
+                candidates.push((id.clone(), format!("Missing service ({id})")));
+            }
+        }
+        let mut count = 0;
+        for (dependency, name) in candidates {
+            count += 1;
+            let checked = selected.contains(&dependency);
+            let id = service.id.clone();
+            let initial = selected.clone();
+            let switch_id = format!("service-dependency-{id}-{dependency}");
+            section = section.child(
+                div()
+                    .mt(px(7.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(12.0))
+                            .child(SharedString::from(name.clone())),
+                    )
+                    .child(
+                        crate::settings::widgets::toggle_switch(theme, checked, switch_id.clone())
+                            .id(SharedString::from(switch_id.clone()))
+                            .debug_selector(move || switch_id.clone())
+                            .tab_index(0)
+                            .role(gpui::Role::Switch)
+                            .aria_label(format!("Wait for {name}"))
+                            .aria_toggled(if checked {
+                                gpui::Toggled::True
+                            } else {
+                                gpui::Toggled::False
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(service) =
+                                    this.project_terminals.editor.open_mut().and_then(|editor| {
+                                        editor.services.iter_mut().find(|s| s.id == id)
+                                    })
+                                {
+                                    let dependencies =
+                                        service.depends_on.get_or_insert_with(|| initial.clone());
+                                    if dependencies.contains(&dependency) {
+                                        dependencies.retain(|id| id != &dependency);
+                                    } else {
+                                        dependencies.push(dependency.clone());
+                                    }
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            );
+        }
+        section.child(div().mt(px(6.0)).text_size(px(11.0)).text_color(theme.text_muted)
+            .child(if count == 0 { "No other services configured." } else { "Only these services and their requirements start first. Databases must pass their ready check." }))
+    }
+
     pub(super) fn suspend_services_plugin(&mut self, cx: &mut Context<Self>) {
         if self.project_terminals.suspended { return; }
         self.project_terminals.suspended = true;
@@ -622,6 +750,7 @@ impl Shell {
             command,
             directory,
             restart: service.restart_on_failure,
+            depends_on: service.depends_on,
             prerequisite,
             readiness,
             readiness_timeout,
@@ -666,6 +795,7 @@ impl Shell {
                 ["Backend", "Frontend", "Cloudflared"]
                     .into_iter()
                     .map(|name| ProjectTerminalService {
+                        depends_on: Some(Vec::new()),
                         id: uuid::Uuid::new_v4().to_string(),
                         name: name.into(),
                         command: String::new(),
@@ -817,7 +947,7 @@ impl Shell {
         action: &'static str,
         cx: &mut Context<Self>,
     ) {
-        if self.project_terminals.control_busy(service.as_deref()) {
+        if self.project_terminals.action_busy(service.as_deref(), Some(action)) {
             return;
         }
         let Some(context) = self.project_terminals.context.clone() else {
@@ -846,7 +976,7 @@ impl Shell {
         let service = (method == methods::CONTROL_PROJECT_TERMINALS)
             .then(|| params["serviceId"].as_str())
             .flatten();
-        if !self.services_plugin_enabled(cx) || self.project_terminals.control_busy(service) {
+        if !self.services_plugin_enabled(cx) || self.project_terminals.action_busy(service, action) {
             return;
         }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
@@ -868,6 +998,9 @@ impl Shell {
         self.project_terminals.poll = None;
         self.project_terminals.epoch += 1;
         let epoch = self.project_terminals.epoch;
+        if let Some(key) = &service_key {
+            self.project_terminals.service_action_epochs.insert(key.clone(), epoch);
+        }
         cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
@@ -877,7 +1010,10 @@ impl Shell {
                 // Only release this request; other service actions can still
                 // be running, including in the previously selected checkout.
                 if let Some(key) = &service_key {
-                    shell.project_terminals.service_actions.remove(key);
+                    if shell.project_terminals.service_action_epochs.get(key) == Some(&epoch) {
+                        shell.project_terminals.service_action_epochs.remove(key);
+                        shell.project_terminals.service_actions.remove(key);
+                    }
                 } else {
                     shell.project_terminals.busy = false;
                     shell.project_terminals.pending_action = None;
@@ -1072,7 +1208,8 @@ impl Shell {
                     && !service_is_active(status)
             }
             "stop" => {
-                !self.project_terminals.control_busy(Some(&service.id)) && service_is_active(status)
+                self.project_terminals.can_stop_service(&service.id)
+                    || (!self.project_terminals.control_busy(Some(&service.id)) && service_is_active(status))
             }
             "restart" => !self.project_terminals.control_busy(Some(&service.id)),
             "output" | "settings" => true,
@@ -1220,13 +1357,13 @@ impl Shell {
             .border_color(theme.border)
             .bg(theme.wash(0.035));
         if let (Some(snapshot), Some(service)) = (snapshot, selected_service.as_ref()) {
-            let service_busy = self.project_terminals.control_busy(Some(&service.id));
             let status = service_status(snapshot, &service.id);
-            let (action, glyph, label) = if service_is_active(status) {
+            let (action, glyph, label) = if service_is_active(status) || self.project_terminals.service_starting(&service.id) {
                 ("stop", icons::STOP, "Stop")
             } else {
                 ("start", icons::ACTION_PLAY, "Start")
             };
+            let service_busy = self.project_terminals.action_busy(Some(&service.id), Some(action));
             let id = service.id.clone();
             let hint = format!("{label} {}", service.name);
             actions = actions
@@ -1531,16 +1668,17 @@ impl Shell {
                     let tab_scope = scope.clone();
                     let key = format!("{}-service-row-{id}", cx.entity_id());
                     let color = service_state_color(snapshot, service, &theme);
-                    let busy = self.project_terminals.control_busy(Some(&id));
                     let pending = self.project_terminals.service_actions.get(&(scope.clone(), id.clone()))
                         .map(|action| format!("{}…", action_label(action)));
-                    let state_label = pending.as_deref().unwrap_or_else(|| service_state_label(snapshot, service));
+                    let progress = snapshot.startups.iter().find(|p| p.service_id == id);
+                    let state_label = if pending.as_deref() == Some("Stopping…") { "Stopping…" } else { progress.map(|p| p.message.as_str()).or(pending.as_deref()).unwrap_or_else(|| service_state_label(snapshot, service)) };
                     let status = service_status(snapshot, &id);
-                    let (action, glyph, label) = if service_is_active(status) {
+                    let (action, glyph, label) = if service_is_active(status) || self.project_terminals.service_starting(&id) {
                         ("stop", icons::STOP, "Stop")
                     } else {
                         ("start", icons::ACTION_PLAY, "Start")
                     };
+                    let busy = self.project_terminals.action_busy(Some(&id), Some(action));
                     let action_id = id.clone();
                     let action_button = service_icon_button(&theme,
                         format!("service-row-{action}-{id}"), glyph,
@@ -1954,6 +2092,7 @@ impl Shell {
                 button.on_click(cx.listener(|this, _, _, cx| {
                     let fields = this.service_fields(
                         ProjectTerminalService {
+                            depends_on: Some(Vec::new()),
                             id: uuid::Uuid::new_v4().to_string(),
                             name: "New service".into(),
                             command: String::new(),
@@ -2144,6 +2283,7 @@ impl Shell {
                         .text_color(theme.text_faint)
                         .child(if prerequisite { "Relative to the main project folder; shared across worktrees." } else { "Relative to the active checkout. Use . for the checkout root." }),
                 )
+                .child(self.render_startup_requirements(editor, service, &theme, cx))
                 .child(
                     div()
                         .mt(px(20.0))
@@ -2570,7 +2710,7 @@ fn terminal_setting_field(theme: &Theme, input: AnyElement) -> gpui::Div {
         .border_color(theme.border)
 }
 
-fn service_icon_button(
+pub(super) fn service_icon_button(
     theme: &Theme,
     id: String,
     glyph: &'static str,
@@ -2717,7 +2857,7 @@ fn service_summary(snapshot: &ProjectTerminalsSnapshot) -> String {
             "starting…"
         } else if states
             .iter()
-            .any(|s| matches!(*s, "Not ready" | "Exited with error" | "Needs restart"))
+            .any(|s| matches!(*s, "Not ready" | "Failed" | "Exited with error" | "Needs restart"))
         {
             "not ready"
         } else if states
@@ -2780,7 +2920,7 @@ fn service_folder_label(directory: &str, checkout: &str) -> String {
     format!("{directory} · {checkout_name}")
 }
 
-fn status_dot(color: gpui::Hsla) -> impl IntoElement {
+pub(super) fn status_dot(color: gpui::Hsla) -> impl IntoElement {
     div().size(px(6.0)).flex_none().rounded_full().bg(color)
 }
 
@@ -2793,11 +2933,26 @@ fn service_readiness(snapshot: &ProjectTerminalsSnapshot, id: &str) -> Option<Re
 }
 
 /// A database's readiness matters more than whether its process is alive.
-fn service_state_label(
-    snapshot: &ProjectTerminalsSnapshot,
+fn service_state_label<'a>(
+    snapshot: &'a ProjectTerminalsSnapshot,
     service: &ProjectTerminalService,
-) -> &'static str {
+) -> &'a str {
+    if let Some(progress) = snapshot
+        .startups
+        .iter()
+        .find(|p| p.service_id == service.id)
+    {
+        return &progress.message;
+    }
     let status = service_status(snapshot, &service.id);
+    if status == Status::Failed
+        && snapshot
+            .runs
+            .iter()
+            .any(|run| run.service_id == service.id && run.exit_code.is_none())
+    {
+        return "Failed";
+    }
     match service_readiness(snapshot, &service.id) {
         Some(Readiness::Checking) if service_is_active(status) => "Starting…",
         Some(Readiness::Ready) if service_is_active(status) || status == Status::Exited => "Ready",
@@ -2811,6 +2966,9 @@ fn service_state_color(
     service: &ProjectTerminalService,
     theme: &Theme,
 ) -> gpui::Hsla {
+    if snapshot.startups.iter().any(|p| p.service_id == service.id) {
+        return theme.warning;
+    }
     match service_state_label(snapshot, service) {
         "Starting…" => theme.warning,
         "Ready" => theme.success,
@@ -2836,6 +2994,7 @@ mod tests {
     #[test]
     fn summary_counts_configured_services_and_distinguishes_recovery_from_running() {
         let service = |id: &str| ProjectTerminalService {
+            depends_on: None,
             id: id.into(),
             name: id.into(),
             command: "sleep 600".into(),
@@ -2853,6 +3012,7 @@ mod tests {
             readiness: None,
         };
         let snapshot = ProjectTerminalsSnapshot {
+            startups: Vec::new(),
             checkout: None,
             config: ProjectTerminalConfig {
                 services: vec![
@@ -2905,6 +3065,7 @@ mod tests {
                 let started = shell.project_terminals.content_started;
                 shell.accept_project_terminal_snapshot(
                     ProjectTerminalsSnapshot {
+                        startups: Vec::new(),
                         checkout: None,
                         config: ProjectTerminalConfig::default(),
                         runs: vec![],
@@ -2996,6 +3157,7 @@ mod tests {
         shell
             .update(cx, |shell, _, cx| {
                 let service = ProjectTerminalService {
+                    depends_on: None,
                     id: "databases".into(),
                     name: "Databases".into(),
                     command: "bun run start-db".into(),
@@ -3024,6 +3186,7 @@ mod tests {
 
     fn database_service(name: &str) -> ProjectTerminalService {
         ProjectTerminalService {
+            depends_on: None,
             id: "db".into(),
             name: name.into(),
             command: "bun run db".into(),
@@ -3038,6 +3201,7 @@ mod tests {
 
     fn app_service(id: &str, name: &str) -> ProjectTerminalService {
         ProjectTerminalService {
+            depends_on: None,
             id: id.into(),
             name: name.into(),
             command: format!("bun run {id}"),
@@ -3059,6 +3223,7 @@ mod tests {
                 shell.project_terminals.context = Some(project.clone());
                 shell.project_terminals.editor.open(Editor::new(project.clone()));
                 let snapshot = |db: &str| ProjectTerminalsSnapshot {
+                    startups: Vec::new(),
                     checkout: None,
                     config: ProjectTerminalConfig {
                         services: vec![database_service(db), app_service("backend", "Backend")],
@@ -3096,6 +3261,7 @@ mod tests {
                 shell.project_terminals.editor.open(Editor::new(project));
                 shell.accept_project_terminal_snapshot(
                     ProjectTerminalsSnapshot {
+                        startups: Vec::new(),
                         checkout: None,
                         config: ProjectTerminalConfig {
                             services: vec![database_service("Databases")],
@@ -3130,6 +3296,7 @@ mod tests {
         };
         let database = database_service("Databases");
         let mut snapshot = ProjectTerminalsSnapshot {
+            startups: Vec::new(),
             checkout: None,
             config: ProjectTerminalConfig {
                 services: vec![
@@ -3188,9 +3355,11 @@ mod tests {
                 shell.project_terminals.context = Some(project.clone());
                 shell.project_terminals.editor.open(Editor::new(project));
                 let snapshot = ProjectTerminalsSnapshot {
+                    startups: Vec::new(),
                     checkout: None,
                     config: ProjectTerminalConfig {
                         services: vec![ProjectTerminalService {
+                            depends_on: None,
                             id: "backend".into(),
                             name: "Backend".into(),
                             command: "bun dev".into(),
@@ -3493,6 +3662,7 @@ mod tests {
 
     fn empty_snapshot() -> ProjectTerminalsSnapshot {
         ProjectTerminalsSnapshot {
+            startups: Vec::new(),
             checkout: None,
             config: ProjectTerminalConfig {
                 services: Vec::new(),
@@ -3561,11 +3731,13 @@ mod tests {
 
     fn service_snapshot(checkout: &str) -> ProjectTerminalsSnapshot {
         ProjectTerminalsSnapshot {
+            startups: Vec::new(),
             checkout: Some(checkout.into()),
             config: ProjectTerminalConfig {
                 services: ["backend", "frontend"]
                     .into_iter()
                     .map(|id| ProjectTerminalService {
+                        depends_on: None,
                         id: id.into(),
                         name: id.into(),
                         command: "sleep 60".into(),
@@ -3926,7 +4098,9 @@ mod tests {
     }
 
     #[gpui::test]
-    fn toolbar_can_start_another_service_while_backend_is_pending(cx: &mut TestAppContext) {
+    fn toolbar_can_start_another_service_and_stop_it_while_startup_is_pending(
+        cx: &mut TestAppContext,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let shell_window = test_shell(cx, dir.path());
         let mut rpc = ServiceRpc::attach(shell_window, cx);
@@ -3958,10 +4132,153 @@ mod tests {
         cx.update(|window, cx| window.draw(cx).clear());
         cx.simulate_click(start, gpui::Modifiers::default());
         cx.run_until_parked();
+        let stop: serde_json::Value =
+            serde_json::from_str(&rpc.requests.try_recv().unwrap()).unwrap();
+        assert_eq!(stop["params"]["serviceId"], "frontend");
+        assert_eq!(stop["params"]["action"], "stop");
+        cx.update(|window, cx| window.draw(cx).clear());
+        cx.simulate_click(start, gpui::Modifiers::default());
+        cx.run_until_parked();
         assert!(
             rpc.requests.try_recv().is_err(),
-            "a pending service ignores duplicate clicks"
+            "a pending Stop ignores duplicate clicks"
         );
+    }
+
+    #[gpui::test]
+    fn late_start_completion_does_not_clear_a_pending_stop(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let shell = test_shell(cx, dir.path());
+        let mut rpc = ServiceRpc::attach(shell, cx);
+        shell
+            .update(cx, |shell, _, cx| {
+                shell.control_project_terminal(Some("backend".into()), "start", cx)
+            })
+            .unwrap();
+        let start = rpc.take(cx).pop().unwrap();
+        shell
+            .update(cx, |shell, _, cx| {
+                shell.control_project_terminal(Some("backend".into()), "stop", cx)
+            })
+            .unwrap();
+        let stop = rpc
+            .take(cx)
+            .pop()
+            .expect("Stop must be sent before Start replies");
+        rpc.reply(&start, serde_json::json!({"ok": service_snapshot("old")}));
+        cx.run_until_parked();
+        shell
+            .update(cx, |shell, _, _| {
+                let key = (
+                    shell.project_terminals.context.as_ref().unwrap().scope(),
+                    "backend".into(),
+                );
+                assert_eq!(
+                    shell.project_terminals.service_actions.get(&key),
+                    Some(&"stop")
+                );
+                assert!(shell.project_terminals.control_busy(Some("backend")));
+            })
+            .unwrap();
+        rpc.reply(
+            &stop,
+            serde_json::json!({"ok": service_snapshot("stopped")}),
+        );
+        cx.run_until_parked();
+        shell
+            .update(cx, |shell, _, _| {
+                assert!(!shell.project_terminals.has_pending_actions())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn service_progress_names_the_dependency_instead_of_reporting_running() {
+        let mut snapshot = service_snapshot("worktree");
+        snapshot.startups.push(zeron_proto::ProjectServiceStartup {
+            service_id: "backend".into(),
+            message: "Waiting for Postgres".into(),
+        });
+        assert_eq!(
+            service_state_label(&snapshot, &snapshot.config.services[0]),
+            "Waiting for Postgres"
+        );
+        assert_eq!(
+            service_state_label(&snapshot, &snapshot.config.services[1]),
+            "Not running"
+        );
+    }
+
+    struct StartupRequirementsHost {
+        shell: Entity<Shell>,
+        _observer: Subscription,
+    }
+
+    impl Render for StartupRequirementsHost {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.shell.update(cx, |shell, cx| {
+                let editor = shell.project_terminals.editor.as_open().unwrap();
+                let theme = Theme::of(cx).clone();
+                shell.render_startup_requirements(editor, &editor.services[0], &theme, cx)
+            })
+        }
+    }
+
+    #[gpui::test]
+    fn service_dependency_switch_saves_selection_and_polling_keeps_it(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let window = test_shell(cx, dir.path());
+        let shell = window
+            .update(cx, |shell, _, cx| {
+                shell.state.update(cx, |state, _| {
+                    state.devices =
+                        vec![serde_json::from_value(serde_json::json!({
+                    "id":"local","name":"local","platform":"linux",
+                    "capabilities":[zeron_proto::capabilities::PROJECT_SERVICE_STARTUP_V1]
+                })).unwrap()];
+                });
+                let mut snapshot = service_snapshot("worktree");
+                snapshot.config.services =
+                    vec![database_service("Postgres"), app_service("api", "API")];
+                let context = test_project(std::path::Path::new("/project"));
+                shell.project_terminals.context = Some(context.clone());
+                shell.project_terminals.editor.open(Editor::new(context));
+                shell.accept_project_terminal_snapshot(snapshot, cx);
+                cx.entity()
+            })
+            .unwrap();
+        let (_, cx) = cx.add_window_view(|_, cx| StartupRequirementsHost {
+            _observer: cx.observe(&shell, |_, _, cx| cx.notify()),
+            shell: shell.clone(),
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        let switch = cx
+            .debug_bounds("service-dependency-api-db")
+            .unwrap()
+            .center();
+        cx.simulate_click(switch, gpui::Modifiers::default());
+        cx.run_until_parked();
+        shell.update(cx, |shell, cx| {
+            assert_eq!(
+                shell.project_terminals.editor.as_open().unwrap().config(cx)[0].depends_on,
+                Some(Vec::new())
+            );
+            let snapshot = shell.project_terminals.snapshot.clone().unwrap();
+            shell.accept_project_terminal_snapshot(snapshot, cx);
+            assert_eq!(
+                shell.project_terminals.editor.as_open().unwrap().config(cx)[0].depends_on,
+                Some(Vec::new())
+            );
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        cx.simulate_click(switch, gpui::Modifiers::default());
+        cx.run_until_parked();
+        shell.update(cx, |shell, cx| {
+            assert_eq!(
+                shell.project_terminals.editor.as_open().unwrap().config(cx)[0].depends_on,
+                Some(vec!["db".into()])
+            );
+        });
     }
 
     struct PromptHost {
@@ -4199,6 +4516,7 @@ mod tests {
                 shell.project_terminals.error = Some("Temporary status error".into());
                 shell.accept_project_terminal_snapshot(
                     ProjectTerminalsSnapshot {
+                        startups: Vec::new(),
                         checkout: None,
                         config: ProjectTerminalConfig {
                             services: Vec::new(),

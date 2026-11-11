@@ -8,11 +8,13 @@ use std::collections::BTreeMap;
 
 pub mod git;
 pub mod services;
+pub mod windows_vm;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PluginId {
     Git,
     Services,
+    WindowsVm,
 }
 
 impl PluginId {
@@ -20,6 +22,7 @@ impl PluginId {
         match self {
             Self::Git => "git",
             Self::Services => "project-services",
+            Self::WindowsVm => "windows-vm",
         }
     }
 }
@@ -30,6 +33,7 @@ pub enum Contribution {
     GitHistory,
     GitCommands,
     ProjectServices,
+    WindowsVm,
 }
 
 pub struct Manifest {
@@ -39,7 +43,7 @@ pub struct Manifest {
     pub contributions: &'static [Contribution],
 }
 
-pub const BUNDLED: [&Manifest; 2] = [&git::MANIFEST, &services::MANIFEST];
+pub const BUNDLED: [&Manifest; 3] = [&git::MANIFEST, &services::MANIFEST, &windows_vm::MANIFEST];
 
 /// Missing entries enable bundled plugins for existing installations. Unknown
 /// IDs survive round trips so a temporarily unavailable plugin keeps its choice.

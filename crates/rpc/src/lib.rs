@@ -287,6 +287,18 @@ pub mod methods {
     /// readOnly}` builds and starts it, or removes it. Never for agents.
     pub const GET_PROJECT_SANDBOX: &str = "GetProjectSandbox";
     pub const SET_PROJECT_SANDBOX: &str = "SetProjectSandbox";
+    /// One project's Windows VM (`zeron_engine::windows_vm`) in the app's
+    /// project settings: `{spaceId}` reads how it is connected and the VM's
+    /// state; `{spaceId, enabled, toVm, fromVm, viewer}` connects it or
+    /// disconnects it; `{spaceId, action}` starts or stops the VM or opens
+    /// its viewer. Never for agents.
+    pub const GET_PROJECT_WINDOWS_VM: &str = "GetProjectWindowsVm";
+    pub const SET_PROJECT_WINDOWS_VM: &str = "SetProjectWindowsVm";
+    pub const CONTROL_PROJECT_WINDOWS_VM: &str = "ControlProjectWindowsVm";
+    /// The calling chat's use of its project's Windows VM: `{chatId,
+    /// action, …}` with `status`, `start`, `stop`, `exec`, `launch`,
+    /// `screenshot` or `input`. Only in a project the person connected.
+    pub const CHAT_WINDOWS_VM: &str = "ChatWindowsVm";
     pub const GET_WORKTREE_SETTINGS: &str = "GetWorktreeSettings";
     pub const SAVE_WORKTREE_SETTINGS: &str = "SaveWorktreeSettings";
     pub const PREPARE_WORKTREE: &str = "PrepareWorktree";
@@ -783,6 +795,10 @@ pub fn agent_allowed(method: &str) -> bool {
             // `zeron sandbox` itself), never from inside one.
             | methods::GET_SANDBOXES
             | methods::SET_SANDBOX
+            // The Windows VM of the calling chat's project, once the person
+            // connected it; the engine checks the chat's access before
+            // anything runs there. Connecting it stays app-only.
+            | methods::CHAT_WINDOWS_VM
             // Saying what the calling chat's agent waits on.
             | methods::AWAIT_BACKGROUND
             // Plugins: authoring, installing (lands waiting for the person),
@@ -1410,6 +1426,8 @@ mod tests {
             methods::SAVE_PROJECT_TERMINALS,
             methods::CONTROL_PROJECT_TERMINALS,
             methods::SAVE_WORKTREE_SETTINGS,
+            methods::SET_PROJECT_WINDOWS_VM,
+            methods::CONTROL_PROJECT_WINDOWS_VM,
             methods::WRITE_WORKSPACE_FILE,
             methods::EXPORT_PLUGIN,
             // The window's own watch of the theme files.
@@ -1445,6 +1463,7 @@ mod tests {
             methods::EDIT_CHAT_WORKTREE_SETTINGS,
             methods::GET_SANDBOXES,
             methods::SET_SANDBOX,
+            methods::CHAT_WINDOWS_VM,
         ] {
             assert!(agent_allowed(method), "{method}");
             let asked = agent.call(method, serde_json::json!({})).await.unwrap();

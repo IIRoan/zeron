@@ -94,6 +94,12 @@ enum Command {
         #[command(subcommand)]
         command: SandboxCommand,
     },
+    /// Connect a project to the Windows VM on this machine (Linux, QEMU/KVM):
+    /// its agents can then use the VM, and the listed ports cross to it.
+    Vm {
+        #[command(subcommand)]
+        command: VmCommand,
+    },
     /// Manage `zeron headless` as a background service (launchd / systemd --user).
     Daemon {
         #[command(subcommand)]
@@ -197,6 +203,14 @@ pub enum SandboxCommand {
         /// file), mounted read-only so agents can't change it. Repeat for more.
         #[arg(long = "read-only", value_name = "PATH")]
         read_only: Vec<std::path::PathBuf>,
+        /// Hand agents there this machine's GitHub login (gh's token), so gh
+        /// and git over HTTPS work, with everything that login may do.
+        #[arg(long)]
+        share_github: bool,
+        /// Sign agents' commits and tags there with this machine's signing
+        /// key (git's user.signingkey), which never goes in.
+        #[arg(long)]
+        sign_commits: bool,
         /// Where Zeron creates the project's worktrees, if not the default.
         #[arg(long)]
         worktrees: Option<std::path::PathBuf>,
@@ -204,6 +218,40 @@ pub enum SandboxCommand {
     /// Run the project on this machine again and remove its container.
     Disable { path: std::path::PathBuf },
     /// List sandboxed projects and their containers.
+    Status,
+}
+
+#[derive(Subcommand)]
+pub enum VmCommand {
+    /// Connect the project, or replace how it is connected. Starts nothing:
+    /// the VM starts from Project settings, `winvm up`, or an agent.
+    Enable {
+        /// The project's folder.
+        path: std::path::PathBuf,
+        /// A port (or `a-b` range) on this machine the VM reaches on its
+        /// own localhost (the project's dev servers). Repeat for more.
+        #[arg(long = "to-vm", value_name = "PORT[-PORT]")]
+        to_vm: Vec<String>,
+        /// A VM port (or `a-b` range) this machine reaches on its localhost
+        /// (a debugger). Repeat for more.
+        #[arg(long = "from-vm", value_name = "PORT[-PORT]")]
+        from_vm: Vec<String>,
+        /// Open the viewer window when the VM starts.
+        #[arg(long)]
+        viewer: bool,
+        /// A service of the project, by name, that starts the VM with it
+        /// (the Windows app's service). Repeat for more.
+        #[arg(long = "start-with", value_name = "SERVICE")]
+        start_with: Vec<String>,
+        /// Connect only the `--to-vm` ports. Without this the ports the
+        /// project's servers listen on (in any worktree) are connected too,
+        /// as they come and go.
+        #[arg(long = "no-auto-ports")]
+        no_auto_ports: bool,
+    },
+    /// Disconnect the project. The VM itself is left as it is.
+    Disable { path: std::path::PathBuf },
+    /// List connected projects and the VM's state.
     Status,
 }
 
@@ -221,6 +269,7 @@ pub enum EngineCommand {
     Plugin(PluginCommand),
     Template(TemplateCommand),
     Sandbox(SandboxCommand),
+    Vm(VmCommand),
 }
 
 /// Where this binary runs [`EngineCommand`]s.
@@ -306,6 +355,7 @@ pub fn run(version: &'static str, engines: Engines) -> Launch {
                         | Command::Plugin { .. }
                         | Command::Template { .. }
                         | Command::Sandbox { .. }
+                        | Command::Vm { .. }
                 )
             ),
         );
@@ -331,6 +381,7 @@ pub fn run(version: &'static str, engines: Engines) -> Launch {
         Some(Command::Plugin { command }) => engine(EngineCommand::Plugin(command)),
         Some(Command::Template { command }) => engine(EngineCommand::Template(command)),
         Some(Command::Sandbox { command }) => engine(EngineCommand::Sandbox(command)),
+        Some(Command::Vm { command }) => engine(EngineCommand::Vm(command)),
         #[cfg(target_os = "linux")]
         Some(Command::Appshot) => Launch::Appshot,
         Some(Command::Update { check }) => Launch::Done(
@@ -367,7 +418,8 @@ impl Command {
             | Self::Mcp
             | Self::Plugin { .. }
             | Self::Template { .. }
-            | Self::Sandbox { .. } => true,
+            | Self::Sandbox { .. }
+            | Self::Vm { .. } => true,
             #[cfg(target_os = "linux")]
             Self::Appshot => false,
             Self::Update { .. } | Self::UpdateWatchdog | Self::Daemon { .. } => false,
@@ -457,6 +509,7 @@ mod tests {
             &["plugin", "new"],
             &["template", "use"],
             &["sandbox", "enable"],
+            &["vm", "enable"],
             &["daemon", "install"],
             &["update"],
         ] {
@@ -489,6 +542,7 @@ mod tests {
             &["plugin", "list"],
             &["template", "list"],
             &["sandbox", "status"],
+            &["vm", "status"],
         ] {
             assert!(parse(args).unwrap().runs_engine(), "{args:?}");
         }

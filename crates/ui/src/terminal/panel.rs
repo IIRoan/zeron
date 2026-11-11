@@ -298,6 +298,11 @@ struct TerminalTab {
     /// Fractional wheel rows owed to a program (reports / arrow keys).
     wheel_remainder: f32,
     exited: Option<i32>,
+    /// The shell runs in a sandbox container (`TerminalSession::sandboxed`),
+    /// and when its session was attached: a shell the container's restart
+    /// killed is replaced by a new one.
+    sandboxed: bool,
+    attached: Option<Instant>,
     last_seq: u64,
     input: InputQueue,
     /// Local echo for a terminal on another device.
@@ -598,6 +603,8 @@ impl TerminalPanel {
             scroll_remainder: 0.0,
             wheel_remainder: 0.0,
             exited: None,
+            sandboxed: false,
+            attached: None,
             last_seq: 0,
             input: InputQueue::default(),
             predictor: Predictor::default(),
@@ -917,6 +924,8 @@ impl TerminalPanel {
                     tab.terminal_id = Some(terminal_id.clone());
                     tab.target_device_id = target.clone();
                     tab.host_replies = session.host_replies;
+                    tab.sandboxed = session.sandboxed;
+                    tab.attached = Some(Instant::now());
                     let size = (tab.emulator.cols() as u16, tab.emulator.rows() as u16);
                     // Keys typed while the PTY was still opening.
                     panel.pump_input(&chat, key, cx);
@@ -1078,10 +1087,62 @@ impl TerminalPanel {
                 tab.predictor.reset();
                 tab.marked_text = None;
                 tab.emulator.feed(&exit_message(exit_code));
+                // An action's or a service's tab ends with its command.
+                if !tab.fixed_title {
+                    let alive = tab.attached.map(|at| at.elapsed()).unwrap_or_default();
+                    if TerminalSession::reconnects(tab.sandboxed, exit_code, alive) {
+                        tab.emulator.feed(
+                            b"\x1b[90m[the sandbox container stopped; opening a new shell in it]\x1b[0m\r\n",
+                        );
+                        // After this stream's task has ended; the container
+                        // may still be coming back.
+                        let chat = chat.to_string();
+                        cx.spawn(async move |this, cx| {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(500))
+                                .await;
+                            this.update(cx, |panel, cx| panel.restart_tab(&chat, key, cx))
+                                .ok();
+                        })
+                        .detach();
+                    } else {
+                        tab.emulator
+                            .feed(b"\x1b[90m[press Enter for a new shell]\x1b[0m\r\n");
+                    }
+                }
                 cx.notify();
                 StreamDisposition::Stop
             }
         }
+    }
+
+    /// Opens a new shell in a tab whose shell has ended, below what it
+    /// showed. In a sandboxed project that is a shell in the container as it
+    /// is now (started again, or rebuilt).
+    fn restart_tab(&mut self, chat: &str, key: u64, cx: &mut Context<Self>) -> bool {
+        let Some(engine) = self.engine(cx) else {
+            return false;
+        };
+        let target = self.chat_target(chat, cx);
+        let cwd = self.state.read(cx).terminal_open_cwd_for(chat);
+        let Some(tab) = self
+            .tab_mut(chat, key)
+            .filter(|tab| tab.exited.is_some() && !tab.fixed_title)
+        else {
+            return false;
+        };
+        tab.terminal_id = None;
+        tab.exited = None;
+        tab.attached = None;
+        tab.last_seq = 0;
+        tab.input = InputQueue::default();
+        tab.resize_task = None;
+        let run = Self::spawn_session(chat.to_string(), key, engine, target, None, cwd, cx);
+        if let Some(tab) = self.tab_mut(chat, key) {
+            tab._run = Some(run);
+        }
+        cx.notify();
+        true
     }
 
     // ---- input ----
@@ -1201,6 +1262,20 @@ impl TerminalPanel {
         {
             cx.stop_propagation();
             return;
+        }
+        // Enter in a tab whose shell has ended opens a new one there.
+        if ks.key == "enter" && !mods.modified() {
+            let chat = self.selected_chat(cx);
+            let ended = self
+                .active_tab(cx)
+                .filter(|tab| tab.exited.is_some())
+                .map(|tab| tab.key);
+            if let Some(key) = ended
+                && self.restart_tab(&chat, key, cx)
+            {
+                cx.stop_propagation();
+                return;
+            }
         }
         let app_cursor = self
             .active_tab(cx)
@@ -2780,6 +2855,7 @@ mod tests {
                 cwd: "/project".into(),
                 shell: "bash".into(),
                 host_replies: Default::default(),
+                sandboxed: false,
             };
             let key = panel.reserve_tab_for_chat("chat".into(), "Terminal 1", cx);
             panel.queue_input(b"typed before attach", cx);

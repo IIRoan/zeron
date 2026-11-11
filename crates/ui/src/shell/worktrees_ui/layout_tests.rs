@@ -1051,6 +1051,7 @@ fn project_settings_database_fields_remain_usable_in_compact_windows(cx: &mut Te
     let (shell, cx) = setup(cx);
     shell.update(cx, |shell, cx| {
         let database = ProjectTerminalService {
+            depends_on: None,
             id: "db".into(),
             name: "Development PostgreSQL database".into(),
             command: "podman compose up database".into(),

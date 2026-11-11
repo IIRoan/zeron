@@ -40,6 +40,7 @@ pub fn catalog() -> Vec<ToolDef> {
         "command":{"type":"string","minLength":1,"maxLength":16384},
         "directory":{"type":"string","description":"Relative folder inside the checkout; defaults to . (project root for databases)."},
         "restartOnFailure":{"type":"boolean"},
+        "dependsOn":{"type":"array","items":{"type":"string","minLength":1},"uniqueItems":true,"maxItems":12,"description":"Service ids to start first. Databases must pass their readiness check. An empty list starts no dependencies."},
         "readinessCommand":{"type":"string","minLength":1,"description":"Required for a database: a command that exits successfully when ready, run in the main project folder."},
         "readinessTimeoutSeconds":{"type":"integer","minimum":1,"maximum":7200,"description":"Database readiness timeout; defaults to 120 seconds."}
     });
@@ -81,6 +82,7 @@ pub async fn call(zeron: &Zeron, name: &str, args: Value) -> anyhow::Result<Valu
         .as_ref()
         .context("service tools require a Zeron chat")?;
     let editing = matches!(name, "service_add" | "service_update");
+    let startup_options = editing && args.get("dependsOn").is_some();
     let include_config = if name == "service_list" {
         serde_json::from_value::<ListArgs>(args.clone())?.include_config
     } else {
@@ -107,6 +109,12 @@ pub async fn call(zeron: &Zeron, name: &str, args: Value) -> anyhow::Result<Valu
         info.supports(zeron_proto::capabilities::PROJECT_SERVICE_CONTROL_V1),
         "Update the Zeron daemon to enable service tools"
     );
+    if startup_options {
+        ensure!(
+            info.supports(zeron_proto::capabilities::PROJECT_SERVICE_STARTUP_V1),
+            "Update the Zeron daemon to configure startup dependencies"
+        );
+    }
     if editing || include_config {
         ensure!(
             info.supports(zeron_proto::capabilities::PROJECT_SERVICE_EDIT_V1),

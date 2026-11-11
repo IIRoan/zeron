@@ -64,6 +64,7 @@ fn git(root: &Path, args: &[&str]) {
 }
 fn service(id: &str, database: bool) -> ProjectTerminalService {
     ProjectTerminalService {
+        depends_on: None,
         id: id.into(),
         name: id.into(),
         directory: ".".into(),
@@ -459,7 +460,7 @@ async fn agents_add_and_patch_entries_without_replacing_other_entries_or_setting
     agent
         .call(
             "service_update",
-            json!({"serviceId":id,"name":"Jobs","restartOnFailure":true}),
+            json!({"serviceId":id,"name":"Jobs","restartOnFailure":true,"dependsOn":["db"]}),
         )
         .await
         .unwrap();
@@ -479,6 +480,7 @@ async fn agents_add_and_patch_entries_without_replacing_other_entries_or_setting
         "echo $$ > worker.pid; exec sleep 120"
     );
     assert_eq!(worker["configuration"]["restartOnFailure"], true);
+    assert_eq!(worker["configuration"]["dependsOn"], json!(["db"]));
     assert_eq!(configs["services"].as_array().unwrap().len(), 4);
 
     let db = agent.call("service_add", json!({"kind":"database","name":"Cache","command":"echo $$ > cache.pid; exec sleep 120","readinessCommand":"test -f cache.pid"})).await.unwrap();

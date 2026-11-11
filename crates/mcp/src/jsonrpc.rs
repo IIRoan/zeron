@@ -40,6 +40,13 @@ Databases are shared across project checkouts; app services respect the project'
 checkout mode. Check status and database readiness after an action; after a timeout \
 or lost connection inspect status before retrying.\n\
 \n\
+When the chat's project is connected to a Windows VM (vm_status says so), call vm_start \
+before the other vm tools. vm_exec runs PowerShell there and returns its output; a program \
+with a window needs vm_launch. vm_diagnostics reads the VM's health (processes, ports, recent errors) \
+in one call. vm_screenshot shows the screen and vm_input clicks and types \
+on it, in screenshot pixels. The VM has its own disk, and its localhost reaches only the \
+ports vm_status lists.\n\
+\n\
 Zeron runs coding agents in chats, each hosted on a device, optionally in a project \
 (a folder on that specific device). These tools operate the local Zeron engine: \
 discover devices/projects/chats, create chats with a chosen harness and \
@@ -269,11 +276,11 @@ pub async fn handle_request(tools: &Tools, id: Value, method: &str, params: Valu
                 .cloned()
                 .unwrap_or_else(|| json!({}));
             match tools.call(name, arguments).await {
-                Ok(value) if name == "browser_screenshot" => {
+                Ok(value) if name == "browser_screenshot" || name == "vm_screenshot" => {
                     if let (Some(mime), Some(data)) = (value["mimeType"].as_str(), value["data"].as_str()) {
                         ok_response(id, json!({"content":[{"type":"image","mimeType":mime,"data":data}],"isError":false}))
                     } else {
-                        ok_response(id, json!({"content":[{"type":"text","text":"browser_screenshot_failed: invalid image response"}],"isError":true}))
+                        ok_response(id, json!({"content":[{"type":"text","text":format!("{name}_failed: invalid image response")}],"isError":true}))
                     }
                 }
                 Ok(value) => ok_response(

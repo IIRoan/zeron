@@ -11,6 +11,10 @@ pub struct ProjectTerminalService {
     pub directory: String,
     #[serde(default)]
     pub restart_on_failure: bool,
+    /// Service ids that must start first. Older app entries without this field
+    /// keep waiting for all shared databases; an empty list needs none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depends_on: Option<Vec<String>>,
     /// Present on shared databases: project infrastructure that runs in the
     /// main folder and must pass this check before setup or app services.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -50,6 +54,7 @@ pub struct ProjectServicePatch {
     pub command: Option<String>,
     pub directory: Option<String>,
     pub restart_on_failure: Option<bool>,
+    pub depends_on: Option<Vec<String>>,
     pub readiness_command: Option<String>,
     pub readiness_timeout_seconds: Option<u64>,
 }
@@ -79,6 +84,8 @@ pub enum ProjectServiceEdit {
         directory: String,
         #[serde(default)]
         restart_on_failure: bool,
+        #[serde(default)]
+        depends_on: Option<Vec<String>>,
         readiness_command: Option<String>,
         readiness_timeout_seconds: Option<u64>,
     },
@@ -134,4 +141,14 @@ pub struct ProjectTerminalsSnapshot {
     /// The one checkout currently owning this project's service processes.
     #[serde(default)]
     pub checkout: Option<String>,
+    /// Transient startup progress. Reading it never starts a service.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub startups: Vec<ProjectServiceStartup>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectServiceStartup {
+    pub service_id: String,
+    pub message: String,
 }

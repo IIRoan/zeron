@@ -22,10 +22,13 @@ pub mod capabilities {
     /// Chat-scoped agent tools for configured services and shared databases.
     pub const PROJECT_SERVICE_CONTROL_V1: &str = "project-service-control-v1";
     pub const PROJECT_SERVICE_EDIT_V1: &str = "project-service-edit-v1";
+    pub const PROJECT_SERVICE_STARTUP_V1: &str = "project-service-startup-v1";
     /// Chat-scoped agent tools for the project's worktree settings.
     pub const CHAT_WORKTREE_SETTINGS_V1: &str = "chat-worktree-settings-v1";
     /// `GetSandboxes` / `SetSandbox`: project sandboxes over RPC (and MCP).
     pub const PROJECT_SANDBOX_V1: &str = "project-sandbox-v1";
+    /// `*ProjectWindowsVm` / `ChatWindowsVm`: a project's Windows VM.
+    pub const WINDOWS_VM_V1: &str = "windows-vm-v1";
     /// The host creates a projectless chat's scratch folder
     /// (`crate::projectless`) when it runs; older hosts only know `~`.
     pub const PROJECTLESS_SCRATCH_V1: &str = "projectless-scratch-v1";
@@ -69,8 +72,10 @@ pub mod capabilities {
         PROJECT_DATABASES_V1,
         PROJECT_SERVICE_CONTROL_V1,
         PROJECT_SERVICE_EDIT_V1,
+        PROJECT_SERVICE_STARTUP_V1,
         CHAT_WORKTREE_SETTINGS_V1,
         PROJECT_SANDBOX_V1,
+        WINDOWS_VM_V1,
         PROJECTLESS_SCRATCH_V1,
         SIDEBAR_SECTION_ORDER_V1,
         PROVIDER_SWITCH_V1,
@@ -169,8 +174,10 @@ mod tests {
                     "project-databases-v1",
                     "project-service-control-v1",
                     "project-service-edit-v1",
+                    "project-service-startup-v1",
                     "chat-worktree-settings-v1",
                     "project-sandbox-v1",
+                    "windows-vm-v1",
                     "projectless-scratch-v1",
                     "sidebar-section-order-v1",
                     "provider-switch-v1",

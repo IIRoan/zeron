@@ -77,6 +77,7 @@ fn startup_service(
             &f.root,
             ProjectTerminalConfig {
                 services: vec![ProjectTerminalService {
+                    depends_on: None,
                     id: "databases".into(),
                     name: "Databases".into(),
                     command: command.into(),
@@ -145,6 +146,7 @@ async fn startup_services_gate_setup_and_stay_shared_across_worktrees() {
     f.store.prepare(&f.root, &f.b, false).await.unwrap();
     let mut config = services.snapshot("project", &f.root).unwrap().config;
     config.services.push(ProjectTerminalService {
+        depends_on: None,
         id: "backend".into(),
         name: "Backend".into(),
         command: "test -f \"$ZERON_PROJECT_ROOT/database.ready\" && exec sleep 60".into(),
@@ -721,7 +723,7 @@ async fn custom_prefix_survives_title_rename_and_delete_preserves_a_user_branch(
 }
 
 fn svc() -> ProjectTerminalConfig {
-    ProjectTerminalConfig{services:vec![ProjectTerminalService{id:"backend".into(),name:"Backend".into(),command:"/bin/sh -c 'echo $$ > service.pid; echo \"$TEST_PORT\" > port.marker; exec sleep 60'".into(),directory:".".into(),restart_on_failure:false,setup_prerequisite:None}]}
+    ProjectTerminalConfig{services:vec![ProjectTerminalService{depends_on:None,id:"backend".into(),name:"Backend".into(),command:"/bin/sh -c 'echo $$ > service.pid; echo \"$TEST_PORT\" > port.marker; exec sleep 60'".into(),directory:".".into(),restart_on_failure:false,setup_prerequisite:None}]}
 }
 
 #[tokio::test]
@@ -1859,6 +1861,7 @@ async fn terminals_opened_in_a_worktree_subfolder_get_its_variables() {
 
 fn app(id: &str, name: &str) -> ProjectTerminalService {
     ProjectTerminalService {
+        depends_on: None,
         id: id.into(),
         name: name.into(),
         command: format!("echo {name}; exec sleep 60"),
@@ -1876,6 +1879,498 @@ fn database(id: &str, name: &str) -> ProjectTerminalService {
         }),
         ..app(id, name)
     }
+}
+
+async fn service_marker(path: &Path) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !path.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("service marker did not appear: {}", path.display()));
+}
+
+#[tokio::test]
+async fn service_dependencies_start_only_required_database_and_report_waiting() {
+    for main in [true, false] {
+        let f = Fixture::new();
+        let (services, terminals) = startup_service(
+            &f,
+            "echo $$ > database.pid; exec sleep 60",
+            "test -f database.ready",
+            30,
+        );
+        let mut config = services.snapshot("project", &f.root).unwrap().config;
+        let mut unrelated = database("unused-db", "Unused database");
+        unrelated.command = "touch unused-database; exec sleep 60".into();
+        config.services.push(unrelated);
+        let mut backend = app("backend", "Backend");
+        backend.depends_on = Some(vec!["databases".into()]);
+        backend.command = "test -f \"$ZERON_PROJECT_ROOT/database.ready\" && touch backend.started; exec sleep 60".into();
+        config.services.push(backend);
+        config.services.push(app("unused-app", "Unused app"));
+        services
+            .save_defaults(&f.store, "project", &f.root, config)
+            .await
+            .unwrap();
+        let cwd = if main { &f.root } else { &f.a };
+        let task = {
+            let (services, terminals, store, root, cwd) = (
+                services.clone(),
+                terminals.clone(),
+                f.store.clone(),
+                f.root.clone(),
+                cwd.clone(),
+            );
+            tokio::spawn(async move {
+                services
+                    .control_checkout(
+                        &terminals,
+                        &store,
+                        "project",
+                        &root,
+                        &cwd,
+                        Some("backend"),
+                        "start",
+                    )
+                    .await
+            })
+        };
+        service_marker(&f.root.join("database.pid")).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = services
+                    .checkout_snapshot(
+                        "project",
+                        &f.root,
+                        cwd,
+                        &f.store.effective(&f.root, cwd).unwrap(),
+                    )
+                    .unwrap();
+                if snapshot
+                    .startups
+                    .iter()
+                    .any(|p| p.service_id == "backend" && p.message == "Waiting for Databases")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!cwd.join("backend.started").exists());
+        assert!(!f.root.join("unused-database").exists());
+        std::fs::write(f.root.join("database.ready"), b"ready").unwrap();
+        let snapshot = task.await.unwrap().unwrap();
+        service_marker(&cwd.join("backend.started")).await;
+        assert!(snapshot.startups.is_empty());
+        assert!(
+            !snapshot
+                .runs
+                .iter()
+                .any(|r| r.service_id == "unused-db" || r.service_id == "unused-app")
+        );
+        services.shutdown();
+    }
+}
+
+#[tokio::test]
+async fn service_dependencies_stop_cancels_readiness_without_starting_backend() {
+    for main in [true, false] {
+        let f = Fixture::new();
+        let (services, terminals) = startup_service(
+            &f,
+            "exec sleep 60",
+            "echo $$ > readiness.pid; exec sleep 60",
+            120,
+        );
+        let mut config = services.snapshot("project", &f.root).unwrap().config;
+        let mut backend = app("backend", "Backend");
+        backend.depends_on = Some(vec!["databases".into()]);
+        backend.command = "touch backend.started; exec sleep 60".into();
+        config.services.push(backend);
+        services
+            .save_defaults(&f.store, "project", &f.root, config)
+            .await
+            .unwrap();
+        let cwd = if main { &f.root } else { &f.a };
+        let task = {
+            let (services, terminals, store, root, cwd) = (
+                services.clone(),
+                terminals.clone(),
+                f.store.clone(),
+                f.root.clone(),
+                cwd.clone(),
+            );
+            tokio::spawn(async move {
+                services
+                    .control_checkout(
+                        &terminals,
+                        &store,
+                        "project",
+                        &root,
+                        &cwd,
+                        Some("backend"),
+                        "start",
+                    )
+                    .await
+            })
+        };
+        service_marker(&f.root.join("readiness.pid")).await;
+        let stopped = tokio::time::timeout(
+            Duration::from_secs(8),
+            services.control_checkout(
+                &terminals,
+                &f.store,
+                "project",
+                &f.root,
+                cwd,
+                Some("backend"),
+                "stop",
+            ),
+        )
+        .await
+        .expect("Stop must cancel the 120-second wait")
+        .unwrap();
+        task.await.unwrap().unwrap();
+        assert!(stopped.startups.is_empty());
+        assert_eq!(
+            stopped
+                .runs
+                .iter()
+                .find(|r| r.service_id == "backend")
+                .unwrap()
+                .status,
+            ProjectTerminalStatus::Stopped
+        );
+        assert!(!cwd.join("backend.started").exists());
+        assert!(!cwd.join("prepared").exists());
+        let pid = std::fs::read_to_string(f.root.join("readiness.pid")).unwrap();
+        #[cfg(target_os = "linux")]
+        assert!(
+            !Path::new(&format!("/proc/{}", pid.trim())).exists(),
+            "the cancelled ready check must be reaped"
+        );
+        services.shutdown();
+    }
+}
+
+#[tokio::test]
+async fn service_dependencies_empty_list_skips_unrelated_infrastructure() {
+    let f = Fixture::new();
+    let (services, terminals) =
+        startup_service(&f, "touch database.started; exec sleep 60", "false", 1);
+    let mut config = services.snapshot("project", &f.root).unwrap().config;
+    let mut backend = app("backend", "Backend");
+    backend.depends_on = Some(Vec::new());
+    config.services.push(backend);
+    services
+        .save_defaults(&f.store, "project", &f.root, config)
+        .await
+        .unwrap();
+    let snapshot = services
+        .control_checkout(
+            &terminals,
+            &f.store,
+            "project",
+            &f.root,
+            &f.a,
+            Some("backend"),
+            "start",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot
+            .runs
+            .iter()
+            .find(|r| r.service_id == "backend")
+            .unwrap()
+            .status,
+        ProjectTerminalStatus::Running
+    );
+    assert!(!f.root.join("database.started").exists());
+    services.shutdown();
+}
+
+#[tokio::test]
+async fn service_dependencies_queued_start_can_stop_while_another_start_waits() {
+    let f = Fixture::new();
+    let (services, terminals) = startup_service(
+        &f,
+        "exec sleep 60",
+        "echo checking > readiness.started; exec sleep 60",
+        120,
+    );
+    let mut config = services.snapshot("project", &f.root).unwrap().config;
+    let mut backend = app("backend", "Backend");
+    backend.depends_on = Some(vec!["databases".into()]);
+    config.services.push(backend);
+    let mut frontend = app("frontend", "Frontend");
+    frontend.depends_on = Some(Vec::new());
+    frontend.command = "touch frontend.started; exec sleep 60".into();
+    config.services.push(frontend);
+    services
+        .save_defaults(&f.store, "project", &f.root, config)
+        .await
+        .unwrap();
+    let start = |id: &'static str| {
+        let (services, terminals, store, root, cwd) = (
+            services.clone(),
+            terminals.clone(),
+            f.store.clone(),
+            f.root.clone(),
+            f.a.clone(),
+        );
+        tokio::spawn(async move {
+            services
+                .control_checkout(
+                    &terminals,
+                    &store,
+                    "project",
+                    &root,
+                    &cwd,
+                    Some(id),
+                    "start",
+                )
+                .await
+        })
+    };
+    let backend = start("backend");
+    service_marker(&f.root.join("readiness.started")).await;
+    let frontend = start("frontend");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snapshot = services
+                .checkout_snapshot(
+                    "project",
+                    &f.root,
+                    &f.a,
+                    &f.store.effective(&f.root, &f.a).unwrap(),
+                )
+                .unwrap();
+            if snapshot.startups.iter().any(|p| p.service_id == "frontend") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let snapshot = tokio::time::timeout(
+        Duration::from_secs(3),
+        services.control_checkout(
+            &terminals,
+            &f.store,
+            "project",
+            &f.root,
+            &f.a,
+            Some("frontend"),
+            "stop",
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), frontend)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(snapshot.startups.iter().any(|p| p.service_id == "backend"));
+    assert!(!snapshot.startups.iter().any(|p| p.service_id == "frontend"));
+    assert!(!f.a.join("frontend.started").exists());
+    services
+        .control_checkout(
+            &terminals,
+            &f.store,
+            "project",
+            &f.root,
+            &f.a,
+            Some("backend"),
+            "stop",
+        )
+        .await
+        .unwrap();
+    backend.await.unwrap().unwrap();
+    services.shutdown();
+}
+
+#[tokio::test]
+async fn service_dependencies_reject_missing_ids_and_cycles_before_saving() {
+    let f = Fixture::new();
+    let services = ProjectTerminals::open(&f.temp.path().join("profile")).unwrap();
+    let mut a = app("a", "A");
+    let mut b = app("b", "B");
+    a.depends_on = Some(vec!["b".into()]);
+    b.depends_on = Some(Vec::new());
+    let original = ProjectTerminalConfig {
+        services: vec![a, b],
+    };
+    services
+        .save_defaults(&f.store, "project", &f.root, original.clone())
+        .await
+        .unwrap();
+    for missing in [true, false] {
+        let mut invalid = original.clone();
+        if missing {
+            invalid.services[0].depends_on = Some(vec!["missing".into()]);
+        } else {
+            invalid.services[1].depends_on = Some(vec!["a".into()]);
+        }
+        let error = services
+            .save_defaults(&f.store, "project", &f.root, invalid)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(if missing {
+                "Unknown startup dependency"
+            } else {
+                "cycle"
+            }),
+            "{error}"
+        );
+        assert_eq!(
+            services.snapshot("project", &f.root).unwrap().config,
+            original
+        );
+    }
+}
+
+#[tokio::test]
+async fn service_dependencies_failure_marks_waiting_backend_failed() {
+    let f = Fixture::new();
+    let (services, terminals) = startup_service(&f, "exec sleep 60", "false", 1);
+    let mut config = services.snapshot("project", &f.root).unwrap().config;
+    let mut backend = app("backend", "Backend");
+    backend.depends_on = Some(vec!["databases".into()]);
+    config.services.push(backend);
+    services
+        .save_defaults(&f.store, "project", &f.root, config)
+        .await
+        .unwrap();
+    assert!(
+        services
+            .control_checkout(
+                &terminals,
+                &f.store,
+                "project",
+                &f.root,
+                &f.a,
+                Some("backend"),
+                "start"
+            )
+            .await
+            .is_err()
+    );
+    let snapshot = services
+        .checkout_snapshot(
+            "project",
+            &f.root,
+            &f.a,
+            &f.store.effective(&f.root, &f.a).unwrap(),
+        )
+        .unwrap();
+    assert!(snapshot.startups.is_empty());
+    let backend = snapshot
+        .runs
+        .iter()
+        .find(|r| r.service_id == "backend")
+        .unwrap();
+    assert_eq!(backend.status, ProjectTerminalStatus::Failed);
+    assert!(
+        backend
+            .message
+            .as_ref()
+            .unwrap()
+            .contains("Databases was not ready")
+    );
+    services.shutdown();
+}
+
+#[tokio::test]
+async fn service_dependencies_database_stop_cancels_worktree_preparation() {
+    let f = Fixture::new();
+    let (services, terminals) = startup_service(
+        &f,
+        "exec sleep 60",
+        "echo $$ > readiness.pid; exec sleep 60",
+        120,
+    );
+    let preparing = {
+        let (services, store, root, cwd) = (
+            services.clone(),
+            f.store.clone(),
+            f.root.clone(),
+            f.a.clone(),
+        );
+        tokio::spawn(async move {
+            services
+                .prepare_checkout(&store, "project", &root, &cwd)
+                .await
+        })
+    };
+    service_marker(&f.root.join("readiness.pid")).await;
+    let snapshot = tokio::time::timeout(
+        Duration::from_secs(8),
+        services.control_checkout(
+            &terminals,
+            &f.store,
+            "project",
+            &f.root,
+            &f.b,
+            Some("databases"),
+            "stop",
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let error = preparing.await.unwrap().unwrap_err().to_string();
+    assert!(error.contains("cancelled"), "{error}");
+    assert_eq!(
+        snapshot
+            .runs
+            .iter()
+            .find(|r| r.service_id == "databases")
+            .unwrap()
+            .status,
+        ProjectTerminalStatus::Stopped
+    );
+    assert_eq!(f.phase(&f.a), WorktreeSetupPhase::Interrupted);
+    services.shutdown();
+}
+
+#[tokio::test]
+async fn service_dependencies_database_start_follows_transitive_requirements_only() {
+    let f = Fixture::new();
+    let (services, terminals) = startup_service(
+        &f,
+        "touch first.ready; exec sleep 60",
+        "test -f first.ready",
+        10,
+    );
+    let mut config = services.snapshot("project", &f.root).unwrap().config;
+    let mut second = database("second", "Second database");
+    second.depends_on = Some(vec!["databases".into()]);
+    second.command = "test -f first.ready && touch second.ready; exec sleep 60".into();
+    second.setup_prerequisite.as_mut().unwrap().command = "test -f second.ready".into();
+    config.services.insert(0, second);
+    let mut unrelated = database("unused", "Unused database");
+    unrelated.command = "touch unused.started; exec sleep 60".into();
+    config.services.push(unrelated);
+    services.save("project", &f.root, config).unwrap();
+    let snapshot = services.control_checkout(
+        &terminals, &f.store, "project", &f.root, &f.a, Some("second"), "start",
+    ).await.unwrap();
+    assert!(f.root.join("second.ready").exists());
+    assert!(!f.root.join("unused.started").exists());
+    assert_eq!(snapshot.runs.len(), 2);
+    assert!(snapshot.runs.iter().all(|run| run.readiness == Some(ServiceReadinessState::Ready)));
+    services.shutdown();
 }
 
 fn names(services: &[ProjectTerminalService]) -> Vec<(&str, bool)> {

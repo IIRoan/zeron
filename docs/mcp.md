@@ -171,6 +171,9 @@ Editing shell commands requires full access outside read-only/plan mode.
 
 For example, add an app with `service_add {"name":"API","command":"bun run dev",
 "directory":"apps/api"}`, then pass its returned id to `service_start`.
+
+Set `dependsOn` to service ids from `service_list`, for example `service_update {"serviceId":"<api id>","dependsOn":["<database id>"]}`. An empty list removes startup requirements. New entries default to no requirements; existing entries retain their previous database requirements until their requirements are edited. Startup follows only those dependencies. Status includes `progress` while queued, preparing, or waiting, and `service_stop` can cancel startup before it finishes.
+
 Add a database with `{"kind":"database","name":"Postgres","command":"…",
 "readinessCommand":"pg_isready","readinessTimeoutSeconds":120}`. Update just its
 check with `service_update {"serviceId":"<listed id>","readinessCommand":"…"}`.
@@ -232,6 +235,8 @@ name (default: the local engine's device).
 | `worktree_settings_update` | `EditChatWorktreeSettings {chatId, scope, changes, reset}` (origin chat only; named fields only, no reconnect replay) |
 | `sandbox_status` | `GetSandboxes {chatId}` (origin chat only) |
 | `sandbox_enable`, `sandbox_disable` | `SetSandbox {chatId, spaceId?, enabled, config?, hostPorts?, publishPorts?, readOnly?}` (origin chat only; full access, refused inside a sandbox; no reconnect replay). See [Project sandboxes](sandboxes.md) |
+| `vm_status`, `vm_diagnostics`, `vm_screenshot` | `ChatWindowsVm {chatId, action}` (origin chat only; the project must be connected to a Windows VM by the person) |
+| `vm_start`, `vm_stop`, `vm_exec`, `vm_launch`, `vm_input` | `ChatWindowsVm {chatId, action, command?, cwd?, timeoutSeconds?, input?, x?, y?, text?, keys?}` (origin chat only; full access; no reconnect replay). See [Windows VM](windows-vm.md) |
 
 Watch streams are the engine's only read surface (there is no one-shot "get
 transcript" RPC); a snapshot is "subscribe, take the first item, drop" — drop

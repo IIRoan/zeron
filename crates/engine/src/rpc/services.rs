@@ -47,6 +47,10 @@ struct SandboxEditParams {
     publish_ports: Vec<u16>,
     #[serde(default)]
     read_only: Vec<std::path::PathBuf>,
+    #[serde(default)]
+    share_github: bool,
+    #[serde(default)]
+    sign_commits: bool,
 }
 
 /// What a sandbox is set up with (`Sandbox` without its derived folders).
@@ -61,6 +65,10 @@ struct SandboxSettings {
     publish_ports: Vec<u16>,
     #[serde(default)]
     read_only: Vec<std::path::PathBuf>,
+    #[serde(default)]
+    share_github: bool,
+    #[serde(default)]
+    sign_commits: bool,
 }
 
 #[derive(Deserialize)]
@@ -345,6 +353,8 @@ impl EngineRpc {
                     host_ports: edit.host_ports,
                     publish_ports: edit.publish_ports,
                     read_only: edit.read_only,
+                    share_github: edit.share_github,
+                    sign_commits: edit.sign_commits,
                 }),
             )
             .await?;
@@ -391,6 +401,8 @@ impl EngineRpc {
                     host_ports: settings.host_ports,
                     publish_ports: settings.publish_ports,
                     read_only: settings.read_only,
+                    share_github: settings.share_github,
+                    sign_commits: settings.sign_commits,
                 };
                 tokio::task::spawn_blocking(move || {
                     crate::sandbox::enable(sandbox, true).map(|_| ())
@@ -430,13 +442,19 @@ impl EngineRpc {
                 .await?;
         }
         let suggested = root.join(".devcontainer/devcontainer.json");
-        let status = tokio::task::spawn_blocking(move || crate::sandbox::status_of(&root))
-            .await
-            .map_err(|e| RpcError::Failed(e.to_string()))?
-            .map_err(|e| RpcError::Failed(e.to_string()))?;
+        let (status, build) = tokio::task::spawn_blocking(move || {
+            (
+                crate::sandbox::status_of(&root),
+                crate::sandbox::build_of(&root),
+            )
+        })
+        .await
+        .map_err(|e| RpcError::Failed(e.to_string()))?;
+        let status = status.map_err(|e| RpcError::Failed(e.to_string()))?;
         Ok(RpcReply::Value(json!({
             "available": cfg!(target_os = "linux"),
             "sandbox": status,
+            "build": build,
             "suggestedConfig": suggested.is_file().then_some(suggested),
         })))
     }
@@ -615,12 +633,18 @@ pub(super) fn snapshot(
                 "scope": if service.is_database() { "project" } else { "checkout" },
                 "status": run.map(|r| r.status).unwrap_or(ProjectTerminalStatus::Stopped),
                 "readiness": run.and_then(|r| r.readiness),
+                "progress": snapshot.startups.iter().find(|p| p.service_id == service.id).map(|p| p.message.as_str()),
                 "exitCode": run.and_then(|r| r.exit_code),
                 "restarts": run.map(|r| r.restarts).unwrap_or(0),
                 "message": run.and_then(|r| r.message.as_deref()),
             });
             if include_config {
                 let mut config = json!({"name":service.name,"command":service.command,"directory":service.directory,"restartOnFailure":service.restart_on_failure});
+                config["dependsOn"] = json!(service.depends_on.clone().unwrap_or_else(|| {
+                    if service.is_database() { Vec::new() } else {
+                        snapshot.config.services.iter().filter(|s| s.is_database()).map(|s| s.id.clone()).collect()
+                    }
+                }));
                 if let Some(readiness) = &service.setup_prerequisite {
                     config["readinessCommand"] = json!(readiness.command);
                     config["readinessTimeoutSeconds"] = json!(readiness.timeout_seconds);

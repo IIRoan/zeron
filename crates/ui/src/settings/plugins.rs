@@ -15,7 +15,7 @@ use crate::{
 
 pub struct PluginsPage {
     scroll: widgets::PageScroll,
-    switches: [gpui::FocusHandle; 2],
+    switches: [gpui::FocusHandle; 3],
     _settings: gpui::Subscription,
 }
 
@@ -57,6 +57,7 @@ impl Render for PluginsPage {
                 let (switch, anchor) = match id {
                     PluginId::Git => ("plugin-git-toggle", SettingId::GitPlugin),
                     PluginId::Services => ("plugin-services-toggle", SettingId::ServicesPlugin),
+                    PluginId::WindowsVm => ("plugin-windows-vm-toggle", SettingId::WindowsVmPlugin),
                 };
                 widgets::card_row(&theme, ix == 0)
                     .child(

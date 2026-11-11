@@ -246,6 +246,7 @@ fn main() -> anyhow::Result<()> {
                 .into_iter()
                 .map(
                     |(id, name, directory)| zeron_proto::ProjectTerminalService {
+                        depends_on: None,
                         id: id.into(),
                         name: name.into(),
                         directory: directory.into(),

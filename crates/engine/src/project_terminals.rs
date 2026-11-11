@@ -16,6 +16,8 @@ use zeron_proto::{
 
 use crate::{EngineError, Terminals};
 
+mod startup;
+
 const MAX_SERVICES: usize = 12;
 const MAX_RESTARTS: u32 = 3;
 const RESTART_BUDGET_RESET: Duration = Duration::from_secs(60);
@@ -47,6 +49,8 @@ struct Inner {
     live: Mutex<HashMap<(String, String), LiveRun>>,
     operations: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     managed_operations: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    startups: Mutex<HashMap<String, startup::Startup>>,
+    readiness_checks: Mutex<HashMap<String, startup::ReadinessCheck>>,
 }
 
 impl Drop for Inner {
@@ -116,6 +120,8 @@ impl ProjectTerminals {
                 live: Mutex::new(HashMap::new()),
                 operations: Mutex::new(HashMap::new()),
                 managed_operations: Mutex::new(HashMap::new()),
+                startups: Mutex::new(HashMap::new()),
+                readiness_checks: Mutex::new(HashMap::new()),
             }),
         };
         store.persist()?;
@@ -157,6 +163,7 @@ impl ProjectTerminals {
             .unwrap_or_else(|e| e.into_inner());
         let Some(project) = projects.get(space) else {
             return Ok(ProjectTerminalsSnapshot {
+                startups: self.startup_progress(space),
                 config: ProjectTerminalConfig::default(),
                 runs: Vec::new(),
                 checkout: None,
@@ -164,6 +171,7 @@ impl ProjectTerminals {
         };
         check_root(project, &root)?;
         Ok(ProjectTerminalsSnapshot {
+            startups: self.startup_progress(space),
             config: project.config.clone(),
             runs: project.runs.clone(),
             checkout: project.checkout.clone(),
@@ -565,6 +573,12 @@ impl ProjectTerminals {
     /// Cancel supervision before the engine closes its PTYs, so shutdown can
     /// never be mistaken for a crash that should restart a service.
     pub fn shutdown(&self) {
+        for check in self.inner.readiness_checks.lock().unwrap_or_else(|e| e.into_inner()).values() {
+            check.token.cancel();
+        }
+        for startup in self.inner.startups.lock().unwrap_or_else(|e| e.into_inner()).values() {
+            startup.token.cancel();
+        }
         let keys = self
             .inner
             .live
@@ -605,6 +619,7 @@ impl ProjectTerminals {
     ) -> Result<ProjectTerminalsSnapshot, EngineError> {
         let mut snapshot = self.snapshot(&Self::group_key(space, checkout)?, root)?;
         let defaults = self.snapshot(space, root)?;
+        snapshot.startups.extend(defaults.startups.clone());
         snapshot.config = settings
             .services
             .clone()
@@ -721,7 +736,9 @@ impl ProjectTerminals {
         let root = root.to_path_buf();
         tokio::task::spawn_blocking(move || {
             let current = this.snapshot(&space, &root)?.config;
-            this.reconcile_configs(&environments, &space, &root, with_apps(&current, config))
+            let config = with_apps(&current, config);
+            startup::validate(&config)?;
+            this.reconcile_configs(&environments, &space, &root, config)
         })
         .await
         .map_err(|e| EngineError::Other(e.to_string()))?
@@ -736,7 +753,9 @@ impl ProjectTerminals {
         databases: Vec<ProjectTerminalService>,
     ) -> Result<(), EngineError> {
         let current = self.snapshot(space, root)?.config;
-        self.save(space, root, with_databases(&current, databases)?)?;
+        let config = with_databases(&current, databases)?;
+        startup::validate(&config)?;
+        self.save(space, root, config)?;
         Ok(())
     }
 
@@ -759,6 +778,7 @@ impl ProjectTerminals {
         let checkout = checkout.to_path_buf();
         tokio::task::spawn_blocking(move || {
             let project = this.snapshot(&space, &root)?.config;
+            startup::validate(&with_apps(&project, config.clone().unwrap_or_else(|| project.clone())))?;
             let apps = config.map(|config| ProjectTerminalConfig {
                 services: with_apps(&project, config)
                     .services
@@ -843,6 +863,7 @@ impl ProjectTerminals {
             }
             // Validate the complete visible list before touching either store.
             let config = normalize_config(config)?;
+            startup::validate(&config)?;
             if service.is_database() {
                 let mut project = this.snapshot(&space, &root)?.config;
                 let normalized = config.services.iter().find(|s| s.id == id).unwrap().clone();
@@ -904,10 +925,11 @@ impl ProjectTerminals {
         tokio::task::spawn_blocking(move || {
             // Validate both parts before writing either.
             if let Some(databases) = &databases {
-                normalize_config(with_databases(
+                let config = normalize_config(with_databases(
                     &this.snapshot(&space, &root)?.config,
                     databases.clone(),
                 )?)?;
+                startup::validate(&config)?;
             }
             environments.save(&root, checkout.as_deref(), settings)?;
             match databases {
@@ -971,16 +993,17 @@ impl ProjectTerminals {
 
     /// Infrastructure belongs to the project's main folder, outside checkout
     /// handoffs. Status polling never calls this method.
-    pub(crate) async fn ensure_setup_services(
+    pub(crate) async fn ensure_setup_services_for(
         &self,
         terminals: &Terminals,
         root: &Path,
         settings: &zeron_proto::WorktreeSettings,
         log: &Path,
         token: &CancellationToken,
+        selected: Option<&HashSet<String>>,
     ) -> Result<(), EngineError> {
         let source = canonical_root(root)?;
-        let services = {
+        let mut services = {
             let projects = self
                 .inner
                 .projects
@@ -993,17 +1016,40 @@ impl ProjectTerminals {
                     p.config
                         .services
                         .iter()
-                        .filter(|s| s.setup_prerequisite.is_some())
+                        .filter(|s| {
+                            s.is_database() && selected.is_none_or(|ids| ids.contains(&s.id))
+                        })
                         .cloned()
                         .map(|s| (space.clone(), s))
                         .collect::<Vec<_>>()
                 })
                 .collect::<Vec<_>>()
         };
+        let config = ProjectTerminalConfig {
+            services: services
+                .iter()
+                .map(|(_, service)| service.clone())
+                .collect(),
+        };
+        let ordered = startup::order(
+            &config,
+            &config
+                .services
+                .iter()
+                .map(|service| service.id.clone())
+                .collect::<Vec<_>>(),
+        )?;
+        services.sort_by_key(|(_, service)| ordered.iter().position(|id| id == &service.id));
         for (space, service) in services {
+            let _check = self.readiness_check(&space, &service.id, token.clone());
             if token.is_cancelled() {
                 return Err(EngineError::Other("Worktree setup was cancelled.".into()));
             }
+            self.startup_message(
+                &space,
+                Some(&service),
+                &format!("Waiting for {}", service.name),
+            );
             {
                 let mut projects = self
                     .inner
@@ -1144,16 +1190,286 @@ impl ProjectTerminals {
         service_id: Option<&str>,
         action: &str,
     ) -> Result<ProjectTerminalsSnapshot, EngineError> {
+        if !matches!(
+            action,
+            "start" | "stop" | "restart" | "activate" | "stop-worktree"
+        ) {
+            return Err(EngineError::Other("Unknown terminal action".into()));
+        }
+        if action == "stop-worktree" && service_id.is_some() {
+            return Err(EngineError::Other(
+                "Stop worktree services does not take a service id.".into(),
+            ));
+        }
+        let operation = self.managed_operation(space);
+        let settings = environments.effective(root, checkout)?;
+        let config = self
+            .checkout_snapshot(space, root, checkout, &settings)?
+            .config;
+        if let Some(id) = service_id
+            && !config.services.iter().any(|service| service.id == id)
+        {
+            return Err(EngineError::Other(format!("Unknown service id: {id}")));
+        }
+        let stopping = matches!(action, "stop" | "stop-worktree");
+        if stopping {
+            let cancelled_active =
+                self.cancel_startup(space, checkout, service_id, action == "stop-worktree")?;
+            // A queued start can be cancelled while an unrelated startup keeps
+            // the project lock. Stop its existing process without joining that queue.
+            if let Some(id) = service_id
+                && !cancelled_active
+                && self.has_active_startup(space)
+            {
+                let owner = if config
+                    .services
+                    .iter()
+                    .any(|s| s.id == id && s.is_database())
+                {
+                    space.to_string()
+                } else {
+                    Self::group_key(space, checkout)?
+                };
+                if self
+                    .snapshot(&owner, root)?
+                    .config
+                    .services
+                    .iter()
+                    .any(|s| s.id == id)
+                {
+                    let this = self.clone();
+                    let terminals = terminals.clone();
+                    let root = root.to_path_buf();
+                    let id = id.to_string();
+                    tokio::task::spawn_blocking(move || {
+                        this.control_in_checkout(&terminals, &owner, &root, None, Some(&id), "stop")
+                    })
+                    .await
+                    .map_err(|e| EngineError::Other(e.to_string()))??;
+                }
+                return self.checkout_snapshot(space, root, checkout, &settings);
+            }
+        }
+        let resolve_roots =
+            || -> Result<Vec<String>, EngineError> {
+                let mut roots: Vec<String> = if stopping {
+                    Vec::new()
+                } else if let Some(id) = service_id {
+                    vec![id.into()]
+                } else if action == "activate" {
+                    let key = Self::group_key(space, checkout)?;
+                    let projects = self
+                        .inner
+                        .projects
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let running: HashSet<_> = projects
+                        .iter()
+                        .filter(|(id, project)| {
+                            (*id == space || project.parent.as_deref() == Some(space))
+                                && (settings.service_mode
+                                    == zeron_proto::WorktreeServiceMode::FollowActive
+                                    || **id == key)
+                        })
+                        .flat_map(|(_, project)| project.runs.iter())
+                        .filter(|run| matches!(run.status, Status::Running | Status::Restarting))
+                        .map(|run| run.service_id.as_str())
+                        .collect();
+                    config
+                        .services
+                        .iter()
+                        .filter(|service| {
+                            !service.is_database() && running.contains(service.id.as_str())
+                        })
+                        .map(|service| service.id.clone())
+                        .collect()
+                } else {
+                    config
+                        .services
+                        .iter()
+                        .filter(|service| action != "restart" || !service.is_database())
+                        .map(|service| service.id.clone())
+                        .collect()
+                };
+                // Old profiles activated their shared databases on checkout selection.
+                if action == "activate"
+                    && config
+                        .services
+                        .iter()
+                        .all(|service| service.depends_on.is_none())
+                {
+                    roots.extend(
+                        config
+                            .services
+                            .iter()
+                            .filter(|service| service.is_database())
+                            .map(|service| service.id.clone()),
+                    );
+                }
+                if !stopping
+                    && !service_id.is_some_and(|id| {
+                        config
+                            .services
+                            .iter()
+                            .any(|s| s.id == id && s.is_database())
+                    })
+                {
+                    let key = Self::group_key(space, checkout)?;
+                    let needs_prepare = !environments.is_prepared(root, checkout)?;
+                    let variables: HashMap<_, _> = settings.variables.clone().into_iter().collect();
+                    let projects = self
+                        .inner
+                        .projects
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    for (_, project) in projects.iter().filter(|(id, p)| {
+                        (*id == space || p.parent.as_deref() == Some(space))
+                            && (*id == space
+                                || (settings.service_mode
+                                    == zeron_proto::WorktreeServiceMode::FollowActive
+                                    && **id != key)
+                                || (**id == key && (needs_prepare || p.environment != variables)))
+                    }) {
+                        for run in project.runs.iter().filter(|run| {
+                            matches!(run.status, Status::Running | Status::Restarting)
+                        }) {
+                            if config
+                                .services
+                                .iter()
+                                .any(|s| s.id == run.service_id && !s.is_database())
+                                && !roots.contains(&run.service_id)
+                            {
+                                roots.push(run.service_id.clone());
+                            }
+                        }
+                    }
+                }
+                Ok(roots)
+            };
+        let mut roots = resolve_roots()?;
+        let mut order = startup::order(&config, &roots)?;
+        let token = CancellationToken::new();
+        let startup = if stopping {
+            None
+        } else {
+            Some(self.begin_startup(space, checkout, &config, &roots, &order, token.clone())?)
+        };
+        let _guard = if stopping {
+            operation.lock().await
+        } else {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => {
+                    drop(startup);
+                    return self.checkout_snapshot(space, root, checkout, &settings);
+                }
+                guard = operation.lock() => guard,
+            }
+        };
+        let current_settings = environments.effective(root, checkout)?;
+        if !stopping
+            && (current_settings != settings
+                || self
+                    .checkout_snapshot(space, root, checkout, &current_settings)?
+                    .config
+                    != config)
+        {
+            return Err(EngineError::Other(
+                "Service settings changed while startup was queued. Try Start again.".into(),
+            ));
+        }
+        roots = resolve_roots()?;
+        order = startup::order(&config, &roots)?;
+        if let Some(startup) = &startup {
+            startup.activate(&roots, &order);
+        }
+        let result = self
+            .control_checkout_impl(
+                terminals,
+                environments,
+                space,
+                root,
+                checkout,
+                service_id,
+                action,
+                &order,
+                &token,
+            )
+            .await;
+        if let Err(error) = &result
+            && action != "activate"
+        {
+            let group = Self::group_key(space, checkout)?;
+            for id in &roots {
+                let owner = if config
+                    .services
+                    .iter()
+                    .any(|service| service.id == *id && service.is_database())
+                {
+                    space
+                } else {
+                    &group
+                };
+                let previous = self
+                    .snapshot(owner, root)?
+                    .runs
+                    .into_iter()
+                    .find(|run| run.service_id == *id);
+                if previous
+                    .as_ref()
+                    .is_none_or(|run| !matches!(run.status, Status::Running | Status::Restarting))
+                {
+                    self.update(
+                        owner,
+                        ProjectTerminalRun {
+                            service_id: id.clone(),
+                            status: if token.is_cancelled() {
+                                Status::Stopped
+                            } else {
+                                Status::Failed
+                            },
+                            exit_code: None,
+                            restarts: previous.as_ref().map_or(0, |run| run.restarts),
+                            message: (!token.is_cancelled()).then(|| error.to_string()),
+                            terminal: previous.and_then(|run| run.terminal),
+                            readiness: None,
+                        },
+                    );
+                }
+            }
+        }
+        let cancelled = token.is_cancelled();
+        drop(startup);
+        if cancelled || result.is_ok() {
+            self.checkout_snapshot(space, root, checkout, &settings)
+        } else {
+            result
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn control_checkout_impl(
+        &self,
+        terminals: &Terminals,
+        environments: &crate::worktree_settings::WorktreeSettingsStore,
+        space: &str,
+        root: &Path,
+        checkout: &Path,
+        service_id: Option<&str>,
+        action: &str,
+        order: &[String],
+        token: &CancellationToken,
+    ) -> Result<ProjectTerminalsSnapshot, EngineError> {
         let worktree_only = action == "stop-worktree";
         if worktree_only && service_id.is_some() {
-            return Err(EngineError::Other("Stop worktree services does not take a service id.".into()));
+            return Err(EngineError::Other(
+                "Stop worktree services does not take a service id.".into(),
+            ));
         }
         let action = if worktree_only { "stop" } else { action };
         if !matches!(action, "start" | "stop" | "restart" | "activate") {
             return Err(EngineError::Other("Unknown terminal action".into()));
         }
-        let operation = self.managed_operation(space);
-        let _guard = operation.lock().await;
         let settings = environments.effective(root, checkout)?;
         let config = self
             .checkout_snapshot(space, root, checkout, &settings)?
@@ -1176,27 +1492,30 @@ impl ProjectTerminals {
             let owner = space.to_string();
             let source = root.to_path_buf();
             let id = service_id.map(str::to_string);
-            let operation = action.to_string();
-            tokio::task::spawn_blocking(move || {
-                this.control_in_checkout(
-                    &startup_terminals,
-                    &owner,
-                    &source,
-                    Some(&source),
-                    id.as_deref(),
-                    &operation,
-                )
-            })
-            .await
-            .map_err(|e| EngineError::Other(e.to_string()))??;
+            let operation = if action == "restart" { "stop" } else { action }.to_string();
+            if action != "start" {
+                tokio::task::spawn_blocking(move || {
+                    this.control_in_checkout(
+                        &startup_terminals,
+                        &owner,
+                        &source,
+                        Some(&source),
+                        id.as_deref(),
+                        &operation,
+                    )
+                })
+                .await
+                .map_err(|e| EngineError::Other(e.to_string()))??;
+            }
             if action != "stop" {
                 let log = self.readiness_log(root)?;
-                self.ensure_setup_services(
+                self.ensure_setup_services_for(
                     terminals,
                     root,
                     &environments.defaults(root)?,
                     &log,
-                    &CancellationToken::new(),
+                    token,
+                    Some(&order.iter().cloned().collect()),
                 )
                 .await?;
             }
@@ -1214,7 +1533,6 @@ impl ProjectTerminals {
             .map_err(|e| EngineError::Other(e.to_string()))??;
         }
         let key = Self::group_key(space, checkout)?;
-        let mut restart = HashSet::new();
         let needs_prepare = !environments.is_prepared(root, checkout)?;
         let variables: HashMap<_, _> = settings.variables.clone().into_iter().collect();
         let groups = {
@@ -1248,7 +1566,6 @@ impl ProjectTerminals {
                 .collect::<Vec<_>>()
         };
         for (group, services) in groups {
-            restart.extend(services.iter().cloned());
             if !services.is_empty() {
                 let this = self.clone();
                 let root = root.to_path_buf();
@@ -1282,86 +1599,105 @@ impl ProjectTerminals {
                 settings.variables.clone().into_iter().collect();
             self.write(&projects)?;
         }
-        if action != "stop" {
-            if !shared.is_empty()
-                && root.canonicalize()? == checkout.canonicalize()?
-            {
-                let log = self.readiness_log(root)?;
-                self.ensure_setup_services(
-                    terminals,
-                    root,
-                    &environments.defaults(root)?,
-                    &log,
-                    &CancellationToken::new(),
-                )
-                .await?;
-            }
-            environments.activate(root, checkout).await?;
-        }
-        if action != "stop" {
-            // Validate the entire handoff before starting any replacement process.
-            for service in config.services.iter().filter(|s| {
-                s.setup_prerequisite.is_none()
-                    && (restart.contains(&s.id)
-                        || (action != "activate" && service_id.is_none_or(|id| id == s.id)))
-            }) {
-                service_directory(checkout, &service.directory)?;
-            }
-            for id in restart
-                .into_iter()
-                .filter(|id| config.services.iter().any(|s| &s.id == id))
-            {
-                let this = self.clone();
-                let terminals = terminals.clone();
-                let root = root.to_path_buf();
-                let checkout = checkout.to_path_buf();
-                let key = key.clone();
-                tokio::task::spawn_blocking(move || {
-                    this.control_in_checkout(
-                        &terminals,
-                        &key,
-                        &root,
-                        Some(&checkout),
-                        Some(&id),
-                        "start",
-                    )
-                })
-                .await
-                .map_err(|e| EngineError::Other(e.to_string()))??;
-            }
-        }
-        let this = self.clone();
-        let terminals = terminals.clone();
-        let source = root.to_path_buf();
-        let destination = checkout.to_path_buf();
-        let key = key.clone();
-        let service = service_id.map(str::to_string);
-        let action = action.to_string();
         if action != "activate" && config.services.is_empty() {
             return Err(EngineError::Other(
                 "No saved terminal services selected".into(),
             ));
         }
-        if !config
-            .services
-            .iter()
-            .any(|s| s.setup_prerequisite.is_none())
-            && service_id.is_none()
-        {
+        if action == "stop" {
+            if config.services.iter().any(|s| !s.is_database()) {
+                let this = self.clone();
+                let terminals = terminals.clone();
+                let source = root.to_path_buf();
+                let service = service_id.map(str::to_string);
+                tokio::task::spawn_blocking(move || {
+                    this.control_in_checkout(
+                        &terminals,
+                        &key,
+                        &source,
+                        None,
+                        service.as_deref(),
+                        "stop",
+                    )
+                })
+                .await
+                .map_err(|e| EngineError::Other(e.to_string()))??;
+            }
             return self.checkout_snapshot(space, root, checkout, &settings);
         }
-        tokio::task::spawn_blocking(move || {
-            this.control_in_checkout(
-                &terminals,
-                &key,
-                &source,
-                Some(&destination),
-                service.as_deref(),
-                &action,
+        check_startup_cancelled(token)?;
+        let prerequisites: HashSet<_> = order
+            .iter()
+            .filter(|id| shared.contains(*id))
+            .cloned()
+            .collect();
+        if root.canonicalize()? == checkout.canonicalize()? {
+            let log = self.readiness_log(root)?;
+            self.ensure_setup_services_for(
+                terminals,
+                root,
+                &environments.defaults(root)?,
+                &log,
+                token,
+                Some(&prerequisites),
             )
-        })
-        .await
-        .map_err(|e| EngineError::Other(e.to_string()))??;
+            .await?;
+        }
+        self.startup_message(space, None, "Preparing worktree…");
+        environments
+            .activate_for_services(root, checkout, Some(&prerequisites), Some(token))
+            .await?;
+        check_startup_cancelled(token)?;
+        for service in config
+            .services
+            .iter()
+            .filter(|s| !s.is_database() && order.contains(&s.id))
+        {
+            service_directory(checkout, &service.directory)?;
+        }
+        for id in order {
+            check_startup_cancelled(token)?;
+            let service = config
+                .services
+                .iter()
+                .find(|s| s.id == *id)
+                .expect("validated dependency");
+            if service.is_database() {
+                self.startup_finished(space, id);
+                continue;
+            }
+            self.startup_message(
+                space,
+                Some(service),
+                &format!("Waiting for {}", service.name),
+            );
+            let this = self.clone();
+            let terminals = terminals.clone();
+            let source = root.to_path_buf();
+            let destination = checkout.to_path_buf();
+            let group = key.clone();
+            let id = id.clone();
+            // Dependencies are reused. Only the requested services restart.
+            let action = if action == "restart" && service_id.is_none_or(|selected| selected == id)
+            {
+                "restart"
+            } else {
+                "start"
+            };
+            tokio::task::spawn_blocking(move || {
+                this.control_in_checkout(
+                    &terminals,
+                    &group,
+                    &source,
+                    Some(&destination),
+                    Some(&id),
+                    action,
+                )
+            })
+            .await
+            .map_err(|e| EngineError::Other(e.to_string()))??;
+            self.startup_finished(space, &service.id);
+        }
         self.checkout_snapshot(space, root, checkout, &settings)
     }
 
@@ -1600,6 +1936,14 @@ fn warm_login_path() {
     let _ = zeron_harness::composed_login_shell_path();
 }
 
+fn check_startup_cancelled(token: &CancellationToken) -> Result<(), EngineError> {
+    if token.is_cancelled() {
+        Err(EngineError::Other("Service startup was cancelled.".into()))
+    } else {
+        Ok(())
+    }
+}
+
 fn canonical_root(root: &Path) -> Result<String, EngineError> {
     let path = std::fs::canonicalize(root)
         .map_err(|_| EngineError::Other("Project directory is unavailable".into()))?;
@@ -1635,6 +1979,7 @@ fn edited_service(
             command,
             directory,
             restart_on_failure,
+            depends_on,
             readiness_command,
             readiness_timeout_seconds,
         } => {
@@ -1655,6 +2000,7 @@ fn edited_service(
                 }
             };
             Ok(ProjectTerminalService {
+                depends_on: Some(depends_on.unwrap_or_default()),
                 id: uuid::Uuid::new_v4().to_string(),
                 name,
                 command,
@@ -1677,6 +2023,7 @@ fn edited_service(
                 && changes.command.is_none()
                 && changes.directory.is_none()
                 && changes.restart_on_failure.is_none()
+                && changes.depends_on.is_none()
                 && changes.readiness_command.is_none()
                 && changes.readiness_timeout_seconds.is_none()
             {
@@ -1695,6 +2042,9 @@ fn edited_service(
             }
             if let Some(value) = changes.restart_on_failure {
                 service.restart_on_failure = value;
+            }
+            if let Some(value) = changes.depends_on {
+                service.depends_on = Some(value);
             }
             if changes.readiness_command.is_some() || changes.readiness_timeout_seconds.is_some() {
                 let readiness = service.setup_prerequisite.as_mut().ok_or_else(|| {
@@ -1823,6 +2173,13 @@ pub fn normalize_config(
                 return invalid(format!(
                     "The readiness timeout for “{name}” must be between 1 and 7200 seconds."
                 ));
+            }
+        }
+        if let Some(dependencies) = &service.depends_on {
+            let mut seen = HashSet::new();
+            if dependencies.len() > MAX_SERVICES || dependencies.iter().any(|id|
+                id.trim().is_empty() || id.len() > 96 || id == &service.id || !seen.insert(id)) {
+                return invalid(format!("Choose each startup requirement for “{name}” once, without the service itself."));
             }
         }
     }

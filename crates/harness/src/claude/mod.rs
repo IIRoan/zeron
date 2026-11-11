@@ -543,6 +543,16 @@ impl ClaudeHarness {
             if let Some(config) = mcp_servers_config_arg(request.mcp.as_ref(), &request.extra_mcp) {
                 cmd.args(["--mcp-config", &config]);
             }
+            // In a project sandbox the CLI has a home of its own: this
+            // machine's plugins load from the container's read-only mount.
+            if request.env.contains_key(zeron_proto::sandbox::SPEC_ENV) {
+                let home = crate::executable::home_or_current_dir();
+                for dir in
+                    crate::sandbox::claude_plugin_dirs(&home, std::path::Path::new(&request.cwd))
+                {
+                    cmd.arg("--plugin-dir").arg(dir);
+                }
+            }
             // When to say it waits on background work (the Zeron tool
             // `wait_on_background`), where that tool is offered. Its own
             // description and the server's instructions say so too, but

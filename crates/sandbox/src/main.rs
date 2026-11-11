@@ -55,6 +55,8 @@ fn main() {
         Some("idle") => loop {
             thread::sleep(Duration::from_secs(3600));
         },
+        // As git's `gpg.program` (`--status-fd=2 -bsau <key>`).
+        Some(arg) if arg.starts_with("--") => gpg(&args),
         _ => {
             eprintln!("usage: zeron-sandbox exec|guard|relay|idle ...");
             2
@@ -389,6 +391,60 @@ fn relay(args: &[String]) -> i32 {
     0
 }
 
+/// The socket this machine signs commits on, when the sandbox has signing on.
+const SIGN_ENV: &str = "ZERON_SIGN_SOCKET";
+
+/// git's `gpg.program` in a sandbox: what git signs goes to this machine,
+/// which signs commits and tags only, with its own key. Its answer is
+/// `<exit code>\n<stderr length>\n<stderr><stdout>`: gpg's status lines on
+/// stderr (git reads `SIG_CREATED` there), the signature on stdout.
+fn gpg(args: &[String]) -> i32 {
+    let Some(socket) = std::env::var_os(SIGN_ENV) else {
+        eprintln!(
+            "gpg: this sandbox doesn't sign commits: turn on Sign commits in the project's sandbox settings"
+        );
+        return 2;
+    };
+    let mut stream = match UnixStream::connect(&socket) {
+        Ok(stream) => stream,
+        Err(error) => {
+            eprintln!("gpg: this machine's signing isn't reachable: {error}");
+            return 2;
+        }
+    };
+    let request = format!("{}\n\n", args.join("\n"));
+    if stream.write_all(request.as_bytes()).is_err() {
+        return 2;
+    }
+    pump(io::stdin(), &stream);
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let mut reply = Vec::new();
+    if stream.read_to_end(&mut reply).is_err() {
+        return 2;
+    }
+    match signed(&reply) {
+        Some((code, stderr, stdout)) => {
+            let _ = io::stderr().write_all(stderr);
+            let _ = io::stdout().write_all(stdout);
+            let _ = io::stdout().flush();
+            code
+        }
+        None => {
+            eprintln!("gpg: this machine's signing answered nonsense");
+            2
+        }
+    }
+}
+
+/// `<code>\n<stderr length>\n<stderr><stdout>` as its parts.
+fn signed(reply: &[u8]) -> Option<(i32, &[u8], &[u8])> {
+    let mut parts = reply.splitn(3, |b| *b == b'\n');
+    let code = std::str::from_utf8(parts.next()?).ok()?.parse().ok()?;
+    let length: usize = std::str::from_utf8(parts.next()?).ok()?.parse().ok()?;
+    let rest = parts.next()?;
+    (rest.len() >= length).then(|| (code, &rest[..length], &rest[length..]))
+}
+
 /// Copies `from` to `to` as data arrives, until either end closes. Not
 /// `io::copy`: between a unix socket and a pipe it splices, and that holds
 /// what it read until the socket's EOF, so an MCP request sat unanswered
@@ -435,6 +491,17 @@ mod tests {
         let mut reply = [0u8; 9];
         reader.read_exact(&mut reply).unwrap();
         assert_eq!(&reply, b"{\"id\":1}\n");
+    }
+
+    #[test]
+    fn a_signing_answer_splits_into_code_status_and_signature() {
+        let reply = b"0\n24\n[GNUPG:] SIG_CREATED D \n-----BEGIN PGP SIGNATURE-----\n";
+        let (code, stderr, stdout) = signed(reply).unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(stderr, b"[GNUPG:] SIG_CREATED D \n");
+        assert_eq!(stdout, b"-----BEGIN PGP SIGNATURE-----\n");
+        assert!(signed(b"1\n99\nshort").is_none());
+        assert!(signed(b"nonsense").is_none());
     }
 
     #[test]

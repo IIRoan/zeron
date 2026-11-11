@@ -79,6 +79,8 @@ settings_index! {
         "plugin enable disable source control staging unstaging branches checkout stashes history syntax diffs"),
     (ServicesPlugin, Plugins, None, "Services",
         "plugin enable disable project services servers databases start stop restart output terminals"),
+    (WindowsVmPlugin, Plugins, None, "Windows VM",
+        "plugin enable disable virtual machine vm windows ports viewer environment sandbox"),
     (WorktreeLocation, General, Some("Git"), "Custom worktree location",
         "folder directory path checkout branches"),
     (CommitCredit, General, Some("Git"), "Credit Zeron in commits",

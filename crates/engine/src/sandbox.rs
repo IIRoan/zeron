@@ -27,6 +27,11 @@ use zeron_proto::{HarnessId, RunRequest};
 
 use crate::EngineError;
 
+#[cfg(unix)]
+mod docker;
+#[cfg(unix)]
+mod sign;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Sandbox {
@@ -48,6 +53,14 @@ pub struct Sandbox {
     /// read-only so agents can't change what the host runs.
     #[serde(default)]
     pub read_only: Vec<PathBuf>,
+    /// Hand agents this machine's GitHub login (`gh`'s token), so `gh` and
+    /// git over HTTPS work there with everything that login may do.
+    #[serde(default)]
+    pub share_github: bool,
+    /// Sign agents' commits and tags there with this machine's signing key
+    /// (its git's `user.signingkey`), which never goes in ([`sign`]).
+    #[serde(default)]
+    pub sign_commits: bool,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -149,6 +162,12 @@ pub fn for_path(path: &Path) -> Result<Option<Sandbox>, EngineError> {
     Ok(None)
 }
 
+/// What names a project's container, image and run folder.
+fn key_of(root: &Path) -> String {
+    let digest = Sha256::digest(root.to_string_lossy().as_bytes());
+    digest.iter().take(6).map(|b| format!("{b:02x}")).collect()
+}
+
 /// `path` as the container sees it (same-path mounts of resolved folders).
 pub fn container_path(path: &Path) -> String {
     resolve(path).to_string_lossy().into_owned()
@@ -156,8 +175,7 @@ pub fn container_path(path: &Path) -> String {
 
 impl Sandbox {
     fn key(&self) -> String {
-        let digest = Sha256::digest(self.root.to_string_lossy().as_bytes());
-        digest.iter().take(6).map(|b| format!("{b:02x}")).collect()
+        key_of(&self.root)
     }
 
     pub fn container(&self) -> String {
@@ -369,12 +387,49 @@ impl Sandbox {
         ]
         .map(String::from)
         .into();
+        // Docker there reads this project's containers here, nothing more
+        // (`docker`, served by [`ensure`]).
+        args.extend([
+            "-e".into(),
+            format!(
+                "DOCKER_HOST=unix://{}",
+                path(&self.run_dir().join("docker.sock"))
+            ),
+        ]);
+        if self.sign_commits {
+            args.extend([
+                "-e".into(),
+                format!(
+                    "ZERON_SIGN_SOCKET={}",
+                    path(&self.run_dir().join("sign.sock"))
+                ),
+            ]);
+        }
         args.extend(["-v".into(), format!("{container}-home:/home/zeron:U")]);
         for dir in [&self.root, &self.worktrees] {
             args.extend(["-v".into(), format!("{0}:{0}", path(dir))]);
         }
         args.extend(["-v".into(), format!("{0}:{0}:ro", path(&self.run_dir()))]);
         args.extend(["-v".into(), format!("{}:{GUARD}:ro", path(helper))]);
+        // Login shells (agents, terminals) search `<run dir>/bin` last, where
+        // the harness puts this machine's Claude Code and Codex: an image
+        // with its own uses those ([`profile`]).
+        args.extend([
+            "-v".into(),
+            format!(
+                "{}:/etc/profile.d/zz-zeron-sandbox.sh:ro",
+                path(&self.run_dir().join("profile.sh"))
+            ),
+        ]);
+        // This machine's skills and Claude Code plugins, read-only at their
+        // own paths (agents here never change what agents there load):
+        // plugin runs name them (`--plugin-dir`), and the home links to the
+        // skill folders ([`link_skills`]). Not mounted in the home itself:
+        // podman would make the folders above root's, so a new home's
+        // `~/.claude` would be unwritable.
+        for folder in skill_folders() {
+            args.extend(["-v".into(), format!("{0}:{0}:ro", path(&folder))]);
+        }
         for (mount, read_only) in self.mounts()? {
             let ro = if read_only { ":ro" } else { "" };
             args.extend(["-v".into(), format!("{0}:{0}{ro}", path(&mount))]);
@@ -387,6 +442,52 @@ impl Sandbox {
         ]);
         Ok(args)
     }
+}
+
+/// This machine's skill folders and Claude Code plugin installs, those that
+/// exist.
+fn skill_folders() -> Vec<PathBuf> {
+    let home = crate::repos::home_dir();
+    [".claude/skills", ".agents/skills", ".claude/plugins/cache"]
+        .into_iter()
+        .map(|folder| home.join(folder))
+        .filter(|folder| folder.is_dir())
+        .collect()
+}
+
+/// Links the container's `~/.claude/skills` and `~/.agents/skills`, where its
+/// CLIs look, to this machine's (mounted read-only, [`Sandbox::run_args`]).
+/// Made from inside, as its user; one its home already has stays.
+fn link_skills(container: &str) -> Result<(), EngineError> {
+    let home = crate::repos::home_dir();
+    let mut pairs = Vec::new();
+    for folder in [".claude/skills", ".agents/skills"] {
+        let host = home.join(folder);
+        if host.is_dir() {
+            pairs.extend([folder.to_owned(), host.to_string_lossy().into_owned()]);
+        }
+    }
+    if pairs.is_empty() {
+        return Ok(());
+    }
+    let mut args = vec![
+        "exec",
+        container,
+        "sh",
+        "-c",
+        r#"cd && while [ $# -gt 1 ]; do mkdir -p "$(dirname "$1")" && { [ -e "$1" ] || [ -L "$1" ] || ln -s "$2" "$1"; }; shift 2; done"#,
+        "sh",
+    ];
+    args.extend(pairs.iter().map(String::as_str));
+    podman(&args).map(|_| ())
+}
+
+/// The container's `/etc/profile.d` script: `<run dir>/bin` last on `PATH`.
+fn profile(run_dir: &Path) -> String {
+    format!(
+        "# Zeron: this machine's Claude Code and Codex, for an image without its own.\ncase \":$PATH:\" in *\":{0}:\"*) ;; *) PATH=\"$PATH:{0}\"; export PATH ;; esac\n",
+        run_dir.join("bin").display()
+    )
 }
 
 /// The helper on the host: beside Zeron, or `ZERON_SANDBOX_HELPER`.
@@ -442,6 +543,15 @@ pub fn ensure(sandbox: &Sandbox) -> Result<Spec, EngineError> {
     let helper = helper()?;
     std::fs::create_dir_all(sandbox.run_dir().join("scripts"))?;
     std::fs::create_dir_all(&sandbox.worktrees)?;
+    #[cfg(unix)]
+    docker::serve(
+        &sandbox.run_dir().join("docker.sock"),
+        [sandbox.root.clone(), sandbox.worktrees.clone()],
+    );
+    #[cfg(unix)]
+    if sandbox.sign_commits {
+        sign::serve(&sandbox.run_dir().join("sign.sock"));
+    }
     let image = podman(&["image", "inspect", "--format", "{{.Id}}", &sandbox.image()]).map_err(|_| {
         EngineError::Other(format!(
             "This project's sandbox image isn't built. Run: zeron sandbox enable {} --config {}",
@@ -450,9 +560,16 @@ pub fn ensure(sandbox: &Sandbox) -> Result<Spec, EngineError> {
         ))
     })?;
     let mut args = sandbox.run_args(&helper, &image)?;
+    std::fs::write(
+        sandbox.run_dir().join("profile.sh"),
+        profile(&sandbox.run_dir()),
+    )?;
     let conf = sandbox.run_dir().join("containers.conf");
     let pasta = sandbox.pasta_conf();
-    let hash: String = Sha256::digest(format!("{}\0{pasta}", args.join("\0")).as_bytes())
+    // With the GitHub setting: switching it recreates the container, which
+    // hands the login over or takes it back ([`github_login`]).
+    let settings = format!("{}\0{pasta}\0{}", args.join("\0"), sandbox.share_github);
+    let hash: String = Sha256::digest(settings.as_bytes())
         .iter()
         .take(8)
         .map(|b| format!("{b:02x}"))
@@ -493,14 +610,164 @@ pub fn ensure(sandbox: &Sandbox) -> Result<Spec, EngineError> {
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
+    if let Err(error) = link_skills(&container) {
+        tracing::warn!(%error, "sandbox: couldn't link this machine's skills");
+    }
+    if let Err(error) = github_login(&container, sandbox) {
+        tracing::warn!(%error, "sandbox: couldn't hand over or take back the GitHub login");
+    }
+    if let Err(error) = commit_signing(&container, sandbox.sign_commits) {
+        tracing::warn!(%error, "sandbox: couldn't set up commit signing");
+    }
     Ok(spec)
+}
+
+/// With [`Sandbox::sign_commits`], git in the container signs through the
+/// helper ([`sign`]), as this machine's git would: its signing key's id and
+/// its `commit.gpgsign`/`tag.gpgsign`. Without, git there is left unsigned.
+fn commit_signing(container: &str, sign: bool) -> Result<(), EngineError> {
+    const UNSET: &str = "for key in gpg.program gpg.format user.signingkey commit.gpgsign tag.gpgsign; do git config --global --unset-all \"$key\"; done; true";
+    if !sign {
+        return podman(&["exec", container, "sh", "-c", UNSET]).map(|_| ());
+    }
+    let global = |key: &str| {
+        Command::new("git")
+            .args(["config", "--global", "--get", key])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+            .filter(|v| !v.is_empty())
+    };
+    let key = global("user.signingkey")
+        .ok_or_else(|| EngineError::Other("This machine's git has no user.signingkey".into()))?;
+    let on = |key: &str| global(key).is_some_and(|v| v == "true").to_string();
+    podman(&[
+        "exec",
+        container,
+        "sh",
+        "-c",
+        r#"git config --global gpg.program "$1" && git config --global gpg.format openpgp && git config --global user.signingkey "$2" && git config --global commit.gpgsign "$3" && git config --global tag.gpgsign "$4""#,
+        "sh",
+        GUARD,
+        &key,
+        &on("commit.gpgsign"),
+        &on("tag.gpgsign"),
+    ])
+    .map(|_| ())
+}
+
+/// With [`Sandbox::share_github`], one of this machine's GitHub logins goes
+/// into the container's home: the account that can read the project's GitHub
+/// `origin`, else `gh`'s active one. It lands in `gh`'s hosts file for any
+/// `gh` there, and in git's credential store with GitHub's SSH remotes read
+/// over HTTPS (no SSH key goes in). Without the setting, both are taken out
+/// again. Written from inside, as its user ([`install_login`]).
+fn github_login(container: &str, sandbox: &Sandbox) -> Result<(), EngineError> {
+    const FORGET: &str = "rm -f ~/.git-credentials ~/.config/gh/hosts.yml; git config --global --unset-all credential.https://github.com.helper; git config --global --unset-all url.https://github.com/.insteadof; true";
+    if !sandbox.share_github {
+        return podman(&["exec", container, "sh", "-c", FORGET]).map(|_| ());
+    }
+    let gh = |args: &[&str], token: Option<&str>| -> Option<String> {
+        let mut cmd = Command::new("gh");
+        if let Some(path) = zeron_harness::composed_login_shell_path() {
+            cmd.env("PATH", path);
+        }
+        if let Some(token) = token {
+            cmd.env("GH_TOKEN", token);
+        }
+        let output = cmd
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|output| output.status.success())?;
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    };
+    // The active account first.
+    let status: serde_json::Value = gh(&["auth", "status", "--json", "hosts"], None)
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default();
+    let mut accounts: Vec<(bool, String)> = status["hosts"]["github.com"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|a| Some((a["active"] != true, a["login"].as_str()?.to_owned())))
+        .collect();
+    accounts.sort();
+    let logins: Vec<(String, String)> = accounts
+        .into_iter()
+        .filter_map(|(_, user)| {
+            let token = gh(&["auth", "token", "-h", "github.com", "-u", &user], None)?;
+            (!token.is_empty()).then_some((user, token))
+        })
+        .collect();
+    let repo = github_repo(&sandbox.root);
+    let (user, token) = logins
+        .iter()
+        .find(|(_, token)| {
+            repo.as_ref().is_some_and(|repo| {
+                gh(&["api", &format!("repos/{repo}"), "--silent"], Some(token)).is_some()
+            })
+        })
+        .or(logins.first())
+        .ok_or_else(|| {
+            EngineError::Other(
+                "This machine's gh isn't signed in to github.com (gh auth login)".into(),
+            )
+        })?;
+    install_login(
+        container,
+        ".config/gh/hosts.yml",
+        &format!(
+            "github.com:\n    users:\n        {user}:\n            oauth_token: {token}\n    git_protocol: https\n    user: {user}\n    oauth_token: {token}\n"
+        ),
+    )?;
+    install_login(
+        container,
+        ".git-credentials",
+        &format!("https://x-access-token:{token}@github.com\n"),
+    )?;
+    podman(&[
+        "exec",
+        container,
+        "sh",
+        "-c",
+        "git config --global --replace-all credential.https://github.com.helper store && git config --global --unset-all url.https://github.com/.insteadof; git config --global --add url.https://github.com/.insteadOf git@github.com: && git config --global --add url.https://github.com/.insteadOf ssh://git@github.com/",
+    ])
+    .map(|_| ())
+}
+
+/// `owner/repo` of the project's `origin`, when it's on GitHub (read from
+/// its `.git/config`, which agents can't change).
+fn github_repo(root: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["config", "--file"])
+        .arg(root.join(".git/config"))
+        .args(["--get", "remote.origin.url"])
+        .output()
+        .ok()?;
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    [
+        "git@github.com:",
+        "ssh://git@github.com/",
+        "https://github.com/",
+    ]
+    .iter()
+    .find_map(|prefix| url.strip_prefix(prefix))
+    .map(|path| {
+        path.trim_end_matches('/')
+            .trim_end_matches(".git")
+            .to_owned()
+    })
+    .filter(|path| path.contains('/'))
 }
 
 /// Ports this machine keeps for itself: a server in a sandbox never takes
 /// them here, even while they're free. On Zeron's IPC port it would answer
 /// the app as the engine; on a login's fixed callback port (ChatGPT's 1455),
 /// the browser; on a host port, the container's own clients.
-fn reserved_ports(host_ports: &[u16]) -> Vec<u16> {
+pub(crate) fn reserved_ports(host_ports: &[u16]) -> Vec<u16> {
     let ipc = std::env::var("ZERON_IPC_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
@@ -1212,50 +1479,157 @@ pub fn enable(mut sandbox: Sandbox, log_to_file: bool) -> Result<Status, EngineE
             .map_err(|e| EngineError::Other(format!("{what} {}: {e}", path.display())))
     };
     sandbox.root = real(&sandbox.root, "Project folder")?;
-    sandbox.config = real(&sandbox.config, "Devcontainer config")?;
-    std::fs::create_dir_all(&sandbox.worktrees)?;
-    sandbox.worktrees = real(&sandbox.worktrees, "Worktrees folder")?;
-    let projects = load()?;
-    let protected = sandbox.protected()?;
-    sandbox.check_input(&sandbox.config, &projects, &protected)?;
-    for input in sandbox.image_inputs()? {
-        sandbox.check_input(&input, &projects, &protected)?;
-    }
-    let mut build = devcontainer(&sandbox, "build");
-    build.args(["--image-name", &sandbox.image()]);
+    let _building = Building::start(&sandbox.root);
+    // With `log_to_file`, the build log says each step as it starts (what
+    // the app shows while it runs, [`build_of`]) and how it ended.
     let log = sandbox.build_log();
-    if log_to_file {
-        std::fs::create_dir_all(sandbox.run_dir())?;
-        let file = std::fs::File::create(&log)?;
-        build
-            .stdout(file.try_clone()?)
-            .stderr(file)
-            .stdin(std::process::Stdio::null());
+    let file = match log_to_file {
+        true => {
+            std::fs::create_dir_all(sandbox.run_dir())?;
+            Some(std::fs::File::create(&log)?)
+        }
+        false => None,
+    };
+    let step = |text: &str| {
+        if let Some(mut file) = file.as_ref() {
+            let _ = std::io::Write::write_all(&mut file, format!("▸ {text}\n").as_bytes());
+        }
+    };
+    let result = (|| -> Result<Status, EngineError> {
+        step("Checking the devcontainer config");
+        sandbox.config = real(&sandbox.config, "Devcontainer config")?;
+        std::fs::create_dir_all(&sandbox.worktrees)?;
+        sandbox.worktrees = real(&sandbox.worktrees, "Worktrees folder")?;
+        let projects = load()?;
+        let protected = sandbox.protected()?;
+        sandbox.check_input(&sandbox.config, &projects, &protected)?;
+        for input in sandbox.image_inputs()? {
+            sandbox.check_input(&input, &projects, &protected)?;
+        }
+        step("Building the image (devcontainer build)");
+        let mut build = devcontainer(&sandbox, "build");
+        build.args(["--image-name", &sandbox.image()]);
+        if let Some(file) = &file {
+            build
+                .stdout(file.try_clone()?)
+                .stderr(file.try_clone()?)
+                .stdin(std::process::Stdio::null());
+        }
+        let status = build.status().map_err(|e| {
+            EngineError::Other(format!(
+                "devcontainer CLI: {e} (install @devcontainers/cli)"
+            ))
+        })?;
+        if !status.success() {
+            let tail = match log_to_file {
+                true => {
+                    let text = log_tail(&log);
+                    let lines: Vec<&str> = text.lines().collect();
+                    format!(":\n{}", lines[lines.len().saturating_sub(15)..].join("\n"))
+                }
+                false => String::new(),
+            };
+            return Err(EngineError::Other(format!(
+                "devcontainer build failed{tail}"
+            )));
+        }
+        step("Starting the container");
+        let mut projects = projects;
+        projects.retain(|s| s.root != sandbox.root);
+        projects.push(sandbox.clone());
+        save(projects)?;
+        ensure(&sandbox)?;
+        Ok(sandbox.status())
+    })();
+    match &result {
+        Ok(_) => step("Ready"),
+        Err(error) => step(&format!("Failed: {error}")),
     }
-    let status = build.status().map_err(|e| {
-        EngineError::Other(format!(
-            "devcontainer CLI: {e} (install @devcontainers/cli)"
-        ))
-    })?;
-    if !status.success() {
-        let tail = match log_to_file {
-            true => {
-                let text = std::fs::read_to_string(&log).unwrap_or_default();
-                let lines: Vec<&str> = text.lines().collect();
-                format!(":\n{}", lines[lines.len().saturating_sub(15)..].join("\n"))
-            }
-            false => String::new(),
-        };
-        return Err(EngineError::Other(format!(
-            "devcontainer build failed{tail}"
-        )));
+    result
+}
+
+/// Projects whose sandbox [`enable`] is building now.
+static BUILDING: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// `root` in [`BUILDING`] while it lives.
+struct Building(PathBuf);
+
+impl Building {
+    fn start(root: &Path) -> Self {
+        let mut building = BUILDING.lock().unwrap_or_else(|e| e.into_inner());
+        building.push(root.to_path_buf());
+        Self(root.to_path_buf())
     }
-    let mut projects = projects;
-    projects.retain(|s| s.root != sandbox.root);
-    projects.push(sandbox.clone());
-    save(projects)?;
-    ensure(&sandbox)?;
-    Ok(sandbox.status())
+}
+
+impl Drop for Building {
+    fn drop(&mut self) {
+        let mut building = BUILDING.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = building.iter().position(|root| *root == self.0) {
+            building.remove(at);
+        }
+    }
+}
+
+/// A project's image build as the app shows it: whether one runs now, and
+/// the end of its log.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Build {
+    pub running: bool,
+    pub log: String,
+}
+
+/// The build of the project at `root`, sandboxed yet or not.
+pub fn build_of(root: &Path) -> Build {
+    let root = resolve(root);
+    Build {
+        running: BUILDING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&root),
+        log: log_tail(
+            &data_dir()
+                .join("sandbox")
+                .join(key_of(&root))
+                .join("build.log"),
+        ),
+    }
+}
+
+/// The last 64 KiB of a build log as it reads in a terminal: colours out, and
+/// of a line redrawn in place (`\r`, progress bars) only its last state.
+fn log_tail(path: &Path) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL: u64 = 64 * 1024;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let length = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut bytes = Vec::new();
+    if file
+        .seek(SeekFrom::Start(length.saturating_sub(TAIL)))
+        .is_err()
+        || file.read_to_end(&mut bytes).is_err()
+    {
+        return String::new();
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    // Cut mid-line: start at the next whole one.
+    let text = match length > TAIL {
+        true => text.split_once('\n').map_or("", |(_, rest)| rest),
+        false => &text,
+    };
+    zeron_proto::redact::strip_ansi(text)
+        .lines()
+        .map(|line| {
+            line.trim_end_matches('\r')
+                .rsplit('\r')
+                .next()
+                .unwrap_or("")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Unregister the project and remove its container. Its image and home
@@ -1287,6 +1661,8 @@ mod tests {
             host_ports: vec![5432],
             publish_ports: vec![3000],
             read_only: vec!["compose.yaml".into()],
+            share_github: false,
+            sign_commits: false,
         }
     }
 
@@ -1464,6 +1840,41 @@ mod tests {
             };
             let refused = linked.mounts().unwrap_err().to_string();
             assert!(refused.contains("is a symlink"), "{refused}");
+        }
+    }
+
+    #[test]
+    fn a_build_log_reads_as_its_terminal_showed_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("build.log");
+        std::fs::write(
+            &path,
+            "▸ Building\n\x1b[32mSTEP 1/2\x1b[0m\r\n10%\r55%\r100%\n",
+        )
+        .unwrap();
+        assert_eq!(log_tail(&path), "▸ Building\nSTEP 1/2\n100%");
+        // Past 64 KiB, the tail starts at the first whole line.
+        std::fs::write(&path, format!("{}\nlast\n", "x".repeat(70 * 1024))).unwrap();
+        assert_eq!(log_tail(&path), "last");
+        assert_eq!(log_tail(&temp.path().join("none")), "");
+    }
+
+    #[test]
+    fn a_github_origin_names_its_owner_and_repo() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join(".git")).unwrap();
+        for (url, repo) in [
+            ("git@github.com:o/r.git", Some("o/r")),
+            ("ssh://git@github.com/o/r.git", Some("o/r")),
+            ("https://github.com/o/r/", Some("o/r")),
+            ("git@gitlab.com:o/r.git", None),
+        ] {
+            std::fs::write(
+                temp.path().join(".git/config"),
+                format!("[remote \"origin\"]\n\turl = {url}\n"),
+            )
+            .unwrap();
+            assert_eq!(github_repo(temp.path()).as_deref(), repo, "{url}");
         }
     }
 

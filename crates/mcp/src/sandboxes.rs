@@ -23,7 +23,7 @@ pub fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: ENABLE,
-            description: "Run a project's agents (Claude Code, Codex), app services, worktree setup commands, project actions and terminals in a container built from a devcontainer config (Linux, rootless podman, devcontainer CLI). Its worktrees are included; shared databases stay on this machine. Builds the image and starts the container: it can take minutes. If the call times out, check sandbox_status: the build carries on. Calling it again for a sandboxed project replaces its settings. Use the project's own devcontainer config (its folder is then mounted read-only; list the compose file or Dockerfile it names elsewhere in the project in readOnly), or write one outside every project. Its image must already hold the agent CLIs and the project's toolchain: Zeron runs no lifecycle commands (onCreateCommand and the like). Agents there use this machine's Claude Code and Codex logins (access tokens only; this machine refreshes them). Refused from a chat inside a sandbox, and without full access outside read-only/plan mode.",
+            description: "Run a project's agents (Claude Code, Codex), app services, worktree setup commands, project actions and terminals in a container built from a devcontainer config (Linux, rootless podman, devcontainer CLI). Its worktrees are included; shared databases stay on this machine. Builds the image and starts the container: it can take minutes. If the call times out, check sandbox_status: the build carries on. Calling it again for a sandboxed project replaces its settings. Use the project's own devcontainer config (its folder is then mounted read-only; list the compose file or Dockerfile it names elsewhere in the project in readOnly), or write one outside every project. Its image must already hold the project's toolchain: Zeron runs no lifecycle commands (onCreateCommand and the like). Without claude or codex of its own, agents there run this machine's. Agents there use this machine's Claude Code and Codex logins (access tokens only; this machine refreshes them). Refused from a chat inside a sandbox, and without full access outside read-only/plan mode.",
             input_schema: json!({
                 "type":"object",
                 "properties":{
@@ -31,7 +31,9 @@ pub fn catalog() -> Vec<ToolDef> {
                     "config":{"type":"string","description":"Absolute path of the devcontainer.json: in this project's main folder, or outside every sandboxed project."},
                     "hostPorts": ports("Ports on this machine the container reaches on its localhost (databases)."),
                     "publishPorts": ports("Container ports this machine reaches on its localhost (dev servers)."),
-                    "readOnly":{"type":"array","items":{"type":"string"},"description":"Paths relative to the project that this machine reads (a database's compose file, a bunfig.toml its checks load), mounted read-only so agents can't change them. .git config and hooks always are."}
+                    "readOnly":{"type":"array","items":{"type":"string"},"description":"Paths relative to the project that this machine reads (a database's compose file, a bunfig.toml its checks load), mounted read-only so agents can't change them. .git config and hooks always are."},
+                    "shareGithub":{"type":"boolean","description":"Hand agents there this machine's GitHub login (gh's token) so gh and git over HTTPS work, with everything that login may do. Off by default."},
+                    "signCommits":{"type":"boolean","description":"Sign agents' commits and tags there with this machine's signing key (git's user.signingkey), which never goes in: only git commits and tags are signed. Off by default."}
                 },
                 "required":["config"],
                 "additionalProperties":false
@@ -64,7 +66,14 @@ pub async fn call(zeron: &Zeron, name: &str, args: Value) -> anyhow::Result<Valu
             request["spaceId"] = json!(zeron.resolve_space(key).await?.id);
         }
         request["enabled"] = json!(name == ENABLE);
-        for key in ["config", "hostPorts", "publishPorts", "readOnly"] {
+        for key in [
+            "config",
+            "hostPorts",
+            "publishPorts",
+            "readOnly",
+            "shareGithub",
+            "signCommits",
+        ] {
             if let Some(value) = args.remove(key) {
                 ensure!(name == ENABLE, "{name} takes only a project");
                 request[key] = value;

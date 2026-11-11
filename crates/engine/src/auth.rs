@@ -1804,7 +1804,7 @@ fn url_encode(input: &str) -> String {
     out
 }
 
-fn url_decode(input: &str) -> String {
+pub(crate) fn url_decode(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;

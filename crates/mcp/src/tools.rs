@@ -826,6 +826,7 @@ impl Tools {
         if in_chat { catalog.extend(crate::services::catalog()); }
         if in_chat { catalog.extend(crate::worktrees::catalog()); }
         if in_chat { catalog.extend(crate::sandboxes::catalog()); }
+        if in_chat { catalog.extend(crate::vm::catalog()); }
         catalog
             .into_iter()
             .filter(|tool| match tool.name {
@@ -845,6 +846,9 @@ impl Tools {
     pub async fn call(&self, name: &str, args: Value) -> Result<Value, String> {
         if crate::services::NAMES.contains(&name) {
             return crate::services::call(&self.zeron, name, args).await.map_err(|error| format!("{error:#}"));
+        }
+        if crate::vm::NAMES.contains(&name) {
+            return crate::vm::call(&self.zeron, name, args).await.map_err(|error| format!("{error:#}"));
         }
         if name.starts_with("browser_") {
             return crate::browser::call(&self.zeron, name, args).await.map_err(|error| format!("{error:#}"));

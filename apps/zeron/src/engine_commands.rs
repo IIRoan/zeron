@@ -62,6 +62,8 @@ pub fn run_engine_command(command: EngineCommand) -> anyhow::Result<()> {
                     host_ports,
                     publish_ports,
                     read_only,
+                    share_github,
+                    sign_commits,
                     worktrees,
                 } => {
                     let ports = |list: Vec<String>| sandbox::parse_ports(&list.join(","));
@@ -77,6 +79,8 @@ pub fn run_engine_command(command: EngineCommand) -> anyhow::Result<()> {
                             host_ports,
                             publish_ports,
                             read_only,
+                            share_github,
+                            sign_commits,
                         },
                         false,
                     )
@@ -94,7 +98,7 @@ pub fn run_engine_command(command: EngineCommand) -> anyhow::Result<()> {
                     }
                     for s in statuses {
                         println!(
-                            "{}\n  config: {}\n  container: {} ({}{})\n  worktrees: {}\n  host ports: {:?}, published: {:?}, read-only: {:?}",
+                            "{}\n  config: {}\n  container: {} ({}{})\n  worktrees: {}\n  host ports: {:?}, published: {:?}, read-only: {:?}, GitHub login shared: {}, commits signed: {}",
                             s.sandbox.root.display(),
                             s.sandbox.config.display(),
                             s.container,
@@ -104,11 +108,68 @@ pub fn run_engine_command(command: EngineCommand) -> anyhow::Result<()> {
                             sandbox::port_ranges(&s.sandbox.host_ports),
                             sandbox::port_ranges(&s.sandbox.publish_ports),
                             s.sandbox.read_only,
+                            s.sandbox.share_github,
+                            s.sandbox.sign_commits,
                         );
                     }
                 }),
             }
             .map_err(|error| anyhow::anyhow!("{error}"))
+        }
+        EngineCommand::Vm(command) => {
+            use zeron_engine::{sandbox, windows_vm};
+            let ports = |list: Vec<String>, flag: &str| {
+                sandbox::parse_ports(&list.join(",")).map_err(|e| anyhow::anyhow!("{flag}: {e}"))
+            };
+            match command {
+                zeron_cli::VmCommand::Enable { path, to_vm, from_vm, viewer, start_with, no_auto_ports } => {
+                    let vm = windows_vm::enable(windows_vm::WindowsVm {
+                        root: path,
+                        to_vm: ports(to_vm, "--to-vm")?,
+                        from_vm: ports(from_vm, "--from-vm")?,
+                        viewer,
+                        start_with,
+                        auto_ports: !no_auto_ports,
+                    })
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                    println!(
+                        "{} is connected to the Windows VM (into the VM: {:?}, from the VM: {:?}). It takes effect the next time the VM starts for this project.",
+                        vm.root.display(),
+                        sandbox::port_ranges(&vm.to_vm),
+                        sandbox::port_ranges(&vm.from_vm),
+                    );
+                    if !windows_vm::available() {
+                        println!("winvm is not installed here yet: see docs/windows-vm.md.");
+                    }
+                }
+                zeron_cli::VmCommand::Disable { path } => {
+                    windows_vm::disable(&path).map_err(|error| anyhow::anyhow!("{error}"))?;
+                    println!("{} is no longer connected to the Windows VM.", path.display());
+                }
+                zeron_cli::VmCommand::Status => {
+                    let projects = windows_vm::projects().map_err(|error| anyhow::anyhow!("{error}"))?;
+                    if projects.is_empty() {
+                        println!("No project is connected to the Windows VM.");
+                    }
+                    for vm in projects {
+                        println!(
+                            "{}\n  into the VM: {:?}, from the VM: {:?}, viewer: {}, starts with: {}, ports of its servers: {}",
+                            vm.root.display(),
+                            sandbox::port_ranges(&vm.to_vm),
+                            sandbox::port_ranges(&vm.from_vm),
+                            if vm.viewer { "opens with the VM" } else { "not opened" },
+                            if vm.start_with.is_empty() { "no service".to_owned() } else { vm.start_with.join(", ") },
+                            if vm.auto_ports { "connected automatically" } else { "only the listed ones" },
+                        );
+                    }
+                    let runtime = tokio::runtime::Runtime::new()?;
+                    match runtime.block_on(windows_vm::status()) {
+                        Ok(status) => println!("VM: {}", status["state"].as_str().unwrap_or("unknown")),
+                        Err(error) => println!("VM: unavailable ({error})"),
+                    }
+                }
+            }
+            Ok(())
         }
         EngineCommand::Engine => crate::background::run(),
     }

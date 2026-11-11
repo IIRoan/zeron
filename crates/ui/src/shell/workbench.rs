@@ -10,6 +10,7 @@ enum Tool {
     History,
     Services,
     Terminal,
+    Environment,
     Views,
 }
 
@@ -59,6 +60,10 @@ impl Shell {
         }
         if tool == Tool::Services {
             self.open_services_panel(cx);
+            return;
+        }
+        if tool == Tool::Environment {
+            self.open_environment_panel(cx);
             return;
         }
         if matches!(tool, Tool::Changes | Tool::History) && !self.git_plugin_enabled(cx) { return; }
@@ -136,6 +141,7 @@ impl Shell {
         let open = self.right_pane_open(cx);
         let git = self.git_tools_available(cx);
         let services = self.services_available(cx);
+        let environment = self.environment_in_use(cx);
         let buttons = [
             (
                 Tool::Explorer,
@@ -157,6 +163,12 @@ impl Shell {
             ),
             (Tool::Services, "workbench-services", icons::SERVICES, "Services"),
             (Tool::Terminal, "workbench-terminal", icons::TERMINAL, "Terminals"),
+            (
+                Tool::Environment,
+                "workbench-environment",
+                icons::MONITOR,
+                environment.unwrap_or("Environment"),
+            ),
             (Tool::Views, "workbench-views", icons::LIST, "All views"),
         ]
         .into_iter()
@@ -171,6 +183,7 @@ impl Shell {
                 open && match (tool, active) {
                     (Tool::Views, RightSurface::Picker) => true,
                     (Tool::Terminal, RightSurface::Terminal(_)) => true,
+                    (Tool::Environment, RightSurface::Environment) => true,
                     (Tool::Changes, RightSurface::Diff(id)) => self
                         .diffs
                         .get(&id)

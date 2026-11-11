@@ -64,6 +64,7 @@ mod services;
 mod direct;
 mod voice_chat;
 mod voice_remote;
+mod windows_vm;
 use async_trait::async_trait;
 use base64::Engine as _;
 use futures::StreamExt;
@@ -2506,6 +2507,10 @@ fn forwardable(method: &str) -> bool {
             // A project's sandbox runs on the device holding the project.
             | methods::GET_PROJECT_SANDBOX
             | methods::SET_PROJECT_SANDBOX
+            // So does its Windows VM (`crate::windows_vm`).
+            | methods::GET_PROJECT_WINDOWS_VM
+            | methods::SET_PROJECT_WINDOWS_VM
+            | methods::CONTROL_PROJECT_WINDOWS_VM
             | methods::PREPARE_WORKTREE
             | methods::CANCEL_WORKTREE_SETUP
             | methods::GET_WORKTREE_SETUP_LOG
@@ -5425,6 +5430,10 @@ impl RpcService for EngineRpc {
             methods::GET_PROJECT_SANDBOX | methods::SET_PROJECT_SANDBOX => {
                 self.project_sandbox(method, params).await
             }
+            methods::GET_PROJECT_WINDOWS_VM
+            | methods::SET_PROJECT_WINDOWS_VM
+            | methods::CONTROL_PROJECT_WINDOWS_VM => self.project_windows_vm(method, params).await,
+            methods::CHAT_WINDOWS_VM => self.chat_windows_vm(params).await,
             methods::GET_CHAT_WORKTREE_SETTINGS | methods::EDIT_CHAT_WORKTREE_SETTINGS => {
                 self.chat_worktree_settings(method, params).await
             }
@@ -5502,7 +5511,7 @@ impl RpcService for EngineRpc {
                 }
                 let project_id = space.id.clone();
                 let snapshot = if matches!(method, methods::CONTROL_PROJECT_TERMINALS | methods::CONTROL_CHAT_SERVICE) {
-                    profiles
+                    let snapshot = profiles
                         .control_checkout(
                             &self.terminals,
                             &environments,
@@ -5513,7 +5522,18 @@ impl RpcService for EngineRpc {
                             p.action.as_deref().unwrap_or("start"),
                         )
                         .await
-                        .map_err(|e| RpcError::Failed(e.to_string()))?
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    if p.action.as_deref().unwrap_or("start") == "start" {
+                        let started: Vec<&str> = snapshot
+                            .config
+                            .services
+                            .iter()
+                            .filter(|service| p.service_id.as_deref().is_none_or(|id| id == service.id))
+                            .map(|service| service.name.as_str())
+                            .collect();
+                        crate::windows_vm::start_with_services(&root, &started);
+                    }
+                    snapshot
                 } else {
                     tokio::task::spawn_blocking(move || {
                         profiles.checkout_snapshot(

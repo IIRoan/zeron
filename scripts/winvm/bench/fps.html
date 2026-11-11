@@ -1,0 +1,44 @@
+<!doctype html><meta charset=utf-8><title>fps</title>
+<style>
+html,body{margin:0;background:#fff;font:16px/1.5 system-ui;overflow:hidden}
+#bits{position:fixed;left:0;top:0;z-index:99;image-rendering:pixelated}
+#stage{position:absolute;inset:0;padding-top:40px}
+.box{position:absolute;width:120px;height:120px;border-radius:16px;background:#2563eb}
+.spin{position:absolute;left:300px;top:200px;width:64px;height:64px;border:8px solid #ddd;border-top-color:#111;border-radius:50%}
+.layer{position:absolute;width:300px;height:200px;border-radius:24px;opacity:.7;box-shadow:0 10px 40px rgba(0,0,0,.4)}
+</style>
+<canvas id=bits></canvas><div id=stage></div>
+<script>
+const q=new URLSearchParams(location.search), DUR=+(q.get('dur')||8000), WARM=1500;
+const dpr=devicePixelRatio, CELL=16, N=24, bits=document.getElementById('bits');
+bits.width=CELL*N; bits.height=CELL; bits.style.width=CELL*N/dpr+'px'; bits.style.height=CELL/dpr+'px';
+const bctx=bits.getContext('2d'), stage=document.getElementById('stage');
+let counter=0, scene=0;
+function stamp(){ // 16-bit counter, 4-bit scene, marker 1010
+  const v=(counter&0xffff)|((scene&15)<<16)|(0b1010<<20);
+  for(let i=0;i<N;i++){bctx.fillStyle=(v>>i)&1?'#fff':'#000';bctx.fillRect(i*CELL,0,CELL,CELL);}
+  counter++;
+}
+function gpu(){try{const c=document.createElement('canvas').getContext('webgl');const e=c.getExtension('WEBGL_debug_renderer_info');return c.getParameter(e.UNMASKED_RENDERER_WEBGL)}catch(e){return 'none: '+e}}
+const scenes={
+ ui(){stage.innerHTML='<div class=box></div><div class=spin></div><p style="margin:420px 40px">Small moving parts, like a normal app screen.</p>';
+   const b=stage.querySelector('.box'),s=stage.querySelector('.spin');
+   return t=>{b.style.transform=`translate(${200+600*(0.5+0.5*Math.sin(t/400))}px,80px)`;s.style.transform=`rotate(${t/3}deg)`}},
+ scroll(){stage.style.overflow='hidden';let h='';for(let i=0;i<400;i++)h+=`<p style="margin:12px 60px"><b>Question ${i}.</b> Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.</p>`;
+   stage.innerHTML='<div id=doc>'+h+'</div>';const d=stage.querySelector('#doc');d.style.willChange='transform';
+   return t=>{d.style.transform=`translateY(${-((t*0.6)%20000)}px)`}},
+ layers(){let h='';for(let i=0;i<24;i++)h+=`<div class=layer style="background:hsl(${i*15},80%,55%)"></div>`;stage.innerHTML=h;const ls=[...stage.querySelectorAll('.layer')];
+   return t=>{ls.forEach((l,i)=>{l.style.transform=`translate(${innerWidth/2-150+Math.sin(t/700+i)*innerWidth*0.35}px,${innerHeight/2-100+Math.cos(t/900+i*1.7)*innerHeight*0.3}px) rotate(${t/20+i*15}deg)`})}},
+ canvas(){stage.innerHTML='<canvas id=cv></canvas>';const c=stage.querySelector('#cv');c.width=innerWidth*dpr;c.height=innerHeight*dpr;c.style.width='100%';c.style.height='100%';const x=c.getContext('2d');
+   return t=>{const g=x.createLinearGradient(0,0,c.width,c.height);g.addColorStop(0,`hsl(${t/20%360},70%,50%)`);g.addColorStop(1,`hsl(${(t/20+180)%360},70%,50%)`);x.fillStyle=g;x.fillRect(0,0,c.width,c.height);
+     for(let i=0;i<300;i++){x.fillStyle=`hsla(${i*7},90%,60%,.6)`;x.fillRect((Math.sin(t/500+i)*0.5+0.5)*c.width,(Math.cos(t/700+i*2)*0.5+0.5)*c.height,60,60)}}},
+};
+const names=Object.keys(scenes).filter(n=>!q.get('only')||q.get('only').split(',').includes(n)), out=[];
+function stats(ts){const d=[];for(let i=1;i<ts.length;i++)d.push(ts[i]-ts[i-1]);d.sort((a,b)=>a-b);const p=x=>d[Math.min(d.length-1,Math.floor(d.length*x))];
+  const total=ts[ts.length-1]-ts[0];return{frames:d.length,fps:+(d.length/total*1000).toFixed(1),p50:+p(.5).toFixed(1),p95:+p(.95).toFixed(1),p99:+p(.99).toFixed(1),max:+d[d.length-1].toFixed(1),over33:+(d.filter(v=>v>33.4).length/d.length*100).toFixed(1),over20:+(d.filter(v=>v>20).length/d.length*100).toFixed(1)}}
+function run(i){ if(i>=names.length){fetch('/result',{method:'POST',body:JSON.stringify({tag:q.get('tag')||'',screen:[screen.width,screen.height],inner:[innerWidth,innerHeight],dpr,gpu:gpu(),cores:navigator.hardwareConcurrency,ua:navigator.userAgent,scenes:out})}).then(()=>{stage.innerHTML='<h1 style="margin:80px">done</h1>';scene=15;stamp()});return}
+  scene=i+1;const step=scenes[names[i]](),ts=[],t0=performance.now();
+  function f(t){step(t);stamp();if(t-t0>WARM)ts.push(t);if(t-t0<DUR+WARM)requestAnimationFrame(f);else{out.push({name:names[i],...stats(ts)});stage.style.overflow='';run(i+1)}}
+  requestAnimationFrame(f)}
+setTimeout(()=>run(0),1500);
+</script>

@@ -44,6 +44,17 @@ pub(crate) fn wrap(cmd: Command, env: &BTreeMap<String, String>) -> Result<Comma
         })
         .collect();
     let names: Vec<String> = values.iter().map(|(key, _)| key.clone()).collect();
+    // This machine's CLI, for an image without one of its own: the
+    // container's login shells look in `<run dir>/bin` last
+    // (`zeron_engine::sandbox`).
+    #[cfg(unix)]
+    if let Err(error) = provide_cli(
+        std::path::Path::new(std.get_program()),
+        std::path::Path::new(&spec.run_dir),
+        &program,
+    ) {
+        tracing::warn!(%error, "sandbox: couldn't hand this machine's CLI to the container");
+    }
     let command: Vec<String> = std::iter::once(program)
         .chain(std.get_args().map(|arg| arg.to_string_lossy().into_owned()))
         .collect();
@@ -67,9 +78,137 @@ pub(crate) fn wrap(cmd: Command, env: &BTreeMap<String, String>) -> Result<Comma
     Ok(wrapped)
 }
 
+/// Puts the CLI `exe` at `<run_dir>/bin/<name>`, unless it's there already: a
+/// hard link, else (another filesystem, or a file another user owns) a copy
+/// with its modification time, so an unchanged CLI is never copied again.
+#[cfg(unix)]
+fn provide_cli(
+    exe: &std::path::Path,
+    run_dir: &std::path::Path,
+    name: &str,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let real = exe.canonicalize()?;
+    let source = std::fs::metadata(&real)?;
+    let dir = run_dir.join("bin");
+    let target = dir.join(name);
+    if std::fs::metadata(&target).is_ok_and(|t| {
+        (t.dev(), t.ino()) == (source.dev(), source.ino())
+            || (t.len(), t.mtime()) == (source.len(), source.mtime())
+    }) {
+        return Ok(());
+    }
+    std::fs::create_dir_all(&dir)?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let staged = dir.join(format!(".{name}.{}.{nanos}", std::process::id()));
+    if std::fs::hard_link(&real, &staged).is_err() {
+        std::fs::copy(&real, &staged)?;
+        std::fs::File::options()
+            .write(true)
+            .open(&staged)?
+            .set_modified(source.modified()?)?;
+    }
+    std::fs::rename(&staged, &target)
+}
+
+/// This machine's Claude Code plugins, for a sandboxed run: its CLI has a home
+/// of its own, so they load with `--plugin-dir` from `~/.claude/plugins/cache`,
+/// which the container mounts read-only at the same path
+/// (`zeron_engine::sandbox`). One turned off here stays off.
+pub(crate) fn claude_plugin_dirs(
+    home: &std::path::Path,
+    cwd: &std::path::Path,
+) -> Vec<std::path::PathBuf> {
+    let config = home.join(".claude");
+    let cache = config.join("plugins/cache");
+    let settings: serde_json::Value = std::fs::read(config.join("settings.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    let mut seen = std::collections::HashSet::new();
+    crate::skills::claude_plugin_installs(&config, cwd)
+        .into_iter()
+        .filter(|(id, path)| {
+            path.starts_with(&cache)
+                && settings["enabledPlugins"][id.as_str()] != false
+                && seen.insert(id.clone())
+        })
+        .map(|(_, path)| path)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_sandbox_gets_this_machines_cli_once_per_version() {
+        use std::os::unix::fs::MetadataExt;
+        let temp = tempfile::tempdir().unwrap();
+        let (cli, run) = (temp.path().join("claude-2.1"), temp.path().join("run"));
+        std::fs::write(&cli, "v1").unwrap();
+        provide_cli(&cli, &run, "claude").unwrap();
+        let provided = run.join("bin/claude");
+        let ino = |p: &std::path::Path| std::fs::metadata(p).unwrap().ino();
+        assert_eq!(
+            ino(&provided),
+            ino(&cli),
+            "a hard link on the same filesystem"
+        );
+        provide_cli(&cli, &run, "claude").unwrap();
+        assert_eq!(ino(&provided), ino(&cli), "unchanged: left alone");
+        let newer = temp.path().join("claude-2.2");
+        std::fs::write(&newer, "v2!").unwrap();
+        provide_cli(&newer, &run, "claude").unwrap();
+        assert_eq!(std::fs::read_to_string(&provided).unwrap(), "v2!");
+        assert_eq!(
+            std::fs::read_dir(run.join("bin")).unwrap().count(),
+            1,
+            "nothing staged is left behind"
+        );
+    }
+
+    #[test]
+    fn a_sandboxed_claude_loads_this_machines_installed_plugins_that_are_on() {
+        let home = tempfile::tempdir().unwrap();
+        let cache = home.path().join(".claude/plugins/cache");
+        let install = json_path;
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(
+            home.path().join(".claude/plugins/installed_plugins.json"),
+            format!(
+                r#"{{"plugins":{{
+                    "on@m":[{{"installPath":{}}},{{"installPath":{}}}],
+                    "off@m":[{{"installPath":{}}}],
+                    "elsewhere@m":[{{"installPath":"/opt/elsewhere"}}],
+                    "project@m":[{{"installPath":{},"projectPath":"/other/project"}}]
+                }}}}"#,
+                install(&cache.join("m/on/1")),
+                install(&cache.join("m/on/2")),
+                install(&cache.join("m/off/1")),
+                install(&cache.join("m/project/1")),
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            home.path().join(".claude/settings.json"),
+            r#"{"enabledPlugins":{"on@m":true,"off@m":false}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            claude_plugin_dirs(home.path(), std::path::Path::new("/repo")),
+            [cache.join("m/on/1")],
+            "only cached installs that apply here and aren't off, once each"
+        );
+    }
+
+    fn json_path(path: &std::path::Path) -> String {
+        serde_json::to_string(&path.to_string_lossy()).unwrap()
+    }
 
     #[test]
     fn a_stamped_run_execs_the_same_cli_in_the_container_with_only_its_own_variables() {

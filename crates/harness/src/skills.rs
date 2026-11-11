@@ -178,35 +178,10 @@ fn discover_at(harness: HarnessId, cwd: &Path, home: &Path) -> Result<Vec<Skill>
             roots.push((config.join("commands"), String::new()));
             roots.push((config.join("skills"), String::new()));
             // Only installed plugin locations; never crawl caches or marketplaces.
-            if let Ok(bytes) = std::fs::read(config.join("plugins/installed_plugins.json")) {
-                if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                    if let Some(plugins) = value.get("plugins").and_then(|v| v.as_object()) {
-                        for (id, installs) in plugins {
-                            let namespace = id.split('@').next().unwrap_or(id);
-                            for install in installs.as_array().into_iter().flatten() {
-                                if let Some(project) =
-                                    install.get("projectPath").and_then(|v| v.as_str())
-                                {
-                                    if !cwd.starts_with(project) {
-                                        continue;
-                                    }
-                                }
-                                if let Some(path) =
-                                    install.get("installPath").and_then(|v| v.as_str())
-                                {
-                                    roots.push((
-                                        Path::new(path).join("skills"),
-                                        format!("{namespace}:"),
-                                    ));
-                                    roots.push((
-                                        Path::new(path).join("commands"),
-                                        format!("{namespace}:"),
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                }
+            for (id, path) in claude_plugin_installs(&config, cwd) {
+                let namespace = id.split('@').next().unwrap_or(&id);
+                roots.push((path.join("skills"), format!("{namespace}:")));
+                roots.push((path.join("commands"), format!("{namespace}:")));
             }
         }
         _ => {}
@@ -234,6 +209,30 @@ fn discover_at(harness: HarnessId, cwd: &Path, home: &Path) -> Result<Vec<Skill>
         scan_root(&root, &namespace, harness, &mut found, &mut remaining)?;
     }
     Ok(found.into_values().collect())
+}
+
+/// Claude Code's installed plugins that apply in `cwd` (everywhere, or for a
+/// project `cwd` is in): each plugin's id and folder.
+pub(crate) fn claude_plugin_installs(config: &Path, cwd: &Path) -> Vec<(String, PathBuf)> {
+    let value: serde_json::Value = std::fs::read(config.join("plugins/installed_plugins.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    let mut installs = Vec::new();
+    for (id, entries) in value["plugins"].as_object().into_iter().flatten() {
+        for install in entries.as_array().into_iter().flatten() {
+            if install["projectPath"]
+                .as_str()
+                .is_some_and(|project| !cwd.starts_with(project))
+            {
+                continue;
+            }
+            if let Some(path) = install["installPath"].as_str() {
+                installs.push((id.clone(), PathBuf::from(path)));
+            }
+        }
+    }
+    installs
 }
 
 fn scan_root(

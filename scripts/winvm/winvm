@@ -1,0 +1,635 @@
+#!/usr/bin/env python3
+"""winvm — the Windows development VM behind Zeron's "Windows VM" project setting (docs/windows-vm.md).
+
+One QEMU/KVM guest, run as an ordinary user process. The VM lives in $WINVM_HOME (default
+~/.local/share/winvm): disk image, install media, SSH key, settings (config.json). Nothing here needs root.
+
+The guest never sees this machine's localhost. Ports cross only through `--to-vm` (a port on this machine
+that the guest reaches on its own localhost) and `--from-vm` (a guest port this machine reaches on its
+localhost), carried by one SSH connection.
+"""
+import argparse, base64, json, os, re, shutil, signal, socket, struct, subprocess, sys, time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+HOME = Path(os.environ.get('WINVM_HOME') or Path.home() / '.local/share/winvm')
+RUN = Path(os.environ.get('XDG_RUNTIME_DIR') or '/tmp') / ('winvm' if 'WINVM_HOME' not in os.environ else 'winvm-' + HOME.name)
+DEFAULTS = {
+    'vcpus': max(2, min(8, (os.cpu_count() or 4) - 2)),  # even numbers pair up as hyperthreads
+    'pin': '',            # host CPUs for the VM, as taskset takes them ("0-11"); empty = anywhere
+    'memory': '8G',
+    'ssh_port': 2222,     # this machine's 127.0.0.1 port for the guest's SSH server
+    'clip_port': 8766,    # the viewer's port for text copied in the guest
+    'user': 'dev',
+}
+
+
+def die(message, code=1):
+    print(f'winvm: {message}', file=sys.stderr)
+    sys.exit(code)
+
+
+def config():
+    try: saved = json.loads((HOME / 'config.json').read_text())
+    except FileNotFoundError: saved = {}
+    return {**DEFAULTS, **saved}
+
+
+# ---- processes ------------------------------------------------------------------------------------------------------
+def pid_of(name):
+    """The live process recorded in RUN/<name>.pid, or None."""
+    try:
+        pid = int((RUN / f'{name}.pid').read_text().split()[0]); os.kill(pid, 0); return pid
+    except (FileNotFoundError, ValueError, IndexError, ProcessLookupError, PermissionError):
+        return None
+
+
+def stop(name, sig=signal.SIGTERM, group=False):
+    pid = pid_of(name)
+    if pid:
+        try: (os.killpg if group else os.kill)(pid, sig)
+        except ProcessLookupError: pass
+    (RUN / f'{name}.pid').unlink(missing_ok=True)
+
+
+def spawn(name, args, log, env=None):
+    """Start a detached process that outlives this command; its output goes to RUN/<log>."""
+    with open(RUN / log, 'ab') as out:
+        p = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=out, stderr=out, start_new_session=True, env=env)
+    (RUN / f'{name}.pid').write_text(str(p.pid))
+    return p
+
+
+# ---- QEMU monitor ---------------------------------------------------------------------------------------------------
+def qmp(command, arguments=None, timeout=10):
+    s = socket.socket(socket.AF_UNIX); s.settimeout(timeout); s.connect(str(RUN / 'qmp.sock')); f = s.makefile('rw')
+    f.readline()
+    def call(c, a=None):
+        f.write(json.dumps({'execute': c, **({'arguments': a} if a else {})}) + '\n'); f.flush()
+        while True:
+            r = json.loads(f.readline())
+            if 'return' in r or 'error' in r: return r
+    call('qmp_capabilities')
+    r = call(command, arguments)
+    if 'error' in r: raise RuntimeError(r['error'].get('desc', str(r['error'])))
+    return r['return']
+
+
+def running():
+    return pid_of('qemu') is not None
+
+
+# ---- SSH ------------------------------------------------------------------------------------------------------------
+def ssh_args(*extra):
+    c = config()
+    return ['ssh', '-q', '-i', str(HOME / 'id_ed25519'), '-o', 'IdentitiesOnly=yes', '-p', str(c['ssh_port']),
+            '-o', 'StrictHostKeyChecking=no', '-o', f'UserKnownHostsFile={HOME / "known_hosts"}', '-o', 'LogLevel=ERROR',
+            '-o', 'ConnectTimeout=5', *extra, f"{c['user']}@127.0.0.1"]
+
+
+def ssh_ready(timeout=2.0):
+    """The guest's SSH server answers (its banner arrives through the forwarded port)."""
+    try:
+        with socket.create_connection(('127.0.0.1', config()['ssh_port']), timeout=timeout) as s:
+            s.settimeout(timeout); return s.recv(8).startswith(b'SSH-')
+    except OSError:
+        return False
+
+
+def powershell(script, timeout=120, cwd=None, capture=True):
+    """Run PowerShell in the guest as its administrator (no desktop: use `launch` for windows). Returns the process."""
+    body = "$ProgressPreference='SilentlyContinue'; "
+    if cwd: body += f"Set-Location -LiteralPath '{cwd.replace(chr(39), chr(39) * 2)}'; "
+    # Errors go to stderr as plain text (PowerShell would wrap them in CLIXML); a thrown error fails the command.
+    body += (f"try {{ & {{ {script} }} 2>&1 | ForEach-Object {{ if ($_ -is [System.Management.Automation.ErrorRecord]) "
+             "{ [Console]::Error.WriteLine(\"$_\") } else { $_ } } | Out-String -Stream -Width 4096 } catch { [Console]::Error.WriteLine(\"$_\"); exit 1 }; exit $LASTEXITCODE")
+    encoded = base64.b64encode(body.encode('utf-16-le')).decode()
+    # The guest's login shell is PowerShell too; without the explicit exit it would flatten every failure to 1.
+    return subprocess.run(ssh_args('-n') + [f'powershell -NoProfile -NonInteractive -EncodedCommand {encoded}; exit $LASTEXITCODE'],
+                          capture_output=capture, timeout=timeout)
+
+
+def need_running():
+    if not running(): die('the VM is not running (winvm up)', 3)
+    if not ssh_ready(5): die('the VM is still starting: Windows is not answering yet', 4)
+
+
+# ---- start / stop ---------------------------------------------------------------------------------------------------
+def dbus_display_module():
+    """Where QEMU finds its D-Bus display when the system package lacks it (None when it has one).
+
+    The viewer and the frame check attach through that display. Fedora ships it as the separate qemu-ui-dbus
+    package; without root it is unpacked beside the VMs instead of installed."""
+    listed = subprocess.run(['qemu-system-x86_64', '-display', 'help'], capture_output=True, text=True).stdout
+    if 'dbus' in listed.split(): return None
+    cache = Path.home() / '.local/share/winvm-qemu-modules'
+    found = next(cache.rglob('ui-dbus.so'), None) if cache.exists() else None
+    if not found and shutil.which('dnf') and shutil.which('rpm2cpio'):
+        cache.mkdir(parents=True, exist_ok=True)
+        print('fetching QEMU\'s D-Bus display module (qemu-ui-dbus) …', file=sys.stderr, flush=True)
+        try: subprocess.run(['dnf', 'download', '-q', 'qemu-ui-dbus'], cwd=cache, capture_output=True, timeout=180)
+        except subprocess.TimeoutExpired: pass
+        for rpm in cache.glob('qemu-ui-dbus-*.rpm'):
+            subprocess.run(f'rpm2cpio {rpm.name} | cpio -idm --quiet', shell=True, cwd=cache, capture_output=True); rpm.unlink()
+        found = next(cache.rglob('ui-dbus.so'), None)
+    if not found: die('this QEMU has no D-Bus display: install the qemu-ui-dbus package')
+    return found.parent
+
+
+def start_vm(extra=()):
+    c = config(); disk = HOME / 'img/win.qcow2'
+    if not disk.exists(): die(f'no VM in {HOME} (winvm create)')
+    RUN.mkdir(parents=True, exist_ok=True)
+    for helper in ('passt', 'swtpm'): stop(helper)
+    time.sleep(0.5)                       # an old swtpm still exiting would remove the new socket
+    for stale in ('qmp.sock', 'qga.sock', 'swtpm.sock', 'passt.sock'): (RUN / stale).unlink(missing_ok=True)
+    (HOME / 'tpm').mkdir(exist_ok=True)
+    subprocess.run(['swtpm', 'socket', '--tpm2', '--tpmstate', f'dir={HOME / "tpm"}', '--ctrl', f'type=unixio,path={RUN / "swtpm.sock"}',
+                    '--pid', f'file={RUN / "swtpm.pid"}', '--daemon'], check=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # No --map-host-loopback: the guest reaches the internet, never this machine's localhost.
+    with open(RUN / 'passt.log', 'ab') as log:
+        net = subprocess.run(['passt', '--socket', str(RUN / 'passt.sock'), '--pid', str(RUN / 'passt.pid'), '-a', '192.168.122.50', '-n', '24',
+                              '-g', '192.168.122.1', '--map-host-loopback', 'none', '--dns-forward', '192.168.122.2',
+                              '-t', f"127.0.0.1/{c['ssh_port']}:22", '-u', 'none', '-q'], stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+    if net.returncode:
+        stop('swtpm')
+        die(f"the VM's network did not start (is port {c['ssh_port']} taken? \"ssh_port\" in {HOME / 'config.json'}); see {RUN / 'passt.log'}")
+    env = dict(os.environ)
+    module = dbus_display_module()
+    if module: env['QEMU_MODULE_DIR'] = str(module)
+    vcpus = max(2, int(c['vcpus']) // 2 * 2)
+    qemu = ['qemu-system-x86_64', '-name', 'winvm,debug-threads=on', '-machine', 'q35,accel=kvm,hpet=off,vmport=off,memory-backend=mem',
+            '-cpu', 'host,hv-passthrough=on,vmx=off', '-smp', f'{vcpus},sockets=1,cores={vcpus // 2},threads=2',
+            '-m', c['memory'], '-object', f"memory-backend-memfd,id=mem,size={c['memory']},share=on",
+            '-drive', 'if=pflash,format=qcow2,readonly=on,file=/usr/share/edk2/ovmf/OVMF_CODE_4M.qcow2',
+            '-drive', f"if=pflash,format=qcow2,file={HOME / 'img/OVMF_VARS.qcow2'}",
+            '-object', 'iothread,id=io0',
+            '-drive', f'file={disk},if=none,id=d0,format=qcow2,cache=none,aio=io_uring,discard=unmap,detect-zeroes=unmap',
+            '-device', 'virtio-blk-pci,drive=d0,iothread=io0,bootindex=1',
+            '-device', 'qemu-xhci', '-device', 'usb-tablet',
+            '-netdev', f"stream,id=n0,server=off,addr.type=unix,addr.path={RUN / 'passt.sock'}", '-device', 'virtio-net-pci,netdev=n0,mac=52:54:00:4d:55:01',
+            '-device', 'virtio-vga,xres=1920,yres=1080',
+            '-audiodev', 'none,id=a0', '-device', 'ich9-intel-hda', '-device', 'hda-output,audiodev=a0',
+            '-chardev', f"socket,id=tpm,path={RUN / 'swtpm.sock'}", '-tpmdev', 'emulator,id=tpm0,chardev=tpm', '-device', 'tpm-crb,tpmdev=tpm0',
+            '-device', 'virtio-serial-pci', '-chardev', f"socket,id=qga,path={RUN / 'qga.sock'},server=on,wait=off",
+            '-device', 'virtserialport,chardev=qga,name=org.qemu.guest_agent.0',
+            '-chardev', 'qemu-vdagent,id=vdagent,clipboard=on,mouse=off', '-device', 'virtserialport,chardev=vdagent,name=com.redhat.spice.0',
+            '-device', 'virtio-balloon-pci,free-page-reporting=on',
+            '-rtc', 'base=localtime,driftfix=slew', '-global', 'kvm-pit.lost_tick_policy=delay',
+            '-qmp', f"unix:{RUN / 'qmp.sock'},server=on,wait=off", '-display', 'dbus,p2p=yes', *extra]
+    if c['pin']: qemu = ['taskset', '-c', str(c['pin'])] + qemu
+    process = spawn('qemu', qemu, 'qemu.log', env)
+    for _ in range(100):
+        if (RUN / 'qmp.sock').exists() or process.poll() is not None: break
+        time.sleep(0.1)
+    time.sleep(1)
+    if process.poll() is not None:          # (a finished child still answers signals until it is reaped)
+        (RUN / 'qemu.pid').unlink(missing_ok=True)
+        tail = (RUN / 'qemu.log').read_text(errors='replace').strip().splitlines()[-3:]
+        die('QEMU did not stay up:\n  ' + '\n  '.join(tail))
+
+
+def wait_ssh(seconds):
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if not running(): die('the VM stopped while starting; see ' + str(RUN / 'qemu.log'))
+        if ssh_ready(): return True
+        time.sleep(2)
+    return False
+
+
+# ---- tunnels --------------------------------------------------------------------------------------------------------
+def ports_file():
+    try: return json.loads((RUN / 'ports.json').read_text())
+    except (FileNotFoundError, ValueError): return {'toVm': [], 'fromVm': []}
+
+
+MAX_PORTS = 64
+
+
+def forward(port, to_vm):
+    """ssh's options for one port: the guest's localhost:port -> this machine's (to_vm), or the other way."""
+    if to_vm: return ['-R', f'127.0.0.1:{port}:127.0.0.1:{port}', '-R', f'[::1]:{port}:127.0.0.1:{port}']   # "localhost" is ::1 first on Windows
+    return ['-L', f'127.0.0.1:{port}:127.0.0.1:{port}']
+
+
+def tunnel_command(ports):
+    # A port that is taken on the other side is left out (ssh warns, tunnel_error reports it); the rest still cross.
+    c = config(); args = [a for a in ssh_args('-N', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3') if a != '-q']
+    args[1:1] = ['-o', 'LogLevel=INFO', '-M', '-S', str(RUN / 'mux.sock')]   # the first value wins: ssh's warnings name the ports
+    for port in sorted(set(ports['toVm']) | {c['clip_port']}): args[1:1] = forward(port, True)
+    for port in sorted(set(ports['fromVm'])): args[1:1] = forward(port, False)
+    return args
+
+
+def mux(operation, *options):
+    """Ask the running tunnel connection to check itself, or to add (forward) or drop (cancel) forwards."""
+    return subprocess.run(['ssh', '-S', str(RUN / 'mux.sock'), '-O', operation, *options, 'winvm'], capture_output=True, text=True, timeout=15)
+
+
+REFUSED = {True: 'remote port forwarding failed for listen port {}', False: 'cannot listen to port: {}'}   # ssh's own words
+
+
+def change_ports(old, new):
+    """Add and drop forwards on the running connection: the ports that stay keep their open connections. False: start it over."""
+    try:
+        if not pid_of('tunnel') or mux('check').returncode: return False
+        added, said = set(), []
+        for key, to_vm in (('toVm', True), ('fromVm', False)):
+            for port in sorted(set(old[key]) - set(new[key])): mux('cancel', *forward(port, to_vm))
+            for port in sorted(set(new[key]) - set(old[key])):
+                added.add(str(port))
+                if mux('forward', *forward(port, to_vm)).returncode: said.append(REFUSED[to_vm].format(port))
+    except (OSError, subprocess.TimeoutExpired): return False
+    kept = [l for l in (RUN / 'tunnel.err').read_text(errors='replace').splitlines() if not set(re.findall(r'\d+', l)) & added]
+    (RUN / 'tunnel.err').write_text('\n'.join(kept + said) + '\n')         # what was said about a port before it was added again is over
+    return True
+
+
+def set_ports(to_vm, from_vm):
+    """(Re)start the tunnel with exactly these ports. Returns an error message, or None when it is up."""
+    c = config(); ports = {'toVm': sorted(set(to_vm)), 'fromVm': sorted(set(from_vm))}
+    reserved = {c['ssh_port'], c['clip_port']}
+    bad = [p for p in ports['toVm'] + ports['fromVm'] if not 1 <= p <= 65535 or p in reserved]
+    if bad: return f'ports {bad} are not allowed ({sorted(reserved)} are winvm\'s own)'
+    # Windows' SSH server has about 250 sockets per connection: two per port into the VM, one per open connection.
+    if max(len(ports['toVm']), len(ports['fromVm'])) > MAX_PORTS: return f'at most {MAX_PORTS} ports can be connected per direction'
+    old = ports_file(); (RUN / 'ports.json').write_text(json.dumps(ports))
+    if tunnel_error() in (None, refused_ports(tunnel_said(), old)) and change_ports(old, ports): return tunnel_error()
+    stop('tunnel', group=True)
+    (RUN / 'tunnel.log').write_text('')
+    spawn('tunnel', [sys.executable, str(Path(__file__).resolve()), '_tunnel'], 'tunnel.log')
+    deadline = time.time() + 20                                   # the loop writes its first line once it knows
+    while time.time() < deadline and pid_of('tunnel') and not (RUN / 'tunnel.log').read_text().strip(): time.sleep(0.3)
+    return tunnel_error()
+
+
+def tunnel_error():
+    if pid_of('tunnel') is None: return 'the tunnel is not running'
+    lines = [l for l in (RUN / 'tunnel.log').read_text(errors='replace').splitlines() if l.strip()]
+    if not lines: return 'the ports are still being connected'
+    if 'tunnel up' not in lines[-1]: return lines[-1]
+    return refused_ports(tunnel_said(), ports_file())
+
+
+def tunnel_said():
+    try: return (RUN / 'tunnel.err').read_text(errors='replace')
+    except FileNotFoundError: return ''
+
+
+def refused_ports(ssh_output, wanted):
+    """What ssh said about forwards it could not set up, as one sentence (None when all the wanted ports are up)."""
+    ports = lambda pattern, key: sorted({int(p) for p in re.findall(pattern, ssh_output)} & set(wanted[key]))
+    parts = [f'{where}: {", ".join(map(str, found))}' for where, found in
+             (('already in use inside Windows', ports(r'remote port forwarding failed for listen port (\d+)', 'toVm')),
+              ('already in use on this machine', ports(r'cannot listen to port: (\d+)', 'fromVm'))) if found]
+    return 'not connected, ' + '; '.join(parts) + ' (the other ports are connected)' if parts else None
+
+
+def tunnel_loop():
+    """Keep one SSH connection carrying the forwards while the VM runs (`winvm _tunnel`, started by set_ports)."""
+    child = None
+    def leave(*_):
+        if child and child.poll() is None: child.terminate()
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, leave)
+    while running():
+        started = time.time()
+        with open(RUN / 'tunnel.err', 'w') as err:
+            child = subprocess.Popen(tunnel_command(ports_file()), stdin=subprocess.DEVNULL, stderr=err)
+        time.sleep(2)
+        if child.poll() is None: print('tunnel up', flush=True)
+        child.wait()
+        if not running(): break
+        said = [l for l in (RUN / 'tunnel.err').read_text(errors='replace').splitlines() if l.strip() and 'forwarding' not in l and 'listen' not in l]
+        print(said[-1] if said else 'the tunnel connection ended', flush=True)
+        time.sleep(1 if time.time() - started > 30 else 5)
+
+
+def check():
+    """`winvm _check`: the parsing that has no VM to fail against."""
+    said = ('Warning: remote port forwarding failed for listen port 3389\nWarning: remote port forwarding failed for listen port 3389\n'
+            'bind [127.0.0.1]:9222: Address already in use\nchannel_setup_fwd_listener_tcpip: cannot listen to port: 9222\n')
+    wanted = {'toVm': [3000, 3389], 'fromVm': [9222]}
+    assert refused_ports(said, wanted) == ('not connected, already in use inside Windows: 3389; already in use on this machine: 9222 '
+                                           '(the other ports are connected)'), refused_ports(said, wanted)
+    assert refused_ports(said, {'toVm': [3000], 'fromVm': []}) is None          # a port no longer wanted is no longer a problem
+    assert refused_ports('Warning: Permanently added [127.0.0.1]:2222 to the list of known hosts.', wanted) is None
+    assert REFUSED[True].format(3389) in said and REFUSED[False].format(9222) in said
+    print('ok')
+
+
+# ---- commands -------------------------------------------------------------------------------------------------------
+def status():
+    state = 'stopped'
+    if running(): state = 'running' if ssh_ready() else 'starting'
+    ports = ports_file() if state != 'stopped' else {'toVm': [], 'fromVm': []}
+    out = {'state': state, 'home': str(HOME), 'viewer': pid_of('viewer') is not None, **ports}
+    if state == 'running':
+        error = tunnel_error()
+        if error: out['tunnelError'] = error
+    return out
+
+
+def cmd_status(a):
+    s = status()
+    if a.json: print(json.dumps(s))
+    else:
+        print(f"{s['state']}  ({s['home']})")
+        if s['state'] != 'stopped':
+            print(f"  into the VM: {s['toVm'] or 'no ports'}   from the VM: {s['fromVm'] or 'no ports'}   viewer: {'open' if s['viewer'] else 'closed'}")
+            if s.get('tunnelError'): print(f"  tunnel: {s['tunnelError']}")
+
+
+def cmd_up(a):
+    if not running(): start_vm()
+    if not wait_ssh(a.wait): die(f'Windows did not answer within {a.wait} s; it may still be starting (winvm status)', 4)
+    error = set_ports(a.to_vm, a.from_vm)
+    if a.view: open_viewer()
+    if a.json: print(json.dumps(status()))
+    if error: die(f'the VM is up, but its ports are not connected: {error}', 5)
+    if not a.json: cmd_status(a)
+
+
+def cmd_ports(a):
+    need_running(); error = set_ports(a.to_vm, a.from_vm)
+    if error: die(error, 5)
+    cmd_status(a)
+
+
+def cmd_down(a):
+    stop('viewer'); stop('tunnel', group=True)
+    if running():
+        if ssh_ready(): powershell('shutdown /s /f /t 0', timeout=30)
+        else:
+            try: qmp('system_powerdown')
+            except (OSError, RuntimeError): pass
+        deadline = time.time() + a.wait       # Windows can take minutes; killing it mid-way costs a long recovery boot
+        while running() and time.time() < deadline: time.sleep(1)
+        if running():
+            print(f'winvm: Windows did not shut down in {a.wait} s, powering off', file=sys.stderr); stop('qemu')
+    for helper in ('qemu', 'passt', 'swtpm'): stop(helper)
+    for leftover in RUN.glob('*.sock'): leftover.unlink(missing_ok=True)
+    (RUN / 'ports.json').unlink(missing_ok=True)
+    print('stopped')
+
+
+def cmd_exec(a):
+    need_running()
+    try: p = powershell(' '.join(a.command), timeout=a.timeout, cwd=a.cwd, capture=False)
+    except subprocess.TimeoutExpired: die(f'no result after {a.timeout} s (the command may still be running in the VM)', 124)
+    sys.exit(p.returncode)
+
+
+DIAGNOSTICS = r'''
+$os = Get-CimInstance Win32_OperatingSystem; $disk = Get-PSDrive C; $video = Get-CimInstance Win32_VideoController | Select-Object -First 1
+$owner = @{}; Get-Process | ForEach-Object { $owner[[int]$_.Id] = $_.ProcessName }
+[ordered]@{
+  os = $os.Caption + ' (build ' + $os.BuildNumber + ')'
+  computerName = $env:COMPUTERNAME
+  uptimeSeconds = [int]((Get-Date) - $os.LastBootUpTime).TotalSeconds
+  loggedOnUser = (Get-CimInstance Win32_ComputerSystem).UserName
+  cpuLoadPercent = [int](Get-CimInstance Win32_Processor | Measure-Object LoadPercentage -Average).Average
+  memoryMB = [ordered]@{ total = [int]($os.TotalVisibleMemorySize / 1KB); free = [int]($os.FreePhysicalMemory / 1KB) }
+  diskGB = [ordered]@{ total = [math]::Round(($disk.Used + $disk.Free) / 1GB, 1); free = [math]::Round($disk.Free / 1GB, 1) }
+  display = '' + $video.CurrentHorizontalResolution + 'x' + $video.CurrentVerticalResolution + '@' + $video.CurrentRefreshRate + ' ' + $video.Name
+  topProcesses = @(Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First 12 | ForEach-Object {
+    [ordered]@{ name = $_.ProcessName; pid = $_.Id; memoryMB = [int]($_.WorkingSet64 / 1MB); cpuSeconds = [int]$_.CPU } })
+  listeningPorts = @(Get-NetTCPConnection -State Listen | Where-Object { $_.LocalPort -lt 49152 } | Sort-Object LocalPort, LocalAddress -Unique | ForEach-Object {
+    '' + $_.LocalAddress + ':' + $_.LocalPort + ' ' + $owner[[int]$_.OwningProcess] })
+  stoppedAutomaticServices = @(Get-Service | Where-Object { $_.StartType -eq 'Automatic' -and $_.Status -ne 'Running' } | ForEach-Object { $_.Name })
+  recentErrors = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application', 'System'; Level = 1, 2; StartTime = (Get-Date).AddHours(-1) } -MaxEvents 15 -ErrorAction SilentlyContinue |
+    ForEach-Object { $_.TimeCreated.ToString('HH:mm:ss') + ' ' + $_.ProviderName + ' ' + $_.Id + ': ' + (('' + $_.Message) -split "`n")[0].Trim() })
+} | ConvertTo-Json -Depth 4
+'''
+
+
+def cmd_diag(a):
+    """The guest's health as JSON: load, memory, disk, display, biggest processes, listening ports, stopped services, the last hour's errors."""
+    need_running(); p = powershell(DIAGNOSTICS, timeout=90)
+    if p.returncode: die('could not read the diagnostics: ' + (p.stderr or p.stdout).decode(errors='replace').strip())
+    sys.stdout.write(p.stdout.decode(errors='replace'))
+
+
+def cmd_copy(a):
+    need_running(); c = config()
+    remote = lambda path: f"{c['user']}@127.0.0.1:{path.replace(chr(92), '/')}"       # scp wants C:/dir, not C:\\dir
+    paths = [remote(p) for p in a.paths[:-1]] + [a.paths[-1]] if a.from_vm else a.paths[:-1] + [remote(a.paths[-1])]
+    scp = ['scp', '-q', '-r', '-i', str(HOME / 'id_ed25519'), '-o', 'IdentitiesOnly=yes', '-P', str(c['ssh_port']),
+           '-o', 'StrictHostKeyChecking=no', '-o', f'UserKnownHostsFile={HOME / "known_hosts"}', '-o', 'LogLevel=ERROR']
+    sys.exit(subprocess.run(scp + paths).returncode)
+
+
+def cmd_media(a):
+    """Attach an ISO to the running VM as a USB disc (until the VM stops); prints its drive letter."""
+    need_running(); iso = Path(a.iso).resolve()
+    if not iso.is_file(): die(f'{iso} is not a file')
+    name = 'media' + str(abs(hash(str(iso))) % 100000)
+    qmp('human-monitor-command', {'command-line': f'drive_add 0 file={iso},if=none,id={name},media=cdrom,readonly=on,format=raw'})
+    try: qmp('device_add', {'driver': 'usb-storage', 'drive': name, 'id': name + 'dev'})
+    except RuntimeError as e:
+        if 'Duplicate' not in str(e) and 'already' not in str(e): raise
+    time.sleep(6)
+    p = powershell("(Get-Volume | Where-Object { $_.DriveType -eq 'CD-ROM' -and $_.Size -gt 0 } | Sort-Object DriveLetter | Select-Object -Last 1).DriveLetter", timeout=60)
+    print(p.stdout.decode().strip())
+
+
+def launch(command_line):
+    """Start a program on the logged-in desktop: SSH itself lands in a session without one."""
+    name = f'winvm-{os.getpid()}-{int(time.time())}'
+    payload = base64.b64encode((command_line + '\r\n').encode()).decode()
+    return powershell(
+        "Get-ChildItem C:\\winvm\\winvm-*.cmd | Where-Object LastWriteTime -lt (Get-Date).AddDays(-1) | Remove-Item; "   # earlier launches' scripts
+        f"[IO.File]::WriteAllBytes('C:\\winvm\\{name}.cmd',[Convert]::FromBase64String('{payload}')); "
+        f"schtasks /create /tn {name} /tr 'conhost.exe --headless C:\\winvm\\{name}.cmd' /sc once /st 23:59 /it /ru {config()['user']} /rl limited /f | Out-Null; "
+        f"schtasks /run /tn {name} | Out-Null; schtasks /delete /tn {name} /f | Out-Null", timeout=60)
+
+
+def cmd_launch(a):
+    need_running(); p = launch(' '.join(a.command))
+    if p.returncode: die('could not start it: ' + (p.stderr or p.stdout).decode(errors='replace').strip())
+
+
+def screenshot(path):
+    qmp('screendump', {'filename': str(path), 'format': 'png'}, timeout=20)
+    with open(path, 'rb') as f: head = f.read(24)
+    return struct.unpack('>II', head[16:24])
+
+
+def cmd_screenshot(a):
+    if not running(): die('the VM is not running (winvm up)', 3)
+    out = Path(a.out).resolve(); width, height = screenshot(out)
+    print(json.dumps({'path': str(out), 'width': width, 'height': height}) if a.json else f'{out} {width}x{height}')
+
+
+KEYS = {'enter': 'ret', 'return': 'ret', 'escape': 'esc', 'space': 'spc', 'del': 'delete', 'win': 'meta_l', 'windows': 'meta_l', 'meta': 'meta_l', 'super': 'meta_l', 'pageup': 'pgup',
+        'pagedown': 'pgdn', 'control': 'ctrl', 'ins': 'insert'}
+SYMBOLS = {' ': 'spc', '-': 'minus', '=': 'equal', '[': 'bracket_left', ']': 'bracket_right', '\\': 'backslash', ';': 'semicolon', "'": 'apostrophe',
+           '`': 'grave_accent', ',': 'comma', '.': 'dot', '/': 'slash', '\n': 'ret', '\t': 'tab'}
+SHIFTED = dict(zip('!@#$%^&*()_+{}|:"~<>?', '1234567890-=[]\\;\'`,./'))
+
+
+def key_events(names):
+    codes = [KEYS.get(n.lower(), n.lower()) for n in names]
+    def ev(code, down): return {'type': 'key', 'data': {'down': down, 'key': {'type': 'qcode', 'data': code}}}
+    return [ev(c, True) for c in codes] + [ev(c, False) for c in reversed(codes)]
+
+
+def cmd_input(a):
+    if not running(): die('the VM is not running (winvm up)', 3)
+    if a.action == 'key':
+        for combo in a.args: qmp('input-send-event', {'events': key_events(combo.split('+'))}); time.sleep(0.03)
+    elif a.action == 'type':
+        for ch in ' '.join(a.args):
+            shift = ch.isupper() or ch in SHIFTED
+            base = SHIFTED.get(ch, ch).lower()
+            code = SYMBOLS.get(base, base)
+            if not (code.isalnum() or code in SYMBOLS.values()): die(f'cannot type {ch!r} (US keyboard characters only)')
+            if shift: qmp('input-send-event', {'events': key_events(['shift'])[:1]}); time.sleep(0.02)   # a held shift, not a chord
+            qmp('input-send-event', {'events': key_events([code])}); time.sleep(0.02)
+            if shift: qmp('input-send-event', {'events': key_events(['shift'])[1:]}); time.sleep(0.01)
+    else:                                   # move / click / doubleclick / rightclick  X Y
+        if len(a.args) != 2: die(f'{a.action} takes X Y in screen pixels')
+        x, y = (int(v) for v in a.args); width, height = screenshot(RUN / 'input-probe.png')
+        if not (0 <= x < width and 0 <= y < height): die(f'{x},{y} is outside the {width}x{height} screen')
+        qmp('input-send-event', {'events': [{'type': 'abs', 'data': {'axis': 'x', 'value': x * 32767 // (width - 1)}},
+                                            {'type': 'abs', 'data': {'axis': 'y', 'value': y * 32767 // (height - 1)}}]})
+        button = 'right' if a.action == 'rightclick' else 'left'
+        for _ in range({'move': 0, 'doubleclick': 2}.get(a.action, 1)):
+            time.sleep(0.05)
+            for down in (True, False):
+                qmp('input-send-event', {'events': [{'type': 'btn', 'data': {'down': down, 'button': button}}]}); time.sleep(0.03)
+
+
+def open_viewer():
+    if pid_of('viewer') is None and running(): spawn('viewer', [sys.executable, str(HERE / 'viewer.py')], 'viewer.log')
+
+
+def cmd_view(a):
+    if not running(): die('the VM is not running (winvm up)', 3)
+    open_viewer()
+
+
+def cmd_snapshot(a):
+    disk = str(HOME / 'img/win.qcow2')
+    if a.action == 'list': sys.exit(subprocess.run(['qemu-img', 'snapshot', '-l', disk]).returncode)
+    if running(): die('stop the VM first (winvm down): snapshots are taken of the disk at rest')
+    flag = {'save': '-c', 'restore': '-a', 'delete': '-d'}[a.action]
+    if a.action == 'save': subprocess.run(['qemu-img', 'snapshot', '-d', a.name, disk], capture_output=True)   # replace
+    sys.exit(subprocess.run(['qemu-img', 'snapshot', flag, a.name, disk]).returncode)
+
+
+# ---- building a VM --------------------------------------------------------------------------------------------------
+MEDIA = {   # what `create` downloads when it is not in media/ yet
+    'win11.iso': 'https://go.microsoft.com/fwlink/?linkid=2289031&clcid=0x409&culture=en-us&country=us',   # Windows 11 Enterprise, 90-day evaluation
+    'virtio-win.iso': 'https://fedorapeople.org/groups/virtio-win/direct-downloads/stable-virtio/virtio-win.iso',
+    'OpenSSH-Win64.msi': 'https://github.com/PowerShell/Win32-OpenSSH/releases/download/v9.8.3.0p2-Preview/OpenSSH-Win64-v9.8.3.0.msi',
+}
+
+
+def cmd_create(a):
+    """Install Windows unattended into a new VM in WINVM_HOME: about 15 minutes after the downloads."""
+    disk = HOME / 'img/win.qcow2'
+    if disk.exists(): die(f'{disk} exists: this would replace the VM. Move it away first.')
+    if running(): die('a VM is running from this folder (winvm down)')
+    if not shutil.which('7z'): die('7z is needed to unpack drivers from the virtio ISO')
+    for d in ('img', 'media'): (HOME / d).mkdir(parents=True, exist_ok=True)
+    subprocess.run(['chattr', '+C', str(HOME / 'img')], capture_output=True)       # btrfs: no copy-on-write under a disk image
+    for name, url in MEDIA.items():
+        target = HOME / 'media' / name
+        if not target.exists():
+            print(f'downloading {name} …', flush=True)
+            subprocess.run(['curl', '-L', '--fail', '-sS', '-C', '-', '-o', str(target) + '.part', url], check=True)
+            (HOME / 'media' / (name + '.part')).rename(target)
+    key = HOME / 'id_ed25519'
+    if not key.exists(): subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-C', 'winvm', '-f', str(key)], check=True)
+    secret = HOME / 'password'
+    if not secret.exists():
+        import secrets
+        secret.touch(mode=0o600); secret.write_text('Wv' + secrets.token_hex(8) + '!a\n')
+    # The answer file and what setup.ps1 installs go on a USB stick that Windows Setup searches.
+    stick = HOME / 'unattend'
+    shutil.rmtree(stick, ignore_errors=True); (stick / 'winvm').mkdir(parents=True)
+    (stick / 'autounattend.xml').write_text((HERE / 'guest/autounattend.xml').read_text().replace('@PASSWORD@', secret.read_text().strip()))
+    (stick / 'autounattend.xml').chmod(0o600)
+    for name in ('setup.ps1', 'clipwatch.ps1'): shutil.copy(HERE / 'guest' / name, stick / 'winvm')
+    shutil.copy(str(key) + '.pub', stick / 'winvm/authorized_keys')
+    shutil.copy(HOME / 'media/OpenSSH-Win64.msi', stick / 'winvm')
+    iso = str(HOME / 'media/virtio-win.iso')
+    subprocess.run(['7z', 'x', '-y', f'-o{stick / "winvm"}', iso, 'virtio-win-guest-tools.exe'], check=True, capture_output=True)
+    subprocess.run(['7z', 'e', '-y', f'-o{stick / "winvm"}', iso, 'viogpudo/w11/amd64/vgpusrv.exe', 'viogpudo/w11/amd64/viogpuap.exe'], check=True, capture_output=True)
+    for driver in ('viostor', 'NetKVM', 'vioserial', 'Balloon'):          # not the display driver: it blanks Setup's screen
+        subprocess.run(['7z', 'x', '-y', f'-o{stick / "$WinPEDriver$"}', iso, f'{driver}/w11/amd64/*'], check=True, capture_output=True)
+    subprocess.run(['qemu-img', 'create', '-q', '-f', 'qcow2', str(disk), a.size], check=True)
+    shutil.copy('/usr/share/edk2/ovmf/OVMF_VARS_4M.qcow2', HOME / 'img/OVMF_VARS.qcow2')
+    shutil.rmtree(HOME / 'tpm', ignore_errors=True)
+    print('installing Windows …', flush=True)
+    start_vm(['-drive', f"file={HOME / 'media/win11.iso'},if=none,id=cd0,media=cdrom,readonly=on", '-device', 'ide-cd,drive=cd0,bootindex=2',
+              '-drive', f'file=fat:ro:{stick},if=none,id=ua,format=raw,readonly=on', '-device', 'usb-storage,drive=ua,removable=on'])
+    for _ in range(16):                                                   # "Press any key to boot from CD or DVD"
+        qmp('send-key', {'keys': [{'type': 'qcode', 'data': 'spc'}]}); time.sleep(0.5)
+    deadline = time.time() + 45 * 60
+    while time.time() < deadline:
+        if not running(): die('the VM stopped during the install; see ' + str(RUN / 'qemu.log'))
+        if ssh_ready() and b'True' in powershell('Test-Path C:\\winvm-setup.done', timeout=30).stdout: break
+        time.sleep(10)
+    else: die('Windows Setup did not finish in 45 minutes (winvm screenshot shows where it is)')
+    built = HOME / 'driver/out'
+    if (built / 'viogpudo.sys').exists():                                 # the VSync display driver (driver/rebuild.sh builds it)
+        print('installing the display driver …', flush=True)
+        powershell('New-Item -Force -ItemType Directory C:\\winvm\\viogpudo-vsync | Out-Null', timeout=30)
+        subprocess.run([sys.executable, str(Path(__file__).resolve()), 'copy', *(str(f) for f in built.iterdir()), 'C:\\winvm\\viogpudo-vsync'], check=True)
+        install = 'powershell -NoProfile -ExecutionPolicy Bypass -File C:\\winvm\\viogpudo-vsync\\install.ps1'
+        powershell(install, timeout=120)                                  # turns test signing on
+        powershell('shutdown /r /f /t 0', timeout=30); time.sleep(20)
+        if not wait_ssh(600): die('Windows did not come back after enabling test signing')
+        time.sleep(20)
+        print(powershell(install, timeout=300).stdout.decode(errors='replace').strip())
+    else:
+        print('no built display driver in driver/out: the stock driver stays (about 40 fps). See docs/windows-vm.md.')
+    cmd_down(argparse.Namespace(wait=900))                                # the first shutdown finishes the install: it can take 10 minutes
+    shutil.rmtree(stick, ignore_errors=True)
+    subprocess.run(['qemu-img', 'snapshot', '-c', 'fresh', str(disk)], check=True)
+    print(f'The VM is ready in {HOME} (snapshot "fresh"). Start it with: winvm up --view')
+
+
+def main():
+    ports = lambda v: [int(p) for p in v.replace(',', ' ').split()]
+    ap = argparse.ArgumentParser(prog='winvm', description=__doc__.split('\n\n')[0])
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    def add(name, fn, help): p = sub.add_parser(name, help=help); p.set_defaults(fn=fn); return p
+    p = add('up', cmd_up, 'start the VM (if needed), wait for Windows, connect the ports')
+    p.add_argument('--to-vm', type=ports, default=[], help="ports on this machine the VM reaches on its localhost, e.g. 3000,3001")
+    p.add_argument('--from-vm', type=ports, default=[], help='VM ports this machine reaches on its localhost')
+    p.add_argument('--view', action='store_true', help='open the viewer window'); p.add_argument('--wait', type=int, default=600); p.add_argument('--json', action='store_true')
+    p = add('ports', cmd_ports, 'replace the connected ports of the running VM')
+    p.add_argument('--to-vm', type=ports, default=[]); p.add_argument('--from-vm', type=ports, default=[]); p.add_argument('--json', action='store_true')
+    p = add('down', cmd_down, 'shut Windows down and stop the VM'); p.add_argument('--wait', type=int, default=300)
+    p = add('status', cmd_status, 'stopped, starting or running; connected ports'); p.add_argument('--json', action='store_true')
+    p = add('exec', cmd_exec, 'run a PowerShell command in the VM as its administrator (no desktop)')
+    p.add_argument('--cwd'); p.add_argument('--timeout', type=int, default=120); p.add_argument('command', nargs='+')
+    add('diag', cmd_diag, "the guest's health as JSON: load, memory, disk, processes, listening ports, recent errors")
+    p = add('copy', cmd_copy, 'copy files or folders into the VM (or out of it with --from-vm): winvm copy SRC... DEST')
+    p.add_argument('--from-vm', action='store_true'); p.add_argument('paths', nargs='+', metavar='PATH')
+    p = add('media', cmd_media, 'attach an ISO to the running VM as a disc; prints its drive letter'); p.add_argument('iso')
+    p = add('launch', cmd_launch, "start a program on the VM's desktop"); p.add_argument('command', nargs='+')
+    p = add('screenshot', cmd_screenshot, 'save the screen as a PNG'); p.add_argument('out'); p.add_argument('--json', action='store_true')
+    p = add('input', cmd_input, 'pointer and keyboard: click X Y | doubleclick X Y | rightclick X Y | move X Y | type TEXT | key ctrl+c ...')
+    p.add_argument('action', choices=['click', 'doubleclick', 'rightclick', 'move', 'type', 'key']); p.add_argument('args', nargs='+')
+    add('view', cmd_view, 'open the viewer window')
+    p = add('snapshot', cmd_snapshot, 'disk snapshots: list | save NAME | restore NAME | delete NAME')
+    p.add_argument('action', choices=['list', 'save', 'restore', 'delete']); p.add_argument('name', nargs='?', default='')
+    p = add('create', cmd_create, 'install Windows into a new VM (unattended, about 15 minutes after downloads)'); p.add_argument('--size', default='96G')
+    sub.add_parser('_tunnel').set_defaults(fn=lambda a: tunnel_loop())
+    sub.add_parser('_check').set_defaults(fn=lambda a: check())
+    a = ap.parse_args()
+    if a.cmd == 'snapshot' and a.action != 'list' and not a.name: ap.error('snapshot needs a name')
+    if a.cmd == 'copy' and len(a.paths) < 2: ap.error('copy needs a source and a destination')
+    for tool in ('qemu-system-x86_64', 'ssh', 'passt', 'swtpm'):
+        if not shutil.which(tool): die(f'{tool} is not installed')
+    try: a.fn(a)
+    except (OSError, RuntimeError) as e: die(str(e))
+
+
+if __name__ == '__main__':
+    main()

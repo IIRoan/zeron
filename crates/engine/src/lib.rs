@@ -82,6 +82,7 @@ mod transcript_history;
 mod update_trial;
 pub mod uploads;
 pub mod voice;
+pub mod windows_vm;
 pub mod workspace_files;
 pub mod workspace_host;
 pub mod worktree_settings;
@@ -1117,6 +1118,7 @@ impl Engine {
             tokens: Arc::new(auth.clone()),
         });
         core.previews.start(projects, preview_signaling).await;
+        windows_vm::keep_ports_current();
         // Release checker: polls {edge}/releases hourly (wall clock); headless
         // installs with ZERON_AUTO_UPDATE=1 apply + restart themselves — gated
         // on quiescence so a restart never lands under a live run or open PTY.

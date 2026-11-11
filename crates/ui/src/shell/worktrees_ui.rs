@@ -11,7 +11,10 @@ use zeron_proto::{
 
 mod environment;
 mod removal;
+mod environment_model;
+mod environment_rail;
 mod sandbox;
+mod windows_vm;
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum SettingsPage {
@@ -70,6 +73,14 @@ pub(super) struct WorktreeSettingsUi {
     pub(super) discard: popover::Popup<DiscardPrompt>,
     /// The open project's sandbox (Environment page, project defaults).
     sandbox: Option<sandbox::Panel>,
+    /// Its build log window.
+    sandbox_log: popover::Popup<sandbox::LogDialog>,
+    /// A sandbox build followed until it ends (the sidebar shows it).
+    sandbox_build: Option<sandbox::Watch>,
+    /// The open project's Windows VM (same page).
+    windows_vm: Option<windows_vm::Panel>,
+    /// What the active project uses of those two (the workbench rail).
+    environment: environment_rail::InUse,
 }
 
 pub(super) struct Editor {
@@ -304,6 +315,7 @@ impl Shell {
         self.worktree_settings.poll = None;
         self.poll_worktree_settings(cx);
         self.load_project_sandbox(cx);
+        self.load_project_windows_vm(cx);
         cx.notify();
     }
 
@@ -346,6 +358,9 @@ impl Shell {
         popover::close_popup(self, cx, |this| &mut this.worktree_settings.removal);
         popover::close_popup(self, cx, |this| &mut this.worktree_settings.discard);
         self.reset_worktree_selects();
+        // The sandbox or the VM may have been turned on or off there.
+        self.worktree_settings.environment.reveal = false;
+        self.watch_environment(cx);
         cx.notify();
     }
 
@@ -1190,6 +1205,11 @@ impl Shell {
                 {
                     panel = panel.child(sandbox);
                 }
+                if editor.checkout.is_none()
+                    && let Some(vm) = self.render_project_windows_vm(&theme, cx)
+                {
+                    panel = panel.child(vm);
+                }
             }
             if page == SettingsPage::Workflow {
                 if editor
@@ -1815,6 +1835,7 @@ impl Shell {
                     el.on_click(cx.listener(|this, _, _, cx| {
                         let database = this.service_fields(
                             ProjectTerminalService {
+                                depends_on: None,
                                 id: uuid::Uuid::new_v4().to_string(),
                                 name: "Databases".into(),
                                 command: String::new(),
@@ -2277,6 +2298,7 @@ mod tests {
 
     fn database(id: &str, name: &str) -> zeron_proto::ProjectTerminalService {
         zeron_proto::ProjectTerminalService {
+            depends_on: None,
             id: id.into(),
             name: name.into(),
             command: "bun run db".into(),

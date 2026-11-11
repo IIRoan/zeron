@@ -5,6 +5,7 @@ use zeron_proto::{ProjectTerminalConfig, ProjectTerminalService, ProjectTerminal
 
 fn service(id: &str, command: &str, restart: bool) -> ProjectTerminalService {
     ProjectTerminalService {
+        depends_on: None,
         id: id.into(),
         name: id.into(),
         command: command.into(),

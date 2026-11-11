@@ -881,6 +881,8 @@ pub enum RightSurface {
     Picker,
     Explorer,
     Services,
+    /// The project's sandbox and Windows VM (`worktrees_ui/environment_rail.rs`).
+    Environment,
     File(u64),
     Browser(u64),
     Diff(u64),
@@ -3763,6 +3765,7 @@ impl Shell {
             .filter(|surface| **surface != RightSurface::Services || self.services_available(cx))
             .filter_map(|surface| match surface {
                 RightSurface::Services => Some((*surface, "Services".into(), false, None)),
+                RightSurface::Environment => Some((*surface, "Environment".into(), false, None)),
                 RightSurface::Explorer => self
                     .files
                     .get(&key)
@@ -3868,6 +3871,7 @@ impl Shell {
             RightSurface::Picker
             | RightSurface::Explorer
             | RightSurface::Services
+            | RightSurface::Environment
             | RightSurface::Diff(_)
             | RightSurface::Terminal(_)
             | RightSurface::SideChat(_)
@@ -4067,6 +4071,7 @@ impl Shell {
                 }
             }
             RightSurface::Subagent(_) | RightSurface::Browser(_) => {}
+            RightSurface::Environment => self.watch_environment(cx),
             RightSurface::Picker => {}
         }
         self.sync_explorer_selection(cx);
@@ -5107,7 +5112,10 @@ impl Shell {
                         .update(cx, |s, _| s.unwatch_subagent_doc(&tab.doc_id));
                 }
             }
-            RightSurface::Picker | RightSurface::Explorer | RightSurface::Services => {}
+            RightSurface::Picker
+            | RightSurface::Explorer
+            | RightSurface::Services
+            | RightSurface::Environment => {}
         }
         self.close_empty_right_pane(&key, cx);
         self.panels.forget_right_surface(&key, surface);
@@ -10468,6 +10476,7 @@ impl Shell {
         )
         .fade_overflow_y(&self.sidebar_scroll);
 
+        let sandbox_build_strip = self.render_sandbox_build_strip(theme, cx);
         let update_strip = self.render_update_strip(theme, cx);
         // Stacked above the update strip, the banner needs its own gap; alone
         // it leans on the user-menu block's padding like the strip does.
@@ -10491,6 +10500,7 @@ impl Shell {
             // "Star on GitHub" banner until dismissed (persisted), then the
             // update strip — both above the user menu, below the lists.
             .when_some(github_star_banner, |el, banner| el.child(banner))
+            .when_some(sandbox_build_strip, |el, strip| el.child(strip))
             .when_some(update_strip, |el, strip| el.child(strip))
             .child(
                 div()
@@ -11727,6 +11737,9 @@ impl Shell {
         if let Some(overlay) = self.render_worktree_removal(viewport, window, cx) {
             overlays.push(overlay);
         }
+        if let Some(overlay) = self.render_sandbox_log(viewport, window, cx) {
+            overlays.push(overlay);
+        }
 
         if let Some((chat_id, _title)) = self.delete_confirm.get().cloned() {
             let chat = self.state.read(cx).chats.iter().find(|c| c.id == chat_id);
@@ -12770,6 +12783,7 @@ impl Shell {
         let content: AnyElement = if showing {
             match self.resolved_right_active(cx) {
                 RightSurface::Services => self.render_services_sidebar(window, cx),
+                RightSurface::Environment => self.render_environment_panel(cx),
                 RightSurface::Explorer => {
                     if let Some(files) = self.files.get(&self.panel_key(cx)).cloned() {
                         files.update(cx, |files, cx| {
@@ -13007,6 +13021,11 @@ impl Shell {
                         row("surface-card-services", icons::SERVICES, "Services")
                             .on_click(cx.listener(|this, _, _, cx| this.open_services_panel(cx))),
                     ))
+                    // The project's sandbox and Windows VM: Linux has them.
+                    .when(cfg!(target_os = "linux"), |el| el.child(
+                        row("surface-card-environment", icons::MONITOR, "Environment")
+                            .on_click(cx.listener(|this, _, _, cx| this.open_environment_panel(cx))),
+                    ))
                     .child(
                         row("surface-card-terminal", icons::TERMINAL, "Terminal").on_click(
                             cx.listener(|this, _, _, cx| {
@@ -13243,6 +13262,7 @@ impl Shell {
                 RightSurface::Picker => icons::PLUS,
                 RightSurface::Explorer => icons::FILE_TREE,
                 RightSurface::Services => icons::SERVICES,
+                RightSurface::Environment => icons::MONITOR,
             };
             // Working chats and subagents swap their harness icon for the
             // mini spinner; subagent liveness follows the doc's streaming tail.
@@ -13557,6 +13577,16 @@ impl Shell {
                                 }))
                                 .child(icon(icons::SERVICES).size(px(13.0)).text_color(theme.text_muted))
                                 .child("Services"),
+                        ))
+                        .when(cfg!(target_os = "linux"), |menu| menu.child(
+                            popover::menu_row(&theme, false, "right-plus-environment")
+                                .id("right-plus-environment-row")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.open_environment_panel(cx);
+                                    this.close_right_plus(cx);
+                                }))
+                                .child(icon(icons::MONITOR).size(px(13.0)).text_color(theme.text_muted))
+                                .child("Environment"),
                         ))
                         .when(self.git_tools_available(cx), |menu| {
                             menu.child(

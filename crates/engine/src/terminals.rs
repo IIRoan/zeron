@@ -789,6 +789,7 @@ impl Terminals {
             cwd: cwd.to_string(),
             shell: shell_name,
             host_replies: true,
+            sandboxed: sandbox.is_some(),
         })
     }
 

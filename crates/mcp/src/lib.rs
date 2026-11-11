@@ -22,6 +22,7 @@ mod services;
 mod tools;
 mod sandboxes;
 mod transcript;
+mod vm;
 mod worktrees;
 mod zeron;
 

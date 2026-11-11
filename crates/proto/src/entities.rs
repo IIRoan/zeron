@@ -2071,6 +2071,22 @@ pub struct TerminalSession {
     /// from hosts that predate it, whose viewers answer as before.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub host_replies: bool,
+    /// The shell runs in the project's sandbox container. The container can
+    /// be restarted or rebuilt under it, which kills the shell; a viewer
+    /// then opens a new one ([`TerminalSession::reconnects`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sandboxed: bool,
+}
+
+impl TerminalSession {
+    /// Whether a viewer opens a new shell in place of one that ended with
+    /// `exit_code` after `alive`: a sandboxed shell that was killed (its
+    /// container stopped) rather than left. Not one that died within
+    /// seconds of opening, so a container that keeps failing isn't retried
+    /// in a loop.
+    pub fn reconnects(sandboxed: bool, exit_code: i32, alive: std::time::Duration) -> bool {
+        sandboxed && exit_code > 128 && alive >= std::time::Duration::from_secs(3)
+    }
 }
 
 /// `TerminalStatus`: whether closing the terminal would end a program
@@ -2188,6 +2204,25 @@ pub struct ChatConnectivity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sandboxed_shell_killed_under_the_viewer_is_reopened_and_others_are_not() {
+        use std::time::Duration;
+        let minute = Duration::from_secs(60);
+        // The container stopped: podman kills the shell (128 + SIGKILL).
+        assert!(TerminalSession::reconnects(true, 137, minute));
+        assert!(TerminalSession::reconnects(true, 129, minute));
+        // The person left the shell, or it ran on this machine.
+        assert!(!TerminalSession::reconnects(true, 0, minute));
+        assert!(!TerminalSession::reconnects(true, 1, minute));
+        assert!(!TerminalSession::reconnects(false, 137, minute));
+        // A container that dies as soon as a shell opens isn't retried forever.
+        assert!(!TerminalSession::reconnects(true, 137, Duration::from_secs(1)));
+        // Older hosts say nothing about it.
+        let old: TerminalSession =
+            serde_json::from_str(r#"{"id":"t","cwd":"/p","shell":"bash"}"#).unwrap();
+        assert!(!old.sandboxed);
+    }
     use chrono::TimeZone;
 
     #[test]

@@ -11,6 +11,10 @@ impl Shell {
         plugins::contributes(Contribution::ProjectServices, cx)
     }
 
+    pub(super) fn windows_vm_plugin_enabled(&self, cx: &App) -> bool {
+        plugins::contributes(Contribution::WindowsVm, cx)
+    }
+
     pub(super) fn git_tools_available(&self, cx: &App) -> bool {
         plugins::contributes(Contribution::SourceControl, cx) && self.space_git_detected(cx)
     }
