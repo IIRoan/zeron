@@ -1057,7 +1057,18 @@ impl AgentAccounts {
             for slot in slots {
                 let active = active_set.is_some_and(|keys| keys.contains(&slot.account_key));
                 let entry = usage.get(&usage_key(harness, &slot.account_key));
-                let snapshot = entry.and_then(|entry| entry.usage.as_ref());
+                // A Claude login Claude Code ended holds no token: its last
+                // meters would pass it off as usable (and switchable).
+                let signed_out = harness == HarnessId::ClaudeCode
+                    && matches!(
+                        entry.and_then(|entry| entry.error.as_ref()),
+                        Some(ProbeError::NoCredentials {
+                            why: NoCredentials::Missing
+                        })
+                    );
+                let snapshot = entry
+                    .and_then(|entry| entry.usage.as_ref())
+                    .filter(|_| !signed_out);
                 accounts.push(AgentAccount {
                     id: slot.id.clone(),
                     harness,
@@ -1246,11 +1257,16 @@ impl AgentAccounts {
             Ok(Some(_)) => Ok(self
                 .read_slot(HarnessId::ClaudeCode, &slot.id)
                 .unwrap_or(slot)),
-            Err(ProbeError::Unauthorized { .. }) => Err(EngineError::Other(format!(
-                "The saved Claude login for {} has expired. Sign in to it again with Add \
-                 account, then switch.",
-                slot.profile.email
-            ))),
+            // No refresh token: Claude Code ended this login (its `invalid_grant`
+            // or time-limit clear blanks both tokens) while it was live, and the
+            // pre-swap snapshot saved that. Installed, every chat fails to sign in.
+            Err(ProbeError::Unauthorized { .. } | ProbeError::NoCredentials { .. }) => {
+                Err(EngineError::Other(format!(
+                    "The saved Claude login for {} has expired. Sign in to it again with Add \
+                     account, then switch.",
+                    slot.profile.email
+                )))
+            }
             Ok(None) | Err(_) => Ok(slot),
         }
     }
@@ -4415,6 +4431,10 @@ fn usage_error_message(
         ProbeError::NoCredentials {
             why: NoCredentials::KeyExpired,
         } => "API key expired — connect again".to_string(),
+        // Claude Code blanks a login it ended (refresh refused, time limit).
+        ProbeError::NoCredentials {
+            why: NoCredentials::Missing,
+        } if harness == HarnessId::ClaudeCode => "Signed out — sign in again".to_string(),
         ProbeError::NoCredentials {
             why: NoCredentials::Missing,
         } => return None,
@@ -6394,6 +6414,68 @@ mod login_tests {
         assert_eq!(oauth["accessToken"], "fresh");
         assert_eq!(oauth["refreshToken"], "rt2");
         assert!(oauth["refreshTokenExpiresAt"].as_i64().unwrap() > now_ms() + 80_000_000);
+    }
+
+    #[tokio::test]
+    async fn a_claude_login_the_cli_ended_reads_signed_out_and_is_never_switched_to() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (token_url, refreshes) = fixed_server(
+            "200 OK",
+            r#"{"access_token":"x","refresh_token":"y","expires_in":3600}"#,
+        )
+        .await;
+        let endpoints = ProbeEndpoints {
+            claude_token: token_url,
+            ..Default::default()
+        };
+        let accounts =
+            AgentAccounts::with_endpoints(config(tmp.path()), endpoints, Default::default());
+        write_live_claude(tmp.path(), "acct-a", "a@example.com", "live");
+        // What Claude Code 2.1.3xx leaves when it ends a login: both tokens
+        // blanked in place, `expiresAt: 0`, the reason alongside.
+        let mut dead = claude_slot("acct-b", "b@example.com", "", 0);
+        dead.credentials["claudeAiOauth"]["accessToken"] = "".into();
+        dead.credentials["claudeAiOauth"]["loginEnded"] = "time_limit".into();
+        accounts.write_slot(&dead).unwrap();
+        let mut entry = UsageEntry::default();
+        let week = AgentUsageWindow {
+            label: "Week".into(),
+            used_fraction: 0.5,
+            resets_at: None,
+        };
+        entry.record(
+            Ok(UsageSnapshot {
+                windows: vec![week],
+                ..Default::default()
+            }),
+            "c".into(),
+            1,
+        );
+        entry.record(
+            Err(ProbeError::NoCredentials {
+                why: NoCredentials::Missing,
+            }),
+            "c".into(),
+            2,
+        );
+        lock(&accounts.inner.usage).insert(usage_key(HarnessId::ClaudeCode, "acct-b"), entry);
+
+        let listed = accounts.list(false).await.unwrap();
+        let row = listed.accounts.iter().find(|a| a.id == dead.id).unwrap();
+        assert!(row.usage_windows.is_empty(), "no stale meters");
+        assert_eq!(
+            row.usage_error.as_deref(),
+            Some("Signed out — sign in again")
+        );
+
+        let err = accounts
+            .activate(HarnessId::ClaudeCode, &dead.id)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("b@example.com"), "{err}");
+        let live = read_json(&config(tmp.path()).claude_creds_file()).unwrap();
+        assert_eq!(live["claudeAiOauth"]["accessToken"], "live");
+        assert_eq!(refreshes.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
