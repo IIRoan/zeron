@@ -394,6 +394,18 @@ fn reserved() -> Vec<u16> {
 /// How long a port stays connected after its server stopped listening: a
 /// dev server that restarts keeps its port.
 const PORT_LINGER: Duration = Duration::from_secs(45);
+/// How often the VM's own ports are compared with the wanted ones while
+/// those don't change.
+const PORT_RECHECK: Duration = Duration::from_secs(30);
+
+/// The ports a running VM has connected, from its status.
+fn connected_ports(vm: &Value) -> Ports {
+    let ports = |key: &str| serde_json::from_value(vm[key].clone()).unwrap_or_default();
+    Ports {
+        to_vm: ports("toVm"),
+        from_vm: ports("fromVm"),
+    }
+}
 
 /// While the engine runs: keep the running VM's ports the ones the connected
 /// projects' servers listen on, so nobody lists a worktree's ports by hand.
@@ -407,13 +419,15 @@ pub fn keep_ports_current() {
     tokio::spawn(async move {
         let mut seen: std::collections::HashMap<(PathBuf, u16), std::time::Instant> =
             Default::default();
-        let mut applied: Option<Ports> = None;
+        // What the VM was last asked for, and when it was last looked at.
+        let mut asked: Option<Ports> = None;
+        let mut checked = std::time::Instant::now();
         let mut idle = 0u32;
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
             let projects = projects().unwrap_or_default();
             if !projects.iter().any(|vm| vm.auto_ports) || !available() {
-                applied = None;
+                asked = None;
                 continue;
             }
             // A stopped VM is asked about only every half minute.
@@ -431,30 +445,39 @@ pub fn keep_ports_current() {
             seen.retain(|_, last| now.duration_since(*last) < PORT_LINGER);
             let lingering: Vec<(PathBuf, u16)> = seen.keys().cloned().collect();
             let wanted = wanted_ports(&projects, &lingering, &reserved());
-            if applied.as_ref() == Some(&wanted) {
+            // Unchanged ports are still compared with the VM's own now and
+            // then: one started again outside Zeron (`winvm down`, `winvm
+            // up`) comes back without them.
+            if asked.as_ref() == Some(&wanted) && checked.elapsed() < PORT_RECHECK {
                 continue;
             }
-            let running = status()
+            checked = std::time::Instant::now();
+            let vm = status()
                 .await
-                .is_ok_and(|vm| vm["state"].as_str() == Some("running"));
-            if !running {
-                applied = None;
+                .ok()
+                .filter(|vm| vm["state"].as_str() == Some("running"));
+            let Some(vm) = vm else {
+                asked = None;
                 idle = 5;
                 continue;
-            }
-            let args = port_args("ports", &wanted, false);
-            let args: Vec<&str> = args.iter().map(String::as_str).collect();
-            match run(&args, Duration::from_secs(60)).await {
-                // 5: connected, except ports that are taken on the other side.
-                Ok(ran) if matches!(ran.code, Some(0 | 5)) => {
-                    tracing::info!(to_vm = ?wanted.to_vm, "windows vm: ports connected");
-                    applied = Some(wanted);
+            };
+            if connected_ports(&vm) != wanted {
+                let args = port_args("ports", &wanted, false);
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                match run(&args, Duration::from_secs(60)).await {
+                    Ok(ran) if ran.code == Some(0) => {
+                        tracing::info!(to_vm = ?wanted.to_vm, "windows vm: ports connected")
+                    }
+                    // Some are taken on the other side (the rest crossed), or
+                    // the VM took none. Said once per try: the next
+                    // comparison with the VM's own ports tries again.
+                    Ok(ran) => {
+                        tracing::warn!(error = %ran.error(), "windows vm: ports not all connected")
+                    }
+                    Err(error) => tracing::warn!(%error, "windows vm: couldn't connect ports"),
                 }
-                Ok(ran) => {
-                    tracing::warn!(error = %ran.error(), "windows vm: couldn't connect ports")
-                }
-                Err(error) => tracing::warn!(%error, "windows vm: couldn't connect ports"),
             }
+            asked = Some(wanted);
         }
     });
 }
@@ -593,7 +616,8 @@ pub async fn screenshot() -> Result<(Vec<u8>, Value), EngineError> {
 /// `doubleclick`, `rightclick`, `move` (with `x y`), `type` (text) or `key`
 /// (combinations like `ctrl+s`).
 pub async fn input(action: &str, values: &[String]) -> Result<(), EngineError> {
-    let mut args = vec!["input", action];
+    // After `--`: text to type may start with a dash.
+    let mut args = vec!["input", action, "--"];
     args.extend(values.iter().map(String::as_str));
     let ran = run(&args, Duration::from_secs(120)).await?;
     if ran.code == Some(0) {

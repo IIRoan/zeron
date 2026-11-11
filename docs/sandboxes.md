@@ -59,8 +59,9 @@ zeron sandbox disable ~/Documents/muute-monorepo
   store, and git there reads GitHub's SSH remotes over HTTPS (no SSH key goes
   in). Agents can then do anything that account can, including push and
   editing workflows. Turning it off takes both files out again when the
-  container is recreated, but a token they copied keeps working until you
-  revoke it (`gh auth refresh`, or on GitHub).
+  container is recreated (a login you made in the container yourself is left
+  alone), but a token they copied keeps working until you revoke it
+  (`gh auth refresh`, or on GitHub).
 - The container's environment has `ZERON_SANDBOX=1`, for a project's own
   tooling to adapt (no ssh keys there, no container daemon).
 - `DOCKER_HOST` there is a read-only Docker API Zeron serves (a socket in the
@@ -74,13 +75,15 @@ zeron sandbox disable ~/Documents/muute-monorepo
 - Agents' commits there are authored with this machine's `user.name` and
   `user.email`. With `--sign-commits` (off by default) they're signed too:
   git there runs the helper as its `gpg.program`, which hands what git signs
-  to a socket in the run folder, and this machine signs it with its git's
-  `user.signingkey` (its gpg and agent; a pinentry may ask here). Only git's
-  own signing call on a commit or tag object is signed, always with that key:
-  agents never hold it, can't pick another, decrypt, or sign anything else.
-  Verifying signatures (`git log --show-signature`) isn't relayed. Without
-  it, commits there are unsigned, and a repository with `commit.gpgsign`
-  refuses them.
+  to a socket in the run folder, and this machine signs it as its own git
+  would: with its `user.signingkey` and `gpg.format` (gpg, gpgsm or an SSH
+  key, through their agents; a pinentry may ask here). `enable` refuses the
+  setting on a machine without a signing key. Only git's own signing call on
+  a commit or tag object is signed, always with that key: agents never hold
+  it, can't pick another, decrypt, or sign anything else. Verifying
+  signatures (`git log --show-signature`) isn't relayed. Without it, commits
+  there are unsigned, a repository with `commit.gpgsign` refuses them, and
+  the socket is gone: turning the setting off closes it at once.
 - Edit the config and run `enable` again to rebuild. `disable` keeps the image
   and the home volume.
 

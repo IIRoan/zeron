@@ -7,7 +7,6 @@
 use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use zeron_proto::{AccessMode, SandboxLevel};
 use zeron_rpc::{Caller, RpcError, RpcReply, methods, parse_params};
 
 use super::EngineRpc;
@@ -123,7 +122,7 @@ impl EngineRpc {
         }
         let settings = windows_vm::for_root(&root).map_err(failed)?;
         // What the action answered: the diagnostics, a command's output, the
-        // screen. The VM's own state follows in `vm` as for every reply.
+        // screen. The VM's own state follows in `vm` (not with the screen).
         let mut result = Value::Null;
         if method == methods::CONTROL_PROJECT_WINDOWS_VM {
             let vm = settings.as_ref().ok_or_else(|| {
@@ -167,10 +166,16 @@ impl EngineRpc {
                 }
             }
         }
+        // Not with the screen: the panel takes that picture every few
+        // seconds and reads the VM's state on its own schedule.
+        let vm = match p.brief || p.action.as_deref() == Some("screenshot") {
+            true => Value::Null,
+            false => vm_state().await,
+        };
         Ok(RpcReply::Value(json!({
             "available": windows_vm::available(),
             "settings": settings,
-            "vm": if p.brief { Value::Null } else { vm_state().await },
+            "vm": vm,
             "result": result,
         })))
     }
@@ -210,16 +215,8 @@ impl EngineRpc {
                     "This project is not connected to a Windows VM. The person connects it in Project settings → Environment → Windows VM, or with zeron vm enable.".into(),
                 )
             })?;
-        let writes = !matches!(p.action.as_str(), "status" | "diagnostics" | "screenshot");
-        if writes
-            && matches!(zeron_rpc::caller(), Caller::Agent { .. })
-            && chat.config.as_ref().is_some_and(|c| {
-                c.access != AccessMode::FullAccess || c.sandbox == SandboxLevel::ReadOnly || c.plan
-            })
-        {
-            return Err(RpcError::Failed(
-                "Using the Windows VM requires a chat with full access outside read-only or plan mode.".into(),
-            ));
+        if !matches!(p.action.as_str(), "status" | "diagnostics" | "screenshot") {
+            self.require_full_access(&p.chat_id, "Using the Windows VM")?;
         }
         let text = |value: Option<String>, what: &str| {
             value

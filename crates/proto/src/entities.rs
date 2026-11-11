@@ -2081,11 +2081,20 @@ pub struct TerminalSession {
 impl TerminalSession {
     /// Whether a viewer opens a new shell in place of one that ended with
     /// `exit_code` after `alive`: a sandboxed shell that was killed (its
-    /// container stopped) rather than left. Not one that died within
-    /// seconds of opening, so a container that keeps failing isn't retried
-    /// in a loop.
-    pub fn reconnects(sandboxed: bool, exit_code: i32, alive: std::time::Duration) -> bool {
-        sandboxed && exit_code > 128 && alive >= std::time::Duration::from_secs(3)
+    /// container stopped) rather than left. A shell ends with its last
+    /// command's status, so one the person leaves after interrupting a
+    /// command (130) reads as killed too: `idle`, how long ago they last
+    /// typed, tells those apart. Not one that died within seconds of
+    /// opening either, so a container that keeps failing isn't retried in a
+    /// loop.
+    pub fn reconnects(
+        sandboxed: bool,
+        exit_code: i32,
+        alive: std::time::Duration,
+        idle: Option<std::time::Duration>,
+    ) -> bool {
+        const SETTLED: std::time::Duration = std::time::Duration::from_secs(3);
+        sandboxed && exit_code > 128 && alive >= SETTLED && idle.is_none_or(|idle| idle >= SETTLED)
     }
 }
 
@@ -2210,14 +2219,23 @@ mod tests {
         use std::time::Duration;
         let minute = Duration::from_secs(60);
         // The container stopped: podman kills the shell (128 + SIGKILL).
-        assert!(TerminalSession::reconnects(true, 137, minute));
-        assert!(TerminalSession::reconnects(true, 129, minute));
+        assert!(TerminalSession::reconnects(true, 137, minute, None));
+        assert!(TerminalSession::reconnects(true, 129, minute, Some(minute)));
         // The person left the shell, or it ran on this machine.
-        assert!(!TerminalSession::reconnects(true, 0, minute));
-        assert!(!TerminalSession::reconnects(true, 1, minute));
-        assert!(!TerminalSession::reconnects(false, 137, minute));
+        assert!(!TerminalSession::reconnects(true, 0, minute, None));
+        assert!(!TerminalSession::reconnects(true, 1, minute, None));
+        assert!(!TerminalSession::reconnects(false, 137, minute, None));
+        // Ctrl-C, then `exit`: the shell ends with the interrupted command's
+        // status, right after what the person typed.
+        let just_now = Some(Duration::from_millis(200));
+        assert!(!TerminalSession::reconnects(true, 130, minute, just_now));
         // A container that dies as soon as a shell opens isn't retried forever.
-        assert!(!TerminalSession::reconnects(true, 137, Duration::from_secs(1)));
+        assert!(!TerminalSession::reconnects(
+            true,
+            137,
+            Duration::from_secs(1),
+            None
+        ));
         // Older hosts say nothing about it.
         let old: TerminalSession =
             serde_json::from_str(r#"{"id":"t","cwd":"/p","shell":"bash"}"#).unwrap();

@@ -666,6 +666,9 @@ impl WorktreeSettingsStore {
                     .and_then(|p| p.checkouts.get(&cwd))
                     .is_some_and(|c| c.prepared_hash == digest))
             })?;
+        // Setup is about to run here: it needs every database up, whichever
+        // services are being started.
+        let prerequisites = prerequisites.filter(|_| already_prepared);
         let project_services = self
             .inner
             .project_services

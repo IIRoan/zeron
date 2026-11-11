@@ -38,9 +38,15 @@ impl Build {
             .find(|line| !line.is_empty())
     }
 
+    /// Whether Zeron's last step (`▸ …`) is its `Failed`. The reason comes
+    /// after it and can run over several lines (a failed build's last output).
     fn failed(&self) -> bool {
-        self.latest()
-            .is_some_and(|line| line.starts_with("▸ Failed"))
+        self.log
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|line| line.starts_with('▸'))
+            .is_some_and(|step| step.starts_with("▸ Failed"))
     }
 }
 
@@ -917,6 +923,15 @@ mod tests {
             ..build
         };
         assert!(failed.failed());
+        // As the engine writes it: the reason, then the build's last output.
+        let with_output = Build {
+            log: format!(
+                "{}▸ Failed: devcontainer build failed:\nSTEP 2/9: RUN false\nError: exit status 1\n",
+                build.log
+            ),
+            ..build.clone()
+        };
+        assert!(with_output.failed());
     }
 
     #[test]

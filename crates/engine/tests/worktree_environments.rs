@@ -1905,6 +1905,8 @@ async fn service_dependencies_start_only_required_database_and_report_waiting() 
         let mut unrelated = database("unused-db", "Unused database");
         unrelated.command = "touch unused-database; exec sleep 60".into();
         config.services.push(unrelated);
+        // Databases are saved on their own: `save_defaults` keeps app services only.
+        services.save("project", &f.root, config.clone()).unwrap();
         let mut backend = app("backend", "Backend");
         backend.depends_on = Some(vec!["databases".into()]);
         backend.command = "test -f \"$ZERON_PROJECT_ROOT/database.ready\" && touch backend.started; exec sleep 60".into();
@@ -1966,12 +1968,11 @@ async fn service_dependencies_start_only_required_database_and_report_waiting() 
         let snapshot = task.await.unwrap().unwrap();
         service_marker(&cwd.join("backend.started")).await;
         assert!(snapshot.startups.is_empty());
-        assert!(
-            !snapshot
-                .runs
-                .iter()
-                .any(|r| r.service_id == "unused-db" || r.service_id == "unused-app")
-        );
+        // The main folder starts only what the backend needs. A worktree
+        // that is new runs its setup first, and that needs every database.
+        let ran = |id: &str| snapshot.runs.iter().any(|r| r.service_id == id);
+        assert_eq!(ran("unused-db"), !main, "{:?}", snapshot.runs);
+        assert!(!ran("unused-app"));
         services.shutdown();
     }
 }
@@ -2076,7 +2077,7 @@ async fn service_dependencies_empty_list_skips_unrelated_infrastructure() {
             &f.store,
             "project",
             &f.root,
-            &f.a,
+            &f.root,
             Some("backend"),
             "start",
         )
@@ -2092,6 +2093,180 @@ async fn service_dependencies_empty_list_skips_unrelated_infrastructure() {
         ProjectTerminalStatus::Running
     );
     assert!(!f.root.join("database.started").exists());
+    services.shutdown();
+}
+
+#[tokio::test]
+async fn a_new_worktrees_setup_gets_every_database_whatever_the_started_service_needs() {
+    let f = Fixture::new();
+    let (services, terminals) = startup_service(
+        &f,
+        "touch database.started; exec sleep 60",
+        "test -f database.started",
+        30,
+    );
+    let mut config = services.snapshot("project", &f.root).unwrap().config;
+    let mut backend = app("backend", "Backend");
+    backend.depends_on = Some(Vec::new());
+    config.services.push(backend);
+    services
+        .save_defaults(&f.store, "project", &f.root, config)
+        .await
+        .unwrap();
+    let control = |id: &'static str, action: &'static str| {
+        services.control_checkout(
+            &terminals,
+            &f.store,
+            "project",
+            &f.root,
+            &f.a,
+            Some(id),
+            action,
+        )
+    };
+    // Setup (migrations, say) runs before the backend's first start here.
+    control("backend", "start").await.unwrap();
+    assert!(f.root.join("database.started").exists());
+    assert_eq!(
+        std::fs::read_to_string(f.a.join("prepared")).unwrap(),
+        "setup"
+    );
+    // Prepared: from now on a start brings up only what the service needs.
+    control("backend", "stop").await.unwrap();
+    control("databases", "stop").await.unwrap();
+    std::fs::remove_file(f.root.join("database.started")).unwrap();
+    control("backend", "start").await.unwrap();
+    assert!(!f.root.join("database.started").exists());
+    assert_eq!(
+        std::fs::read_to_string(f.a.join("prepared")).unwrap(),
+        "setup"
+    );
+    services.shutdown();
+}
+
+#[tokio::test]
+async fn stopping_one_service_of_a_batch_leaves_the_others_starting() {
+    let f = Fixture::new();
+    let (services, terminals) = startup_service(&f, "exec sleep 60", "test -f database.ready", 30);
+    let mut config = services.snapshot("project", &f.root).unwrap().config;
+    let mut backend = app("backend", "Backend");
+    backend.depends_on = Some(vec!["databases".into()]);
+    backend.command = "touch backend.started; exec sleep 60".into();
+    let mut worker = app("worker", "Worker");
+    worker.depends_on = Some(Vec::new());
+    worker.command = "touch worker.started; exec sleep 60".into();
+    config.services.extend([backend, worker]);
+    services
+        .save_defaults(&f.store, "project", &f.root, config)
+        .await
+        .unwrap();
+    let start_all = {
+        let (services, terminals, store, root) = (
+            services.clone(),
+            terminals.clone(),
+            f.store.clone(),
+            f.root.clone(),
+        );
+        tokio::spawn(async move {
+            services
+                .control_checkout(&terminals, &store, "project", &root, &root, None, "start")
+                .await
+        })
+    };
+    let snapshot = || {
+        services
+            .checkout_snapshot(
+                "project",
+                &f.root,
+                &f.root,
+                &f.store.effective(&f.root, &f.root).unwrap(),
+            )
+            .unwrap()
+    };
+    let waiting = |id: &str| snapshot().startups.iter().any(|p| p.service_id == id);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !snapshot()
+            .startups
+            .iter()
+            .any(|p| p.message == "Waiting for Databases")
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // The worker's own Stop, while everything waits for the database.
+    tokio::time::timeout(
+        Duration::from_secs(8),
+        services.control_checkout(
+            &terminals,
+            &f.store,
+            "project",
+            &f.root,
+            &f.root,
+            Some("worker"),
+            "stop",
+        ),
+    )
+    .await
+    .expect("a Stop doesn't wait for the batch")
+    .unwrap();
+    assert!(!waiting("worker"));
+    assert!(waiting("backend"), "the backend is still starting");
+    std::fs::write(f.root.join("database.ready"), b"ready").unwrap();
+    let started = start_all.await.unwrap().unwrap();
+    service_marker(&f.root.join("backend.started")).await;
+    assert!(started.startups.is_empty());
+    let status = |id: &str| {
+        started
+            .runs
+            .iter()
+            .find(|r| r.service_id == id)
+            .map(|r| r.status)
+    };
+    assert_eq!(status("backend"), Some(ProjectTerminalStatus::Running));
+    assert_ne!(status("worker"), Some(ProjectTerminalStatus::Running));
+    assert!(!f.root.join("worker.started").exists());
+    services.shutdown();
+}
+
+#[tokio::test]
+async fn a_failed_start_leaves_a_database_that_is_up_as_it_is() {
+    let f = Fixture::new();
+    // Up once its command has ended, like `docker compose up -d`.
+    let (services, terminals) = startup_service(&f, "true", "true", 30);
+    let mut config = services.snapshot("project", &f.root).unwrap().config;
+    let mut backend = app("backend", "Backend");
+    backend.depends_on = Some(vec!["databases".into()]);
+    backend.directory = "missing".into();
+    config.services.push(backend);
+    services
+        .save_defaults(&f.store, "project", &f.root, config)
+        .await
+        .unwrap();
+    let error = services
+        .control_checkout(
+            &terminals, &f.store, "project", &f.root, &f.root, None, "start",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    let snapshot = services
+        .checkout_snapshot(
+            "project",
+            &f.root,
+            &f.root,
+            &f.store.effective(&f.root, &f.root).unwrap(),
+        )
+        .unwrap();
+    let run = |id: &str| snapshot.runs.iter().find(|r| r.service_id == id).unwrap();
+    assert_eq!(run("backend").status, ProjectTerminalStatus::Failed);
+    assert_eq!(run("backend").message.as_deref(), Some(error.as_str()));
+    let database = run("databases");
+    assert_eq!(database.status, ProjectTerminalStatus::Exited);
+    assert_eq!(database.exit_code, Some(0));
+    assert_eq!(database.readiness, Some(ServiceReadinessState::Ready));
+    assert_eq!(database.message, None);
     services.shutdown();
 }
 

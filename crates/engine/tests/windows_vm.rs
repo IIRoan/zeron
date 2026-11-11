@@ -197,6 +197,9 @@ async fn a_connected_project_uses_the_vm_and_only_the_person_connects_it() {
     assert_eq!(screen["result"]["mimeType"], "image/png");
     // base64 of the stand-in's "PNG bytes".
     assert_eq!(screen["result"]["data"], "UE5HIGJ5dGVz");
+    // The picture is retaken every few seconds: the VM isn't asked for its
+    // state each time.
+    assert!(screen["vm"].is_null());
     let launched = control("launch", Some("notepad.exe")).await.unwrap();
     assert_eq!(launched["result"]["launched"], true);
     assert!(control("view", None).await.unwrap()["result"].is_null());

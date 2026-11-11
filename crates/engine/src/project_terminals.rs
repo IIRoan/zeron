@@ -17,6 +17,7 @@ use zeron_proto::{
 use crate::{EngineError, Terminals};
 
 mod startup;
+pub(crate) use startup::dependencies;
 
 const MAX_SERVICES: usize = 12;
 const MAX_RESTARTS: u32 = 3;
@@ -1250,109 +1251,96 @@ impl ProjectTerminals {
                 return self.checkout_snapshot(space, root, checkout, &settings);
             }
         }
-        let resolve_roots =
-            || -> Result<Vec<String>, EngineError> {
-                let mut roots: Vec<String> = if stopping {
-                    Vec::new()
-                } else if let Some(id) = service_id {
-                    vec![id.into()]
-                } else if action == "activate" {
-                    let key = Self::group_key(space, checkout)?;
-                    let projects = self
-                        .inner
-                        .projects
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    let running: HashSet<_> = projects
-                        .iter()
-                        .filter(|(id, project)| {
-                            (*id == space || project.parent.as_deref() == Some(space))
-                                && (settings.service_mode
-                                    == zeron_proto::WorktreeServiceMode::FollowActive
-                                    || **id == key)
-                        })
-                        .flat_map(|(_, project)| project.runs.iter())
-                        .filter(|run| matches!(run.status, Status::Running | Status::Restarting))
-                        .map(|run| run.service_id.as_str())
-                        .collect();
-                    config
-                        .services
-                        .iter()
-                        .filter(|service| {
-                            !service.is_database() && running.contains(service.id.as_str())
-                        })
-                        .map(|service| service.id.clone())
-                        .collect()
-                } else {
-                    config
-                        .services
-                        .iter()
-                        .filter(|service| action != "restart" || !service.is_database())
-                        .map(|service| service.id.clone())
-                        .collect()
-                };
-                // Old profiles activated their shared databases on checkout selection.
-                if action == "activate"
-                    && config
-                        .services
-                        .iter()
-                        .all(|service| service.depends_on.is_none())
-                {
-                    roots.extend(
-                        config
-                            .services
-                            .iter()
-                            .filter(|service| service.is_database())
-                            .map(|service| service.id.clone()),
-                    );
-                }
-                if !stopping
-                    && !service_id.is_some_and(|id| {
-                        config
-                            .services
-                            .iter()
-                            .any(|s| s.id == id && s.is_database())
+        let resolve_roots = || -> Result<Vec<String>, EngineError> {
+            let mut roots: Vec<String> = if stopping {
+                Vec::new()
+            } else if let Some(id) = service_id {
+                vec![id.into()]
+            } else if action == "activate" {
+                let key = Self::group_key(space, checkout)?;
+                let projects = self
+                    .inner
+                    .projects
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let running: HashSet<_> = projects
+                    .iter()
+                    .filter(|(id, project)| {
+                        (*id == space || project.parent.as_deref() == Some(space))
+                            && (settings.service_mode
+                                == zeron_proto::WorktreeServiceMode::FollowActive
+                                || **id == key)
                     })
+                    .flat_map(|(_, project)| project.runs.iter())
+                    .filter(|run| matches!(run.status, Status::Running | Status::Restarting))
+                    .map(|run| run.service_id.as_str())
+                    .collect();
+                config
+                    .services
+                    .iter()
+                    .filter(|service| {
+                        !service.is_database() && running.contains(service.id.as_str())
+                    })
+                    .map(|service| service.id.clone())
+                    .collect()
+            } else {
+                config
+                    .services
+                    .iter()
+                    .filter(|service| action != "restart" || !service.is_database())
+                    .map(|service| service.id.clone())
+                    .collect()
+            };
+            // Old profiles activated their shared databases on checkout selection.
+            if action == "activate"
+                && config
+                    .services
+                    .iter()
+                    .all(|service| service.depends_on.is_none())
+            {
+                roots.extend(
+                    config
+                        .services
+                        .iter()
+                        .filter(|service| service.is_database())
+                        .map(|service| service.id.clone()),
+                );
+            }
+            if !stopping
+                && !service_id.is_some_and(|id| {
+                    config
+                        .services
+                        .iter()
+                        .any(|s| s.id == id && s.is_database())
+                })
+            {
+                let key = Self::group_key(space, checkout)?;
+                let needs_prepare = !environments.is_prepared(root, checkout)?;
+                for id in self
+                    .handed_over(space, &key, &settings, needs_prepare)
+                    .into_iter()
+                    .flat_map(|(_, running)| running)
                 {
-                    let key = Self::group_key(space, checkout)?;
-                    let needs_prepare = !environments.is_prepared(root, checkout)?;
-                    let variables: HashMap<_, _> = settings.variables.clone().into_iter().collect();
-                    let projects = self
-                        .inner
-                        .projects
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    for (_, project) in projects.iter().filter(|(id, p)| {
-                        (*id == space || p.parent.as_deref() == Some(space))
-                            && (*id == space
-                                || (settings.service_mode
-                                    == zeron_proto::WorktreeServiceMode::FollowActive
-                                    && **id != key)
-                                || (**id == key && (needs_prepare || p.environment != variables)))
-                    }) {
-                        for run in project.runs.iter().filter(|run| {
-                            matches!(run.status, Status::Running | Status::Restarting)
-                        }) {
-                            if config
-                                .services
-                                .iter()
-                                .any(|s| s.id == run.service_id && !s.is_database())
-                                && !roots.contains(&run.service_id)
-                            {
-                                roots.push(run.service_id.clone());
-                            }
-                        }
+                    if config
+                        .services
+                        .iter()
+                        .any(|s| s.id == id && !s.is_database())
+                        && !roots.contains(&id)
+                    {
+                        roots.push(id);
                     }
                 }
-                Ok(roots)
-            };
+            }
+            Ok(roots)
+        };
         let mut roots = resolve_roots()?;
-        let mut order = startup::order(&config, &roots)?;
+        // A missing or circular requirement is refused before queueing.
+        startup::order(&config, &roots)?;
         let token = CancellationToken::new();
         let startup = if stopping {
             None
         } else {
-            Some(self.begin_startup(space, checkout, &config, &roots, &order, token.clone())?)
+            Some(self.begin_startup(space, checkout, &config, &roots, token.clone())?)
         };
         let _guard = if stopping {
             operation.lock().await
@@ -1379,9 +1367,9 @@ impl ProjectTerminals {
             ));
         }
         roots = resolve_roots()?;
-        order = startup::order(&config, &roots)?;
+        let order = startup::order(&config, &roots)?;
         if let Some(startup) = &startup {
-            startup.activate(&roots, &order);
+            startup.activate(&config, &roots);
         }
         let result = self
             .control_checkout_impl(
@@ -1394,6 +1382,7 @@ impl ProjectTerminals {
                 action,
                 &order,
                 &token,
+                startup.as_ref(),
             )
             .await;
         if let Err(error) = &result
@@ -1415,10 +1404,17 @@ impl ProjectTerminals {
                     .runs
                     .into_iter()
                     .find(|run| run.service_id == *id);
-                if previous
-                    .as_ref()
-                    .is_none_or(|run| !matches!(run.status, Status::Running | Status::Restarting))
-                {
+                // Not what runs, nor a database that is up though its command
+                // has ended (`compose up -d`): this start didn't fail those.
+                let up = previous.as_ref().is_some_and(|run| {
+                    matches!(run.status, Status::Running | Status::Restarting)
+                        || (run.status == Status::Exited
+                            && run.exit_code == Some(0)
+                            && run.readiness == Some(Readiness::Ready))
+                });
+                // Nor, after a failure, a service that was stopped meanwhile.
+                let asked = token.is_cancelled() || startup.as_ref().is_none_or(|s| s.wants(id));
+                if !up && asked {
                     self.update(
                         owner,
                         ProjectTerminalRun {
@@ -1459,7 +1455,10 @@ impl ProjectTerminals {
         action: &str,
         order: &[String],
         token: &CancellationToken,
+        startup: Option<&startup::Guard>,
     ) -> Result<ProjectTerminalsSnapshot, EngineError> {
+        // Whether a service is still to start (one stopped meanwhile is not).
+        let wanted = |id: &str| startup.is_none_or(|startup| startup.wants(id));
         let worktree_only = action == "stop-worktree";
         if worktree_only && service_id.is_some() {
             return Err(EngineError::Other(
@@ -1534,38 +1533,15 @@ impl ProjectTerminals {
         }
         let key = Self::group_key(space, checkout)?;
         let needs_prepare = !environments.is_prepared(root, checkout)?;
-        let variables: HashMap<_, _> = settings.variables.clone().into_iter().collect();
-        let groups = {
-            let projects = self
-                .inner
-                .projects
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            projects
-                .iter()
-                .filter(|(id, p)| {
-                    (*id == space || p.parent.as_deref() == Some(space))
-                        && action != "stop"
-                        && (*id == space
-                            || (settings.service_mode
-                                == zeron_proto::WorktreeServiceMode::FollowActive
-                                && **id != key)
-                            || (**id == key && (needs_prepare || p.environment != variables)))
-                })
-                .map(|(id, p)| {
-                    (
-                        id.clone(),
-                        p.runs
-                            .iter()
-                            .filter(|r| matches!(r.status, Status::Running | Status::Restarting))
-                            .filter(|r| !shared.contains(&r.service_id))
-                            .map(|r| r.service_id.clone())
-                            .collect::<Vec<_>>(),
-                    )
-                })
-                .collect::<Vec<_>>()
+        let groups = match action {
+            "stop" => Vec::new(),
+            _ => self.handed_over(space, &key, &settings, needs_prepare),
         };
         for (group, services) in groups {
+            let services: Vec<_> = services
+                .into_iter()
+                .filter(|id| !shared.contains(id))
+                .collect();
             if !services.is_empty() {
                 let this = self.clone();
                 let root = root.to_path_buf();
@@ -1628,7 +1604,7 @@ impl ProjectTerminals {
         check_startup_cancelled(token)?;
         let prerequisites: HashSet<_> = order
             .iter()
-            .filter(|id| shared.contains(*id))
+            .filter(|id| shared.contains(*id) && wanted(id))
             .cloned()
             .collect();
         if root.canonicalize()? == checkout.canonicalize()? {
@@ -1657,6 +1633,9 @@ impl ProjectTerminals {
         }
         for id in order {
             check_startup_cancelled(token)?;
+            if !wanted(id) {
+                continue;
+            }
             let service = config
                 .services
                 .iter()
@@ -1671,34 +1650,75 @@ impl ProjectTerminals {
                 Some(service),
                 &format!("Waiting for {}", service.name),
             );
-            let this = self.clone();
-            let terminals = terminals.clone();
-            let source = root.to_path_buf();
-            let destination = checkout.to_path_buf();
-            let group = key.clone();
-            let id = id.clone();
-            // Dependencies are reused. Only the requested services restart.
-            let action = if action == "restart" && service_id.is_none_or(|selected| selected == id)
-            {
-                "restart"
-            } else {
-                "start"
+            let control = |action: &'static str| {
+                let this = self.clone();
+                let terminals = terminals.clone();
+                let source = root.to_path_buf();
+                let destination = checkout.to_path_buf();
+                let group = key.clone();
+                let id = id.clone();
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        this.control_in_checkout(
+                            &terminals,
+                            &group,
+                            &source,
+                            Some(&destination),
+                            Some(&id),
+                            action,
+                        )
+                    })
+                    .await
+                    .map_err(|e| EngineError::Other(e.to_string()))?
+                }
             };
-            tokio::task::spawn_blocking(move || {
-                this.control_in_checkout(
-                    &terminals,
-                    &group,
-                    &source,
-                    Some(&destination),
-                    Some(&id),
-                    action,
-                )
-            })
-            .await
-            .map_err(|e| EngineError::Other(e.to_string()))??;
+            // Dependencies are reused. Only the requested services restart.
+            let restart = action == "restart" && service_id.is_none_or(|selected| selected == id);
+            control(if restart { "restart" } else { "start" }).await?;
+            // Stopped while it started: that Stop found nothing running yet.
+            if !wanted(id) {
+                control("stop").await?;
+                continue;
+            }
             self.startup_finished(space, &service.id);
         }
         self.checkout_snapshot(space, root, checkout, &settings)
+    }
+
+    /// The groups a start in the checkout `key` takes running services from,
+    /// each with those services: the project's own, other checkouts' when
+    /// services follow the active one, and this checkout's when it has to be
+    /// prepared or its variables changed.
+    fn handed_over(
+        &self,
+        space: &str,
+        key: &str,
+        settings: &zeron_proto::WorktreeSettings,
+        needs_prepare: bool,
+    ) -> Vec<(String, Vec<String>)> {
+        let variables: HashMap<_, _> = settings.variables.clone().into_iter().collect();
+        let follows = settings.service_mode == zeron_proto::WorktreeServiceMode::FollowActive;
+        self.inner
+            .projects
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(id, p)| {
+                (*id == space || p.parent.as_deref() == Some(space))
+                    && (*id == space
+                        || (follows && *id != key)
+                        || (*id == key && (needs_prepare || p.environment != variables)))
+            })
+            .map(|(id, p)| {
+                let running = p
+                    .runs
+                    .iter()
+                    .filter(|r| matches!(r.status, Status::Running | Status::Restarting))
+                    .map(|r| r.service_id.clone())
+                    .collect();
+                (id.clone(), running)
+            })
+            .collect()
     }
 
     fn readiness_log(&self, root: &Path) -> Result<PathBuf, EngineError> {

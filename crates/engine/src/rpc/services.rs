@@ -461,7 +461,7 @@ impl EngineRpc {
 
     /// Authoring a shell command must not bypass a chat's approval or
     /// read-only/plan settings through Zeron's unsandboxed runners.
-    fn require_full_access(&self, chat_id: &str, what: &str) -> Result<(), RpcError> {
+    pub(super) fn require_full_access(&self, chat_id: &str, what: &str) -> Result<(), RpcError> {
         if !matches!(zeron_rpc::caller(), Caller::Agent { .. }) {
             return Ok(());
         }
@@ -640,11 +640,7 @@ pub(super) fn snapshot(
             });
             if include_config {
                 let mut config = json!({"name":service.name,"command":service.command,"directory":service.directory,"restartOnFailure":service.restart_on_failure});
-                config["dependsOn"] = json!(service.depends_on.clone().unwrap_or_else(|| {
-                    if service.is_database() { Vec::new() } else {
-                        snapshot.config.services.iter().filter(|s| s.is_database()).map(|s| s.id.clone()).collect()
-                    }
-                }));
+                config["dependsOn"] = json!(crate::project_terminals::dependencies(&snapshot.config, service));
                 if let Some(readiness) = &service.setup_prerequisite {
                     config["readinessCommand"] = json!(readiness.command);
                     config["readinessTimeoutSeconds"] = json!(readiness.timeout_seconds);

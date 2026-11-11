@@ -430,7 +430,15 @@ impl Shell {
                     .map_err(|error| error.to_string())
                     .and_then(|mut view| {
                         let result = std::mem::take(&mut view.result);
-                        shell.worktree_settings.environment.windows_vm = Some(view);
+                        let state = &mut shell.worktree_settings.environment;
+                        // Like a brief reply, the screen comes without the
+                        // VM's state: what is shown stays.
+                        if action == "screenshot"
+                            && let Some(old) = &state.windows_vm
+                        {
+                            view.vm = old.vm.clone();
+                        }
+                        state.windows_vm = Some(view);
                         shell.keep_environment_result(action, command, result, cx)
                     });
                 if let Err(error) = answered {

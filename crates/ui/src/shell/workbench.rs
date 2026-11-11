@@ -141,7 +141,8 @@ impl Shell {
         let open = self.right_pane_open(cx);
         let git = self.git_tools_available(cx);
         let services = self.services_available(cx);
-        let environment = self.environment_in_use(cx);
+        // The project's sandbox and Windows VM: Linux has them.
+        let environment = cfg!(target_os = "linux").then(|| self.environment_in_use(cx));
         let buttons = [
             (
                 Tool::Explorer,
@@ -167,13 +168,14 @@ impl Shell {
                 Tool::Environment,
                 "workbench-environment",
                 icons::MONITOR,
-                environment.unwrap_or("Environment"),
+                environment.flatten().unwrap_or("Environment"),
             ),
             (Tool::Views, "workbench-views", icons::LIST, "All views"),
         ]
         .into_iter()
         .filter(|(tool, ..)| git || !matches!(tool, Tool::Changes | Tool::History))
         .filter(|(tool, ..)| services || *tool != Tool::Services)
+        .filter(|(tool, ..)| environment.is_some() || *tool != Tool::Environment)
         .map(|(tool, id, icon_path, label)| {
             let selected = if tool == Tool::Explorer {
                 explorer

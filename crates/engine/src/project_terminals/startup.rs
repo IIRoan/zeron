@@ -29,9 +29,66 @@ pub(super) struct Startup {
     pub checkout: String,
     pub group: String,
     pub token: CancellationToken,
+    /// What is still to start: the requested services and all they need.
     pub services: HashSet<String>,
     pub shared: HashSet<String>,
+    /// Each requested service with everything it needs.
+    requests: Vec<(String, HashSet<String>)>,
+    /// Services stopped since: the requests that need one are dropped, the
+    /// others carry on.
+    stopped: HashSet<String>,
     pub progress: BTreeMap<(String, String), ProjectServiceStartup>,
+}
+
+impl Startup {
+    /// Requests `roots`, each shown as `message`, except those a stopped
+    /// service is part of.
+    fn request(&mut self, config: &ProjectTerminalConfig, roots: &[String], message: &str) {
+        self.requests = roots
+            .iter()
+            .map(|root| {
+                let needs = order(config, std::slice::from_ref(root)).unwrap_or_default();
+                (root.clone(), needs.into_iter().collect())
+            })
+            .collect();
+        self.progress = roots
+            .iter()
+            .map(|id| {
+                let owner = if self.shared.contains(id) {
+                    self.space.clone()
+                } else {
+                    self.group.clone()
+                };
+                (
+                    (owner, id.clone()),
+                    ProjectServiceStartup {
+                        service_id: id.clone(),
+                        message: message.into(),
+                    },
+                )
+            })
+            .collect();
+        self.withdraw();
+    }
+
+    /// Drops the requests a stopped service is part of. False when none is
+    /// left.
+    fn withdraw(&mut self) -> bool {
+        let Self {
+            requests,
+            stopped,
+            services,
+            progress,
+            ..
+        } = self;
+        requests.retain(|(_, needs)| needs.is_disjoint(stopped));
+        *services = requests
+            .iter()
+            .flat_map(|(_, needs)| needs.iter().cloned())
+            .collect();
+        progress.retain(|(_, id), _| requests.iter().any(|(root, _)| root == id));
+        !requests.is_empty()
+    }
 }
 
 pub(super) struct Guard {
@@ -40,7 +97,7 @@ pub(super) struct Guard {
 }
 
 impl Guard {
-    pub fn activate(&self, roots: &[String], order: &[String]) {
+    pub fn activate(&self, config: &ProjectTerminalConfig, roots: &[String]) {
         if let Some(startup) = self
             .store
             .inner
@@ -50,25 +107,20 @@ impl Guard {
             .get_mut(&self.key)
         {
             startup.active = true;
-            startup.services = order.iter().cloned().collect();
-            startup.progress = roots
-                .iter()
-                .map(|id| {
-                    let owner = if startup.shared.contains(id) {
-                        startup.space.clone()
-                    } else {
-                        startup.group.clone()
-                    };
-                    (
-                        (owner, id.clone()),
-                        ProjectServiceStartup {
-                            service_id: id.clone(),
-                            message: "Starting…".into(),
-                        },
-                    )
-                })
-                .collect();
+            startup.request(config, roots, "Starting…");
         }
+    }
+
+    /// Whether `id` is still to start: not stopped since this startup began,
+    /// nor only needed by a service that was.
+    pub fn wants(&self, id: &str) -> bool {
+        self.store
+            .inner
+            .startups
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&self.key)
+            .is_some_and(|startup| startup.services.contains(id))
     }
 }
 
@@ -142,7 +194,7 @@ pub(super) fn order(
     Ok(result)
 }
 
-pub(super) fn dependencies(
+pub(crate) fn dependencies(
     config: &ProjectTerminalConfig,
     service: &ProjectTerminalService,
 ) -> Vec<String> {
@@ -219,51 +271,32 @@ impl ProjectTerminals {
         checkout: &Path,
         config: &ProjectTerminalConfig,
         roots: &[String],
-        order: &[String],
         token: CancellationToken,
     ) -> Result<Guard, EngineError> {
-        let group = Self::group_key(space, checkout)?;
-        let shared: HashSet<_> = config
-            .services
-            .iter()
-            .filter(|s| s.is_database())
-            .map(|s| s.id.clone())
-            .collect();
-        let progress = roots
-            .iter()
-            .map(|id| {
-                let owner = if shared.contains(id) {
-                    space.to_string()
-                } else {
-                    group.clone()
-                };
-                (
-                    (owner, id.clone()),
-                    ProjectServiceStartup {
-                        service_id: id.clone(),
-                        message: "Waiting for another service operation…".into(),
-                    },
-                )
-            })
-            .collect();
+        let mut startup = Startup {
+            space: space.into(),
+            active: false,
+            checkout: canonical_root(checkout)?,
+            group: Self::group_key(space, checkout)?,
+            token,
+            services: HashSet::new(),
+            shared: config
+                .services
+                .iter()
+                .filter(|s| s.is_database())
+                .map(|s| s.id.clone())
+                .collect(),
+            requests: Vec::new(),
+            stopped: HashSet::new(),
+            progress: BTreeMap::new(),
+        };
+        startup.request(config, roots, "Waiting for another service operation…");
         let key = uuid::Uuid::new_v4().to_string();
         self.inner
             .startups
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(
-                key.clone(),
-                Startup {
-                    space: space.into(),
-                    active: false,
-                    checkout: canonical_root(checkout)?,
-                    group,
-                    token,
-                    services: order.iter().cloned().collect(),
-                    shared,
-                    progress,
-                },
-            );
+            .insert(key.clone(), startup);
         Ok(Guard {
             store: self.clone(),
             key,
@@ -309,6 +342,8 @@ impl ProjectTerminals {
     }
 
     /// Cancellation must happen before waiting for the project's control lock.
+    /// True when an active startup was cancelled as a whole: it then gives up
+    /// that lock. One that only lost a service keeps starting the others.
     pub(super) fn cancel_startup(
         &self,
         space: &str,
@@ -354,6 +389,14 @@ impl ProjectTerminals {
                             |id| startup.shared.contains(id),
                         )))
             {
+                // Stopping one service leaves the rest of its batch starting,
+                // unless they need it.
+                if let Some(id) = service {
+                    startup.stopped.insert(id.into());
+                    if startup.withdraw() && !startup.token.is_cancelled() {
+                        continue;
+                    }
+                }
                 startup.token.cancel();
                 active |= startup.active;
                 if !startup.active {

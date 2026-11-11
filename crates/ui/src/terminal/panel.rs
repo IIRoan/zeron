@@ -1090,7 +1090,8 @@ impl TerminalPanel {
                 // An action's or a service's tab ends with its command.
                 if !tab.fixed_title {
                     let alive = tab.attached.map(|at| at.elapsed()).unwrap_or_default();
-                    if TerminalSession::reconnects(tab.sandboxed, exit_code, alive) {
+                    let idle = tab.last_input.map(|at| at.elapsed());
+                    if TerminalSession::reconnects(tab.sandboxed, exit_code, alive, idle) {
                         tab.emulator.feed(
                             b"\x1b[90m[the sandbox container stopped; opening a new shell in it]\x1b[0m\r\n",
                         );

@@ -186,6 +186,11 @@ impl Sandbox {
         format!("localhost/zeron-sandbox-{}", self.key())
     }
 
+    /// Where this machine signs the container's commits ([`sign`]).
+    fn sign_socket(&self) -> PathBuf {
+        self.run_dir().join("sign.sock")
+    }
+
     pub fn run_dir(&self) -> PathBuf {
         data_dir().join("sandbox").join(self.key())
     }
@@ -399,10 +404,7 @@ impl Sandbox {
         if self.sign_commits {
             args.extend([
                 "-e".into(),
-                format!(
-                    "ZERON_SIGN_SOCKET={}",
-                    path(&self.run_dir().join("sign.sock"))
-                ),
+                format!("ZERON_SIGN_SOCKET={}", path(&self.sign_socket())),
             ]);
         }
         args.extend(["-v".into(), format!("{container}-home:/home/zeron:U")]);
@@ -549,8 +551,9 @@ pub fn ensure(sandbox: &Sandbox) -> Result<Spec, EngineError> {
         [sandbox.root.clone(), sandbox.worktrees.clone()],
     );
     #[cfg(unix)]
-    if sandbox.sign_commits {
-        sign::serve(&sandbox.run_dir().join("sign.sock"));
+    match sandbox.sign_commits {
+        true => sign::serve(&sandbox.sign_socket()),
+        false => sign::stop(&sandbox.sign_socket()),
     }
     let image = podman(&["image", "inspect", "--format", "{{.Id}}", &sandbox.image()]).map_err(|_| {
         EngineError::Other(format!(
@@ -622,35 +625,38 @@ pub fn ensure(sandbox: &Sandbox) -> Result<Spec, EngineError> {
     Ok(spec)
 }
 
+/// A value of this machine's own git config (`~/.gitconfig` and the files it
+/// includes).
+fn host_git_config(key: &str) -> Option<String> {
+    Command::new("git")
+        .args(["config", "--global", "--includes", "--get", key])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .filter(|v| !v.is_empty())
+}
+
 /// With [`Sandbox::sign_commits`], git in the container signs through the
-/// helper ([`sign`]), as this machine's git would: its signing key's id and
-/// its `commit.gpgsign`/`tag.gpgsign`. Without, git there is left unsigned.
+/// helper ([`sign`]) when this machine's git would (its `commit.gpgsign` and
+/// `tag.gpgsign`); the key is this machine's business, whatever git there
+/// asks for. Without, Zeron's own setup is taken out again and anything the
+/// person set up in the container themselves is left alone.
 fn commit_signing(container: &str, sign: bool) -> Result<(), EngineError> {
-    const UNSET: &str = "for key in gpg.program gpg.format user.signingkey commit.gpgsign tag.gpgsign; do git config --global --unset-all \"$key\"; done; true";
+    const UNSET: &str = r#"[ "$(git config --global --get gpg.program)" = "$1" ] || exit 0; for key in gpg.program gpg.format user.signingkey commit.gpgsign tag.gpgsign; do git config --global --unset-all "$key"; done; true"#;
     if !sign {
-        return podman(&["exec", container, "sh", "-c", UNSET]).map(|_| ());
+        return podman(&["exec", container, "sh", "-c", UNSET, "sh", GUARD]).map(|_| ());
     }
-    let global = |key: &str| {
-        Command::new("git")
-            .args(["config", "--global", "--get", key])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-            .filter(|v| !v.is_empty())
-    };
-    let key = global("user.signingkey")
-        .ok_or_else(|| EngineError::Other("This machine's git has no user.signingkey".into()))?;
-    let on = |key: &str| global(key).is_some_and(|v| v == "true").to_string();
+    let on = |key: &str| (host_git_config(key).as_deref() == Some("true")).to_string();
     podman(&[
         "exec",
         container,
         "sh",
         "-c",
-        r#"git config --global gpg.program "$1" && git config --global gpg.format openpgp && git config --global user.signingkey "$2" && git config --global commit.gpgsign "$3" && git config --global tag.gpgsign "$4""#,
+        r#"git config --global gpg.program "$1" && git config --global gpg.format openpgp && git config --global commit.gpgsign "$2" && git config --global tag.gpgsign "$3""#,
         "sh",
         GUARD,
-        &key,
         &on("commit.gpgsign"),
         &on("tag.gpgsign"),
     ])
@@ -661,12 +667,15 @@ fn commit_signing(container: &str, sign: bool) -> Result<(), EngineError> {
 /// into the container's home: the account that can read the project's GitHub
 /// `origin`, else `gh`'s active one. It lands in `gh`'s hosts file for any
 /// `gh` there, and in git's credential store with GitHub's SSH remotes read
-/// over HTTPS (no SSH key goes in). Without the setting, both are taken out
-/// again. Written from inside, as its user ([`install_login`]).
+/// over HTTPS (no SSH key goes in). Without the setting, what Zeron handed
+/// over is taken out again; a login the person made in the container
+/// themselves stays. Written from inside, as its user ([`install_login`]).
 fn github_login(container: &str, sandbox: &Sandbox) -> Result<(), EngineError> {
-    const FORGET: &str = "rm -f ~/.git-credentials ~/.config/gh/hosts.yml; git config --global --unset-all credential.https://github.com.helper; git config --global --unset-all url.https://github.com/.insteadof; true";
+    // Zeron's own: marked when handed over (before the mark existed, known
+    // by the credential line only Zeron writes).
+    const FORGET: &str = r#"cd; [ -e "$1" ] || grep -qs '^https://x-access-token:' .git-credentials || exit 0; rm -f .git-credentials .config/gh/hosts.yml "$1"; git config --global --unset-all credential.https://github.com.helper; git config --global --unset-all url.https://github.com/.insteadof; true"#;
     if !sandbox.share_github {
-        return podman(&["exec", container, "sh", "-c", FORGET]).map(|_| ());
+        return podman(&["exec", container, "sh", "-c", FORGET, "sh", GITHUB_MARK]).map(|_| ());
     }
     let gh = |args: &[&str], token: Option<&str>| -> Option<String> {
         let mut cmd = Command::new("gh");
@@ -728,6 +737,7 @@ fn github_login(container: &str, sandbox: &Sandbox) -> Result<(), EngineError> {
         ".git-credentials",
         &format!("https://x-access-token:{token}@github.com\n"),
     )?;
+    install_login(container, GITHUB_MARK, "")?;
     podman(&[
         "exec",
         container,
@@ -737,6 +747,10 @@ fn github_login(container: &str, sandbox: &Sandbox) -> Result<(), EngineError> {
     ])
     .map(|_| ())
 }
+
+/// In the container's home while its GitHub login is the one Zeron handed
+/// over ([`github_login`]).
+const GITHUB_MARK: &str = ".config/zeron/github-login";
 
 /// `owner/repo` of the project's `origin`, when it's on GitHub (read from
 /// its `.git/config`, which agents can't change).
@@ -1288,16 +1302,8 @@ fn install_login(container: &str, path: &str, contents: &str) -> Result<(), Engi
 /// agents make in the container, so they're authored as here. Not its
 /// signing key: those commits are unsigned.
 fn install_git_identity(container: &str) -> Result<(), EngineError> {
-    let get = |key: &str| {
-        Command::new("git")
-            .args(["config", "--global", "--get", key])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-            .filter(|v| !v.is_empty())
-    };
-    let (Some(name), Some(email)) = (get("user.name"), get("user.email")) else {
+    let (Some(name), Some(email)) = (host_git_config("user.name"), host_git_config("user.email"))
+    else {
         return Ok(());
     };
     podman(&[
@@ -1506,6 +1512,13 @@ pub fn enable(mut sandbox: Sandbox, log_to_file: bool) -> Result<Status, EngineE
         for input in sandbox.image_inputs()? {
             sandbox.check_input(&input, &projects, &protected)?;
         }
+        // Said now, not by every commit an agent later fails to make.
+        #[cfg(unix)]
+        if sandbox.sign_commits {
+            sign::signer().map_err(|why| {
+                EngineError::Other(format!("Sign commits can't be set up. {why}"))
+            })?;
+        }
         step("Building the image (devcontainer build)");
         let mut build = devcontainer(&sandbox, "build");
         build.args(["--image-name", &sandbox.image()]);
@@ -1645,6 +1658,8 @@ pub fn disable(root: &Path) -> Result<(), EngineError> {
     };
     let sandbox = projects.remove(index);
     save(projects)?;
+    #[cfg(unix)]
+    sign::stop(&sandbox.sign_socket());
     let _ = podman(&["rm", "-f", "-t", "1", &sandbox.container()]);
     Ok(())
 }

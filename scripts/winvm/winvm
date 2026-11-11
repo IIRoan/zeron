@@ -12,7 +12,7 @@ import argparse, base64, json, os, re, shutil, signal, socket, struct, subproces
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-HOME = Path(os.environ.get('WINVM_HOME') or Path.home() / '.local/share/winvm')
+HOME = Path(os.environ.get('WINVM_HOME') or Path.home() / '.local/share/winvm').absolute()
 RUN = Path(os.environ.get('XDG_RUNTIME_DIR') or '/tmp') / ('winvm' if 'WINVM_HOME' not in os.environ else 'winvm-' + HOME.name)
 DEFAULTS = {
     'vcpus': max(2, min(8, (os.cpu_count() or 4) - 2)),  # even numbers pair up as hyperthreads
@@ -54,8 +54,9 @@ def stop(name, sig=signal.SIGTERM, group=False):
 
 def spawn(name, args, log, env=None):
     """Start a detached process that outlives this command; its output goes to RUN/<log>."""
+    # In /: not the folder winvm was called from. Zeron reads a listening server's folder as its project (the viewer listens).
     with open(RUN / log, 'ab') as out:
-        p = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=out, stderr=out, start_new_session=True, env=env)
+        p = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=out, stderr=out, start_new_session=True, env=env, cwd='/')
     (RUN / f'{name}.pid').write_text(str(p.pid))
     return p
 
@@ -247,13 +248,14 @@ def change_ports(old, new):
 
 
 def set_ports(to_vm, from_vm):
-    """(Re)start the tunnel with exactly these ports. Returns an error message, or None when it is up."""
+    """(Re)start the tunnel with exactly these ports. Returns an error message, or None when it is up.
+    Ports that can't be asked for end the command (exit 2) with nothing changed."""
     c = config(); ports = {'toVm': sorted(set(to_vm)), 'fromVm': sorted(set(from_vm))}
     reserved = {c['ssh_port'], c['clip_port']}
     bad = [p for p in ports['toVm'] + ports['fromVm'] if not 1 <= p <= 65535 or p in reserved]
-    if bad: return f'ports {bad} are not allowed ({sorted(reserved)} are winvm\'s own)'
+    if bad: die(f'ports {bad} are not allowed ({sorted(reserved)} are winvm\'s own); no ports were changed', 2)
     # Windows' SSH server has about 250 sockets per connection: two per port into the VM, one per open connection.
-    if max(len(ports['toVm']), len(ports['fromVm'])) > MAX_PORTS: return f'at most {MAX_PORTS} ports can be connected per direction'
+    if max(len(ports['toVm']), len(ports['fromVm'])) > MAX_PORTS: die(f'at most {MAX_PORTS} ports can be connected per direction; no ports were changed', 2)
     old = ports_file(); (RUN / 'ports.json').write_text(json.dumps(ports))
     if tunnel_error() in (None, refused_ports(tunnel_said(), old)) and change_ports(old, ports): return tunnel_error()
     stop('tunnel', group=True)

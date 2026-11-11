@@ -1,15 +1,16 @@
 //! Commit signing for a sandbox whose project turned it on: git there runs
 //! the helper as its `gpg.program`, which hands what git signs to this
-//! socket. This machine signs it with its own signing key (`git config
-//! --global user.signingkey`, through its gpg and agent), but only git's own
-//! signing call (`--status-fd=2 -bsau`) on a commit or tag object: agents
-//! never hold the key, choose another, decrypt, or sign anything else.
+//! socket. This machine signs it as its own git would (`git config --global`
+//! `user.signingkey` and `gpg.format`: gpg, gpgsm or ssh-keygen, with their
+//! agents), but only git's own signing call (`--status-fd=2 -bsau`) on a
+//! commit or tag object: agents never hold the key, choose another, decrypt,
+//! or sign anything else.
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// Signing requests served at once.
@@ -17,11 +18,14 @@ const MAX_CONNECTIONS: usize = 4;
 /// The most a commit or tag to sign may be.
 const MAX_OBJECT: u64 = 4 * 1024 * 1024;
 
-/// Serves `socket` once per engine process.
+/// The sockets served, each with the flag that ends its listener.
+static SERVING: std::sync::Mutex<Vec<(PathBuf, Arc<AtomicBool>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Serves `socket`, once, until [`stop`].
 pub(super) fn serve(socket: &Path) {
-    static SERVING: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
     let mut serving = SERVING.lock().unwrap_or_else(|e| e.into_inner());
-    if serving.iter().any(|s| s == socket) {
+    if serving.iter().any(|(served, _)| served == socket) {
         return;
     }
     let _ = std::fs::remove_file(socket);
@@ -34,10 +38,14 @@ pub(super) fn serve(socket: &Path) {
     };
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600));
-    serving.push(socket.to_path_buf());
+    let stopped = Arc::new(AtomicBool::new(false));
+    serving.push((socket.to_path_buf(), stopped.clone()));
     let active = Arc::new(AtomicUsize::new(0));
     std::thread::spawn(move || {
         for client in listener.incoming().flatten() {
+            if stopped.load(Ordering::SeqCst) {
+                break;
+            }
             if active.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
                 active.fetch_sub(1, Ordering::SeqCst);
                 continue;
@@ -51,28 +59,58 @@ pub(super) fn serve(socket: &Path) {
     });
 }
 
-/// This machine's signing: its git's gpg program and signing key.
-fn signer() -> Result<(String, String), String> {
-    let global = |key: &str| {
-        Command::new("git")
-            .args(["config", "--global", "--get", key])
-            .stdin(Stdio::null())
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-            .filter(|v| !v.is_empty())
-    };
-    let key = global("user.signingkey")
-        .ok_or("This machine's git has no user.signingkey to sign with")?;
-    Ok((global("gpg.program").unwrap_or_else(|| "gpg".into()), key))
+/// Stops serving `socket` and removes it: its project doesn't sign commits
+/// (any more), so nothing in its container may reach this machine's key.
+pub(super) fn stop(socket: &Path) {
+    let mut serving = SERVING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(at) = serving.iter().position(|(served, _)| served == socket) {
+        let (_, stopped) = serving.remove(at);
+        stopped.store(true, Ordering::SeqCst);
+        // Wakes the listener, which sees the flag and ends.
+        let _ = UnixStream::connect(socket);
+    }
+    // Also one an earlier engine process left behind.
+    let _ = std::fs::remove_file(socket);
 }
+
+/// How this machine's git signs: the program and key of its `gpg.format`.
+pub(super) struct Signer {
+    program: String,
+    key: String,
+    ssh: bool,
+}
+
+pub(super) fn signer() -> Result<Signer, String> {
+    let config = super::host_git_config;
+    let key = config("user.signingkey")
+        .ok_or("This machine's git has no signing key (git config --global user.signingkey)")?;
+    let format = config("gpg.format").unwrap_or_else(|| "openpgp".into());
+    let own = config(&format!("gpg.{format}.program"));
+    let (program, ssh) = match format.as_str() {
+        "openpgp" => (own.or_else(|| config("gpg.program")), false),
+        "x509" => (own.or(Some("gpgsm".into())), false),
+        "ssh" => (own.or(Some("ssh-keygen".into())), true),
+        other => {
+            return Err(format!(
+                "This machine's git signs with gpg.format {other}, which Zeron's sandbox doesn't know"
+            ));
+        }
+    };
+    Ok(Signer {
+        program: program.unwrap_or_else(|| "gpg".into()),
+        key,
+        ssh,
+    })
+}
+
+/// A signing program's exit code, what it said on stderr, and its stdout.
+type Signed = (i32, Vec<u8>, Vec<u8>);
 
 /// One request: `<args, one per line>\n\n<object>`; the answer is
 /// `<exit code>\n<stderr length>\n<stderr><stdout>`.
 fn handle(
     mut client: UnixStream,
-    signer: &dyn Fn() -> Result<(String, String), String>,
+    signer: &dyn Fn() -> Result<Signer, String>,
 ) -> std::io::Result<()> {
     client.set_read_timeout(Some(Duration::from_secs(30)))?;
     let mut request = Vec::new();
@@ -88,10 +126,7 @@ fn handle(
     client.write_all(&stdout)
 }
 
-fn sign(
-    request: &[u8],
-    signer: &dyn Fn() -> Result<(String, String), String>,
-) -> Result<(i32, Vec<u8>, Vec<u8>), String> {
+fn sign(request: &[u8], signer: &dyn Fn() -> Result<Signer, String>) -> Result<Signed, String> {
     let split = request
         .windows(2)
         .position(|w| w == b"\n\n")
@@ -107,7 +142,10 @@ fn sign(
     if !is_commit_or_tag(object) {
         return Err("Zeron's sandbox signs git commits and tags only".into());
     }
-    let (program, key) = signer()?;
+    let Signer { program, key, ssh } = signer()?;
+    if ssh {
+        return sign_ssh(&program, &key, object);
+    }
     let mut child = Command::new(&program)
         .args(["--status-fd=2", "-bsau", &key])
         .stdin(Stdio::piped())
@@ -127,6 +165,44 @@ fn sign(
         output.stderr,
         output.stdout,
     ))
+}
+
+/// Signs as git does with `gpg.format ssh`: `ssh-keygen -Y sign -n git -f
+/// <key> <file>` leaves the signature in `<file>.sig`. git in the container
+/// asked its "gpg", so the answer reads as gpg's: git takes the signature as
+/// it comes, and whoever verifies it tells its kind by its armor.
+fn sign_ssh(program: &str, key: &str, object: &[u8]) -> Result<Signed, String> {
+    let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let buffer = dir.path().join("object");
+    std::fs::write(&buffer, object).map_err(|e| e.to_string())?;
+    let mut command = Command::new(program);
+    command.args(["-Y", "sign", "-n", "git", "-f"]);
+    // A key written out in the config is looked up in the agent (`-U`);
+    // anything else names its file.
+    match key
+        .strip_prefix("key::")
+        .or(key.starts_with("ssh-").then_some(key))
+    {
+        Some(public) => {
+            let file = dir.path().join("key.pub");
+            std::fs::write(&file, public).map_err(|e| e.to_string())?;
+            command.arg(file).arg("-U")
+        }
+        None => match key.strip_prefix("~/") {
+            Some(rest) => command.arg(crate::repos::home_dir().join(rest)),
+            None => command.arg(key),
+        },
+    };
+    let output = command
+        .arg(&buffer)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("{program}: {e}"))?;
+    if !output.status.success() {
+        return Ok((output.status.code().unwrap_or(2), output.stderr, Vec::new()));
+    }
+    let signature = std::fs::read(buffer.with_extension("sig")).map_err(|e| e.to_string())?;
+    Ok((0, b"\n[GNUPG:] SIG_CREATED \n".to_vec(), signature))
 }
 
 /// A git commit (`tree <id>` … `committer`) or annotated tag (`object <id>`,
@@ -196,7 +272,13 @@ mod tests {
         std::thread::spawn(move || {
             for client in listener.incoming().flatten() {
                 let program = program.clone();
-                let _ = handle(client, &move || Ok((program.clone(), "HOSTKEY".into())));
+                let _ = handle(client, &move || {
+                    Ok(Signer {
+                        program: program.clone(),
+                        key: "HOSTKEY".into(),
+                        ssh: false,
+                    })
+                });
             }
         });
 
@@ -223,5 +305,39 @@ mod tests {
             assert_eq!(code, "2", "{args}: {out}");
             assert!(!out.contains("SIG_CREATED"), "gpg never ran: {out}");
         }
+    }
+
+    #[test]
+    fn a_socket_is_gone_once_its_project_stops_signing() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("sign.sock");
+        serve(&socket);
+        assert!(UnixStream::connect(&socket).is_ok());
+        stop(&socket);
+        assert!(!socket.exists());
+        assert!(UnixStream::connect(&socket).is_err());
+        // Turned on again: served again.
+        serve(&socket);
+        assert!(UnixStream::connect(&socket).is_ok());
+        stop(&socket);
+    }
+
+    #[test]
+    fn an_ssh_key_signs_what_git_verifies_as_an_ssh_signature() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = temp.path().join("key");
+        let made = Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+            .arg(&key)
+            .status();
+        if !made.is_ok_and(|status| status.success()) {
+            return; // no ssh-keygen on this machine
+        }
+        let (code, status, signature) =
+            sign_ssh("ssh-keygen", &key.to_string_lossy(), COMMIT.as_bytes()).unwrap();
+        assert_eq!(code, 0);
+        // What git looks for in its gpg's status output.
+        assert!(String::from_utf8_lossy(&status).contains("\n[GNUPG:] SIG_CREATED "));
+        assert!(signature.starts_with(b"-----BEGIN SSH SIGNATURE-----"));
     }
 }
