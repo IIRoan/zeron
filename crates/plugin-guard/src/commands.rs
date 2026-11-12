@@ -753,6 +753,13 @@ fn run_with(
     if let Some(cwd) = &cwd {
         command.current_dir(cwd);
     }
+    // (No console of its own: run from a windowless app, gh and git would
+    // each open one on Windows.)
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
     let stdin = asked["stdin"].as_str().map(str::to_string);
     command.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() });
     let timeout = asked["timeout"]
