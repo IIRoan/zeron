@@ -503,13 +503,31 @@ def cmd_input(a):
                 qmp('input-send-event', {'events': [{'type': 'btn', 'data': {'down': down, 'button': button}}]}); time.sleep(0.03)
 
 
+def desktop_env():
+    """This environment, plus the desktop session's display when it has none: Zeron's headless engine starts at boot,
+    before the compositor exports WAYLAND_DISPLAY/DISPLAY to the user's systemd manager, and a window needs them."""
+    env = dict(os.environ)
+    if env.get('WAYLAND_DISPLAY') or env.get('DISPLAY'): return env
+    try: out = subprocess.run(['systemctl', '--user', 'show-environment'], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.TimeoutExpired): return env
+    for line in out.splitlines():
+        key, _, value = line.partition('=')
+        if key in ('WAYLAND_DISPLAY', 'DISPLAY', 'XAUTHORITY', 'XDG_SESSION_TYPE', 'XDG_CURRENT_DESKTOP'): env[key] = value
+    return env
+
+
 def open_viewer():
-    if pid_of('viewer') is None and running(): spawn('viewer', [sys.executable, str(HERE / 'viewer.py')], 'viewer.log')
+    if pid_of('viewer') is None and running():
+        return spawn('viewer', [sys.executable, str(HERE / 'viewer.py')], 'viewer.log', env=desktop_env())
 
 
 def cmd_view(a):
     if not running(): die('the VM is not running (winvm up)', 3)
-    open_viewer()
+    p = open_viewer()
+    # A viewer that can't open its window exits within a second; say so instead of reporting success.
+    try:
+        if p: p.wait(timeout=3); die(f'the viewer closed straight away: see {RUN / "viewer.log"}')
+    except subprocess.TimeoutExpired: pass
 
 
 def cmd_snapshot(a):
