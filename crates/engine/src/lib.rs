@@ -87,6 +87,7 @@ pub mod workspace_files;
 pub mod workspace_host;
 pub mod worktree_settings;
 pub mod workspace_search;
+mod worktree_lifecycle;
 mod worktree_location_settings;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
@@ -376,6 +377,13 @@ impl EngineCore {
         repos
             .worktree_settings()
             .bind_project_services(project_actions.project_terminals.clone(), terminals.clone());
+        worktree_lifecycle::WorktreeLifecycle {
+            repos: repos.clone(),
+            services: project_actions.project_terminals.clone(),
+            terminals: terminals.clone(),
+            device_id: device_id.clone(),
+        }
+        .watch_archives(workspace.watch_chats());
         doc_host.set_project_action_runtime(project_actions.clone(), terminals.clone());
         let previews = zeron_preview::PreviewService::new(
             profile.store_root().join("previews.json"),

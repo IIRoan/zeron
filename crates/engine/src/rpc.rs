@@ -2161,11 +2161,9 @@ impl EngineRpc {
                     .map(drop)
             }
             MutateParams::DeleteChat { chat_id } => {
-                let on_cloud = self
-                    .workspace
-                    .chat(&chat_id)
-                    .ok()
-                    .flatten()
+                let deleted = self.workspace.chat(&chat_id).ok().flatten();
+                let on_cloud = deleted
+                    .as_ref()
                     .is_some_and(|chat| zeron_proto::is_cloud_device(&chat.device_id, ""));
                 // A Cloud chat's children on Cloud go with it: its delegates
                 // (each on a machine of its own, which would otherwise outlive
@@ -2196,6 +2194,15 @@ impl EngineRpc {
                 }
                 if on_cloud {
                     self.delete_cloud_machines(std::iter::once(chat_id).chain(children).collect());
+                }
+                if let (Some(deleted), Ok(remaining)) = (deleted, self.workspace.read_chats()) {
+                    crate::worktree_lifecycle::WorktreeLifecycle {
+                        repos: self.repos.clone(),
+                        services: self.project_actions.project_terminals.clone(),
+                        terminals: self.terminals.clone(),
+                        device_id: self.doc_host.device_id().to_string(),
+                    }
+                    .chat_deleted(&deleted, &remaining);
                 }
                 Ok(())
             }

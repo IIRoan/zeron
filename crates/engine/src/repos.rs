@@ -1918,7 +1918,7 @@ impl Repos {
         self.inner.worktree_settings.clone()
     }
 
-    async fn workspace_checkout_root(&self, cwd: &Path) -> Result<PathBuf, EngineError> {
+    pub(crate) async fn workspace_checkout_root(&self, cwd: &Path) -> Result<PathBuf, EngineError> {
         let output = self
             .git(&["worktree", "list", "--porcelain", "-z"], Some(cwd))
             .await?;
