@@ -16,10 +16,16 @@
 -- the file taking the room as it goes (the sidebar's motion); showing is
 -- the same back. `shown` is the caller's, so it can be remembered.
 --
--- A pane too narrow to hold the tree beside a file uses a flat drawer
--- attached to its left, top and bottom edges. It shares the pane's toolbar,
--- slides in from the edge, and closes on selection, toggle, outside click
--- or Escape. There is no floating card inside the tools pane.
+-- Narrow (too little room for a file beside the tree: under the tree's
+-- width and a file's least, 288 + 240), the two never share the row. With
+-- no file open the tree takes the whole pane, until a file is chosen. With
+-- one open the file has the whole pane: opening a file closes the tree, the
+-- toggle brings the tree over the whole pane, and a file chosen there goes
+-- back to the file. Whether the tree stands beside the file (`shown`) is
+-- left as it was, so widening brings it back if it was out. With no file
+-- at all, the tree shows whatever `shown` says: never an empty file.
+-- (The Linux fork's copy of ds/files_pane: its own file viewer, which
+-- adds workspace search, ../ui/file_viewer.)
 --
 -- `FilesPane { shown = state, tree = { FileTree's props }, viewer = { FileViewer's props }, head = "line" }`.
 
@@ -39,26 +45,26 @@ export type Props = {
 	head: FileViewer.Head?,
 	-- The tree's width beside the file (the theme's).
 	width: number?,
-	-- The pane's last width and whether the drawer is out, if the caller
-	-- keeps them: a pane made again starts exactly as it was.
+	-- The pane's last width, if the caller keeps it: a pane made again starts
+	-- exactly as it was.
 	room: State<number>?,
-	drawer: State<boolean>?,
-	-- Accepted for screen compatibility; this pane measures its own width
-	-- instead of using the stock right-side layout's docking allowance.
-	docked: (() -> boolean)?,
-	-- Filled with `toggle`, for a command bound outside (it knows which way
-	-- the tree shows here: beside the file, or over it).
+	-- Filled with `toggle`, for a command bound outside.
 	commands: { [string]: () -> () }?,
+	-- Narrow with a file open: whether the tree is out over it (the
+	-- caller's, so a pane made again shows it as it was).
+	over: State<boolean>?,
 	[any]: any,
 }
 
-local OWN = { docked = true, shown = true, tree = true, viewer = true, head = true, width = true, commands = true, room = true, drawer = true, children = true }
+local OWN = { shown = true, tree = true, viewer = true, head = true, width = true, commands = true, room = true, over = true, children = true }
 
 -- How the tree moves: the sidebar's slide, and its ink a beat quicker.
 local SLIDE = { duration = 260, ease = "out(3)" }
 local INK = { duration = 160 }
 -- The keys that hide and show it.
 local KEYS = "cmd+shift+e"
+-- The least a file's side is worth having, with no file to show yet.
+local FILE_LEAST = 240
 
 local function num(token: string, fallback: number): number
 	return (ui.theme.get(token) :: number?) or fallback
@@ -70,92 +76,102 @@ M.keys = KEYS
 local made = ui.component(function(props: Props): Node
 	local shown = props.shown
 	local tree_w = props.width or num("zeron.files.tree", 288)
-	local view_min = num("zeron.files.view", 360)
 	local head_h = num(if props.head == "stack" then "zeron.files.stack" else "zeron.files.head", 40)
 	local square = num("zeron.icon_button.lg", 28)
 	local pad = num("space.2", 8)
 	-- Room the heads keep at their start: the inset, the toggle, a step.
 	local lead_w = pad + square + pad
 
-	-- How wide the pane is, and so whether it holds the tree beside a file.
-	-- (Kept by the caller, with whether the drawer is out, a pane made again
-	-- — a reload, a template — knows both on its first frame, so nothing
-	-- opens, closes or fades that was at rest.)
+	-- How wide the pane is. (Kept by the caller, a pane made again knows it on its
+	-- first frame, so nothing opens, closes or fades that was at rest.)
 	local room = props.room or ui.use_state(0)
-	-- (Computed: a resize moves `room` every frame, and what follows only
-	-- cares when the answer flips.)
-	-- The tools pane already has its own allocated width. Decide here,
-	-- rather than applying the stock right-side layout's tree allowance.
-	local narrow_c = ui.computed(function(): boolean
-		local r = room:get()
-		return r > 0 and r - tree_w < view_min
-	end)
-	local function narrow(): boolean
-		return narrow_c:get()
-	end
-	-- Over the file (narrow), whether the tree is out.
-	local drawer = props.drawer or ui.use_state(false)
-	-- Whether the tree is out at all, either way.
-	local out_c = ui.computed(function(): boolean
-		return if narrow() then drawer:get() else shown:get()
-	end)
-	local function out(): boolean
-		return out_c:get()
-	end
-	-- How far out it is: its width beside the file, or how far the drawer
-	-- has come. Eased, once the pane has been measured (before that, set:
-	-- a pane opens with its tree where it was, not sliding there).
-	local far = ui.use_state(if out() then tree_w else 0)
 	local settled = false
-	local easing: any = nil
-	ui.effect(function()
-		local to = if out() then tree_w else 0
-		if easing then
-			easing:cancel()
-			easing = nil
+	local doc = props.viewer.doc :: any
+	local function open_doc(): any
+		return if type(doc) == "function" then doc() else doc:get()
+	end
+	-- No room for a file beside the tree: the two never share the row.
+	local function narrow(): boolean
+		local w = room:get()
+		return w > 0 and w < tree_w + FILE_LEAST
+	end
+	-- Narrow with a file open: the tree over it (else the file alone).
+	local over = props.over or ui.use_state(false)
+	-- Whether the toggle, narrow with a file open, says the tree over it
+	-- rather than beside it.
+	local function overlaying(): boolean
+		return narrow() and open_doc() ~= nil
+	end
+	-- With no file to show, the tree is out however it was left: never a
+	-- file's side with nothing in it. (`shown` stays as it was: a file
+	-- chosen shows as it asked.)
+	local function out(): boolean
+		if open_doc() == nil then
+			return true
 		end
-		if settled then
-			easing = anime.animate(far, motion.params({ value = to, duration = SLIDE.duration, ease = SLIDE.ease }))
-		else
-			far:set(to)
+		return if overlaying() then over:get() else shown:get()
+	end
+	-- Narrow, the tree out has it all.
+	local function whole(): boolean
+		return out() and narrow()
+	end
+	-- A file opened, or the pane widened: the tree off the file (narrow, the
+	-- file shows; wide, the tree is where `shown` says).
+	local was_open: string? = nil
+	do
+		local d = open_doc()
+		was_open = if type(d) == "table" then d.path else nil
+	end
+	ui.effect(function()
+		local d = open_doc()
+		local path = if type(d) == "table" then d.path else nil
+		if path ~= was_open then
+			was_open = path
+			if over:peek() then
+				over:set(false)
+			end
 		end
 	end)
-	-- The tree's room beside the file: its width while it's out there, none
-	-- over it. Eased as it comes and goes, on the user's toggle by the
-	-- tree's own slide; when the window's layout docks or floats it, on the
-	-- columns' motion (ds/motion), which the panel's edge rides too, so the
-	-- file beside it holds still as one makes the room the other gives up.
+	ui.effect(function()
+		if not narrow() and over:peek() then
+			over:set(false)
+		end
+	end)
+	-- The tree's room beside the file, eased as it comes and goes by the tree's own
+	-- slide.
 	local function dock_target(): number
-		return if not narrow() and shown:get() then tree_w else 0
+		return if whole() then room:get() elseif out() then tree_w else 0
 	end
 	local dock_w = ui.use_state(dock_target())
 	local dock_easing: any = nil
+	local was_whole = whole()
 	local was_narrow = narrow()
 	ui.effect(function()
 		local to = dock_target()
-		local flipped = narrow() ~= was_narrow
-		was_narrow = narrow()
+		local now_whole = whole()
+		-- (All of it already, the pane resizing: with the pane, not after it.)
+		local follows = now_whole and was_whole
+		was_whole = now_whole
+		-- (The pane's own width crossing the narrow line, as the window or a
+		-- column beside it moves: the tree goes or comes at once, the file
+		-- not sliding under a drag; it slides only for its toggle.)
+		local now_narrow = narrow()
+		if now_narrow ~= was_narrow then
+			follows = true
+		end
+		was_narrow = now_narrow
 		if dock_easing then
 			dock_easing:cancel()
 			dock_easing = nil
 		end
-		if not settled then
+		if not settled or follows then
 			dock_w:set(to)
-		elseif flipped then
-			dock_easing = anime.animate(dock_w, motion.column(dock_w:peek(), to))
 		else
 			dock_easing = anime.animate(dock_w, motion.params({ value = to, duration = SLIDE.duration, ease = SLIDE.ease }))
 		end
 	end)
-	-- Leaving narrow closes the drawer (once measured: before, the pane's
-	-- width isn't known, and an open drawer is kept as it was).
-	ui.effect(function()
-		if room:peek() > 0 and not narrow() and drawer:peek() then
-			drawer:set(false)
-		end
-	end)
 	-- Its ink (and the toggle's glyph): on while it is out; the ink eased
-	-- once the pane has been measured, set before (as `far` is).
+	-- once the pane has been measured, set before.
 	local lit = ui.use_state(out())
 	local ink = ui.use_state(if out() then 1 else 0)
 	local fading: any = nil
@@ -174,8 +190,8 @@ local made = ui.component(function(props: Props): Node
 		end
 	end)
 	local function toggle()
-		if narrow() then
-			drawer:set(not drawer:peek())
+		if overlaying() then
+			over:set(not over:peek())
 		else
 			shown:set(not shown:peek())
 		end
@@ -184,36 +200,35 @@ local made = ui.component(function(props: Props): Node
 		props.commands.toggle = toggle
 	end
 
-	-- The tree's props, beside the file or floating over it.
-	local function tree_props_for(floating: boolean): FileTree.Props
+	-- The tree's width: its own, or all it's been given (it never slides narrower,
+	-- only away).
+	local function tree_now(): number
+		return math.max(tree_w, dock_w:get())
+	end
+	-- The tree's props, beside the file.
+	local function tree_props(): FileTree.Props
 		local tp: FileTree.Props = table.clone(props.tree)
-		local on_open = tp.on_open
+		-- A file chosen over the narrow pane's file (that one again too):
+		-- back to the file.
+		local opened = props.tree.on_open
 		tp.on_open = function(path: string)
-			-- A file picked from the floating tree: it goes.
-			if narrow() then
-				drawer:set(false)
+			if over:peek() then
+				over:set(false)
 			end
-			if on_open then
-				on_open(path)
+			if opened then
+				opened(path)
 			end
 		end
-		if floating then
-			tp.float = false
-			tp.head = head_h
-			tp.lead = lead_w
-			tp.w_full = true
-		else
-			tp.head = head_h
-			tp.lead = lead_w
-			-- The toggle's room, in the tree's own points as it slides (its
-			-- right edge less where the tree's start is): the head is cut
-			-- there, so it never shows under the toggle. At rest that's left
-			-- of the head's field (`lead`), so nothing changes there.
-			tp.head_cut = function(): number
-				return pad + square - (dock_w:get() - tree_w)
-			end
-			tp.w = tree_w
+		tp.head = head_h
+		tp.lead = lead_w
+		-- The toggle's room, in the tree's own points as it slides (its
+		-- right edge less where the tree's start is): the head is cut
+		-- there, so it never shows under the toggle. At rest that's left
+		-- of the head's field (`lead`), so nothing changes there.
+		tp.head_cut = function(): number
+			return pad + square - (dock_w:get() - tree_now())
 		end
+		tp.w = tree_now :: any
 		tp.h_full = true
 		return tp
 	end
@@ -226,62 +241,36 @@ local made = ui.component(function(props: Props): Node
 			left = 0,
 			top = 0,
 			bottom = 0,
-			w = tree_w,
+			w = tree_now,
 			x = function(): number
-				return dock_w:get() - tree_w
+				return dock_w:get() - tree_now()
 			end,
-			-- (Its ink goes as the user hides it; leaving for the floating
-			-- one, it slides away whole with its room.)
+			-- (Its ink goes as the user hides it.)
 			opacity = function(): number
-				return if narrow() then 1 else ink:get()
+				return ink:get()
 			end,
 			-- (Gone, its ink is out and nothing in it can be touched.)
 			pointer_events = function(): PointerEvents
-				return if not narrow() and dock_w:get() > 0.5 then "auto" else "none"
+				return if dock_w:get() > 0.5 then "auto" else "none"
 			end,
-			FileTree(tree_props_for(false)),
+			FileTree(tree_props()),
 			-- Its edge, from under the band (the band's hairline runs across
 			-- both heads).
-			ui.div { absolute = true, right = 0, top = head_h, bottom = 0, w = 1, bg = "$border.subtle" },
+			-- (None with no file's side to part it from.)
+			ui.div {
+				absolute = true,
+				right = 0,
+				top = head_h,
+				bottom = 0,
+				w = 1,
+				bg = "$border.subtle",
+				opacity = function(): number
+					return if dock_w:get() >= room:get() - 0.5 then 0 else 1
+				end,
+			},
 		}
 	end
-	-- In a narrow pane, attach the drawer to the same edges as the file.
-	-- It shares the toolbar and has one divider, with no nested card.
-	local function float_w(): number
-		return math.max(0, math.min(tree_w, room:get()))
-	end
-	local function floating(): Node
-		return ui.column {
-			id = "files-tree-float",
-			class = "files-tree-drawer",
-			absolute = true,
-			left = 0,
-			top = 0,
-			bottom = 0,
-			w = float_w,
-			bg = "$zeron.menu.solid",
-			rounded = 0,
-			border_sides = { 0, 1, 0, 0 },
-			border_color = "$border.subtle",
-			overflow = "hidden",
-			x = function(): number
-				return float_w() * (far:get() / tree_w - 1)
-			end,
-			hidden = function(): boolean return far:get() < 0.5 end,
-			pointer_events = function(): PointerEvents
-				return if far:get() > 0.5 then "auto" else "none"
-			end,
-			FileTree(tree_props_for(true)),
-		}
-	end
-	-- (A real swap: the tree beside the file and the floating one are made
-	-- differently; what they show is the caller's, kept.)
-	-- (Beside while its room is still going: it slides away with it.)
-	local tree = ui.presence(function(): string
-		return if narrow() and dock_w:get() < 0.5 then "float" else "beside"
-	end, function(which: string): Node
-		return if which == "float" then floating() else beside()
-	end, { absolute = true, left = 0, top = 0, right = 0, bottom = 0, pointer_events = "none", z = 2 })
+	local tree = ui.div { absolute = true, left = 0, top = 0, right = 0, bottom = 0, pointer_events = "none", beside() }
 
 	-- The file, beside the tree's room; as the tree goes, its header keeps
 	-- room for the toggle instead, so its name comes to meet it.
@@ -293,6 +282,11 @@ local made = ui.component(function(props: Props): Node
 	viewer_props.grow = 1
 	viewer_props.min_w = 0
 	viewer_props.h_full = true
+	-- (With no file, what its side says goes before it has no room to say it.)
+	viewer_props.opacity = function(): number
+		local open = if type(doc) == "function" then doc() else doc:get()
+		return if open then 1 else math.clamp((room:get() - dock_w:get() - 100) / 100, 0, 1)
+	end
 
 	-- The toggle, at the band's start, over whichever head is under it.
 	local toggle_button = ui.div {
@@ -310,48 +304,6 @@ local made = ui.component(function(props: Props): Node
 			SidebarIcon { open = lit, size = 16 },
 		},
 	}
-	-- While it floats over the file, a click anywhere else closes it: on
-	-- the band over it, the file beside it, or the room under it. (Each
-	-- part a box of its own, so none lies under the panel.)
-	local function close_float()
-		drawer:set(false)
-	end
-	local catcher = ui.show(function(): boolean
-		return narrow() and drawer:get()
-	end, ui.div {
-		-- (Where a click closes the panel: nothing to read or reach.)
-		aria_hidden = true,
-		absolute = true,
-		z = 1,
-		left = 0,
-		right = 0,
-		top = 0,
-		bottom = 0,
-		pointer_events = "none",
-		ui.div {
-			id = "files-tree-dismiss-band",
-			absolute = true,
-			left = 0,
-			right = 0,
-			top = 0,
-			h = head_h,
-			pointer_events = "auto",
-			on_press = close_float,
-		},
-		ui.div {
-			id = "files-tree-dismiss",
-			label = locale.t("ds.files_pane.close_tree"),
-			absolute = true,
-			left = function(): any
-				return float_w()
-			end,
-			right = 0,
-			top = 0,
-			bottom = 0,
-			pointer_events = "auto",
-			on_press = close_float,
-		},
-	})
 
 	local box: { [any]: any } = {}
 	for k, v in props :: any do
@@ -376,26 +328,19 @@ local made = ui.component(function(props: Props): Node
 			toggle()
 			return true
 		end
-		-- Esc closes the floating tree, as it would any floating panel.
-		if e.key == "Escape" and narrow() and drawer:peek() then
-			drawer:set(false)
-			return true
-		end
 		return nil
 	end
-	-- The tree's room beside the file (none over it).
+	-- The tree's room beside the file.
 	box[#box + 1] = ui.div {
 		shrink = 0,
 		h_full = true,
 		w = dock_w,
 	}
 	-- (The toggle and the tree first, as they stand left of the file: Tab
-	-- reaches them before it. Drawn over it by `z`, the click-catcher
-	-- between.)
+	-- reaches them before it. Drawn over it by `z`.)
 	box[#box + 1] = toggle_button
 	box[#box + 1] = tree
 	box[#box + 1] = FileViewer(viewer_props)
-	box[#box + 1] = catcher
 	return ui.row(box)
 end)
 

@@ -2359,7 +2359,9 @@ impl Bridge {
                 async move {
                     let bridge = me.upgrade().ok_or("The window closed")?;
                     let item = bridge.item(&plugin).ok_or("This plugin isn't on")?;
-                    let records = bridge.sources(false).0.sessions;
+                    // (The session list: projects and chats, as the records are
+                    // made from it; `Sources::sessions` is no longer filled.)
+                    let records = value_json(&bridge.sources(false).1);
                     let request = workbench::prepare(&item, &records, &value_json(&asked))?;
                     let screenshot = request.kind == workbench::Kind::WindowsVm && request.params["action"] == "screenshot";
                     let space = request.params["spaceId"].as_str().unwrap_or_default().to_owned();

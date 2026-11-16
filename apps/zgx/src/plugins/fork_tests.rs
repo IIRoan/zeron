@@ -10,7 +10,7 @@ use zgx_script::{ScriptHost, testing::TestApp};
 use super::Item;
 use super::examples_tests::{World, shell_with};
 
-const FORK_PLUGINS: &[&str] = &["project-services", "zeron-git", "project-sandbox", "windows-vm"];
+const FORK_PLUGINS: &[&str] = &["project-services", "zeron-git", "project-sandbox", "windows-vm", "linux-workbench"];
 
 fn dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins-fork")
@@ -61,6 +61,24 @@ fn every_fork_plugin_loads_into_the_shell() {
     let _ = std::fs::remove_dir_all(broken);
 }
 
+/// The Linux Workbench replaces seven of Zeron's screens with the fork's
+/// layout, kept in step with upstream's own (three-way merged): with a chat
+/// open its panel, page, sidebar and files all run, and none may fail.
+#[test]
+fn the_workbench_runs_its_screens_with_a_chat_open() {
+    let world: World = std::rc::Rc::new(std::cell::RefCell::new(json!({ "viewer": "ada" })));
+    let items = vec![fork("linux-workbench"), fork("project-services"), fork("project-sandbox"), fork("windows-vm")];
+    let (mut app, heard) = shell_with(items, world);
+    assert_eq!(app.error(), None, "{}", app.tree());
+    app.click("#shell-sidebar >> role:button \"Fix the build\"");
+    app.frames(60);
+    assert_eq!(app.error(), None, "with a chat open: {}", app.tree());
+    let problems: Vec<_> = heard.borrow().iter().filter(|(key, _)| key.ends_with(".problem")).cloned().collect();
+    assert!(problems.is_empty(), "{problems:?}");
+    // The fork's layout: its activity rail is there.
+    assert!(app.find("fork-activity").is_some(), "{}", app.tree());
+}
+
 /// The fork's plugins that use the SDK carry upstream's own unchanged
 /// (plugins-sdk/zeron.luau stays upstream's) and the fork's addition beside
 /// it (plugins-fork/fork_sdk.luau), byte for byte. Linux Workbench replaces
@@ -73,6 +91,9 @@ fn fork_plugins_carry_the_sdk_and_its_fork_addition() {
     let addition = std::fs::read(dir().join("fork_sdk.luau")).unwrap();
     let mut stale = Vec::new();
     for id in FORK_PLUGINS {
+        if *id == "linux-workbench" {
+            continue;
+        }
         for (name, canonical) in [("zeron.luau", &sdk), ("fork_sdk.luau", &addition)] {
             let copy = dir().join(id).join(name);
             if std::fs::read(&copy).ok().as_ref() != Some(canonical) {

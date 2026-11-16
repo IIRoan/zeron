@@ -152,7 +152,7 @@ return function(zeron: any, Model: any)
 				gap = "$space.3",
 				ui.column {
 					grow = 1,
-					gap = 2,
+					gap = ui.raw(2, "a label and its note"),
 					ui.text { label, text_size = "$font.size.sm" },
 					Note("Takes effect when you apply."),
 				},

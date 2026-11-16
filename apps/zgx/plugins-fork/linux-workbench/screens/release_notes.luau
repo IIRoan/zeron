@@ -53,7 +53,7 @@ M.View=ui.component(function(): Node
                     ui.text {`Zeron {r.version}`,weight="$font.weight.semibold"},
                     ui.scroll {id="fork-release-notes",w_full=true,h=400,selectable=true,
                         ui.column {w_full=true,gap="$space.4",
-                            if index==current() then Markdown {text="### Workbench plugins\n- Original Linux layout, folder navigation and advanced workspace search.\n- Full Git menus, selection, syntax highlighting and commit drafts.\n- Services in the left tools panel, shared databases, worktree settings and an optional shell terminal dock.\n\nThese changes are provided by three independent fork plugins."} else nil,
+                            if index==current() then Markdown {text="### Workbench plugins\n- Original Linux layout, folder navigation and advanced workspace search.\n- Full Git menus, selection, syntax highlighting and commit drafts.\n- Services in the left tools panel, shared databases, worktree settings, what each service starts after, and an optional shell terminal dock.\n- The project's sandbox: its devcontainer, build progress and log.\n- The project's Windows VM: its screen, health, ports and commands.\n\nThese changes are provided by five independent fork plugins."} else nil,
                             Markdown {text=table.concat(changes,"\n")},
                             Markdown {text=`### Upstream\n{if r.notes_source=="git_history" then "Notes from the bundled Git history.\n\n" else ""}{r.upstream_notes}`}}}}
             end),

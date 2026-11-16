@@ -147,3 +147,16 @@ zgx. Engine-side work needs no port: zgx runs the same engine.
   broken one is caught), the SDK copies match, the ports and models read
   the engine's replies, and the Sandbox and Windows VM tabs are driven
   against the engine's reply shapes.
+- Linux Workbench's seven screen overrides and its copies of `ds/sidebar`,
+  `ds/files_pane` and `ds/file_viewer` were taken from upstream at
+  `b7218f40` and had gone stale (with a chat open, its panel failed and
+  zgx withdrew the plugin). Each was three-way merged (base `b7218f40`,
+  the fork's copy, upstream v0.3.7): the fork's changes kept (tools and
+  panel at the left, chats at the right with their edge and drag
+  mirrored, the shell dock under the conversation, plugin-owned
+  preferences, local project icons), upstream's since taken (settings in
+  the page, the session tab strip, seams, card styling). Where upstream
+  had answered the fork's change itself (the panel's "+" placement, the
+  narrow files pane without a floating card) upstream's stands. After the
+  next upstream merge, repeat this per file: `git merge-file` with base
+  the upstream commit these were last merged from.

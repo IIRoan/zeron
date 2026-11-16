@@ -141,7 +141,7 @@ return function(zeron: any, Model: any)
 				w_full = true,
 				items = "center",
 				gap = "$space.3",
-				ui.column { grow = 1, gap = 2, ui.text { label, text_size = "$font.size.sm", wrap = true }, Note(hint) },
+				ui.column { grow = 1, gap = ui.raw(2, "a label and its note"), ui.text { label, text_size = "$font.size.sm", wrap = true }, Note(hint) },
 				Switch { value = value, label = label },
 			}
 		end
