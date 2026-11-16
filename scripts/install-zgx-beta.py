@@ -3,7 +3,8 @@
 
 Build apps/zgx with --features beta and ZERON_BETA_VERSION first, and the
 engine (`cargo build --release -p zeron --bin zeron-engine`) from this same
-commit. Supply the native source manifest taken at build time. No regular
+commit, and the static sandbox helper (`scripts/build-sandbox-helper.sh`),
+which the engine runs project sandboxes with from beside itself. Supply the native source manifest taken at build time. No regular
 Zeron/demo files or services change.
 
 A release is laid out as the Linux tarball is (scripts/package-linux.sh):
@@ -12,6 +13,7 @@ the app with `ui/` and `plugins-builtin/` beside it, where zgx looks for them.
 import argparse
 from datetime import datetime, timezone
 import hashlib
+import re
 import json
 import os
 from pathlib import Path
@@ -44,12 +46,16 @@ def main():
     parser.add_argument('--frontend', type=Path, required=True)
     parser.add_argument('--native-source', type=Path, required=True)
     parser.add_argument('--engine', type=Path, required=True, help='zeron-engine built from this commit')
+    parser.add_argument('--sandbox-helper', type=Path, required=True, help='zeron-sandbox from scripts/build-sandbox-helper.sh')
     parser.add_argument('--apply', action='store_true')
     args = parser.parse_args()
     if os.uname().sysname != 'Linux':
         raise SystemExit('This installer is for Linux.')
     frontend = args.frontend.resolve(strict=True)
     engine = args.engine.resolve(strict=True)
+    helper = args.sandbox_helper.resolve(strict=True)
+    if not re.search(r'static(-pie|ally) linked', subprocess.check_output(['file', str(helper)], text=True)):
+        raise SystemExit(f'{helper} is not the static sandbox helper.')
     native = json.loads(args.native_source.read_text())
     actual = {str(p.relative_to(ROOT)): sha(p) for p in (ROOT / 'apps/zgx/src').rglob('*.rs')}
     if native != actual:
@@ -71,7 +77,7 @@ def main():
             raise SystemExit(f'{binary.name} contains staging account configuration.')
     paths = subprocess.check_output(['git', 'ls-files', '-m', '-o', '--exclude-standard', '-z'], cwd=ROOT).decode().split('\0')
     sources = {p: sha(ROOT / p) for p in sorted(set(paths)) if p and (ROOT / p).is_file()}
-    binaries = {'zeron-beta': sha(frontend), 'zeron-engine': sha(engine)}
+    binaries = {'zeron-beta': sha(frontend), 'zeron-engine': sha(engine), 'zeron-sandbox': sha(helper)}
     fingerprint = hashlib.sha256(json.dumps({'sources': sources, 'binaries': binaries}, sort_keys=True).encode()).hexdigest()
     base = Path.home() / '.local/share/zeron-beta'
     release = base / 'releases' / f'{version}-{fingerprint[:10]}'
@@ -91,6 +97,7 @@ def main():
         try:
             shutil.copy2(frontend, temporary / 'zeron-beta')
             shutil.copy2(engine, temporary / 'zeron-engine')
+            shutil.copy2(helper, temporary / 'zeron-sandbox')
             shutil.copytree(ROOT / 'apps/zgx/ui', temporary / 'ui', ignore=shutil.ignore_patterns('.zgx', 'tests', '.lock', '.DS_Store'))
             shutil.copytree(ROOT / 'apps/zgx/plugins-builtin', temporary / 'plugins-builtin', ignore=shutil.ignore_patterns('.zgx', '.DS_Store'))
             subprocess.run(['python3', str(ROOT / 'apps/zgx/scripts/bundle-fork-plugins.py'), '--resources', str(temporary), '--apply'], check=True, stdout=subprocess.DEVNULL)
