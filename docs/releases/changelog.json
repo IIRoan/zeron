@@ -4,6 +4,26 @@
   "fork_repository": "IIRoan/zeron",
   "releases": [
     {
+      "version": "0.3.7",
+      "upstream_commit": "55a5c392199ca0f7907c485b57b6a4252cc42e98",
+      "upstream_url": "https://github.com/zeronsh/zeron/releases/tag/v0.3.7",
+      "published_at": "2026-11-16T00:31:24Z",
+      "notes_source": "github_release",
+      "upstream_notes": "## What's Changed\n* main catches up with the release line (Zeron 0.3.6) by @wingleeio in https://github.com/zeronsh/zeron/pull/1457\n* Composer: a Cloud chat's model menu offers Cloud's accounts by @wingleeio in https://github.com/zeronsh/zeron/pull/1467\n* Transcript: a scroll away from the end stays where it was taken by @wingleeio in https://github.com/zeronsh/zeron/pull/1450\n\n\n**Full Changelog**: https://github.com/zeronsh/zeron/compare/v0.3.6...v0.3.7",
+      "fork_changes": [],
+      "fork_through_commit": "d182cc8bdf1ab269eb221458967983e5ab3fb2c5"
+    },
+    {
+      "version": "0.3.6",
+      "upstream_commit": "e48dcbed1254f1ee97cbc4fcfc95de791c3a2122",
+      "upstream_url": "https://github.com/zeronsh/zeron/releases/tag/v0.3.6",
+      "published_at": "2026-11-15T05:20:00Z",
+      "notes_source": "github_release",
+      "upstream_notes": "## What's Changed\n* main catches up with the release line (Zeron 0.3.5) by @wingleeio in https://github.com/zeronsh/zeron/pull/1449\n* Browser: let a load error be dismissed to show what rendered by @wingleeio in https://github.com/zeronsh/zeron/pull/1431\n* Plugins: a plugin can read the composer's draft and set it aside by @hoangvu12 in https://github.com/zeronsh/zeron/pull/1445\n* Plugins: the draft is written for plugins only while one may read it by @wingleeio in https://github.com/zeronsh/zeron/pull/1452\n* Plugins: compose can replace a draft's words or write another chat's; draft_of reads any chat's by @wingleeio in https://github.com/zeronsh/zeron/pull/1453\n* Cloud: keep zeron-engine, and put it back before each start by @wingleeio in https://github.com/zeronsh/zeron/pull/1454\n* Cloud: the updater and the pre-sleep tidy keep zeron-engine by @wingleeio in https://github.com/zeronsh/zeron/pull/1455\n* Providers: Cloud is a choice again, its accounts and API keys managed there by @wingleeio in https://github.com/zeronsh/zeron/pull/1456\n\n\n**Full Changelog**: https://github.com/zeronsh/zeron/compare/v0.3.5...v0.3.6",
+      "fork_changes": [],
+      "fork_through_commit": "d182cc8bdf1ab269eb221458967983e5ab3fb2c5"
+    },
+    {
       "version": "0.3.0",
       "upstream_commit": "d0c77e9c144f9f34e0b5e7e8eea8dc3e3369330b",
       "upstream_url": "https://github.com/zeronsh/zeron/releases/tag/v0.3.0",
@@ -252,16 +272,6 @@
         "Safer worktree creation and removal, env-file handoff, and service shutdown and restart handling.",
         "Project settings protect unsaved edits; inactive Git panels poll less often and diff colors follow your theme."
       ],
-      "fork_through_commit": "85016cff1a9eb690a49c96c2c10ab39f590082ee"
-    },
-    {
-      "version": "0.2.106",
-      "upstream_commit": "916cb1ccb1342c2061963a5f6ecf5c977ba46f2c",
-      "upstream_url": "https://github.com/zeronsh/zeron/releases/tag/v0.2.106",
-      "published_at": "2026-10-07T19:49:28Z",
-      "notes_source": "github_release",
-      "upstream_notes": "## What's Changed\n* Fold dated Claude snapshot IDs into curated model rows by @wingleeio in https://github.com/zeronsh/zeron/pull/835\n* Fix native voice startup compatibility with Codex 0.161 by @jsgrrchg in https://github.com/zeronsh/zeron/pull/834\n\n\n**Full Changelog**: https://github.com/zeronsh/zeron/compare/v0.2.105...v0.2.106",
-      "fork_changes": [],
       "fork_through_commit": "85016cff1a9eb690a49c96c2c10ab39f590082ee"
     }
   ]

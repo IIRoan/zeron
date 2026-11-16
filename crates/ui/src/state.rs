@@ -2208,6 +2208,7 @@ impl AppState {
                     subagent_ref: None,
                     subagent_status: None,
                     subagent_tail: None,
+                    preview_paths: Vec::new(),
                     exit_code: None,
                     output_truncated: false,
                     output_lines: None,
@@ -5860,7 +5861,7 @@ mod tests {
             assert_eq!(state.transcript[0].id, "new-authoritative-row");
             // An authoritative empty reset must still be honored.
             state
-                .apply_transcript_frame(TranscriptFrame::reset::<zeron_doc::SessionMessageEntry>(&[]))
+                .apply_transcript_frame(TranscriptFrame::reset::<SessionMessageEntry>(&[]))
                 .unwrap();
             assert!(state.transcript.is_empty());
         });
