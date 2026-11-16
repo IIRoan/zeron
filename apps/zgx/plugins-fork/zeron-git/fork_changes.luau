@@ -2,7 +2,6 @@
 local Button=require("@ds/button")
 local Checkbox=require("@ds/checkbox")
 local Dropdown=require("@ds/dropdown")
-local TextField=require("@ds/text_field")
 local TextArea=require("@ds/text_area")
 local ContextMenu=require("./ui/context_menu")
 local Dialog=require("@ds/dialog").Dialog
@@ -37,7 +36,7 @@ return function(zeron: any,Repo: any)
     return ui.component(function(p: any): Node
         local m,w=p.model,p.model.workbench
         w.watch_draft()
-        local filter=ui.use_state("");local sort=ui.persist("git.fork.sort","path")
+        local sort=ui.persist("git.fork.sort","path")
         local folded=ui.persist("git.fork.group_folded",{} :: any)
         local selected,chosen,anchor=w.selected,w.chosen,w.anchor
         local diff=ui.use_state(nil :: any)
@@ -67,7 +66,6 @@ return function(zeron: any,Repo: any)
         local function rows(): {any}
             local r=w.repo();local groups={conflicts={},staged={},unstaged={}}
             for _,f in (r and r.files) or {} do
-                if filter:get()~="" and not string.find(string.lower(f.path),string.lower(filter:get()),1,true) then continue end
                 if conflict(f) then table.insert(groups.conflicts,f)
                 else
                     if f.index~="unchanged" and f.index~="untracked" then table.insert(groups.staged,f) end
@@ -90,6 +88,20 @@ return function(zeron: any,Repo: any)
             return out
         end
         local row_list=ui.computed(rows)
+        -- A diff always shows while there are changes: the chosen file's
+        -- (in its new group once it's staged or unstaged), else the first.
+        ui.effect(function()
+            local list=row_list:get();local now=chosen:peek();local first,same=nil,nil
+            for _,row in list do
+                if row.file then
+                    first=first or row
+                    if now and row.key==now.key then return end
+                    if now and not same and row.file.path==now.file.path then same=row end
+                end
+            end
+            local want=same or first
+            if want~=now then ui.after(0,function() chosen:set(want);diff_offset:set(0) end) end
+        end)
         local function paths(group: string?,all: boolean?): {string}
             return Selection.paths(w.repo(),selected:get(),group,all)
         end
@@ -203,7 +215,7 @@ return function(zeron: any,Repo: any)
                     -- blur it. That is still an interaction inside this
                     -- surface, so keep the selection on the moved files.
                     if not focus_inside and not hover_inside and zeron.window().active and not discard:peek() and not w.conflict_open:peek() then
-                        selected:set({});chosen:set(nil);anchor:set(nil)
+                        selected:set({});anchor:set(nil)
                     end
                 end)
             end,
@@ -214,13 +226,24 @@ return function(zeron: any,Repo: any)
                 Button {"Stage all",size="xs",tone="secondary",disabled=function() return not w.can_stage(paths("unstaged",true)) end,on_click=function() stage_all(true) end},
                 Button {"Unstage all",size="xs",tone="secondary",disabled=function() return not w.can_stage(paths("staged",true)) end,on_click=function() stage_all(false) end},
                 Button {"Undo discard",size="xs",tone="secondary",disabled=function() return w.recovery:get()==nil or w.busy:get() end,on_click=w.undo},
+                Button {"Stage selected",size="xs",tone="secondary",disabled=function() return not w.can_stage(paths("unstaged",false)) and not w.can_stage(paths("conflicts",false)) end,
+                    on_click=function() local targets=paths("unstaged",false);for _,path in paths("conflicts",false) do table.insert(targets,path) end;stage_paths(targets,true) end},
+                Button {"Unstage selected",size="xs",tone="secondary",disabled=function() return not w.can_stage(paths("staged",false)) end,on_click=function() stage_paths(paths("staged",false),false) end},
+                ui.text {function() local n=0;for _,on in selected:get() do if on then n+=1 end end;return if n>0 then `{n} selected` else "" end,text_size="$font.size.xs",color="$text.secondary"},
+                ui.div {grow=1},
+                Checkbox {value=git.prefs.split,label="Side by side"},
+                Checkbox {value=git.prefs.wrap,label="Wrap lines"},
             },
             ui.row {class="git-branch-actions",w_full=true,provide={git_branch=branch_info},
                 zeron.slot("branch",{direction="row",gap="$space.1",items="center"})},
             ui.show(function() return w.error:get()~="" end,ui.text {function() return w.error:get() end,color="$danger",wrap=true}),
             ui.show(function() local r=w.repo();return r~=nil and not r.complete end,ui.text {"Repository status is incomplete. Refresh before changing files.",color="$warning",wrap=true}),
-            TextField {value=filter,label="Filter changed files",placeholder="Filter changed files",w_full=true},
-            (if p.wide then ui.row else ui.column) {w_full=true,grow=1,min_h=0,gap="$space.2",
+            -- A clean tree says so, rather than an empty list and diff.
+            ui.show(function() local r=w.repo();return r~=nil and #row_list:get()==0 end,ui.column {id="git-fork-clean",w_full=true,grow=1,min_h=0,items="center",justify="center",gap="$space.1",
+                ui.text {"No changes",weight="$font.weight.semibold",color="$text.secondary"},
+                ui.text {function() local r=w.repo();local s=r and r.git;return if s and s.branch then `{s.branch} matches its last commit.` else "The working tree matches its last commit." end,text_size="$font.size.sm",color="$text.tertiary"},
+            }),
+            ui.show(function() return #row_list:get()>0 end,(if p.wide then ui.row else ui.column) {w_full=true,grow=1,min_h=0,gap="$space.2",
                 ui.list {id="git-source-control",ref=list_box,focusable=true,on_key=list_key,w=if p.wide then 300 else "100%",h=if p.wide then "100%" else 180,shrink=0,offset=list_offset,
                     heights=function() local heights={};for _ in row_list:get() do table.insert(heights,32) end;return heights end,
                     key=function(i: number) local r=row_list:get()[i];return if r then `{i}:{r.key}:{r.title or ""}:{w.revision:get()}` else tostring(i) end,
@@ -257,14 +280,7 @@ return function(zeron: any,Repo: any)
                     end,
                 },
                 ui.column {grow=1,min_w=0,min_h=0,gap="$space.1",
-                    ui.text {function() local row=chosen:get();return if row then row.file.path else "Select a file to view its diff" end,color="$text.secondary"},
-                    ui.row {w_full=true,gap="$space.2",flex_wrap=true,
-                        Checkbox {value=git.prefs.split,label="Side by side"},Checkbox {value=git.prefs.wrap,label="Wrap lines"},
-                        Button {"Stage selected",size="xs",tone="secondary",disabled=function() return not w.can_stage(paths("unstaged",false)) and not w.can_stage(paths("conflicts",false)) end,
-                            on_click=function() local targets=paths("unstaged",false);for _,path in paths("conflicts",false) do table.insert(targets,path) end;stage_paths(targets,true) end},
-                        Button {"Unstage selected",size="xs",tone="secondary",disabled=function() return not w.can_stage(paths("staged",false)) end,on_click=function() stage_paths(paths("staged",false),false) end},
-                        ui.text {function() local n=0;for _,on in selected:get() do if on then n+=1 end end;return if n>0 then `{n} selected` else "" end,text_size="$font.size.xs",color="$text.secondary"},
-                    },
+                    ui.text {function() local row=chosen:get();return if row then row.file.path else "" end,color="$text.secondary",font="$font.mono",text_size="$font.size.sm"},
                     Changes.list {id="git-fork-diff",bare=true,columns=2,offset=diff_offset,
                         files=function() local row=chosen:get();return if row then {Changes.file(row.file.path,"modified",0,0)} else {} end,
                         ranges=true,on_comment=function(path: string,key: string,line: any,range: any?)
@@ -287,7 +303,7 @@ return function(zeron: any,Repo: any)
                         lines=function(_f: any) diff_version:get();return diff_cache or {} end},
                     ui.show(function() local d=diff:get();return d~=nil and d.truncated end,ui.text {"Partial diff: the file exceeds the display limit.",color="$text.secondary"}),
                 },
-            },
+            }),
             TextArea {value=m.message,label="Commit message",placeholder="Commit message",w_full=true,rows=2,max_rows=5},
             ui.row {w_full=true,gap="$space.2",items="center",flex_wrap=true,
                 Button {function() return if w.busy:get() then "Working…" elseif w.amend:get() then "Amend staged" else "Commit staged" end,
