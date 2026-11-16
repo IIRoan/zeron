@@ -567,7 +567,9 @@ local function folder(w: Workspace, v: View, props: Props, here: () -> Where?): 
 			-- (The file tree's toggle, the pane having no band of its own.)
 			ds.IconButton {label="Toggle file tree",tooltip="Toggle file tree",size="sm",tone="quiet",
 				on_click=function() if pane_commands.toggle then pane_commands.toggle() end end,
-				ds.SidebarIcon {open=tree_shown,size=14}},
+				-- (The glyph's parts are placed absolutely: held in a box of
+				-- its own, or they go to the bar's corner.)
+				ui.div {relative=true,w=14,h=14,shrink=0,ds.SidebarIcon {open=tree_shown,size=14}}},
 			ds.FadeText {w.target.root or w.name,grow=1,min_w=0,text_size="$font.size.xs",color="$text.secondary",tooltip=w.target.root or w.name},
 			ds.IconButton {icon="copy",label="Copy directory path",size="sm",on_click=function() ui.clipboard.write(w.target.root or w.name) end},
 			ds.IconButton {icon="magnifer",label="Find in Files",size="sm",on_click=function() Search.show() end},
