@@ -80,11 +80,13 @@ env = {key: value for key, value in os.environ.items()
 paths = [str(Path.home() / '.local/bin'), str(Path.home() / '.cargo/bin'),
          '/var/home/linuxbrew/.linuxbrew/bin', '/usr/local/bin', '/usr/bin', '/bin']
 env['PATH'] = os.pathsep.join(dict.fromkeys([*paths, *env.get('PATH', '').split(os.pathsep)]))
+# (Not XDG_*_HOME: the engine, and every service, check, terminal and
+# agent it starts, must see the user's own: under the beta's folders
+# rootless podman saw none of the user's containers, so a project's shared
+# databases never passed their ready check. ZERON_DATA_DIR, the port and the
+# app id keep the beta apart.)
 env.update({'ZERON_DATA_DIR': str(profile / 'engine'),
             'ZERON_IPC_PORT': str(port), 'ZERON_AUTO_UPDATE': '0',
-            'XDG_CONFIG_HOME': str(profile / 'config'),
-            'XDG_DATA_HOME': str(profile / 'data'),
-            'XDG_CACHE_HOME': str(profile / 'cache'),
             'RUST_MIN_STACK': '16777216', 'ZGX_CHECK': '0'})
 if not args or all(arg in {'--inspect', '--zeron-template'} for arg in args):
     args.insert(0, 'main')
