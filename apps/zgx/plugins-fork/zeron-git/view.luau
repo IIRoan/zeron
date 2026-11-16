@@ -22,6 +22,7 @@ local EmptyState = require("@ds/empty_state")
 local progress = require("@ds/progress")
 local Branches=require("./branches")
 local fm=require("./fork_motion")
+local ForkHistory=require("./fork_history")
 
 -- What Changes shows: the work tree, the branch, the last turn.
 local SCOPES = { "working", "branch", "turn" }
@@ -32,6 +33,7 @@ local SCOPE_ICON: { [string]: string } = { working = "pen", branch = "git-branch
 local WIDE = 760
 
 return function(zeron: any, Repo: any, words: any)
+	ForkHistory.apply(zeron, Repo)
 	local ChangesView = require("./changes")(zeron, Repo, words)
 	local ForkChanges = require("./fork_changes")(zeron,Repo)
 	local HistoryView, CommitView = require("./history")(zeron, Repo, words)
@@ -308,6 +310,10 @@ return function(zeron: any, Repo: any, words: any)
 			local which, layout = string.match(key, "^ready:([^:]+):([^:]+)")
 			local wide = layout == "wide"
 			if which == "history" then
+				-- (Off in the fork: a History tab from before says so.)
+				if not ForkHistory.on then
+					return EmptyState { icon = "git-commit", title = "History is off", body = "This build leaves Git history out. Close this tab.", size = "sm", fill = true }
+				end
 				return HistoryView { model = m, wide = wide, panel = props.panel }
 			elseif which == "commit" then
 				-- (A commit's own tab: what it was opened with.)

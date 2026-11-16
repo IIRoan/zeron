@@ -43,7 +43,6 @@ function M.Activity(): Node
         ds.IconButton {icon="folder",label="Explorer",disabled=function() return route.session:get()==nil end,tooltip="Explorer · open a chat to use its checkout",on_click=function() panel().show_files() end},
         ds.IconButton {icon="magnifer",label="Find in Files",disabled=function() return route.session:get()==nil end,tooltip="Find in Files · open a chat to search its checkout",on_click=function() require("./files_search").show() end},
         ui.show(function() return M.enabled("zeron-git") end,ds.IconButton {icon="git-branch",label="Source control",disabled=function() return route.session:get()==nil end,tooltip="Source control · open a chat to use its checkout",on_click=function() git("changes") end}),
-        ui.show(function() return M.enabled("zeron-git") end,ds.IconButton {icon="git-commit",label="Git history",disabled=function() return route.session:get()==nil end,tooltip="Git history · open a chat to use its checkout",on_click=function() git("history") end}),
         ui.show(function() return M.enabled("project-services") end,ds.IconButton {icon="remote-server",label="Project services",on_click=function()
             local session=route.session:peek()
             if not session then route.plugin_page("project-services","services");return end
