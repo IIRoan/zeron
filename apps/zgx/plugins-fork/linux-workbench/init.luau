@@ -8,3 +8,4 @@ ui.override {module="@app/screens/shell/project_look",with="./screens/project_lo
 ui.override {module="@app/screens/settings/about",with="./screens/about"}
 ui.override {module="@app/screens/settings/projects",with="./screens/projects"}
 ui.override {module="@app/screens/shell/title_bar",with="./screens/title_bar"}
+ui.override {module="@app/screens/chat/turn_glue",with="./screens/turn_glue"}

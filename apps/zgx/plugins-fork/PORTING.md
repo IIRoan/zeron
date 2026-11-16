@@ -181,3 +181,12 @@ zgx. Engine-side work needs no port: zgx runs the same engine.
   `screens/title_bar.luau` wraps `@app-original/screens/shell/title_bar`.
   Under Dark+ this gives the desktop app's `#181818` / `#1e1e1e` / sidebar
   wash exactly.
+- A prompt waiting on its project's local setup says what it waits for
+  ("Preparing worktree quiet-falcon: waiting for Databases to be ready…",
+  "…: installing dependencies (npm ci)…") instead of "Sending…": Linux
+  Workbench wraps `@app-original/screens/chat/turn_glue`, reading the
+  project's worktree setup step through Settings' `GetWorktreeSettings`.
+- One upstream fix outside the plugins: `ui/ds/transcript.luau` declares
+  `turn_line` ahead of the waiting line that calls it (it was nil there,
+  so any turn state said in words failed the transcript). Drop it when
+  upstream fixes the same; `fork_tests` covers it.

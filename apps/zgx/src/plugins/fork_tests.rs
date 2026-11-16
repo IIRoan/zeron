@@ -503,3 +503,45 @@ fn a_project_s_settings_page_holds_each_fork_plugin_s_section() {
     let problems: Vec<_> = heard.borrow().iter().filter(|(key, _)| key.ends_with(".problem")).cloned().collect();
     assert!(problems.is_empty(), "{problems:?}");
 }
+
+/// A prompt on its way says what it waits for (Linux Workbench's turn
+/// state: "Preparing worktree …: installing dependencies (npm ci)…"): the
+/// transcript draws a turn state's words in the reply's place. (Upstream's
+/// waiting line called its line-drawer before declaring it, and failed.)
+#[test]
+fn a_sending_prompt_says_what_it_waits_for() {
+    let root = std::env::temp_dir().join(format!("zeron-fork-waiting-{}-{}", std::process::id(), rand_suffix()));
+    std::fs::create_dir_all(&root).unwrap();
+    // (`ds.setup` reads its themes beside the script, as the app's own does.)
+    let themes = root.join("ds/themes");
+    std::fs::create_dir_all(&themes).unwrap();
+    for theme in std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("ui/ds/themes")).unwrap().flatten() {
+        std::fs::copy(theme.path(), themes.join(theme.file_name())).unwrap();
+    }
+    let entry = root.join("app.luau");
+    std::fs::write(
+        &entry,
+        r#"
+require("@ds").setup()
+local T = require("@ds/transcript")
+local messages = ui.state("waiting.messages", { { id = "m1", role = "user", text = "hi", attachments = {}, waiting = "sending" } } :: any)
+local Chat = ui.component(function(): Node
+	return T.Transcript {
+		messages = messages,
+		turn_state = function(m: any, sending: boolean): any
+			return if sending then { text = "Preparing worktree quiet-falcon: installing dependencies (npm ci)…", spinner = true } else nil
+		end,
+	}
+end)
+return ui.div { w_full = true, h_full = true, Chat {} }
+"#,
+    )
+    .unwrap();
+    let ui_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("ui");
+    let mut app = TestApp::new(move |runtime| super::lend_design_system(ScriptHost::new(runtime, entry.clone()), &ui_dir.join("app.luau")));
+    app.ui.scene.borrow_mut().resize(700., 500.);
+    app.frames(20);
+    assert_eq!(app.error(), None, "{}", app.tree());
+    assert!(app.wait_until(|a| shows(a, "installing dependencies (npm ci)")), "{}", app.tree());
+    let _ = std::fs::remove_dir_all(root);
+}

@@ -476,6 +476,9 @@ end
 -- word and clock, as Zeron's working trailer (transcript.rs); not
 -- delivered, a line to send it again. The reply's own row takes over once
 -- it comes.
+-- (Declared ahead: the waiting line below says a turn's state with it, and a
+-- local function is only in scope after its own line.)
+local turn_line: (line: () -> TurnLine?) -> Node
 local function waiting_line(row: State<Message>, on_retry: ((id: string) -> ())?, turn_state: ((m: Message, sending: boolean) -> TurnLine?)?): Node
 	local function said(): TurnLine?
 		local m = row:get()
@@ -598,7 +601,7 @@ export type TurnLine = { text: string, spinner: boolean?, step: string?, summary
 
 -- The line said in a working word's place: a ring while it's still on its
 -- way, then its words, in the working word's quiet ink.
-local function turn_line(line: () -> TurnLine?): Node
+function turn_line(line: () -> TurnLine?): Node
 	return ui.row {
 		gap = "$space.2",
 		items = "center",

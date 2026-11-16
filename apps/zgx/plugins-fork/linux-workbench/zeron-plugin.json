@@ -18,7 +18,8 @@
       "@app/screens/shell/project_look",
       "@app/screens/settings/about",
       "@app/screens/settings/projects",
-      "@app/screens/shell/title_bar"
+      "@app/screens/shell/title_bar",
+      "@app/screens/chat/turn_glue"
     ]
   }
 }
