@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bundle independent fork plugins into a new demo's Resources directory.
+"""Bundle independent fork plugins into a new release (the folder holding ui/).
 
 Check-only unless --apply is given. Existing, different plugin folders are
 left untouched; build a new release directory to retain a rollback.

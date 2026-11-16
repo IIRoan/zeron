@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Package and install the separate Linux beta. Check-only without --apply.
 
-Build apps/zgx with --features beta and ZERON_BETA_VERSION first. Supply the
-native source manifest taken at build time, and an existing engine release
-with build.json provenance. No regular Zeron/demo files or services change.
+Build apps/zgx with --features beta and ZERON_BETA_VERSION first, and the
+engine (`cargo build --release -p zeron --bin zeron-engine`) from this same
+commit. Supply the native source manifest taken at build time. No regular
+Zeron/demo files or services change.
+
+A release is laid out as the Linux tarball is (scripts/package-linux.sh):
+the app with `ui/` and `plugins-builtin/` beside it, where zgx looks for them.
 """
 import argparse
 from datetime import datetime, timezone
@@ -39,24 +43,21 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--frontend', type=Path, required=True)
     parser.add_argument('--native-source', type=Path, required=True)
-    parser.add_argument('--engine-release', type=Path, required=True)
+    parser.add_argument('--engine', type=Path, required=True, help='zeron-engine built from this commit')
     parser.add_argument('--apply', action='store_true')
     args = parser.parse_args()
     if os.uname().sysname != 'Linux':
         raise SystemExit('This installer is for Linux.')
     frontend = args.frontend.resolve(strict=True)
-    engine_release = args.engine_release.resolve(strict=True)
-    engine = engine_release / 'bin/zeron-engine'
-    provenance = json.loads((engine_release / 'build.json').read_text())
+    engine = args.engine.resolve(strict=True)
     native = json.loads(args.native_source.read_text())
     actual = {str(p.relative_to(ROOT)): sha(p) for p in (ROOT / 'apps/zgx/src').rglob('*.rs')}
     if native != actual:
         raise SystemExit('Native source changed since the supplied build manifest. Rebuild first.')
-    for name in ['crates/engine/src/plugins/mod.rs', 'crates/engine/src/plugins/tests.rs']:
-        if provenance['source_files'].get(name) != sha(ROOT / name):
-            raise SystemExit(f'Engine provenance differs: {name}. Rebuild the engine first.')
-    if sha(engine) != provenance['binaries']['zeron-engine']:
-        raise SystemExit('Engine checksum differs from its build receipt.')
+    head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
+    build_id = subprocess.check_output([str(engine), '--build-id'], text=True).strip()
+    if not build_id.startswith(head[:12]):
+        raise SystemExit(f'The engine was built from {build_id}, not this checkout ({head[:12]}). Rebuild it.')
     # --version is read-only, with an explicit beta data/port boundary even
     # when this installer is invoked by the regular Zeron app.
     env = dict(os.environ, ZERON_DATA_DIR=str(Path.home() / '.local/share/zeron-beta/profile/engine'), ZERON_IPC_PORT='27946')
@@ -88,26 +89,26 @@ def main():
     if not release.exists():
         temporary = Path(tempfile.mkdtemp(prefix='.beta-', dir=base / 'releases'))
         try:
-            (temporary / 'bin').mkdir()
-            shutil.copy2(frontend, temporary / 'bin/zeron-beta')
-            shutil.copy2(engine, temporary / 'bin/zeron-engine')
-            resources = temporary / 'Resources'
-            shutil.copytree(ROOT / 'apps/zgx/ui', resources / 'ui', ignore=shutil.ignore_patterns('.zgx', 'tests', '.lock', '.DS_Store'))
-            shutil.copytree(ROOT / 'apps/zgx/plugins-builtin', resources / 'plugins-builtin', ignore=shutil.ignore_patterns('.zgx', '.DS_Store'))
-            subprocess.run(['python3', str(ROOT / 'apps/zgx/scripts/bundle-fork-plugins.py'), '--resources', str(resources), '--apply'], check=True, stdout=subprocess.DEVNULL)
-            shutil.copy2(ROOT / 'apps/zgx/plugins-fork/PORTING.md', resources / 'FORK-PORTING.md')
-            for name in ['LICENSE', 'THIRD_PARTY_NOTICES.md', 'UPSTREAM-README.md']:
-                shutil.copy2(engine_release / name, temporary / name)
-            shutil.copytree(engine_release / 'licenses', temporary / 'licenses')
-            shutil.copy2(engine_release / 'zeron-zgx-demo.png', temporary / 'zeron-beta.png')
+            shutil.copy2(frontend, temporary / 'zeron-beta')
+            shutil.copy2(engine, temporary / 'zeron-engine')
+            shutil.copytree(ROOT / 'apps/zgx/ui', temporary / 'ui', ignore=shutil.ignore_patterns('.zgx', 'tests', '.lock', '.DS_Store'))
+            shutil.copytree(ROOT / 'apps/zgx/plugins-builtin', temporary / 'plugins-builtin', ignore=shutil.ignore_patterns('.zgx', '.DS_Store'))
+            subprocess.run(['python3', str(ROOT / 'apps/zgx/scripts/bundle-fork-plugins.py'), '--resources', str(temporary), '--apply'], check=True, stdout=subprocess.DEVNULL)
+            shutil.copy2(ROOT / 'apps/zgx/plugins-fork/PORTING.md', temporary / 'FORK-PORTING.md')
+            for name in ['LICENSE', 'THIRD_PARTY_NOTICES.md']:
+                shutil.copy2(ROOT / name, temporary / name)
+            (temporary / 'licenses/fonts').mkdir(parents=True)
+            for licence in [*(ROOT / 'crates/ui/assets/fonts/licenses').iterdir(), *(ROOT / 'apps/zgx/fonts').glob('*-OFL.txt')]:
+                shutil.copy2(licence, temporary / 'licenses/fonts' / licence.name)
+            shutil.copy2(ROOT / 'dist/zeron.png', temporary / 'zeron-beta.png')
             patch = subprocess.check_output(['git', 'diff', '--binary', 'HEAD'], cwd=ROOT)
             (temporary / 'source-changes.patch').write_bytes(patch)
-            # Untracked plugin source is included in Resources, and its
+            # Untracked plugin source is included in the release, and its
             # complete hashes are retained alongside tracked source changes.
             (temporary / 'source-files.json').write_text(json.dumps(sources, indent=2) + '\n')
             metadata = dict(plan, built_at=datetime.now(timezone.utc).isoformat(),
-                            engine_reused_from=str(engine_release), source_files=sources,
-                            source_revision=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
+                            engine_build_id=build_id, source_files=sources,
+                            source_revision=head,
                             scripted_agent=False, native_features=['beta'])
             (temporary / 'build.json').write_text(json.dumps(metadata, indent=2) + '\n')
             os.rename(temporary, release)

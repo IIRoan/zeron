@@ -14,8 +14,8 @@ The demo and Linux beta bundle these folders as separate plugins. Settings -> Cu
 the stock layout; Git and Services can also run in the stock interface.
 The stock Git and GitHub plugins are disabled to avoid duplicate controls.
 
-For a new release, `scripts/bundle-fork-plugins.py --resources <Resources>`
-checks its bundle; add `--apply` to copy these separate plugin folders.
+For a new release, `scripts/bundle-fork-plugins.py --resources <release>`
+checks its bundle (the folder holding `ui/`, beside the app); add `--apply` to copy these separate plugin folders.
 Keep the stock Git/GitHub plugin switches off. Their implementations remain
 available for switching back.
 
@@ -63,13 +63,15 @@ under `~/.local/share/zeron-beta/profile`. It uses the installed agent CLIs
 and their normal login locations; it does not copy regular Zeron's chats,
 settings or credentials, and contains no scripted demo provider.
 
-Build `apps/zgx` with `--features beta` and `ZERON_BETA_VERSION` set.
-`scripts/install-zgx-beta.py --frontend <binary> --native-source <manifest>
---engine-release <verified-release>` checks the package. Add `--apply` to
-install it. The native-source manifest maps every `apps/zgx/src/*.rs` path
-(recursively, relative to the repository root) to its SHA-256 at build time.
-The existing engine release must include its `build.json` source/checksum
-receipt. The installer preserves both regular Zeron and the demo and only
+Build `apps/zgx` with `--features beta` and `ZERON_BETA_VERSION` set, and
+the engine from the same commit (`cargo build --release -p zeron --bin
+zeron-engine`). `scripts/install-zgx-beta.py --frontend <binary>
+--native-source <manifest> --engine <zeron-engine>` checks the package. Add
+`--apply` to install it. The native-source manifest maps every
+`apps/zgx/src/*.rs` path (recursively, relative to the repository root) to its
+SHA-256 at build time. The engine's `--build-id` must name this checkout's
+commit. A release is flat, as the Linux tarball is: the app with `ui/` and
+`plugins-builtin/` beside it, where zgx looks for them. The installer preserves both regular Zeron and the demo and only
 seeds stock Git/GitHub switches off for a new beta profile. Future installs
 preserve the beta's plugin switches. About & updates identifies this local
 beta and explains its separate manual updates. `zeron-beta --status` lists

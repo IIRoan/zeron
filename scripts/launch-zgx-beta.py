@@ -21,7 +21,7 @@ def processes():
             continue
         try:
             exe = (item / 'exe').resolve(strict=True)
-            if exe.parent.parent.parent != base / 'releases':
+            if base / 'releases' not in exe.parents:
                 continue
             if exe.name not in {'zeron-beta', 'zeron-engine'}:
                 continue
@@ -97,6 +97,7 @@ if args[0] in {'main', 'intro', 'onboarding', 'gallery'}:
     os.dup2(log, 1)
     os.dup2(log, 2)
     os.close(log)
-binary = release / 'bin/zeron-beta'
+# Releases since 0.3.7 are flat (ui/ beside the app); older ones kept bin/.
+binary = release / 'zeron-beta' if (release / 'zeron-beta').exists() else release / 'bin/zeron-beta'
 os.chdir(profile / 'projects')
 os.execve(binary, [str(binary), *args], env)
