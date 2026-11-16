@@ -1,5 +1,4 @@
 --!strict
-local Button=require("@ds/button")
 local Dropdown=require("@ds/dropdown")
 local TextField=require("@ds/text_field")
 local Dialog=require("@ds/dialog").Dialog
@@ -8,7 +7,7 @@ local COMMANDS=require("./command_items")
 return function(zeron: any)
     return ui.component(function(p: any): Node
         local m,w=p.model,p.model.workbench
-        local command=ui.use_state("");local prompt=ui.use_state(false);local title=ui.use_state("")
+        local prompt=ui.use_state(false);local title=ui.use_state("")
         local choice=ui.use_state("");local extra=ui.use_state("");local kind=ui.use_state("")
         local pin: any=nil
         local function commit(amend: boolean,follow: string?) w.commit(amend,follow,pin) end
@@ -73,11 +72,9 @@ return function(zeron: any)
             else for _,b in d.branches do table.insert(list,{value=b.name,label=b.name}) end end
             return list
         end
+        -- (No control of its own: the tab's ⋯ menu asks; this runs it, and
+        -- asks what a command needs.)
         return ui.row {items="center",gap="$space.1",
-            Dropdown {value=command,label="Git commands",placeholder="Git commands…",search="Search Git commands",width=360,
-                items=function() local items={};for _,c in COMMANDS do table.insert(items,{value=c[1],label=c[2]}) end;return items end,
-                on_open=function() pin=w.capture();w.load_details() end,
-                on_choose=function(k: string) choose(k);ui.after(0,function() command:set("") end) end},
             ui.presence(function() return kind:get() end,function(k: string): Node return Dialog {open=prompt,title=function() return title:get() end,size="md",
                 tone=if k=="dropStash" or k=="deleteBranch" or k=="undoCommit" or k=="abort" or k=="revertCommit" then "danger" else "default",
                 confirm=if k=="incoming" or k=="outgoing" or k=="recent" then nil else {label="Run",on_click=run},

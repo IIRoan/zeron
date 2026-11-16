@@ -244,6 +244,16 @@ return function(zeron: any, Repo: any, words: any)
 				gap = "$space.1",
 				items = "center",
 				branch_switcher(m),
+				IconButton {
+					id = "git-refresh",
+					icon = "refresh",
+					label = "Refresh",
+					tone = "quiet",
+					on_click = function()
+						m.refresh(true)
+						m.workbench.refresh()
+					end,
+				},
 				more_menu(m),
 			},
 		}

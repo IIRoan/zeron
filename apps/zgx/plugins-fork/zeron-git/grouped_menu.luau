@@ -7,6 +7,12 @@ return function(m: any): Node
     local anchor: any=nil;local show: any=nil
     return ContextMenu {width=240,hook=function(open: any) show=open end,items=function(): {any}
         local pin=m.workbench.capture();local groups={}
+        -- (The view shown's own first: Changes' staging and its diff's look.)
+        local extra=m.workbench.menu_extra
+        if extra then
+            for _,entry in extra() do table.insert(groups,entry) end
+            table.insert(groups,{separator=true})
+        end
         for _,name in order do
             local entries={}
             for _,item in commands do if item[3]==name then

@@ -1,6 +1,5 @@
 --!strict
 local Button=require("@ds/button")
-local Checkbox=require("@ds/checkbox")
 local Dropdown=require("@ds/dropdown")
 local TextArea=require("@ds/text_area")
 local ContextMenu=require("./ui/context_menu")
@@ -46,6 +45,7 @@ return function(zeron: any,Repo: any)
         local focus_inside=false;local hover_inside=false
         ui.on_cleanup(function() selected:set({});chosen:set(nil);anchor:set(nil) end)
         local commenting=ui.use_state(false);local note=ui.use_state("");local comment: any=nil
+        local commit_menu: any=nil;local commit_anchor: any=nil
         local branch_info=ui.use_state(nil :: any)
         ui.effect(function()
             local s=m.status:get();local device,cwd=m.where()
@@ -120,6 +120,20 @@ return function(zeron: any,Repo: any)
             end)
         end
         local function stage_all(on: boolean) stage_paths(paths(if on then "unstaged" else "staged",true),on) end
+        -- What the tab's ⋯ menu has of this view's own, before Git's groups.
+        w.menu_extra=function(): {any}
+            return {
+                {label="Stage selected",disabled=not w.can_stage(paths("unstaged",false)) and not w.can_stage(paths("conflicts",false)),
+                    on_select=function() local targets=paths("unstaged",false);for _,path in paths("conflicts",false) do table.insert(targets,path) end;stage_paths(targets,true) end},
+                {label="Unstage selected",disabled=not w.can_stage(paths("staged",false)),on_select=function() stage_paths(paths("staged",false),false) end},
+                {label="Stage all",disabled=not w.can_stage(paths("unstaged",true)),on_select=function() stage_all(true) end},
+                {label="Unstage all",disabled=not w.can_stage(paths("staged",true)),on_select=function() stage_all(false) end},
+                {label="Undo discard",disabled=w.recovery:peek()==nil or w.busy:peek(),on_select=w.undo},
+                {separator=true},
+                {label="Side by side",checked=function() return git.prefs.split:get() end,keep_open=true,on_select=function() git.prefs.split:set(not git.prefs.split:peek()) end},
+            }
+        end
+        ui.on_cleanup(function() w.menu_extra=nil end)
         ui.effect(function()
             if m.discard_ask:get() then ui.after(0,function() m.discard_ask:set(nil);ask(paths(nil,true),true) end) end
         end)
@@ -219,19 +233,34 @@ return function(zeron: any,Repo: any)
                     end
                 end)
             end,
-            ui.row {w_full=true,items="center",gap="$space.2",flex_wrap=true,
-                Dropdown {value=w.repository,label="Repository",items=function() local items={};for _,r in w.repositories:get() do table.insert(items,{value=r.path,label=r.name .. (if r.complete then "" else " (incomplete)")}) end;return items end},
-                Commands {model=m,sort=sort,stage_all=stage_all,discard_all=function(all: boolean,pin: any) ask(paths(nil,true),all,pin) end,
-                    open_commit=function(c: any) if p.panel then Repo.open_commit(p.panel,m.id,c) end end},
-                Button {"Stage all",size="xs",tone="secondary",disabled=function() return not w.can_stage(paths("unstaged",true)) end,on_click=function() stage_all(true) end},
-                Button {"Unstage all",size="xs",tone="secondary",disabled=function() return not w.can_stage(paths("staged",true)) end,on_click=function() stage_all(false) end},
-                Button {"Undo discard",size="xs",tone="secondary",disabled=function() return w.recovery:get()==nil or w.busy:get() end,on_click=w.undo},
-                Button {"Stage selected",size="xs",tone="secondary",disabled=function() return not w.can_stage(paths("unstaged",false)) and not w.can_stage(paths("conflicts",false)) end,
-                    on_click=function() local targets=paths("unstaged",false);for _,path in paths("conflicts",false) do table.insert(targets,path) end;stage_paths(targets,true) end},
-                Button {"Unstage selected",size="xs",tone="secondary",disabled=function() return not w.can_stage(paths("staged",false)) end,on_click=function() stage_paths(paths("staged",false),false) end},
-                ui.text {function() local n=0;for _,on in selected:get() do if on then n+=1 end end;return if n>0 then `{n} selected` else "" end,text_size="$font.size.xs",color="$text.secondary"},
-                ui.div {grow=1},
-                Checkbox {value=git.prefs.split,label="Side by side"},
+            -- (Runs what the ⋯ menu asks, and asks what a command needs.)
+            Commands {model=m,sort=sort,stage_all=stage_all,discard_all=function(all: boolean,pin: any) ask(paths(nil,true),all,pin) end,
+                open_commit=function(c: any) if p.panel then Repo.open_commit(p.panel,m.id,c) end end},
+            -- (Which repository, where the checkout holds more than one.)
+            ui.show(function() return #w.repositories:get()>1 end,Dropdown {value=w.repository,label="Repository",items=function() local items={};for _,r in w.repositories:get() do table.insert(items,{value=r.path,label=r.name .. (if r.complete then "" else " (incomplete)")}) end;return items end}),
+            -- The commit, first: its message (Ctrl+Enter commits) and the
+            -- button, its ways (push, sync, amend) in the menu beside it.
+            ui.column {id="git-commit-box",w_full=true,gap="$space.1",
+                TextArea {value=m.message,name="Commit message",placeholder="Message (Ctrl+Enter to commit)",w_full=true,rows=2,max_rows=6,
+                    on_submit=function() if w.commit_reason()==nil then w.commit(w.amend:peek()) end end},
+                ui.row {w_full=true,gap="$space.1",items="center",
+                    Button {function() return if w.busy:get() then "Working…" elseif w.amend:get() then "Amend" else "Commit" end,
+                        grow=1,disabled=function() return w.commit_reason()~=nil end,tooltip=ui.text {function() return w.commit_reason() or "Commit the staged changes" end},
+                        on_click=function() w.commit(w.amend:peek()) end},
+                    ContextMenu {width=220,hook=function(open: any) commit_menu=open end,items=function(): {any}
+                        local pin=w.capture()
+                        local function run(kind: string) return function() w.command_request:set({kind=kind,pin=pin}) end end
+                        return {
+                            {label="Commit and push",disabled=w.commit_reason()~=nil,on_select=run("commitPush")},
+                            {label="Commit and sync",disabled=w.commit_reason()~=nil,on_select=run("commitSync")},
+                            {separator=true},
+                            {label="Amend last commit",checked=function() return w.amend:get() end,keep_open=true,on_select=function() w.toggle_amend() end},
+                            {label="Undo last local commit",disabled=w.busy:peek(),on_select=run("undoCommit")},
+                        }
+                    end,
+                        IconButton {icon="alt-arrow-down",label="More ways to commit",size="sm",tone="normal",on_mount=function(el: any) commit_anchor=el end,
+                            on_click=function() if commit_menu and commit_anchor then commit_menu(commit_anchor.x,commit_anchor.y+commit_anchor.height) end end}},
+                },
             },
             ui.row {class="git-branch-actions",w_full=true,provide={git_branch=branch_info},
                 zeron.slot("branch",{direction="row",gap="$space.1",items="center"})},
@@ -303,17 +332,6 @@ return function(zeron: any,Repo: any)
                     ui.show(function() local d=diff:get();return d~=nil and d.truncated end,ui.text {"Partial diff: the file exceeds the display limit.",color="$text.secondary"}),
                 },
             }),
-            TextArea {value=m.message,label="Commit message",placeholder="Commit message",w_full=true,rows=2,max_rows=5},
-            ui.row {w_full=true,gap="$space.2",items="center",flex_wrap=true,
-                Button {function() return if w.busy:get() then "Working…" elseif w.amend:get() then "Amend staged" else "Commit staged" end,
-                    disabled=function() return w.commit_reason()~=nil end,tooltip=ui.text {function() return w.commit_reason() or "Commit the staged changes" end},on_click=function()
-                    w.commit(w.amend:peek())
-                end},
-                Checkbox {value=function() return w.amend:get() end,label="Amend",on_change=function(on: boolean) w.toggle_amend(on) end},
-                Button {"Pull",size="sm",tone="secondary",disabled=function() return w.busy:get() end,on_click=function() w.action({kind="pull"}) end},
-                Button {"Push",size="sm",tone="secondary",disabled=function() return w.busy:get() end,on_click=function() w.action({kind="push"}) end},
-                ui.text {function() local r=w.repo();local s=r and r.git;return if s then `{s.branch or "Detached"}  ↑{s.ahead or 0} ↓{s.behind or 0} {s.operation or ""}` else "Loading repository…" end,color="$text.secondary"},
-            },
             Dialog {open=discard,title="Discard these changes?",tone="danger",body=function() return `Discard {if preview then preview.fileCount else 0} files? A recovery copy will be kept for Undo discard.` end,
                 confirm={label="Discard",on_click=function() if preview then w.confirm_discard(preview,discard_pin) end end}},
             Dialog {open=w.conflict_open,title="Stage files with conflict markers?",tone="danger",
