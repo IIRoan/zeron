@@ -81,7 +81,12 @@ return function(props: Props): Node
 		end)
 	end, { w_full = true, h_full = true })
 
-	local pane: ContainerProps = ds.wallpaper.follow(box, px, py, home)
+	-- (Where the pointer is, only while a wallpaper reads it: a plugin's.
+	-- Your picture, or none, never does, and its writes on every move
+	-- went nowhere.)
+	local pane: ContainerProps = ds.wallpaper.follow(box, px, py, function(): boolean
+		return home() and string.find(appearance.showing:peek(), "^plugin:") ~= nil
+	end)
 	pane.ref = box
 	pane.id = "shell-page"
 	pane.hook = "shell.page"
@@ -90,15 +95,9 @@ return function(props: Props): Node
 	pane.h_full = true
 	pane.relative = true
 	pane.overflow = "hidden"
-	-- A trackpad's swipe between pages (the mouse's back and forward too):
-	-- the history, as the router's own view takes it.
-	pane.on_navigate = function(e)
-		if e.direction == "back" then
-			route.back()
-		else
-			route.forward()
-		end
-	end
+	-- No `on_navigate`: a trackpad's swipe over the page scrolls and never
+	-- steps the history (that's the title bar's arrows, the mouse's buttons,
+	-- ⌘[ and ⌘]).
 	-- Whether it shows, for what stands over it (screens/shell/art).
 	ui.effect(function()
 		local on = home() and not on_plugin() and appearance.showing:get() ~= "none"
@@ -118,6 +117,9 @@ return function(props: Props): Node
 				return home() and not on_plugin()
 			end,
 			width = props.width,
+			picture = function(): any
+				return if appearance.showing:peek() == "image" then appearance.image:peek() else nil
+			end,
 			key = function(): string
 				local showing = appearance.showing:get()
 				if showing == "image" then
@@ -209,6 +211,28 @@ return function(props: Props): Node
 	-- (Collapsed, past the bar's controls by as much as Zeron's title
 	-- stands past its last control's glyph.)
 	local after_controls = (ui.theme.get("space.1") :: number?) or 4
+	-- Where the title starts: past the title bar's controls while they
+	-- stand over it (the sidebar collapsed), else the page's inset.
+	-- (`full`, `tracked`: as ds.TitleBar's `controls_end`.)
+	local function title_left(full: boolean?, tracked: boolean?): number
+		if shell_view.collapsed:get() or not fit.current:get().sidebar then
+			return ds.TitleBar.controls_end(full, tracked) + after_controls
+		end
+		return inset
+	end
+	-- How far it moves with the controls as the window goes in or out of
+	-- full screen (macOS hides the traffic lights there), kept by the title
+	-- bar's `follow`: still while macOS animates, then sliding with them;
+	-- eased as the sidebar's moves otherwise, as its `left` is.
+	local function full_screen_shift(full: boolean?, tracked: boolean?): number
+		return title_left(full, tracked) - title_left(false, tracked)
+	end
+	local header_ref = ui.ref()
+	ds.TitleBar.follow(header_ref, {
+		x = function(full: boolean): number
+			return full_screen_shift(full)
+		end,
+	}, motion.sidebar)
 	table.insert(
 		pane,
 		ui.show(
@@ -227,13 +251,23 @@ return function(props: Props): Node
 					end),
 				},
 				absolute = true,
-				top = TITLE_TOP,
+				-- (Centred on the bar's line: 21 down, or the window's own
+				-- buttons' middle where they set it.)
+				top = function(): number
+					return ds.TitleBar.middle() - (TITLE_H - TITLE_TOP) / 2
+				end,
 				h = TITLE_H - TITLE_TOP,
+				ref = header_ref,
 				left = motion.tween(ui.computed(function(): number
-					return if shell_view.collapsed:get() or not fit.current:get().sidebar then ds.TitleBar.controls_end() + after_controls else inset
+					return title_left(false, true)
 				end), motion.sidebar),
-				-- (Clear of the bar's own controls at its right.)
-				right = ui.raw(TITLE_RIGHT, "the title bar's controls at the right, and their room"),
+				x = full_screen_shift(ds.TitleBar.full_screen_now(), false),
+				-- (Clear of the bar's own controls at its right, and of the
+				-- window's buttons where they stand there; TITLE_RIGHT counts the
+				-- bar's row padding, 10, which `actions_right` gives as it is.)
+				right = function(): number
+					return ui.raw(TITLE_RIGHT - 10 + ds.TitleBar.actions_right(), "the title bar's controls at the right, and their room")
+				end,
 				gap = "$zeron.space.tight",
 				items = "center",
 				pointer_events = "none",
@@ -502,6 +536,7 @@ return function(props: Props): Node
 	local base = open_w:peek()
 	local off = ui.use_state(0)
 	local easing: any = nil
+	local steps = 0
 	-- Whose panel shows (the session's, a plugin page's; none on a new
 	-- chat): another one is the route moving, not the person opening or
 	-- closing this one, and the panel lands at once, as it is there.
@@ -574,15 +609,16 @@ return function(props: Props): Node
 			end
 			off:set(showing - to)
 			local params = motion.column(off:peek(), 0)
-			local this: any = nil
+			-- (By number: a callback holding its own clip would keep both for good.)
+			steps += 1
+			local this = steps
 			params.onComplete = function()
-				if easing == this then
+				if steps == this then
 					easing = nil
 					revealing:set(false)
 				end
 			end
-			this = anime.animate(off, params)
-			easing = this
+			easing = anime.animate(off, params)
 		else
 			-- The window resized (or the room it fills while expanded moved):
 			-- where it goes moves at once; a step under way goes on.
@@ -669,6 +705,9 @@ return function(props: Props): Node
 			if boundary.load("@app/screens/panel")
 				then boundary.screen(boundary.named("shell.boundary.screen.panel"), "@app/screens/panel", function(panel): Node
 					return panel.Panel {
+						visible = function(): boolean
+							return shown:get()
+						end,
 						project = route.project,
 						session = route.session,
 						page = route.page,

@@ -217,8 +217,7 @@ impl Render for ProjectIcon {
     }
 }
 
-/// Same card as the pull-request badge tooltip: project name, then the
-/// owning device below in the muted line.
+/// Project name, then the owning device below in the muted line.
 struct ProjectIconTooltip {
     name: SharedString,
     device: SharedString,

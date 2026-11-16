@@ -51,7 +51,7 @@ use zeron_rpc::methods;
 use crate::comments::{self, CommentSide, ReviewComment};
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::history::{
-    GitHistory, GitHistoryCount, GitHistoryEvent, GitHistoryFetchButton, GitHistorySearchControl,
+    GitHistory, GitHistoryCount, GitHistoryEvent, GitHistorySearchControl,
     GitHistoryViewButton,
 };
 use crate::markdown::render;
@@ -826,6 +826,33 @@ pub fn line_anchor(line: &DiffLine) -> Option<(CommentSide, u32)> {
 // ---------------------------------------------------------------------------
 // Resolution + states (pure)
 // ---------------------------------------------------------------------------
+
+/// A chat on another device, as a `WatchCheckoutDiffs` asks for it: its host, and
+/// the chat, whose checkout that host only scans while it's being looked at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteDiffWatch {
+    pub device: String,
+    pub chat: String,
+}
+
+impl RemoteDiffWatch {
+    /// The watch for `chat`, when it isn't this device's.
+    pub(crate) fn of(chat: &Chat, local_device: Option<&str>) -> Option<Self> {
+        (local_device != Some(chat.device_id.as_str())).then(|| Self {
+            device: chat.device_id.clone(),
+            chat: chat.id.clone(),
+        })
+    }
+
+    pub(crate) fn params(watch: Option<&Self>) -> serde_json::Value {
+        match watch {
+            Some(watch) => {
+                serde_json::json!({ "targetDeviceId": watch.device, "chatId": watch.chat })
+            }
+            None => serde_json::json!({}),
+        }
+    }
+}
 
 /// The diff shown for a chat: `checkout_id` match first, then device+cwd,
 /// then cwd alone (§1.11).
@@ -1649,7 +1676,7 @@ pub struct Changes {
     /// `Some(id)` = a remote chat's host (relay-forwarded). The stream only
     /// carries the TARGET device's checkouts, so a selection change onto a
     /// chat hosted elsewhere tears the watch down and re-subscribes.
-    watch_target: Option<String>,
+    watch_target: Option<RemoteDiffWatch>,
     watch_task: Option<Task<()>>,
     /// Set by every render and consumed by the single-file poll's visibility
     /// probe; the poll stops while the pane is hidden and render restarts it.
@@ -1700,7 +1727,6 @@ pub struct Changes {
     history: Option<Entity<GitHistory>>,
     history_count: Option<Entity<GitHistoryCount>>,
     history_search_control: Option<Entity<GitHistorySearchControl>>,
-    history_fetch_button: Option<Entity<GitHistoryFetchButton>>,
     history_view_button: Option<Entity<GitHistoryViewButton>>,
     history_events: Option<Subscription>,
     /// Pinned commit for a [`DiffScope::Commit`] pane (sha + subject drive
@@ -1805,7 +1831,6 @@ impl Changes {
             history: None,
             history_count: None,
             history_search_control: None,
-            history_fetch_button: None,
             history_view_button: None,
             history_events: None,
             commit: None,
@@ -1845,6 +1870,19 @@ impl Changes {
         changes
     }
 
+    pub(crate) fn suspend_git_plugin(&mut self, cx: &mut Context<Self>) {
+        self.watch_task = None;
+        self.started = false;
+        self.file_watch_paused = true;
+        self.scoped_task = None;
+        self.scoped_inflight = None;
+        self.scoped_for = None;
+        self.branches_task = None;
+        self.branches_for = None;
+        if let Some(view) = &self.source_control { view.update(cx, |view, cx| view.suspend_plugin(cx)); }
+        if let Some(history) = &self.history { history.update(cx, |view, cx| view.suspend_plugin(cx)); }
+    }
+
     pub(crate) fn set_notifications(&mut self, notifications: Entity<crate::progress_toast::Toasts>, cx: &mut Context<Self>) {
         if let Some(view) = &self.source_control {
             view.update(cx, |view, _| view.set_notifications(notifications.clone()));
@@ -1856,6 +1894,7 @@ impl Changes {
     }
 
     pub(crate) fn open_git_command(&mut self, command: crate::source_control::GitCommand, cx: &mut Context<Self>) {
+        if !crate::plugins::enabled(crate::plugins::PluginId::Git, cx) { return; }
         self.file_selection = None;
         self.set_scope(DiffScope::WorkingTree, cx);
         self.source_control(cx).update(cx, |view, cx| view.request_git_command(command, cx));
@@ -2030,7 +2069,12 @@ impl Changes {
     /// Retries with a flat 2 s delay if the stream fails or ends; the last
     /// content stays visible under an error banner meanwhile.
     pub fn ensure_watch(&mut self, cx: &mut Context<Self>) {
-        let target = self.desired_target(cx);
+        let target = {
+            let state = self.state.read(cx);
+            state
+                .selected_chat_row()
+                .and_then(|chat| RemoteDiffWatch::of(chat, state.local_device_id.as_deref()))
+        };
         if self.started && self.watch_target == target {
             return;
         }
@@ -2051,23 +2095,16 @@ impl Changes {
 
     fn spawn_watch(
         engine: EngineHandle,
-        target: Option<String>,
+        target: Option<RemoteDiffWatch>,
         cx: &mut Context<Self>,
     ) -> Task<()> {
         cx.spawn(async move |this, cx| {
             loop {
-                let mut params = serde_json::Map::new();
-                if let Some(target) = &target {
-                    params.insert(
-                        "targetDeviceId".into(),
-                        serde_json::Value::String(target.clone()),
-                    );
-                }
                 let subscribed = engine
                     .client()
                     .subscribe(
                         methods::WATCH_CHECKOUT_DIFFS,
-                        serde_json::Value::Object(params),
+                        RemoteDiffWatch::params(target.as_ref()),
                     )
                     .await;
                 match subscribed {
@@ -2428,16 +2465,6 @@ impl Changes {
         count
     }
 
-    fn history_fetch_button(&mut self, cx: &mut Context<Self>) -> Entity<GitHistoryFetchButton> {
-        if let Some(button) = &self.history_fetch_button {
-            return button.clone();
-        }
-        let history = self.history_pane(cx);
-        let button = cx.new(|cx| GitHistoryFetchButton::new(history, cx));
-        self.history_fetch_button = Some(button.clone());
-        button
-    }
-
     fn history_search_control(
         &mut self,
         cx: &mut Context<Self>,
@@ -2478,6 +2505,7 @@ impl Changes {
 
     /// Reconcile parsed content with the currently-active diff.
     fn sync(&mut self, cx: &mut Context<Self>) {
+        if !crate::plugins::enabled(crate::plugins::PluginId::Git, cx) { return; }
         if self.scope == DiffScope::WorkingTree && self.file_selection.is_none() {
             self.source_control(cx)
                 .update(cx, |view, cx| view.ensure_loaded(cx));
@@ -4120,8 +4148,6 @@ impl Changes {
         let history_count = (scope == DiffScope::History).then(|| self.history_count(cx));
         let history_search_control =
             (scope == DiffScope::History).then(|| self.history_search_control(cx));
-        let history_fetch_button =
-            (scope == DiffScope::History).then(|| self.history_fetch_button(cx));
         let history_view_button =
             (scope == DiffScope::History).then(|| self.history_view_button(cx));
         let scope_trigger = div()
@@ -4215,7 +4241,6 @@ impl Changes {
                 .items_center()
                 .gap(px(crate::surface_chrome::CONTROL_GAP))
                 .children(history_search_control)
-                .children(history_fetch_button)
                 .children(history_view_button)
                 .child(
                     Self::header_button(
@@ -4712,92 +4737,6 @@ fn code_text_viewport(
         }
         None => viewport.into_any_element(),
     }
-}
-
-/// Read-only unified row for PR diffs; reuse the Changes pane's gutters,
-/// source text, font settings, markers and semantic colors. The caller owns
-/// virtualization and the shared horizontal viewport.
-pub(crate) fn readonly_diff_line(
-    line: &DiffLine,
-    spans: &[zeron_syntax::HighlightSpan],
-    theme: &Theme,
-    gutter_px: f32,
-) -> AnyElement {
-    diff_line_row(line, spans, theme, gutter_px, DiffCodeWidth::Clipped, None, &[])
-}
-
-/// Read-only unified row whose code plane scrolls with `scroll` while the
-/// gutters stay put. Every row shares one extent, so a whole multi-file
-/// stream moves as one horizontal plane.
-pub(crate) fn readonly_scrolled_diff_line(
-    line: &DiffLine,
-    spans: &[zeron_syntax::HighlightSpan],
-    theme: &Theme,
-    gutter_px: f32,
-    text_width: f32,
-    scroll: &gpui::ScrollHandle,
-    row: usize,
-) -> AnyElement {
-    diff_line_row(
-        line,
-        spans,
-        theme,
-        gutter_px,
-        DiffCodeWidth::Scrollable(DiffHorizontalMetrics {
-            max_text_width: text_width,
-            max_gutter_width: gutter_px,
-        }),
-        Some(DiffCodeScroll {
-            handle: scroll.clone(),
-            id: format!("pr-code-{row}").into(),
-        }),
-        &[],
-    )
-}
-
-/// Read-only split row using the same cells and divider as the Changes pane.
-pub(crate) fn readonly_split_line(
-    left: Option<(&DiffLine, &[zeron_syntax::HighlightSpan])>,
-    right: Option<(&DiffLine, &[zeron_syntax::HighlightSpan])>,
-    theme: &Theme,
-    gutter_px: f32,
-    text_width: f32,
-    scroll: &gpui::ScrollHandle,
-    row: usize,
-) -> AnyElement {
-    let width = DiffCodeWidth::Scrollable(DiffHorizontalMetrics {
-        max_text_width: text_width,
-        max_gutter_width: gutter_px,
-    });
-    let cell = |side: Option<(&DiffLine, &[zeron_syntax::HighlightSpan])>, old: bool| {
-        let content = side
-            .map(|(line, spans)| {
-                let runs = render::runs_for_syntax_line_with_plain(
-                    &line.text,
-                    spans,
-                    &font(theme.font_mono.clone()),
-                    theme.text.opacity(0.92),
-                    theme,
-                );
-                split_line_cell(
-                    line,
-                    if old { line.old_no } else { line.new_no },
-                    runs,
-                    theme,
-                    gutter_px,
-                    width,
-                    Some(DiffCodeScroll {
-                        handle: scroll.clone(),
-                        id: format!("pr-split-code-{row}-{old}").into(),
-                    }),
-                )
-            })
-            .unwrap_or_else(split_filler);
-        content
-            .debug_selector(move || format!("pr-split-cell-{row}-{old}"))
-            .into_any_element()
-    };
-    split_row(cell(left, true), cell(right, false), false, theme).into_any_element()
 }
 
 /// One +/−/context/meta diff line: coloured accent bar, dual line-number
@@ -6430,6 +6369,7 @@ rename to new_name.rs
             space_id: None,
             last_seen_at: None,
             room_gen: None,
+            sleep: None,
         }
     }
 
@@ -6453,6 +6393,19 @@ rename to new_name.rs
         assert!(resolve_diff(&diffs, &c).is_none());
         let c = chat(None, "dev-a", Some("/elsewhere"));
         assert!(resolve_diff(&diffs, &c).is_none());
+    }
+
+    #[test]
+    fn a_remote_chats_diff_watch_names_the_chat_to_its_host() {
+        let mut remote = chat(None, "dev-b", Some("/repo"));
+        remote.id = "chat-b".into();
+        assert_eq!(RemoteDiffWatch::of(&remote, Some("dev-b")), None);
+        let watch = RemoteDiffWatch::of(&remote, Some("dev-a")).unwrap();
+        assert_eq!(
+            RemoteDiffWatch::params(Some(&watch)),
+            serde_json::json!({ "targetDeviceId": "dev-b", "chatId": "chat-b" })
+        );
+        assert_eq!(RemoteDiffWatch::params(None), serde_json::json!({}));
     }
 
     #[test]

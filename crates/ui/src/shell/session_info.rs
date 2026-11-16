@@ -40,9 +40,9 @@ pub(super) fn session_card_reserve(main: f32, transcript: f32) -> Option<f32> {
 #[derive(Default)]
 pub(super) struct SessionDiffs {
     diffs: Vec<zeron_proto::CheckoutDiff>,
-    /// Device the running watch targets: `None` the connected engine, else
-    /// a remote chat's host (diffs are produced where the checkout lives).
-    target: Option<Option<String>>,
+    /// What the running watch targets: `None` the connected engine, else a
+    /// remote chat on its host (diffs are produced where the checkout lives).
+    target: Option<Option<crate::changes::RemoteDiffWatch>>,
     _watch: Option<Task<()>>,
     /// The comparison base per `device:cwd`, from `ListBranches`.
     base: Option<(String, String)>,
@@ -113,17 +113,24 @@ fn row_glyph(path: &'static str, theme: &Theme) -> AnyElement {
 }
 
 impl Shell {
+    pub(super) fn suspend_git_info(&mut self) {
+        self.session_diffs._watch = None;
+        self.session_diffs._fetch = None;
+        self.session_diffs.target = None;
+        self.session_diffs.fetched = None;
+    }
+
     /// Watch the selected chat's host for checkout diffs (idempotent per
     /// host); it retries every 2s while the stream fails or ends.
     fn ensure_session_diffs(&mut self, cx: &mut Context<Self>) {
+        if !self.git_plugin_enabled(cx) { return; }
         let (target, engine) = {
             let state = self.state.read(cx);
             let Some(chat) = state.selected_chat_row() else {
                 return;
             };
-            let device = chat.device_id.clone();
             let target =
-                (state.local_device_id.as_deref() != Some(device.as_str())).then_some(device);
+                crate::changes::RemoteDiffWatch::of(chat, state.local_device_id.as_deref());
             (target, state.engine().cloned())
         };
         if self.session_diffs.target.as_ref() == Some(&target) {
@@ -137,18 +144,11 @@ impl Shell {
         self.session_diffs.target = Some(target.clone());
         self.session_diffs._watch = Some(cx.spawn(async move |this, cx| {
             loop {
-                let mut params = serde_json::Map::new();
-                if let Some(target) = &target {
-                    params.insert(
-                        "targetDeviceId".into(),
-                        serde_json::Value::String(target.clone()),
-                    );
-                }
                 if let Ok(mut rx) = engine
                     .client()
                     .subscribe(
                         methods::WATCH_CHECKOUT_DIFFS,
-                        serde_json::Value::Object(params),
+                        crate::changes::RemoteDiffWatch::params(target.as_ref()),
                     )
                     .await
                 {
@@ -241,6 +241,7 @@ impl Shell {
     /// the Changes pane presets it; the last totals stay while a re-capture
     /// runs.
     fn ensure_branch_totals(&mut self, chat: &zeron_proto::Chat, cx: &mut Context<Self>) {
+        if !self.git_plugin_enabled(cx) { return; }
         let Some(cwd) = chat.cwd.clone() else {
             return;
         };
@@ -256,7 +257,12 @@ impl Shell {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        let target = self.session_diffs.target.clone().flatten();
+        let target = self
+            .session_diffs
+            .target
+            .clone()
+            .flatten()
+            .map(|watch| watch.device);
         let repo = format!("{}:{cwd}", target.as_deref().unwrap_or("local"));
         let known_base = self
             .session_diffs
@@ -486,7 +492,7 @@ impl Shell {
                         SharedString::from(space.path.clone()),
                     )
                 });
-            let branch = crate::change_requests::conversation_branch(&chat, &state.spaces)
+            let branch = crate::state::conversation_branch(&chat, &state.spaces)
                 .map(str::trim)
                 .filter(|branch| !branch.is_empty())
                 .map(|branch| SharedString::from(branch.to_owned()));
@@ -525,7 +531,7 @@ impl Shell {
         };
         self.ensure_session_diffs(cx);
         self.ensure_branch_totals(&chat, cx);
-        let totals = self.session_diffs.totals(&chat);
+        let totals = self.git_plugin_enabled(cx).then(|| self.session_diffs.totals(&chat)).flatten();
         let branch_row = branch.map(|branch| {
             info_row(&theme, row_glyph(icons::GIT_BRANCH, &theme), branch.clone())
                 .id("session-info-branch")
@@ -938,7 +944,7 @@ impl Shell {
             .read(cx)
             .selected_space_row()
             .map(|space| space.id.clone());
-        if let Some(space) = services_space {
+        if let Some(space) = services_space.filter(|_| self.services_plugin_enabled(cx)) {
             rows.push(
                 popover::picker_row(theme, false, false, "session-info-project-services")
                     .id("session-info-project-services")
@@ -965,7 +971,7 @@ impl Shell {
     }
 }
 
-/// The pull-request badge's pill, in frosted grey: a sleeping Cloud machine.
+/// A frosted grey pill for a sleeping Cloud machine.
 fn asleep_badge(theme: &Theme) -> impl IntoElement {
     crate::frost::frosted(
         6.0,

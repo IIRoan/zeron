@@ -11,13 +11,20 @@
 //! |----------|--------|--------|--------------------------------|-------|
 //! | Grok     | yes    | yes    | `grok login --device-auth`     | yes   |
 //! | Devin    | yes    | yes    | ACP `authenticate` (loopback)  | yes   |
-//! | OpenCode | yes    | yes    | ChatGPT loopback, Copilot code | yes   |
-//! | Pi       | yes    | yes    | ChatGPT loopback               | yes   |
+//! | OpenCode | yes    | yes²   | ChatGPT loopback, Copilot code | yes   |
+//! | Pi       | yes    | yes²   | ChatGPT loopback, Copilot code | yes   |
 //! | Hermes   | yes    | no¹    | `hermes auth add` (device code) | yes  |
 //!
 //! ¹ Hermes keeps every account in its own credential pool and rotates
 //! through it itself; zeron lists the pool and adds to it through Hermes'
 //! own CLI, but never rewrites it.
+//!
+//! ² Per model provider: these agents keep one login per provider in one
+//! store, and a run reads the entry of its model's provider. Each row
+//! carries its provider (`AgentAccount::provider`); rows sharing one form a
+//! group with at most one in use, and switching (or a new sign-in) rewrites
+//! that provider's entry alone — a ChatGPT switch never touches the Claude
+//! or Copilot login beside it.
 //!
 //! The original four providers each store exactly one live login:
 //!
@@ -105,12 +112,15 @@ pub struct RelayedCallback {
     pub location: Option<String>,
 }
 
+mod api_keys;
 mod muse;
+mod pins;
 mod oauth;
 mod registry_login;
 #[cfg(test)]
 mod provider_tests;
 pub use muse::MuseRunEnvironment;
+pub use pins::{ChatPin, PinHook, PinRunEnvironment};
 mod stores;
 mod usage;
 
@@ -723,6 +733,12 @@ struct ProbeEndpoints {
     github_api: String,
     /// GitHub's OAuth root (`/login/device/code`, `/login/oauth/access_token`).
     github_login: String,
+    /// A Copilot session's API root (`/models`): `None` in production, where
+    /// it's read from the session token itself.
+    copilot_api: Option<String>,
+    /// Where API keys are checked: `None` in production (each provider's
+    /// own host, `api_keys::key_check`), a mock in tests.
+    api_key_check: Option<String>,
     /// OpenAI's OAuth root (`/oauth/authorize`, `/oauth/token`).
     openai_auth: String,
     /// The ChatGPT sign-in's loopback port — FIXED at 1455 by the client
@@ -750,6 +766,8 @@ impl Default for ProbeEndpoints {
             grok_usage: usage::GROK_USAGE_URL.into(),
             github_api: "https://api.github.com".into(),
             github_login: "https://github.com".into(),
+            copilot_api: None,
+            api_key_check: None,
             openai_auth: oauth::OPENAI_AUTH.into(),
             openai_port: oauth::OPENAI_LOOPBACK_PORT,
             nous_portal: usage::NOUS_PORTAL.into(),
@@ -795,6 +813,15 @@ struct Inner {
     identities: Mutex<HashMap<String, IdentityLookup>>,
     /// Test seam: fixed CLI binaries per agent instead of PATH resolution.
     cli_overrides: Mutex<HashMap<HarnessId, PathBuf>>,
+    /// The last snapshot a list, switch or removal made, for whoever follows
+    /// them (plugins' usage and account events). Never holds a credential.
+    snapshots: tokio::sync::watch::Sender<Option<AgentAccountsSnapshot>>,
+    /// Chats pinned to an account of their own; mirrored to disk (see
+    /// [`pins`]).
+    pins: Mutex<pins::PinState>,
+    /// Asked for a chat's account at its first run (a plugin's
+    /// `run.preparing`).
+    pin_hook: Mutex<Option<PinHook>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -861,6 +888,7 @@ impl AgentAccounts {
                 }
             }
         }
+        let pins = pins::PinState::load(&config.root_dir().join(pins::PINS_FILE));
         let http = reqwest::Client::builder()
             .timeout(HTTP_TIMEOUT)
             .build()
@@ -886,8 +914,42 @@ impl AgentAccounts {
                 callback_routes,
                 identities: Mutex::new(HashMap::new()),
                 cli_overrides: Mutex::new(HashMap::new()),
+                snapshots: tokio::sync::watch::channel(None).0,
+                pins: Mutex::new(pins),
+                pin_hook: Mutex::new(None),
             }),
         }
+    }
+
+    /// Each snapshot as lists, switches and removals make them (from
+    /// Settings, the composer's usage ring, a plugin): the current one at
+    /// once, then every change.
+    pub fn watch_snapshots(&self) -> tokio::sync::watch::Receiver<Option<AgentAccountsSnapshot>> {
+        self.inner.snapshots.subscribe()
+    }
+
+    fn published(
+        &self,
+        result: Result<AgentAccountsSnapshot, EngineError>,
+    ) -> Result<AgentAccountsSnapshot, EngineError> {
+        // (A live login is saved again at each list: when isn't a change.)
+        fn unstamped(s: &AgentAccountsSnapshot) -> AgentAccountsSnapshot {
+            let mut s = s.clone();
+            for a in &mut s.accounts {
+                a.saved_at = None;
+            }
+            s
+        }
+        if let Ok(snapshot) = &result {
+            self.inner.snapshots.send_if_modified(|last| {
+                let changed = last.as_ref().map(unstamped) != Some(unstamped(snapshot));
+                if changed {
+                    *last = Some(snapshot.clone());
+                }
+                changed
+            });
+        }
+        result
     }
 
     /// Test seam: run `harness`'s sign-in with the CLI at `path` instead of
@@ -923,7 +985,8 @@ impl AgentAccounts {
     /// backoff window or probed in the last [`FORCED_MIN_INTERVAL`].
     pub async fn list(&self, force_usage: bool) -> Result<AgentAccountsSnapshot, EngineError> {
         let _ops = self.inner.ops.lock().await;
-        self.list_locked(force_usage).await
+        let listed = self.list_locked(force_usage).await;
+        self.published(listed)
     }
 
     /// Caller holds [`Inner::ops`].
@@ -991,6 +1054,15 @@ impl AgentAccounts {
             live(*harness, detected);
             self.snapshot_detected(*harness, detected)?;
         }
+        if self.opencode_keeps_its_own_store() {
+            warnings.push(AgentAccountWarning {
+                harness: HarnessId::Opencode,
+                message: "This OpenCode keeps its logins in its own database: switching or adding \
+                          them here doesn't reach it yet — use `opencode auth switch` / \
+                          `opencode auth login`."
+                    .into(),
+            });
+        }
         if let Some(message) = stores::opencode_env_warning() {
             warnings.push(AgentAccountWarning {
                 harness: HarnessId::Opencode,
@@ -1057,7 +1129,18 @@ impl AgentAccounts {
             for slot in slots {
                 let active = active_set.is_some_and(|keys| keys.contains(&slot.account_key));
                 let entry = usage.get(&usage_key(harness, &slot.account_key));
-                let snapshot = entry.and_then(|entry| entry.usage.as_ref());
+                // A Claude login Claude Code ended holds no token: its last
+                // meters would pass it off as usable (and switchable).
+                let signed_out = harness == HarnessId::ClaudeCode
+                    && matches!(
+                        entry.and_then(|entry| entry.error.as_ref()),
+                        Some(ProbeError::NoCredentials {
+                            why: NoCredentials::Missing
+                        })
+                    );
+                let snapshot = entry
+                    .and_then(|entry| entry.usage.as_ref())
+                    .filter(|_| !signed_out);
                 accounts.push(AgentAccount {
                     id: slot.id.clone(),
                     harness,
@@ -1142,6 +1225,15 @@ impl AgentAccounts {
         harness: HarnessId,
         account_id: &str,
     ) -> Result<AgentAccountsSnapshot, EngineError> {
+        let activated = self.activate_unpublished(harness, account_id).await;
+        self.published(activated)
+    }
+
+    async fn activate_unpublished(
+        &self,
+        harness: HarnessId,
+        account_id: &str,
+    ) -> Result<AgentAccountsSnapshot, EngineError> {
         if harness == HarnessId::Hermes {
             return Err(EngineError::Other(
                 "Hermes picks from its own credential pool — zeron doesn't reorder it. Use \
@@ -1187,7 +1279,7 @@ impl AgentAccounts {
                 let key = slot.store_key.as_deref().ok_or_else(|| {
                     EngineError::Other("That saved login names no provider.".into())
                 })?;
-                self.write_keyed_entry(harness, key, Some(&slot.credentials))?;
+                self.swap_keyed(harness, key, &slot).await?;
             }
             other => {
                 return Err(EngineError::Other(format!(
@@ -1197,6 +1289,41 @@ impl AgentAccounts {
         }
         *lock(&self.inner.claude_credentials) = None;
         self.list_locked(false).await
+    }
+
+    /// Point OpenCode's / Pi's entry for `key` at `slot`'s login, under the
+    /// agent's own lock (Pi's is the one it refreshes under). The login in
+    /// use is identified first and saved into its slot with the tokens it
+    /// has NOW — the agent may have refreshed it since the last list, and
+    /// Claude's and ChatGPT's refresh tokens are single-use. If it can't be
+    /// identified (its profile call rate limited), or it changes between
+    /// that and the lock, the switch is refused rather than overwrite a
+    /// login no slot holds.
+    async fn swap_keyed(&self, harness: HarnessId, key: &str, slot: &Slot) -> Result<(), EngineError> {
+        let live = match self.detect_keyed_entry(harness, key).await {
+            None => None,
+            Some(Some(detected)) => Some(detected),
+            Some(None) => {
+                return Err(EngineError::Other(
+                    "Couldn't confirm the login in use — try again in a moment.".into(),
+                ));
+            }
+        };
+        if let Some(detected) = &live
+            && detected.account_key != slot.account_key
+        {
+            self.snapshot_detected(harness, detected)?;
+        }
+        let saved = live.as_ref().and_then(|d| d.credentials.clone());
+        self.swap_keyed_entry(harness, key, &slot.credentials, &mut |old| {
+            if old.cloned() == saved {
+                Ok(())
+            } else {
+                Err(EngineError::Other(
+                    "The login in use just changed — try again in a moment.".into(),
+                ))
+            }
+        })
     }
 
     /// Claude Code's own refresh lock (see
@@ -1246,11 +1373,16 @@ impl AgentAccounts {
             Ok(Some(_)) => Ok(self
                 .read_slot(HarnessId::ClaudeCode, &slot.id)
                 .unwrap_or(slot)),
-            Err(ProbeError::Unauthorized { .. }) => Err(EngineError::Other(format!(
-                "The saved Claude login for {} has expired. Sign in to it again with Add \
-                 account, then switch.",
-                slot.profile.email
-            ))),
+            // No refresh token: Claude Code ended this login (its `invalid_grant`
+            // or time-limit clear blanks both tokens) while it was live, and the
+            // pre-swap snapshot saved that. Installed, every chat fails to sign in.
+            Err(ProbeError::Unauthorized { .. } | ProbeError::NoCredentials { .. }) => {
+                Err(EngineError::Other(format!(
+                    "The saved Claude login for {} has expired. Sign in to it again with Add \
+                     account, then switch.",
+                    slot.profile.email
+                )))
+            }
             Ok(None) | Err(_) => Ok(slot),
         }
     }
@@ -1474,6 +1606,15 @@ impl AgentAccounts {
         harness: HarnessId,
         account_id: &str,
     ) -> Result<AgentAccountsSnapshot, EngineError> {
+        let forgotten = self.forget_unpublished(harness, account_id).await;
+        self.published(forgotten)
+    }
+
+    async fn forget_unpublished(
+        &self,
+        harness: HarnessId,
+        account_id: &str,
+    ) -> Result<AgentAccountsSnapshot, EngineError> {
         // Reject anything that isn't a slot id (16 lowercase hex) BEFORE touching
         // the filesystem: `account_id` is a raw RPC string that becomes a path,
         // so a crafted id (`../../…`) must never reach `remove_file`.
@@ -1553,8 +1694,12 @@ impl AgentAccounts {
 
     /// [`Self::start_login_for`] for one model provider of an agent that
     /// keeps a login per provider (`provider`: OpenCode's `openai` /
-    /// `github-copilot`, Pi's `openai-codex`, Hermes' `openai-codex` /
-    /// `nous`); `None` picks the agent's default.
+    /// `github-copilot`, Pi's `openai-codex` / `github-copilot`, Hermes'
+    /// `openai-codex` / `nous` / `xai-oauth` —
+    /// `zeron_proto::providers::login_options`); `None` picks the agent's
+    /// default. The new login joins its provider's group only: it takes
+    /// over that provider's live login when there is none (or it re-signs
+    /// that one in), and never touches another provider's.
     pub async fn start_login_with(
         &self,
         harness: HarnessId,
@@ -1592,6 +1737,8 @@ impl AgentAccounts {
                     self.start_openai_login(HarnessId::Pi, "openai-codex")
                         .await?
                 }
+                "github-copilot" => self.start_copilot_login(HarnessId::Pi).await?,
+                "anthropic" => self.start_pi_claude_login().await?,
                 other => return Err(stores::unsupported_login(harness, other)),
             },
             HarnessId::Hermes => {
@@ -3216,6 +3363,7 @@ impl AgentAccounts {
         let access_token = str_field(tokens, "access_token").ok_or(ProbeError::NoCredentials {
             why: NoCredentials::Missing,
         })?;
+        let provider_account_id = str_field(tokens, "account_id").unwrap_or_default();
         let body = probe_json(
             "codex",
             "usage",
@@ -3223,14 +3371,12 @@ impl AgentAccounts {
                 .http
                 .get(&self.inner.endpoints.codex_usage)
                 .bearer_auth(&access_token)
-                .header(
-                    "chatgpt-account-id",
-                    str_field(tokens, "account_id").unwrap_or_default(),
-                ),
+                .header("chatgpt-account-id", &provider_account_id),
         )
         .await?;
+        // The reply names the workspace, not our user-plus-workspace slot key.
         if let Some(account_id) = str_field(&body, "account_id")
-            && account_id != slot.account_key
+            && account_id != codex_workspace(&slot.account_key)
         {
             return Err(ProbeError::NoCredentials {
                 why: NoCredentials::Missing,
@@ -3465,15 +3611,36 @@ impl AgentAccounts {
     }
 
     async fn refresh_claude_slot_once(&self, slot: &Slot) -> Result<String, ProbeError> {
-        let missing = ProbeError::NoCredentials {
-            why: NoCredentials::Missing,
-        };
         let oauth = slot
             .credentials
             .get("claudeAiOauth")
-            .ok_or(missing.clone())?
+            .ok_or(ProbeError::NoCredentials {
+                why: NoCredentials::Missing,
+            })?
             .clone();
-        let refresh_token = str_field(&oauth, "refreshToken").ok_or(missing)?;
+        let updated = self.refreshed_claude_oauth(oauth).await?;
+        let access_token = str_field(&updated, "accessToken").unwrap_or_default();
+        let mut refreshed = slot.clone();
+        // Keep sibling keys (mcpOAuth, pluginSecrets, …) — rewriting the blob
+        // as oauth-only would drop them, and a later activate of this slot
+        // would have nothing to merge if live credentials were also empty.
+        refreshed.credentials = with_claude_ai_oauth(&slot.credentials, updated);
+        refreshed.saved_at = now_ms();
+        if let Err(err) = self.write_slot(&refreshed) {
+            tracing::warn!(slot = %slot.id, error = %err, "refreshed slot write failed");
+        }
+        Ok(access_token)
+    }
+
+    /// `claudeAiOauth` with its token pair refreshed (the refresh token is
+    /// single-use: the caller must save the result, or the login is lost).
+    async fn refreshed_claude_oauth(
+        &self,
+        oauth: serde_json::Value,
+    ) -> Result<serde_json::Value, ProbeError> {
+        let refresh_token = str_field(&oauth, "refreshToken").ok_or(ProbeError::NoCredentials {
+            why: NoCredentials::Missing,
+        })?;
         let body = probe_json(
             "claude-code",
             "refresh",
@@ -3529,17 +3696,86 @@ impl AgentAccounts {
                 }
             }
         }
-        let mut refreshed = slot.clone();
-        // Keep sibling keys (mcpOAuth, pluginSecrets, …) — rewriting the blob
-        // as oauth-only would drop them, and a later activate of this slot
-        // would have nothing to merge if live credentials were also empty.
-        refreshed.credentials = with_claude_ai_oauth(&slot.credentials, updated);
-        refreshed.saved_at = now_ms();
-        if let Err(err) = self.write_slot(&refreshed) {
-            tracing::warn!(slot = %slot.id, error = %err, "refreshed slot write failed");
-        }
-        Ok(access_token)
+        Ok(updated)
     }
+
+    /// This machine's login for a CLI in a project sandbox: its credential
+    /// file (relative to the container's home) holding the access token
+    /// alone. Refresh tokens are single-use, so a copy that refreshed would
+    /// sign this machine out; only this machine refreshes. A Claude login
+    /// close to expiry is refreshed here first, under the CLI's own lock and
+    /// re-read inside it, as another Claude process would. `None`: no login.
+    pub async fn sandbox_login(
+        &self,
+        harness: HarnessId,
+    ) -> Result<Option<(&'static str, String)>, EngineError> {
+        match harness {
+            HarnessId::ClaudeCode => {
+                let expiring = |creds: &Option<serde_json::Value>| {
+                    creds
+                        .as_ref()
+                        .and_then(|c| c.get("claudeAiOauth")?.get("expiresAt")?.as_i64())
+                        .is_some_and(|at| at - now_ms() < SANDBOX_LOGIN_SLACK_MS)
+                };
+                let (mut creds, _) = self.read_claude_credentials().await;
+                if expiring(&creds) {
+                    let _lock = self.claude_refresh_lock().await?;
+                    creds = self.read_claude_credentials().await.0;
+                    if let Some(live) = creds.as_ref().filter(|_| expiring(&creds)) {
+                        let oauth = self
+                            .refreshed_claude_oauth(live["claudeAiOauth"].clone())
+                            .await
+                            .map_err(|e| {
+                                EngineError::Other(format!(
+                                    "Couldn't refresh Claude's login: {e:?}"
+                                ))
+                            })?;
+                        let live = with_claude_ai_oauth(live, oauth);
+                        self.write_claude_credentials(&live).await?;
+                        *lock(&self.inner.claude_credentials) = None;
+                        creds = Some(live);
+                    }
+                }
+                Ok(creds
+                    .as_ref()
+                    .and_then(|c| sandbox_copy(HarnessId::ClaudeCode, c))
+                    .map(|copy| (".claude/.credentials.json", copy.to_string())))
+            }
+            HarnessId::Codex => Ok(read_json(&self.inner.config.codex_auth_file())
+                .and_then(|auth| sandbox_copy(HarnessId::Codex, &auth))
+                .map(|copy| (".codex/auth.json", copy.to_string()))),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// A Claude login with less than this left is refreshed before a sandbox
+/// gets it (the CLI there can't refresh; it re-reads its file instead).
+const SANDBOX_LOGIN_SLACK_MS: i64 = 15 * 60_000;
+
+/// A login's credential file as a sandbox gets it: the access token without
+/// the refresh token (emptied, not removed: the CLIs reject a file without
+/// one), and only the account login (Claude's MCP tokens stay here).
+fn sandbox_copy(harness: HarnessId, creds: &serde_json::Value) -> Option<serde_json::Value> {
+    let mut copy = match harness {
+        HarnessId::ClaudeCode => {
+            serde_json::json!({ "claudeAiOauth": creds.get("claudeAiOauth")?.clone() })
+        }
+        _ => creds.clone(),
+    };
+    let token = match harness {
+        HarnessId::ClaudeCode => copy.get_mut("claudeAiOauth"),
+        _ => copy.get_mut("tokens"),
+    };
+    if let Some(token) = token.and_then(|t| t.as_object_mut()) {
+        let key = match harness {
+            HarnessId::ClaudeCode => "refreshToken",
+            _ => "refresh_token",
+        };
+        token.insert(key.into(), serde_json::json!(""));
+        token.remove("refreshTokenExpiresAt");
+    }
+    Some(copy)
 }
 
 // ── macOS Keychain (documented here; compiled only on macOS) ────────────────
@@ -3893,15 +4129,6 @@ fn codex_plan(plan: Option<&str>) -> Option<String> {
     zeron_proto::plan_usage::codex_plan(plan)
 }
 
-/// Meter label for a Codex rate-limit window from its `limit_window_seconds`:
-/// the free tier's window is a 30-day month (2_592_000s), Plus runs a 5-hour
-/// primary (~18_000s) with a weekly secondary (604_800s). A bare "> 1 day =
-/// week" rule mislabeled the monthly window "Week"; thresholds in seconds
-/// leave the middle gaps to the nearest label rather than guessing a plan.
-fn codex_window_label(span_seconds: i64) -> &'static str {
-    zeron_proto::plan_usage::codex_window_label(span_seconds)
-}
-
 /// Compose a target Claude login with the machine's current shared fields.
 ///
 /// `claudeAiOauth` (and any other slot-owned sibling, including
@@ -4051,6 +4278,14 @@ fn parse_codex_auth(auth: serde_json::Value) -> Option<Detected> {
     })
 }
 
+// account keys put the user id before "::" so team seats sharing a workspace
+// stay distinct (`parse_codex_auth`), but openai only ever reports the workspace
+fn codex_workspace(account_key: &str) -> &str {
+    account_key
+        .rsplit_once("::")
+        .map_or(account_key, |(_, workspace)| workspace)
+}
+
 fn codex_slot_auth(slot: &Slot) -> Result<(&str, &str), EngineError> {
     let detected = parse_codex_auth(slot.credentials.clone())
         .ok_or_else(|| EngineError::Other("This Codex login needs to be refreshed.".into()))?;
@@ -4064,7 +4299,7 @@ fn codex_slot_auth(slot: &Slot) -> Result<(&str, &str), EngineError> {
     match (account_id, access_token) {
         (Some(account_id), Some(access_token))
             if !access_token.is_empty()
-                && account_id == slot.account_key
+                && account_id == codex_workspace(&slot.account_key)
                 && detected.account_key == slot.account_key =>
         {
             Ok((access_token, account_id))
@@ -4327,6 +4562,10 @@ fn usage_error_message(
         ProbeError::NoCredentials {
             why: NoCredentials::KeyExpired,
         } => "API key expired — connect again".to_string(),
+        // Claude Code blanks a login it ended (refresh refused, time limit).
+        ProbeError::NoCredentials {
+            why: NoCredentials::Missing,
+        } if harness == HarnessId::ClaudeCode => "Signed out — sign in again".to_string(),
         ProbeError::NoCredentials {
             why: NoCredentials::Missing,
         } => return None,
@@ -5183,10 +5422,19 @@ mod tests {
 
     #[test]
     fn codex_reset_auth_rejects_an_account_mismatch() {
-        let claims = serde_json::json!({
+        for user_claim in [None, Some("chatgpt_user_id"), Some("user_id")] {
+            check_codex_reset_auth(user_claim);
+        }
+    }
+
+    fn check_codex_reset_auth(user_claim: Option<&str>) {
+        let mut claims = serde_json::json!({
             "email": "alice@example.com",
             "https://api.openai.com/auth": { "chatgpt_account_id": "account-alice" }
         });
+        if let Some(user_claim) = user_claim {
+            claims["https://api.openai.com/auth"][user_claim] = serde_json::json!("user-alice");
+        }
         let id_token = format!("x.{}.x", BASE64_URL.encode(claims.to_string()));
         let credentials = serde_json::json!({
             "tokens": {
@@ -5210,6 +5458,8 @@ mod tests {
         assert!(codex_slot_auth(&slot).is_err());
         slot.credentials["tokens"]["account_id"] = serde_json::json!("account-alice");
         assert_eq!(codex_slot_auth(&slot).unwrap().1, "account-alice");
+        slot.account_key = "user-bob::account-alice".into();
+        assert!(codex_slot_auth(&slot).is_err());
     }
 
     #[test]
@@ -5234,6 +5484,7 @@ mod tests {
 
     #[test]
     fn codex_window_labels_track_the_window_span() {
+        use zeron_proto::plan_usage::codex_window_label;
         // Codex free tier: one 30-day window (observed live:
         // limit_window_seconds = 2_592_000) — NOT a week.
         assert_eq!(codex_window_label(2_592_000), "Month");
@@ -6091,7 +6342,11 @@ mod login_tests {
             while let Ok((mut socket, _)) = listener.accept().await {
                 let mut request = vec![0u8; 16 * 1024];
                 let _ = socket.read(&mut request).await;
-                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // (A preview scan elsewhere in the test process probes every
+                // local listener with `HEAD /`: not counted.)
+                if !request.starts_with(b"HEAD ") {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
                 let _ = socket
                     .write_all(
                         http_response(status, &[("Content-Type", "application/json")], body)
@@ -6294,6 +6549,132 @@ mod login_tests {
         assert_eq!(oauth["accessToken"], "fresh");
         assert_eq!(oauth["refreshToken"], "rt2");
         assert!(oauth["refreshTokenExpiresAt"].as_i64().unwrap() > now_ms() + 80_000_000);
+    }
+
+    #[tokio::test]
+    async fn a_claude_login_the_cli_ended_reads_signed_out_and_is_never_switched_to() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (token_url, refreshes) = fixed_server(
+            "200 OK",
+            r#"{"access_token":"x","refresh_token":"y","expires_in":3600}"#,
+        )
+        .await;
+        let endpoints = ProbeEndpoints {
+            claude_token: token_url,
+            ..Default::default()
+        };
+        let accounts =
+            AgentAccounts::with_endpoints(config(tmp.path()), endpoints, Default::default());
+        write_live_claude(tmp.path(), "acct-a", "a@example.com", "live");
+        // What Claude Code 2.1.3xx leaves when it ends a login: both tokens
+        // blanked in place, `expiresAt: 0`, the reason alongside.
+        let mut dead = claude_slot("acct-b", "b@example.com", "", 0);
+        dead.credentials["claudeAiOauth"]["accessToken"] = "".into();
+        dead.credentials["claudeAiOauth"]["loginEnded"] = "time_limit".into();
+        accounts.write_slot(&dead).unwrap();
+        let mut entry = UsageEntry::default();
+        let week = AgentUsageWindow {
+            label: "Week".into(),
+            used_fraction: 0.5,
+            resets_at: None,
+        };
+        entry.record(
+            Ok(UsageSnapshot {
+                windows: vec![week],
+                ..Default::default()
+            }),
+            "c".into(),
+            1,
+        );
+        entry.record(
+            Err(ProbeError::NoCredentials {
+                why: NoCredentials::Missing,
+            }),
+            "c".into(),
+            2,
+        );
+        lock(&accounts.inner.usage).insert(usage_key(HarnessId::ClaudeCode, "acct-b"), entry);
+
+        let listed = accounts.list(false).await.unwrap();
+        let row = listed.accounts.iter().find(|a| a.id == dead.id).unwrap();
+        assert!(row.usage_windows.is_empty(), "no stale meters");
+        assert_eq!(
+            row.usage_error.as_deref(),
+            Some("Signed out — sign in again")
+        );
+
+        let err = accounts
+            .activate(HarnessId::ClaudeCode, &dead.id)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("b@example.com"), "{err}");
+        let live = read_json(&config(tmp.path()).claude_creds_file()).unwrap();
+        assert_eq!(live["claudeAiOauth"]["accessToken"], "live");
+        assert_eq!(refreshes.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_gets_the_live_logins_without_their_refresh_tokens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (token_url, _server) = fixed_server(
+            "200 OK",
+            r#"{"access_token":"fresh","refresh_token":"rt2","expires_in":3600}"#,
+        )
+        .await;
+        let endpoints = ProbeEndpoints {
+            claude_token: token_url,
+            ..Default::default()
+        };
+        let cfg = config(tmp.path());
+        let accounts = AgentAccounts::with_endpoints(cfg.clone(), endpoints, Default::default());
+        std::fs::create_dir_all(&cfg.claude_config_dir).unwrap();
+        std::fs::create_dir_all(&cfg.codex_home).unwrap();
+        // Minutes left: refreshed (and saved) here before the sandbox gets it.
+        std::fs::write(
+            cfg.claude_creds_file(),
+            serde_json::json!({
+                "claudeAiOauth": {"accessToken": "old", "refreshToken": "rt1",
+                    "expiresAt": now_ms() + 60_000, "refreshTokenExpiresAt": 1},
+                "mcpOAuth": {"server": "keep"},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            cfg.codex_auth_file(),
+            r#"{"tokens":{"access_token":"at","refresh_token":"rt","id_token":"id"},"last_refresh":"then"}"#,
+        )
+        .unwrap();
+
+        let (path, copy) = accounts
+            .sandbox_login(HarnessId::ClaudeCode)
+            .await
+            .unwrap()
+            .unwrap();
+        let copy: serde_json::Value = serde_json::from_str(&copy).unwrap();
+        assert_eq!(path, ".claude/.credentials.json");
+        assert_eq!(copy["claudeAiOauth"]["accessToken"], "fresh");
+        assert_eq!(copy["claudeAiOauth"]["refreshToken"], "");
+        assert!(copy["claudeAiOauth"].get("refreshTokenExpiresAt").is_none());
+        assert!(copy.get("mcpOAuth").is_none(), "MCP tokens stay here");
+        let live = read_json(&cfg.claude_creds_file()).unwrap();
+        assert_eq!(live["claudeAiOauth"]["refreshToken"], "rt2");
+        assert_eq!(live["mcpOAuth"]["server"], "keep");
+
+        let (path, copy) = accounts
+            .sandbox_login(HarnessId::Codex)
+            .await
+            .unwrap()
+            .unwrap();
+        let copy: serde_json::Value = serde_json::from_str(&copy).unwrap();
+        assert_eq!(path, ".codex/auth.json");
+        assert_eq!(copy["tokens"]["access_token"], "at");
+        assert_eq!(copy["tokens"]["refresh_token"], "");
+        assert_eq!(copy["last_refresh"], "then");
+        assert_eq!(
+            read_json(&cfg.codex_auth_file()).unwrap()["tokens"]["refresh_token"],
+            "rt"
+        );
     }
 
     #[tokio::test]
@@ -6713,5 +7094,41 @@ mod login_tests {
                 .await
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod snapshot_watch_tests {
+    use super::*;
+
+    fn write(path: &Path, contents: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    /// Lists publish what they found (for plugins' events), once per change.
+    #[tokio::test]
+    async fn a_list_publishes_its_snapshot_once_per_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AgentAccountsConfig::isolated(dir.path());
+        write(
+            &config.claude_config_file,
+            &serde_json::json!({ "oauthAccount": { "accountUuid": "u-1", "emailAddress": "one@example.com" } }).to_string(),
+        );
+        write(
+            &config.claude_creds_file(),
+            &serde_json::json!({ "claudeAiOauth": { "accessToken": "at", "refreshToken": "rt", "expiresAt": 1 } }).to_string(),
+        );
+        let accounts = AgentAccounts::new(config);
+        let mut watch = accounts.watch_snapshots();
+        assert!(watch.borrow_and_update().is_none(), "nothing listed yet");
+        let listed = accounts.list(false).await.unwrap();
+        assert!(watch.has_changed().unwrap());
+        assert_eq!(watch.borrow_and_update().as_ref(), Some(&listed));
+        let text = serde_json::to_string(&listed).unwrap();
+        assert!(!text.contains("\"at\"") && !text.contains("\"rt\""), "no credential in a snapshot: {text}");
+        // (A live login is saved again at each list: not a change.)
+        accounts.list(false).await.unwrap();
+        assert!(!watch.has_changed().unwrap(), "the same snapshot again isn't a change");
     }
 }

@@ -18,8 +18,12 @@
 
 mod jsonrpc;
 mod browser;
+mod services;
 mod tools;
+mod sandboxes;
 mod transcript;
+mod vm;
+mod worktrees;
 mod zeron;
 
 pub use jsonrpc::serve_stdio;

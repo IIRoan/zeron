@@ -424,6 +424,7 @@ impl Shell {
             f32::from(window.viewport_size().width) - f32::from(event.event.position.x)
         };
         self.settings.files_panel_width = requested.clamp(FILES_PANEL_MIN, FILES_PANEL_MAX);
+        self.remember_panel_size(PaneResizeKind::Files, cx);
         self.pane_resize_dragging = Some(PaneResizeKind::Files);
         self.pane_resize_active = (requested > FILES_PANEL_MIN && requested < FILES_PANEL_MAX)
             .then_some(PaneResizeKind::Files);

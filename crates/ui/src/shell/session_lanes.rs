@@ -61,8 +61,7 @@ pub(super) struct ChildChatRow {
     pub title: SharedString,
     pub status: ChatIndicator,
     pub time_ago: SharedString,
-    /// The chat's linked pull request, drawn as the sidebar's badge.
-    pub change_request: Option<zeron_proto::ChangeRequestSummary>,
+
     /// The harness it runs on, drawn as the sidebar's brand mark.
     pub harness: Option<zeron_proto::HarnessId>,
     activity: DateTime<Utc>,
@@ -87,7 +86,7 @@ pub(super) fn child_chat_rows(
                 title: child_chat_title(chat).into(),
                 status: state.display_status_for(chat, now),
                 time_ago: zeron_proto::view::format_time_ago(activity, now).into(),
-                change_request: state.change_request_for_chat(chat).cloned(),
+
                 harness: chat.config.as_ref().map(|config| config.harness),
                 activity,
             }
@@ -431,7 +430,7 @@ impl Shell {
     ) -> gpui::Stateful<gpui::Div> {
         let key = format!("session-lanes-chat-{}", row.chat_id);
         let mark = status_mark(key.clone(), row.status, view, theme, cx);
-        let rename_input = self.rename_input_for(&row.chat_id, ChatRenameSurface::SessionCard);
+        let rename_input = self.rename_input_for(&row.chat_id, ChatRenameSurface::SideChat);
         let revealing = rename_input.is_some() && self.chat_rename_revealing();
         let title = match rename_input {
             Some(input) => chat_title_editor(format!("{key}-title-editor").into(), input, theme),
@@ -483,15 +482,6 @@ impl Shell {
                     .inset_0(),
                 )
             })
-            .children(row.change_request.clone().map(|summary| {
-                crate::change_requests::pull_request_badge(
-                    format!("{key}-pr").into(),
-                    summary,
-                    crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
-                    Some(row.device_id.clone()),
-                    theme,
-                )
-            }))
             .child(time_label(row.time_ago.clone(), theme))
     }
 
@@ -633,6 +623,7 @@ mod tests {
             subagent_ref: doc.map(str::to_owned),
             subagent_status: status,
             subagent_tail: None,
+            preview_paths: Vec::new(),
             exit_code: None,
             output_truncated: false,
             output_lines: None,

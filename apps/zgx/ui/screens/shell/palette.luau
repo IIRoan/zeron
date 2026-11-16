@@ -59,6 +59,7 @@ local function session_items(): { Item }
 				time = c.updated,
 				agent = c.agent,
 				project = if p then p.name else nil,
+				project_id = if p then p.id else nil,
 				hue = if p then (route.look(p.id) or { hue = route.hue(p.id) }).hue else nil,
 				src = if p then (route.look(p.id) or {}).src else nil,
 				emoji = if p then (route.look(p.id) or {}).emoji else nil,
@@ -98,11 +99,12 @@ local function projects_page(): any
 		placeholder = locale.s("shell.palette.search_projects"),
 		items = function(): { Item }
 			local out: { Item } = {}
-			for _, p in sessions.now:get().projects do
+			for _, p in sessions.projects:get() do
 				table.insert(out, {
 					id = `project:{p.id}`,
 					label = p.name,
 					section = locale.s("shell.palette.projects"),
+					project = p.id,
 					hue = (route.look(p.id) or { hue = route.hue(p.id) }).hue,
 					src = (route.look(p.id) or {}).src,
 					emoji = (route.look(p.id) or {}).emoji,
@@ -219,6 +221,47 @@ local function theme_items(): { Item }
 				end
 			end,
 		})
+	end
+	return out
+end
+
+-- Everything the app's menus hold (src/main.rs `serve_commands` publishes
+-- them), each run as its menu item would be, its shortcut beside it. Where
+-- the system draws no menu bar (Windows, Linux) this is how a pointer
+-- reaches them. Those the palette lists as its own already are left out.
+local menu_commands = ui.shared("app.menu_commands", {} :: { any })
+local LISTED: { [string]: boolean } = {
+	["shell.new_chat"] = true,
+	["shell.new_project"] = true,
+	["shell.archive"] = true,
+	["shell.toggle_sidebar"] = true,
+	["shell.settings"] = true,
+	["shell.reload"] = true,
+	["shell.reload_interface"] = true,
+	-- (The palette itself.)
+	["shell.palette"] = true,
+}
+-- The host's own way back from any template (its "Use Default Interface").
+local DEFAULT_INTERFACE = "zeron.use-zeron-template"
+local function command_items(): { Item }
+	local out: { Item } = {}
+	for _, c in menu_commands:get() do
+		local id = c.id :: string
+		if not LISTED[id] then
+			local default = id == DEFAULT_INTERFACE
+			table.insert(out, {
+				id = `menu:{id}`,
+				label = if default then locale.s("shell.palette.default_interface") else c.title,
+				section = locale.s(if default then "shell.palette.templates" else "shell.palette.commands"),
+				icon = if default then "gallery" else nil,
+				shortcut = c.key,
+				keywords = if default then "template interface safe revert" else c.menu,
+				verb = locale.s("shell.palette.run"),
+				run = function()
+					host.invoke("app.run_menu_command", id)
+				end,
+			})
+		end
 	end
 	return out
 end
@@ -495,6 +538,9 @@ local function root(): { Item }
 	end
 	for _, t in theme_items() do
 		table.insert(out, t)
+	end
+	for _, c in command_items() do
+		table.insert(out, c)
 	end
 	for _, s in session_items() do
 		table.insert(out, s)

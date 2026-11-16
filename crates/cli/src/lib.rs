@@ -41,6 +41,10 @@ struct Cli {
     /// Open a Zeron conversation URL.
     #[arg(value_name = "URL")]
     open_url: Option<String>,
+    /// Open with Zeron's own interface, whatever template is in use (as
+    /// holding Alt, or ⌥ on a Mac, as Zeron opens does).
+    #[arg(long)]
+    safe_mode: bool,
     #[cfg(windows)]
     #[arg(long, hide = true)]
     wait_for_exit: Option<u32>,
@@ -88,6 +92,18 @@ enum Command {
         #[command(subcommand)]
         command: TemplateCommand,
     },
+    /// Run a project's agents, services and terminals in a container built
+    /// from a devcontainer config (Linux, rootless podman).
+    Sandbox {
+        #[command(subcommand)]
+        command: SandboxCommand,
+    },
+    /// Connect a project to the Windows VM on this machine (Linux, QEMU/KVM):
+    /// its agents can then use the VM, and the listed ports cross to it.
+    Vm {
+        #[command(subcommand)]
+        command: VmCommand,
+    },
     /// Manage `zeron headless` as a background service (launchd / systemd --user).
     Daemon {
         #[command(subcommand)]
@@ -99,6 +115,10 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
+    /// Watches a new version while it proves itself after an update: started by
+    /// the old version just before it hands over.
+    #[command(name = "update-watchdog", hide = true)]
+    UpdateWatchdog,
 }
 
 #[derive(Subcommand)]
@@ -136,6 +156,26 @@ pub enum PluginCommand {
     Verify { path: String },
     /// List the plugins Zeron knows.
     List,
+    /// Save a plugin as one signed .zeron-plugin file to share (attach it
+    /// to a GitHub release, or send it): anyone installs it from that file
+    /// or its link. Your own plugin is signed again first.
+    Export {
+        /// The plugin's id (`zeron plugin list` names them).
+        id: String,
+        /// Where to save it: a folder, or a file ending .zeron-plugin
+        /// (defaults to Zeron's plugin-exports folder).
+        #[arg(long, value_name = "PATH", value_parser = absolute_path)]
+        to: Option<std::path::PathBuf>,
+    },
+}
+
+/// A path as given, made absolute against the current folder (the engine
+/// takes full paths only).
+fn absolute_path(text: &str) -> Result<std::path::PathBuf, String> {
+    if text.trim().is_empty() {
+        return Err("give a path".into());
+    }
+    std::path::absolute(text).map_err(|e| e.to_string())
 }
 
 #[derive(Subcommand)]
@@ -162,6 +202,83 @@ pub enum TemplateCommand {
     Delete { id: String },
 }
 
+#[derive(Subcommand)]
+pub enum SandboxCommand {
+    /// Build the project's image and start its container. Agents (Claude
+    /// Code, Codex), app services, setup commands and terminals of the
+    /// project and its worktrees then run inside it; shared databases stay
+    /// on this machine.
+    Enable {
+        /// The project's folder.
+        path: std::path::PathBuf,
+        /// Its devcontainer.json: the project's own (its folder is then
+        /// mounted read-only), or one outside every sandboxed project.
+        #[arg(long)]
+        config: std::path::PathBuf,
+        /// A port (or `a-b` range) on this machine the container reaches on
+        /// its localhost (a database). Repeat for more.
+        #[arg(long = "host-port", value_name = "PORT[-PORT]")]
+        host_ports: Vec<String>,
+        /// A container port (or `a-b` range) this machine reaches on its
+        /// localhost (dev servers). Repeat for more.
+        #[arg(long = "publish", value_name = "PORT[-PORT]")]
+        publish_ports: Vec<String>,
+        /// A path in the project this machine reads (a database's compose
+        /// file), mounted read-only so agents can't change it. Repeat for more.
+        #[arg(long = "read-only", value_name = "PATH")]
+        read_only: Vec<std::path::PathBuf>,
+        /// Hand agents there this machine's GitHub login (gh's token), so gh
+        /// and git over HTTPS work, with everything that login may do.
+        #[arg(long)]
+        share_github: bool,
+        /// Sign agents' commits and tags there with this machine's signing
+        /// key (git's user.signingkey), which never goes in.
+        #[arg(long)]
+        sign_commits: bool,
+        /// Where Zeron creates the project's worktrees, if not the default.
+        #[arg(long)]
+        worktrees: Option<std::path::PathBuf>,
+    },
+    /// Run the project on this machine again and remove its container.
+    Disable { path: std::path::PathBuf },
+    /// List sandboxed projects and their containers.
+    Status,
+}
+
+#[derive(Subcommand)]
+pub enum VmCommand {
+    /// Connect the project, or replace how it is connected. Starts nothing:
+    /// the VM starts from Project settings, `winvm up`, or an agent.
+    Enable {
+        /// The project's folder.
+        path: std::path::PathBuf,
+        /// A port (or `a-b` range) on this machine the VM reaches on its
+        /// own localhost (the project's dev servers). Repeat for more.
+        #[arg(long = "to-vm", value_name = "PORT[-PORT]")]
+        to_vm: Vec<String>,
+        /// A VM port (or `a-b` range) this machine reaches on its localhost
+        /// (a debugger). Repeat for more.
+        #[arg(long = "from-vm", value_name = "PORT[-PORT]")]
+        from_vm: Vec<String>,
+        /// Open the viewer window when the VM starts.
+        #[arg(long)]
+        viewer: bool,
+        /// A service of the project, by name, that starts the VM with it
+        /// (the Windows app's service). Repeat for more.
+        #[arg(long = "start-with", value_name = "SERVICE")]
+        start_with: Vec<String>,
+        /// Connect only the `--to-vm` ports. Without this the ports the
+        /// project's servers listen on (in any worktree) are connected too,
+        /// as they come and go.
+        #[arg(long = "no-auto-ports")]
+        no_auto_ports: bool,
+    },
+    /// Disconnect the project. The VM itself is left as it is.
+    Disable { path: std::path::PathBuf },
+    /// List connected projects and the VM's state.
+    Status,
+}
+
 /// A subcommand that runs the engine's own code in this process: what the
 /// engine helper (or a binary linking the engine) does with it.
 pub enum EngineCommand {
@@ -175,6 +292,8 @@ pub enum EngineCommand {
     Mcp,
     Plugin(PluginCommand),
     Template(TemplateCommand),
+    Sandbox(SandboxCommand),
+    Vm(VmCommand),
 }
 
 /// Where this binary runs [`EngineCommand`]s.
@@ -193,8 +312,9 @@ pub enum Launch {
     Done(anyhow::Result<()>),
     /// Run this in-process ([`Engines::InProcess`] only); logging is set up.
     Engine(EngineCommand),
-    /// No subcommand: open the window, on a conversation URL if one was given.
-    Window { open_url: Option<String> },
+    /// No subcommand: open the window, on a conversation URL if one was
+    /// given; `safe_mode` with Zeron's own interface (`--safe-mode`).
+    Window { open_url: Option<String>, safe_mode: bool },
     /// Ask the running headed instance for an Appshot (the interface's own).
     #[cfg(target_os = "linux")]
     Appshot,
@@ -221,7 +341,14 @@ pub fn run(version: &'static str, engines: Engines) -> Launch {
     };
     if engines == Engines::Helper && cli.command.as_ref().is_some_and(Command::runs_engine) {
         // The helper parses the same arguments and does all of the below
-        // itself (logging, Windows' image cleanup, the command).
+        // itself (logging, the command). Windows' image cleanup is this
+        // executable's, though (the helper isn't the installed zeron.exe): an
+        // install that's only ever run headless must lose the image an update
+        // set aside too.
+        #[cfg(windows)]
+        if matches!(&cli.command, Some(Command::Headless) | Some(Command::Engine)) {
+            zeron_update::windows::cleanup_previous_image();
+        }
         let exe = match std::env::current_exe() {
             Ok(exe) => exe,
             Err(error) => return Launch::Done(Err(error.into())),
@@ -253,7 +380,16 @@ pub fn run(version: &'static str, engines: Engines) -> Launch {
         init_logging(
             long_running,
             mode,
-            matches!(&cli.command, Some(Command::Mcp | Command::Plugin { .. } | Command::Template { .. })),
+            matches!(
+                &cli.command,
+                Some(
+                    Command::Mcp
+                        | Command::Plugin { .. }
+                        | Command::Template { .. }
+                        | Command::Sandbox { .. }
+                        | Command::Vm { .. }
+                )
+            ),
         );
     }
     if long_running {
@@ -276,6 +412,8 @@ pub fn run(version: &'static str, engines: Engines) -> Launch {
         Some(Command::Mcp) => engine(EngineCommand::Mcp),
         Some(Command::Plugin { command }) => engine(EngineCommand::Plugin(command)),
         Some(Command::Template { command }) => engine(EngineCommand::Template(command)),
+        Some(Command::Sandbox { command }) => engine(EngineCommand::Sandbox(command)),
+        Some(Command::Vm { command }) => engine(EngineCommand::Vm(command)),
         #[cfg(target_os = "linux")]
         Some(Command::Appshot) => Launch::Appshot,
         Some(Command::Update { check }) => Launch::Done(
@@ -283,6 +421,7 @@ pub fn run(version: &'static str, engines: Engines) -> Launch {
                 .map_err(anyhow::Error::from)
                 .and_then(|runtime| runtime.block_on(update_cli::update(&edge_url_from_env(), check))),
         ),
+        Some(Command::UpdateWatchdog) => Launch::Done(zeron_update::transaction::run_watchdog()),
         Some(Command::Daemon { command }) => Launch::Done(match command {
             DaemonCommand::Install => daemon::install(&paths::data_dir()),
             DaemonCommand::Uninstall => daemon::uninstall(),
@@ -293,6 +432,7 @@ pub fn run(version: &'static str, engines: Engines) -> Launch {
         }),
         None => Launch::Window {
             open_url: cli.open_url,
+            safe_mode: cli.safe_mode,
         },
     }
 }
@@ -310,10 +450,12 @@ impl Command {
             | Self::Quiesce
             | Self::Mcp
             | Self::Plugin { .. }
-            | Self::Template { .. } => true,
+            | Self::Template { .. }
+            | Self::Sandbox { .. }
+            | Self::Vm { .. } => true,
             #[cfg(target_os = "linux")]
             Self::Appshot => false,
-            Self::Update { .. } | Self::Daemon { .. } => false,
+            Self::Update { .. } | Self::UpdateWatchdog | Self::Daemon { .. } => false,
         }
     }
 }
@@ -398,7 +540,10 @@ mod tests {
             &["quiesce"],
             &["mcp"],
             &["plugin", "new"],
+            &["plugin", "export"],
             &["template", "use"],
+            &["sandbox", "enable"],
+            &["vm", "enable"],
             &["daemon", "install"],
             &["update"],
         ] {
@@ -429,7 +574,10 @@ mod tests {
             &["quiesce"],
             &["mcp"],
             &["plugin", "list"],
+            &["plugin", "export", "focus"],
             &["template", "list"],
+            &["sandbox", "status"],
+            &["vm", "status"],
         ] {
             assert!(parse(args).unwrap().runs_engine(), "{args:?}");
         }
@@ -437,6 +585,37 @@ mod tests {
             assert!(!parse(args).unwrap().runs_engine(), "{args:?}");
         }
         assert!(parse(&[]).is_none());
+    }
+
+    /// `--to` reaches the engine as a full path: a relative one is taken
+    /// from the current folder.
+    #[test]
+    fn plugin_export_takes_a_full_path() {
+        let export = |args: &[&str]| {
+            let argv = ["zeron", "plugin", "export"].into_iter().chain(args.iter().copied());
+            match Cli::from_arg_matches(&command("0.0.0").try_get_matches_from(argv).unwrap())
+                .unwrap()
+                .command
+            {
+                Some(Command::Plugin { command: PluginCommand::Export { id, to } }) => (id, to),
+                _ => panic!("not plugin export"),
+            }
+        };
+        assert_eq!(export(&["focus"]), ("focus".to_owned(), None));
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            export(&["focus", "--to", "dist/focus.zeron-plugin"]).1,
+            Some(cwd.join("dist/focus.zeron-plugin"))
+        );
+        assert_eq!(export(&["focus", "--to", "."]).1.unwrap(), cwd);
+        let full = if cfg!(windows) { r"C:\out" } else { "/tmp/out" };
+        assert_eq!(export(&["focus", "--to", full]).1, Some(std::path::PathBuf::from(full)));
+        assert!(
+            command("0.0.0")
+                .try_get_matches_from(["zeron", "plugin", "export", "focus", "--to", ""])
+                .is_err()
+        );
+        assert!(command("0.0.0").try_get_matches_from(["zeron", "plugin", "export"]).is_err());
     }
 
     #[test]

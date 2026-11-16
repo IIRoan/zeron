@@ -506,7 +506,7 @@ fn pinned_layer(layer: AnyElement) -> AnyElement {
 /// Eased exit progress (0..=1) for a [`Popup`] closing instant, computed from
 /// the wall clock at render time. Monotonic by construction — unlike the
 /// animation element's own clock, it can never replay from 0 mid-exit.
-fn exit_progress(since: std::time::Instant) -> f32 {
+pub(crate) fn exit_progress(since: std::time::Instant) -> f32 {
     let total = motion::MENU_OUT
         .total()
         .mul_f32(motion::speed_scale())

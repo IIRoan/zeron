@@ -777,7 +777,6 @@ mod tests {
     }
 
     use crate::state::AppState;
-    use gpui::AppContext as _;
 
     fn window(
         cx: &mut gpui::TestAppContext,
@@ -830,6 +829,7 @@ mod tests {
             space_id: None,
             last_seen_at: None,
             room_gen: None,
+            sleep: None,
         }
     }
 
@@ -871,6 +871,7 @@ mod tests {
                 running_subagents: 0,
                 running_background_tasks: 0,
                 background_tasks: tasks,
+                waiting: None,
             }];
             state.selected_chat = Some(chat_id.into());
         });

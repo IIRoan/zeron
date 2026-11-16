@@ -698,7 +698,7 @@ impl Shell {
             .selected_chat
             .as_deref()
             .is_some_and(|chat| self.can_reuse_chat_checkout(chat, cx));
-        let has_git_workspace = palette_workspace(self, cx).is_some()
+        let has_git_workspace = self.git_plugin_enabled(cx) && palette_workspace(self, cx).is_some()
             && self.state.read(cx).chats.iter().any(|chat| chat.id == self.active_chat && chat.cwd.is_some());
         let commands = |section| {
             PaletteSection::new(
@@ -852,25 +852,15 @@ impl Shell {
             .iter()
             .filter(|chat| chat.is_top_level())
             .filter_map(|chat| {
-                let pull_request = state
-                    .change_request_for_chat(chat)
-                    .map(|pr| {
-                        format!(
-                            "#{} {} {} {}",
-                            pr.number, pr.title, pr.head_ref, pr.base_ref
-                        )
-                    })
-                    .unwrap_or_default();
                 let fields = thread_search::ThreadFields {
                     title: chat.title.as_deref().unwrap_or("New session"),
                     project: state
                         .space_for_chat(chat)
                         .map(|s| s.display_name())
                         .unwrap_or(""),
-                    branch: crate::change_requests::conversation_branch(chat, &state.spaces)
-                        .unwrap_or(""),
+                    branch: crate::state::conversation_branch(chat, &state.spaces).unwrap_or(""),
                     device: state.device_name(&chat.device_id).unwrap_or(""),
-                    pull_request: &pull_request,
+
                     archived: chat.archived,
                 };
                 let score = thread_search::score_thread(&fields, &terms)?;
@@ -952,6 +942,7 @@ impl Shell {
         self.close_command_palette(window, cx);
         match row.kind {
             RowKind::Command(Command::Git(command)) => {
+                if !self.git_plugin_enabled(cx) { return; }
                 self.set_surfaces_open(true, cx);
                 if self.active_changes(cx).is_none() {
                     self.add_diff_surface(window, cx);
@@ -1186,16 +1177,12 @@ impl Shell {
                 let branch = self
                     .settings
                     .sidebar_show_branch
-                    .then(|| crate::change_requests::conversation_branch(chat, &state.spaces))
+                    .then(|| crate::state::conversation_branch(chat, &state.spaces))
                     .flatten()
                     .map(str::trim)
                     .filter(|branch| !branch.is_empty())
                     .map(SharedString::from);
-                let pr = self
-                    .settings
-                    .sidebar_show_pull_request
-                    .then(|| state.change_request_for_chat(chat).cloned())
-                    .flatten();
+
                 let harness = self
                     .settings
                     .sidebar_show_harness
@@ -1208,7 +1195,6 @@ impl Shell {
                         .into(),
                     folder.into(),
                     branch,
-                    pr,
                     harness,
                     state.display_status_for(chat, Utc::now()),
                     active,

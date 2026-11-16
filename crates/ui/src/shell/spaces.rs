@@ -1361,7 +1361,7 @@ mod pinned_session_tests {
         let (host, cx) = cx.add_window_view(|_, cx| {
             PinnedHost(cx.new(|cx| {
                 let state = cx.new(|_| AppState::new());
-                let mut shell = Shell::new(
+                let shell = Shell::new(
                     state,
                     EngineBootConfig {
                         data_dir: dir.path().into(),
@@ -1658,7 +1658,7 @@ mod pinned_session_tests {
         assert_eq!(dragged_card.origin.x, source_bounds.origin.x);
         assert_eq!(
             f32::from(dragged_card.size.height),
-            super::super::sidebar_row_height(compact, show_label, true, false)
+            super::super::sidebar_row_height(compact, show_label, true)
         );
         // Even a sub-row move follows the pointer immediately, before a drop slot changes.
         let pointer = from + gpui::point(px(8.0), px(7.0));
@@ -2355,7 +2355,7 @@ struct ActiveChatRow {
     chat: zeron_proto::Chat,
     folder: String,
     branch: Option<String>,
-    change_request: Option<zeron_proto::ChangeRequestSummary>,
+
     group: Option<(String, String)>,
 }
 
@@ -2490,8 +2490,8 @@ pub(super) fn sidebar_header_glyph(theme: &Theme) -> gpui::Hsla {
     theme.text_muted.opacity(0.5)
 }
 
-/// A collapsed section's session count, cut like the sidebar's pull-request
-/// badge (16pt tall, 4pt radius, monospace digits) in a muted tone.
+/// A collapsed section's session count: 16pt tall with a 4pt radius and
+/// monospace digits in a muted tone.
 fn sidebar_count_badge(theme: &Theme, count: usize) -> gpui::Div {
     div()
         .flex_none()
@@ -2981,7 +2981,7 @@ fn clone_row(
 ) -> gpui::Stateful<gpui::Div> {
     let owner = clone.label.split('/').next().unwrap_or_default().to_owned();
     let leading = if clone.github {
-        crate::pull_request_media::avatar(
+        crate::account_avatar::avatar(
             &owner,
             SharedString::from(format!("clone-avatar-{}", clone.label)),
             16.0,
@@ -3131,7 +3131,8 @@ pub(crate) fn status_dot_color(status: ChatIndicator, theme: &Theme) -> gpui::Hs
         // Non-done statuses sit well below full
         // strength: at full alpha the colored words shouted across the
         // whole sidebar (user request) — only Done keeps its pop.
-        ChatIndicator::Working => theme.busy.opacity(0.55),
+        // (Waiting reads as Working here: `display_status_for`.)
+        ChatIndicator::Working | ChatIndicator::Waiting => theme.busy.opacity(0.55),
         // Blue: "asking you a question" must read differently from "busy
         // working" at a glance.
         ChatIndicator::AwaitingInput => theme.accent.opacity(0.6),
@@ -3283,9 +3284,7 @@ impl Shell {
         }
         self.close_spaces_menu(cx);
         self.schedule_save(cx);
-        if let Some(page) = self.pull_requests_page.as_ref() {
-            page.update(cx, |page, cx| page.on_project_scope_changed(cx));
-        }
+
         cx.notify();
     }
 
@@ -4949,15 +4948,12 @@ impl Shell {
         };
         // The branch shows whenever the engine has stamped one —
         // main-checkout sessions included, not just worktrees.
-        let branch = crate::change_requests::conversation_branch(&chat, &state.spaces)
+        let branch = crate::state::conversation_branch(&chat, &state.spaces)
             .map(str::trim)
             .filter(|b| !b.is_empty())
             .map(str::to_string)
             .filter(|_| self.settings.sidebar_show_branch);
-        let change_request = state
-            .change_request_for_chat(&chat)
-            .cloned()
-            .filter(|_| self.settings.sidebar_show_pull_request);
+
         let group = match self.sidebar_organization() {
             SidebarOrganization::ByDevice => Some((chat.device_id.clone(), device)),
             SidebarOrganization::ByProject => Some(sidebar_project_group(state, &chat)),
@@ -4968,7 +4964,7 @@ impl Shell {
             chat: chat.clone(),
             folder,
             branch,
-            change_request,
+
             group,
         }
     }
@@ -5034,7 +5030,6 @@ impl Shell {
                     self.settings.sidebar_compact,
                     self.settings.sidebar_show_project_label,
                     row.branch.is_some(),
-                    row.change_request.is_some(),
                 )
             })
             .collect();
@@ -5133,7 +5128,6 @@ impl Shell {
                     self.settings.sidebar_compact,
                     self.settings.sidebar_show_project_label,
                     rows[index].branch.is_some(),
-                    rows[index].change_request.is_some(),
                 );
                 // Move the vacant slot to the destination instead of keeping two
                 // holes. Sample layout and paint with the same reversible easing.
@@ -5249,7 +5243,7 @@ impl Shell {
                     chat,
                     folder,
                     branch,
-                    change_request,
+
                     group: _,
                 } = row;
                 let time_ago: SharedString =
@@ -5264,7 +5258,6 @@ impl Shell {
                     self.settings.sidebar_compact,
                     self.settings.sidebar_show_project_label,
                     branch.is_some(),
-                    change_request.is_some(),
                 );
                 // Only rows a jump slot can reach wear a chip; row 10 onward
                 // keeps its time-ago.
@@ -5318,7 +5311,6 @@ impl Shell {
                     time_ago,
                     folder.into(),
                     branch.map(SharedString::from),
-                    change_request,
                     harness,
                     status,
                     is_selected,
@@ -5814,7 +5806,7 @@ impl Shell {
         // "Show more" matches the row slot: compact rows are 29px, so the
         // button shrinks with them instead of towering over the list.
         let more_height = if self.settings.sidebar_compact {
-            super::sidebar_row_height(true, true, false, false)
+            super::sidebar_row_height(true, true, false)
         } else {
             36.0
         };
@@ -5830,14 +5822,8 @@ impl Shell {
         }
         let compact = self.settings.sidebar_compact;
         let show_label = self.settings.sidebar_show_project_label;
-        let row_height = |row: &ActiveChatRow| {
-            sidebar_row_height(
-                compact,
-                show_label,
-                row.branch.is_some(),
-                row.change_request.is_some(),
-            )
-        };
+        let row_height =
+            |row: &ActiveChatRow| sidebar_row_height(compact, show_label, row.branch.is_some());
         let group_height = |group: &Option<(String, String)>, rows: &[ActiveChatRow]| {
             let rows_height = rows.iter().map(&row_height).sum::<f32>()
                 + rows.len().saturating_sub(1) as f32 * SIDEBAR_LIST_GAP;
@@ -5930,7 +5916,6 @@ impl Shell {
                                 .into(),
                             row.folder.into(),
                             row.branch.map(SharedString::from),
-                            row.change_request,
                             harness,
                             row.status,
                             is_selected,
@@ -6049,20 +6034,6 @@ impl Shell {
     }
 
     // ---- add-space flow ----
-
-    pub(super) fn open_add_space_on_device(&mut self, device_id: &str, cx: &mut Context<Self>) {
-        let device = self
-            .state
-            .read(cx)
-            .devices
-            .iter()
-            .find(|device| device.id == device_id)
-            .cloned();
-        self.open_add_space(cx);
-        if let Some(device) = device {
-            self.add_space_pick_device(device, cx);
-        }
-    }
 
     pub(super) fn open_add_space(&mut self, cx: &mut Context<Self>) {
         self.release_home_folder_search(cx);
@@ -8675,7 +8646,7 @@ impl Shell {
                         .child(SharedString::from("Reset icon")),
                 ))
                 .child(popover::menu_separator())
-                .child(
+                .when(self.services_plugin_enabled(cx), |menu| menu.child(
                     popover::menu_row(&theme, false, "space-project-terminals")
                         .id("space-project-terminals")
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -8688,7 +8659,7 @@ impl Shell {
                                 .text_color(theme.text_muted),
                         )
                         .child(SharedString::from("Project services…")),
-                )
+                ))
                 .child(
                     popover::menu_row(&theme, false, format!("space-menu-rename-{space_id}"))
                         .id("space-menu-rename")
@@ -8846,6 +8817,7 @@ mod tests {
             space_id: None,
             last_seen_at: None,
             room_gen: None,
+            sleep: None,
         }
     }
 

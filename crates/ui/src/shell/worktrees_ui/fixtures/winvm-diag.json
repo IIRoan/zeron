@@ -1,0 +1,52 @@
+{
+  "os": "Microsoft Windows 11 Enterprise Evaluation (build 26100)",
+  "computerName": "WINVM",
+  "uptimeSeconds": 608,
+  "loggedOnUser": "WINVM\\dev",
+  "cpuLoadPercent": 4,
+  "memoryMB": {
+    "total": 8185,
+    "free": 5460
+  },
+  "diskGB": {
+    "total": 94.8,
+    "free": 40.2
+  },
+  "display": "944x1024@60 Red Hat VirtIO GPU DOD controller",
+  "topProcesses": [
+    {
+      "name": "MsMpEng",
+      "pid": 3712,
+      "memoryMB": 267,
+      "cpuSeconds": 25
+    },
+    {
+      "name": "explorer",
+      "pid": 6008,
+      "memoryMB": 233,
+      "cpuSeconds": 12
+    },
+    {
+      "name": "StartMenuExperienceHost",
+      "pid": 6920,
+      "memoryMB": 144,
+      "cpuSeconds": 5
+    }
+  ],
+  "listeningPorts": [
+    ":::22 sshd",
+    "0.0.0.0:22 sshd",
+    ":::135 svchost",
+    "0.0.0.0:135 svchost"
+  ],
+  "stoppedAutomaticServices": [
+    "edgeupdate",
+    "MapsBroker",
+    "QEMU-GA",
+    "sppsvc"
+  ],
+  "recentErrors": [
+    "11:35:05 Microsoft-Windows-TPM-WMI 1040: Pre-attestation health checks confirm a critical component has failed, and the device is not expected to pass attestation.",
+    "11:35:05 Service Control Manager 7009: A timeout was reached (45000 milliseconds) while waiting for the QEMU-GA service to connect."
+  ]
+}

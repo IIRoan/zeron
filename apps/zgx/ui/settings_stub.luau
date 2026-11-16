@@ -1,6 +1,6 @@
 -- Settings' host calls, answered here as the host would (no engine or edge
 -- in a test host): your profile and card, your organization, its members
--- and invitations, this Mac's engine settings and banners. The shell's
+-- and invitations, this computer's engine settings and banners. The shell's
 -- fixture requires it, so Settings' pages build headless; the tests drive
 -- it (tests/settings_in_place.test.luau).
 --
@@ -8,6 +8,8 @@
 -- "name:detail" each). `ui.command`s change the data as the edge would on
 -- its own, or make the next change fail:
 --   settings_stub.sign_in          signed in as Ada, in org_1 (else signed out)
+--   settings_stub.restoring        the engine hasn't answered yet
+--   settings_stub.signed_out       the engine says signed out
 --   settings_stub.open_account     a way in to `settings/account` (a link)
 --   settings_stub.member_joins     someone accepts an invitation
 --   settings_stub.refuse_next      the next change is refused ("refused")
@@ -28,7 +30,7 @@ local delete_word = ui.state("settings_stub_delete_word", "ok")
 -- What a delete after signing in again answers: "ok", "wait" (until
 -- `settings_stub.signed_in_again`, or cancelled), or a refusal.
 local step_up_word = ui.state("settings_stub_step_up_word", "ok")
--- The account's signing keys: "some" (this Mac's, one new on another
+-- The account's signing keys: "some" (this computer's, one new on another
 -- device, one revoked; listed out of order) or "none".
 local keys_mode = ui.state("settings_stub_keys", "some")
 local signing_keys = {
@@ -137,6 +139,9 @@ end
 local answers: { [string]: (arg: any) -> any } = {
 	["account.me"] = function()
 		return settled(table.clone(me))
+	end,
+	["dictation.call"] = function(arg: any)
+		return settled(if arg.op == "status" then { installed = false, size = 670479942 } elseif arg.op == "inputs" then {} else nil)
 	end,
 	["account.rename"] = function(name: string)
 		local r = change(nil)
@@ -342,6 +347,15 @@ local answers: { [string]: (arg: any) -> any } = {
 		end
 		return settled({ version = "0.2.140" })
 	end,
+	-- This computer's fonts (src/fonts.rs), a few of each kind.
+	["fonts.list"] = function()
+		return settled({
+			{ family = "Fira Code", mono = true },
+			{ family = "Inter", mono = false },
+			{ family = "JetBrains Mono", mono = true },
+			{ family = "Noto Serif", mono = false },
+		})
+	end,
 	-- A background image kept: the picked file itself (the app's own PNG,
 	-- so a headless host can draw it), 512 square.
 	["wallpaper.keep"] = function(arg: any)
@@ -414,10 +428,25 @@ apis.invite = function(_org: string, emails: { string }): any
 	end
 	return settled({ sent = sent, failed = failed })
 end
--- This Mac's agents and another device's (account/agents): one each, so
+-- This computer's agents and another device's (account/agents): one each, so
 -- a switch of device shows whose.
 local agents = require("@account/agents")
 local function agents_of(target: string?): any
+	-- Cloud (the engine answers for it from the vault): Claude Code and
+	-- Codex, always installed; Codex with an account, so on.
+	if target == "cloud" then
+		local function one(id: string, name: string, mark: string, accounts: { any }): any
+			return { id = id, name = name, mark = mark, installed = true, can_install = false, enabled = #accounts > 0, version = nil, installing = false, login = "idle", accounts = accounts }
+		end
+		return {
+			state = "ready",
+			target = target,
+			list = {
+				one("claude-code", "Claude Code", "claude", {}),
+				one("codex", "Codex", "openai", { { id = "c1", email = "ada@example.com", plan = "Pro", session = 0.1, week = 0.2, active = true } }),
+			},
+		}
+	end
 	local name = if target then "Codex" else "Claude Code"
 	local id = if target then "codex" else "claude-code"
 	return {
@@ -495,6 +524,22 @@ auths.sign_out = function(done: (() -> ())?)
 	end
 end
 
+-- The launch before the engine has answered, and the engine saying signed out.
+ui.command {
+	id = "settings_stub.restoring",
+	title = "The engine hasn't answered yet",
+	run = function()
+		auth.account:set({ state = "restoring", env = "staging" } :: any)
+	end,
+}
+ui.command {
+	id = "settings_stub.signed_out",
+	title = "The engine says signed out",
+	run = function()
+		auth.account:set({ state = "signed_out", env = "staging" } :: any)
+	end,
+}
+
 ui.command {
 	id = "settings_stub.member_joins",
 	title = "A member joins",
@@ -536,8 +581,8 @@ ui.command {
 		require("@app/screens/shell/route").settings("account")
 	end,
 }
--- What the main window's theme overrides now (ds.look): its accent and a
--- syntax colour, for a test to read.
+-- What the main window's theme overrides now (ds.look): its accent, a
+-- syntax colour and its fonts, for a test to read.
 local window_theme = ui.state("settings_stub_window_theme", {} :: { [string]: any })
 ui.command {
 	id = "settings_stub.read_theme",
@@ -549,6 +594,22 @@ ui.command {
 			keyword = t["zeron.syntax.keyword"],
 			body = t["font.size.md"],
 			window = t["zeron.window"],
+			sans = t["font.sans"],
+			mono = t["font.mono"],
+			secondary = t["text.secondary"],
+			tertiary = t["text.tertiary"],
+			-- "Accent colour throughout": a status dot, a find's highlight,
+			-- an @file token, a list marker, and a link's ink (nil: the
+			-- text's own).
+			working_dot = t["zeron.status.dot.working"],
+			working = t["zeron.status.working"],
+			find = t["zeron.editor.match"],
+			file_token = t["zeron.composer.token.file"],
+			marker = t["zeron.prose.marker"],
+			link = require("@ds/look").accented_ink(nil)(),
+			-- What the accent's own token is, and what the theme's says.
+			accented_ink = ui.theme.get("zeron.accented.ink"),
+			accent_ink = ui.theme.get("accent"),
 		})
 	end,
 }

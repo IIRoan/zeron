@@ -41,6 +41,10 @@ local function owner(c: any): string?
 	if c.name == "plugin" and c.plugin and c.page then
 		return `page:{c.plugin}/{c.page}`
 	end
+	-- (A new chat's page has a panel of its own too.)
+	if c.name == "home" then
+		return "home"
+	end
 	return if c.name == "session" then c.session else nil
 end
 local function session(): string?
@@ -78,6 +82,7 @@ function M.set_files(on: boolean)
 		return
 	end
 	local members = sharing(id, true)
+	local was_open = M.files:peek()
 	local now = table.clone(M.panels:peek())
 	for _, member in members do
 		now[member] = if on then true else nil
@@ -91,6 +96,8 @@ function M.set_files(on: boolean)
 				M.expanded_panels:set_key(member, nil)
 			end
 		end
+	else
+		require("@app/screens/shell/fit").panel_opened(was_open)
 	end
 end
 function M.toggle_files()
@@ -109,6 +116,12 @@ function M.toggle_expanded()
 	end
 	M.expanded_panels:set_key(id, if M.expanded:peek() then nil else true)
 end
+-- The sidebar's width as it shows, each frame as it folds or comes back
+-- (its column, the window's gap before its card included).
+M.sidebar_shown = ui.state("shell_sidebar_shown", 0)
+-- Counts the sidebar's edge double-clicked (its width put back): the page
+-- splits the chat and the panel again then.
+M.seam_reset = ui.state("shell_seam_reset", 0)
 -- The command palette (⌘K), open.
 M.palette = ui.state("shell_palette_open", false)
 -- New project's palette, open (screens/shell/add_project).

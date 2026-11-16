@@ -219,7 +219,7 @@ pub fn activate_link(
         source_session: ui.and_then(|ui| ui.source_session.clone()),
     };
     let outcome = ui.map_or_else(
-        || activation.web_outcome(false),
+        || activation.web_outcome(),
         |ui| (ui.handler)(&activation, window, cx),
     );
     if let LinkOutcome::External(url) = outcome {
@@ -1759,17 +1759,6 @@ thread_local! {
     static PAINTING_SURFACE: Cell<u64> = const { Cell::new(0) };
     /// Surfaces whose reset painted since the latest one's previous reset.
     static PAINTED_SURFACES: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
-}
-
-#[cfg(test)]
-pub(crate) fn selection_test_entry_count(prefix: &str) -> usize {
-    REGISTRY.with(|registry| {
-        registry
-            .borrow()
-            .iter()
-            .filter(|entry| entry.key.starts_with(prefix))
-            .count()
-    })
 }
 
 #[cfg(test)]

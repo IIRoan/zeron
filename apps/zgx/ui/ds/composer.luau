@@ -22,10 +22,10 @@
 -- Everything else is in the pill or behind it. In it, over the draft: the
 -- cargo (ds/composer_cargo: what the message carries, as chips), or what
 -- the agent asks (ds/composer_ask: a question's options, an approval), the
--- draft then being the answer. Behind it: the trays (ds/composer_dock: the
--- queue, what is running, the plan), tucked under the pill, one open at a
--- time. Above all of it, a line of notice when there is one (offline, a
--- failed send, a draft restored): small text with a dot, never a box.
+-- draft then being the answer. Over it, the deck (ds/composer_dock: the
+-- alerts, the queue, subagents, what is running, the plan): folded, a pill
+-- floating over it; opened, its own top. A notice (offline, a failed send,
+-- a draft restored) is the first of the alerts, there till it's over.
 -- Mentions (ds/composer_mentions) open at the caret. Dictating, a track
 -- unrolls from the microphone over the controls: a dot, "Listening", the
 -- voice, a clock.
@@ -52,9 +52,18 @@ local dock = require("@self/composer_dock")
 local ask = require("@self/composer_ask")
 local mentions = require("@self/composer_mentions")
 local locale = require("@self/locale")
+local VoiceWave = require("@self/voice_wave").VoiceWave
 local context_usage = require("@self/context_usage")
-local motion = require("@self/motion")
+local TextMetrics = require("@self/composer_metrics")
+local Layout = require("@self/composer_layout")
+local ComposerMotion = require("@self/composer_motion")
 local EditorMenu = require("@self/editor_menu")
+
+type ViewGeometry = {
+	height: number, header_height: number, tray_inset: number,
+	text: { left: number, right: number, top: number, height: number },
+	controls: Layout.Controls,
+}
 
 -- What the model's context holds, as its agent reports it: the tokens in
 -- it and the window's size (either may be missing).
@@ -83,11 +92,16 @@ export type Notice = {
 	spinner: boolean?,
 	action: string?,
 	dismissable: boolean?,
+	-- Worth knowing, not worth raising: read with the deck's alerts once
+	-- they're open, never putting up the pill on its own.
+	quiet: boolean?,
 }
 export type Answer = { values: { string }, text: string }
 -- Where an existing chat works (`branch_fixed`).
-export type Fixed = { name: string?, worktree: boolean, project: string?, hue: string?, src: string?, emoji: string? }
+export type Fixed = { device: string?, name: string?, worktree: boolean, project: string?, hue: string?, src: string?, emoji: string? }
+export type Sizes = { rest: number, target: number, presented: number, active: boolean, ready: boolean, settling: boolean, context: number }
 export type Props = {
+	on_sizes: ((sizes: Sizes) -> ())?,
 	value: State<string>,
 	placeholder: (string | Message)?,
 	-- What sends (the shipping app's setting): "enter", ↩ sends and ⇧↩
@@ -123,6 +137,19 @@ export type Props = {
 	-- functions of them, followed in place as a catalog comes and changes).
 	harnesses: { ModelPicker.Harness } | State<{ ModelPicker.Harness }> | () -> { ModelPicker.Harness },
 	models: { ModelPicker.Model } | State<{ ModelPicker.Model }> | () -> { ModelPicker.Model },
+	models_loading: (() -> boolean)?,
+	-- The model's name while the catalog doesn't list it (ds.ModelPicker's
+	-- `model_label`).
+	model_label: (() -> string?)?,
+	-- What runs while no model is chosen, shown and not sent
+	-- (ds.ModelPicker's `default_model`).
+	default_model: (() -> string?)?,
+	-- A model's agent's accounts, putting one in use, and asking after them
+	-- again (ds.ModelPicker's).
+	accounts: ((harness: string, model: string, provider: string?) -> { ModelPicker.Account }?)?,
+	account_group: ((harness: string, provider: string?) -> ModelPicker.AccountGroup?)?,
+	on_account: ((harness: string, id: string) -> ())?,
+	on_accounts_open: (() -> ())?,
 	-- How much of the model's context is used (0 to 1): a ring beside its
 	-- chip.
 	context: (number | () -> number)?,
@@ -199,7 +226,19 @@ export type Props = {
 	tasks: State<{ dock.Task }>?,
 	on_stop_task: ((id: string) -> ())?,
 	on_stop_all: (() -> ())?,
+	on_open_task: ((id: string) -> ())?,
 	tray: State<dock.Tray?>?,
+	-- What to know about the chat (ds/composer_dock's alerts): each in its
+	-- tone's colours, its action, and letting one go.
+	alerts: State<{ dock.Alert }>?,
+	on_alert_action: ((id: string) -> ())?,
+	on_dismiss_alert: ((id: string) -> ())?,
+	-- Another pill over its middle ("Scroll to end"): its width while it
+	-- shows, so the folded trays' pill moves aside for it.
+	aside: (() -> number?)?,
+	-- The trays' pill's width while it shows (for "Scroll to end" to make
+	-- room in turn).
+	on_pill_width: ((w: number?) -> ())?,
 
 	-- What the agent asks: a question (its chosen options kept by the
 	-- caller), or an approval.
@@ -225,6 +264,11 @@ export type Props = {
 	dictating: State<boolean>?,
 	on_dictate: (() -> ())?,
 	on_cancel_dictation: (() -> ())?,
+	-- Dictation for real (screens/chat/dictation's `bind`): its microphone,
+	-- the editor's events it follows, and Send waiting for its words. With
+	-- its `levels` and `phase`, the track's waveform follows the microphone
+	-- (ds/voice_wave); without, it moves from the time alone.
+	dictation: any?,
 	-- Nothing can be written (a chat archived, an agent gone): dimmed, the
 	-- notice saying why.
 	disabled: (boolean | () -> boolean)?,
@@ -252,41 +296,14 @@ export type Props = {
 	-- send).
 	on_mention: ((item: any, trigger: string, token: string) -> ())?,
 	mention_empty: { [string]: string }?,
+	-- Whose draft it shows (a composer that moves between chats: the
+	-- chat), so a mention list put away is that draft's alone.
+	draft_key: (() -> any)?,
+	-- A trigger whose list is a launcher, by trigger: its sections, in order
+	-- (ds/composer_mentions `sections`).
+	mention_sections: { [string]: { { id: string, label: any } } }?,
 }
 
--- Zeron's geometry. The one line: 47 points inside the hairline, the text
--- centred in it. Opened out: the text box (16 above the text, 4 below)
--- between its floor and cap, then the controls' row (2, a 32-point chip
--- zone, 8). Round controls are 28 across, concentric with the pill's
--- corner: on one line (a pill, its corner half its height) centred in it,
--- as far from its sides as from its foot; opened out, as far in from the
--- side and the foot as the pill's corner (inside its hairline) is round
--- less theirs.
-local LINE = 22
-local ONE_LINE = 47
-local TEXT_TOP, TEXT_BOTTOM, TEXT_MIN, TEXT_MAX = 16, 4, 76, 260
-local ACTIONS = 42
-local HAIRLINES = 2
-local CONTROL = 28
-local INSET_LINE = (ONE_LINE - CONTROL) / 2
-local function open_inset(): number
-	return control.nest("$zeron.composer.radius", 1) - CONTROL / 2
-end
--- The controls' row opened out: its 42 points, or more where a rounder
--- pill (a template's) sets its controls further in from the foot, so they
--- keep the room over them they have at Zeron's own corner (its controls'
--- top 3 under the row's) rather than rising into the text.
-local ACTIONS_OVER = 3
-local function actions(): number
-	return math.max(ACTIONS, open_inset() + CONTROL + ACTIONS_OVER)
-end
--- The draft's own inset either side on one line, and opened out.
-local TEXT_SIDE = 8
-local TEXT_OPEN_SIDE = 16
--- Opened out, the pill folds back to one line only once the text is this
--- much narrower than the line holds, so a width at the boundary cannot
--- flicker between the two.
-local HYSTERESIS = 32
 -- How wide where-it-works stays before the access mode folds: its project's
 -- name (to PROJECT_MAX) and BRANCH_KEEP of the branch's, with the chip's
 -- own room (its padding, the glyph, the gaps, the chevron); until
@@ -300,6 +317,11 @@ local BRANCH_KEEP, PLACE_CHROME = 72, 50
 -- first, to that, then the name to its least, then the chip folds to its
 -- glyph. (Never a bare "›" with nothing after it.)
 local PROJECT_MIN, PROJECT_MAX, BRANCH_MAX, BRANCH_FLOOR = 44, 140, 180, 36
+-- The device's name before them: how wide at most, kept before the access
+-- mode folds, and least.
+local DEVICE_MAX, DEVICE_KEEP, DEVICE_MIN = 120, 72, 36
+-- What a chevron between two of them takes, with its gap.
+local PLACE_CHEVRON = 14
 -- The footer's chips: one height, one corner (the menus' row corner),
 -- each lead (a glyph's 12) 6 in all round, and as far from its words.
 local CHIP_H, CHIP_RADIUS = 24, "$radius.lg"
@@ -307,7 +329,7 @@ local CHIP_H, CHIP_RADIUS = 24, "$radius.lg"
 -- chip): centred by their capitals, lowercase reads low beside a glyph. (A
 -- margin under them of twice that: their box stays centred, a point up.)
 local LIFT = "$zeron.space.hair"
-type Folded = { level: number, access_at: { [string]: number }, where_icon: number? }
+type Folded = { level: number, access_at: { [string]: number }, where_icon: number?, model_at: { [string]: number }? }
 local FOOTER_SIDES, FOOTER_GAP = 20, 4
 -- With cargo or a question over the draft, the draft keeps the strip's
 -- `below` over it (the theme's; read as the composer is built) rather than
@@ -441,6 +463,7 @@ local function list_of(given: any): any
 end
 
 local function submenu(
+	siblings: { State<boolean> },
 	label: Message,
 	value: State<string?>,
 	choices: { Choice } | () -> { Choice },
@@ -464,7 +487,16 @@ local function submenu(
 		-- (None yet, as a list still coming: a blank row.)
 		return listed[fallback] or listed[1] or { value = "", label = "" }
 	end
+	local own: State<boolean>? = nil
+	local function close_siblings()
+		for _, open in siblings do
+			if open ~= own then
+				open:set(false)
+			end
+		end
+	end
 	return Dropdown {
+		on_open = close_siblings,
 		value = value,
 		items = choices,
 		actions = actions,
@@ -472,16 +504,37 @@ local function submenu(
 		label = label :: any,
 		search = search or false,
 		width = 260,
+		submenu = true,
 		-- Close beside the panel, as a submenu sits: 2 from its edge (the
 		-- row it opens from sits 5 inside it, its inset and border).
 		placement = { side = "right", align = "start", offset = 7 },
 		trigger = function(menu: Dropdown.Menu): Node
-			return menu_row {
+			own = menu.open
+			table.insert(siblings, menu.open)
+			return ui.menu_item(Menu.look {
 				label = label,
 				bg = function()
 					return if menu.open:get() then "$hover" else "#00000000"
 				end,
-				on_click = menu.toggle,
+				-- A press opens it, as hovering does; one already open stays
+				-- open (a hover opened it just before), as a system menu's row.
+				on_click = function()
+					close_siblings()
+					if not menu.open:peek() then
+						menu.toggle()
+					end
+				end,
+				on_hover = function(inside: boolean)
+					if menu.on_hover then
+						menu.on_hover(inside)
+					end
+					if inside then
+						close_siblings()
+						if not menu.open:peek() then
+							menu.toggle()
+						end
+					end
+				end,
 				-- The choice's own tile (a project's hue or artwork), else its
 				-- icon: one or the other, following the choice.
 				ui.presence(function(): string
@@ -501,6 +554,10 @@ local function submenu(
 							end,
 							emoji = function(): string?
 								return current().emoji
+							end,
+							-- (A project's choice: its tile `.project-icon`.)
+							project = function(): string?
+								return (current() :: any).project
 							end,
 							size = 18,
 						}
@@ -526,7 +583,7 @@ local function submenu(
 					Icon { name = "wifi-off", size = 12 },
 				}),
 				Menu.chevron(),
-			}
+			})
 		end,
 	}
 end
@@ -543,6 +600,8 @@ export type Project = {
 	warn: boolean?,
 	disabled: boolean?,
 	description: string?,
+	-- A folder with no git: it can't make a worktree.
+	plain: boolean?,
 }
 -- What working in no project is, among the projects.
 local NO_PROJECT = "none"
@@ -562,8 +621,8 @@ local function on_cloud(device: State<string?>?, devices: any): boolean
 	return false
 end
 
--- The head of where-it-works's panel: "Work in", then the project, the
--- device it runs on and the checkout, each a row opening its choices
+-- The head of where-it-works's panel: "Work in", then the device it runs
+-- on, the project there and the checkout, each a row opening its choices
 -- beside the panel (the project's with "New project" under them).
 local function work_in(
 	project: State<string?>?,
@@ -573,46 +632,10 @@ local function work_in(
 	device: State<string?>?,
 	devices: ({ Device } | State<{ Device }> | () -> { Device })?
 ): Node
+	local siblings: { State<boolean> } = {}
 	local rows: { Node } = {
 		Menu.Heading { locale.t("ds.composer.work_in") },
 	}
-	if project and projects then
-		-- Following the projects as they come and go.
-		local function choices(): { Choice }
-			local out: { Choice } = {}
-			for _, p in list_of(projects) :: { Project } do
-				local icon: Icon.Name? = if p.hue or p.src or p.emoji then nil else "folder"
-				table.insert(out, {
-					value = p.value,
-					label = p.label,
-					hue = p.hue,
-					src = p.src,
-					emoji = p.emoji,
-					icon = icon,
-					warn = p.warn,
-					disabled = p.disabled,
-					description = p.description,
-				})
-			end
-			return out
-		end
-		-- Under the projects, together: working in none, and making one.
-		local p = project
-		table.insert(
-			rows,
-			submenu(locale.t("ds.composer.project.label"), project, choices, 1, locale.s("ds.composer.project.search"), {
-				worded({
-					icon = "close",
-					on_click = function()
-						p:set(NO_PROJECT)
-					end,
-				}, { label = "ds.composer.project.none_action" }),
-				worded({ icon = "plus", on_click = on_new_project }, { label = "ds.composer.project.new" }),
-			}, function(): { Choice }
-				return { worded({ value = NO_PROJECT, icon = "folder" }, { label = "ds.composer.project.none" }) }
-			end)
-		)
-	end
 	if device and devices then
 		-- Following the devices as they come and go; with none, no row.
 		local function choices(): { Choice }
@@ -635,27 +658,76 @@ local function work_in(
 			rows,
 			ui.show(function(): boolean
 				return #choices() > 0
-			end, submenu(locale.t("ds.composer.device.label"), device, choices, 1, locale.s("ds.composer.device.search")))
+			end, submenu(siblings, locale.t("ds.composer.device.label"), device, choices, 1, locale.s("ds.composer.device.search")))
+		)
+	end
+	if project and projects then
+		-- Following the projects as they come and go.
+		local function choices(): { Choice }
+			local out: { Choice } = {}
+			for _, p in list_of(projects) :: { Project } do
+				local icon: Icon.Name? = if p.hue or p.src or p.emoji then nil else "folder"
+				table.insert(out, {
+					value = p.value,
+					label = p.label,
+					hue = p.hue,
+					src = p.src,
+					emoji = p.emoji,
+					icon = icon,
+					warn = p.warn,
+					disabled = p.disabled,
+					description = p.description,
+				})
+			end
+			return out
+		end
+		-- Under the projects, together: working in none, and making one. (Not
+		-- none on Cloud: its machine clones a project's repository.)
+		local p = project
+		table.insert(
+			rows,
+			submenu(siblings, locale.t("ds.composer.project.label"), project, choices, 1, locale.s("ds.composer.project.search"), {
+				worded({
+					icon = "close",
+					on_click = function()
+						p:set(NO_PROJECT)
+					end,
+					shown = function(): boolean
+						return not on_cloud(device, devices)
+					end,
+				}, { label = "ds.composer.project.none_action" }),
+				worded({ icon = "plus", on_click = on_new_project }, { label = "ds.composer.project.new" }),
+			}, function(): { Choice }
+				return { worded({ value = NO_PROJECT, icon = "folder" }, { label = "ds.composer.project.none" }) }
+			end)
 		)
 	end
 	if checkout then
-		-- A checkout is a project's: with none, no row; nor on Cloud, whose
-		-- machine checks the repository out on its own.
+		-- Whether the project chosen is a folder with no git.
+		local function plain(): boolean
+			if not project or not projects then
+				return false
+			end
+			local v = project:get()
+			for _, pr in list_of(projects) :: { Project } do
+				if pr.value == v then
+					return pr.plain == true
+				end
+			end
+			return false
+		end
+		-- A checkout is a project's: with none, no row; nor in a folder with
+		-- no git, with only itself to work in; nor on Cloud, whose machine
+		-- checks the repository out on its own.
 		table.insert(
 			rows,
 			ui.show(function(): boolean
-				return (project == nil or project:get() ~= NO_PROJECT) and not on_cloud(device, devices)
-			end, submenu(locale.t("ds.composer.checkout.label"), checkout, CHECKOUTS, 2))
+				return (project == nil or project:get() ~= NO_PROJECT) and not plain() and not on_cloud(device, devices)
+			end, submenu(siblings, locale.t("ds.composer.checkout.label"), checkout, CHECKOUTS, 2))
 		)
 	end
 	return ui.column { w_full = true, table.unpack(rows) }
 end
-
--- The context ring: a faint track under an arc from twelve o'clock, alone
--- (no percentage), in a chip-high box of its own. As Zeron's: the text's
--- own ink while there is room, amber from three quarters full, red from
--- nine tenths.
-local fill_color = context_usage.ink
 
 -- The ring, in a chip-high box of its own, washed under the pointer as the
 -- chips beside it are. Given what the context holds, it opens the card
@@ -681,20 +753,7 @@ local function ring(used: number | () -> number, usage: (() -> Usage?)?, side: (
 			tooltip = if usage then context_usage.Card { usage = usage } else nil,
 			tooltip_placement = if at then { side = at, align = "end", offset = 8 } else nil,
 			tooltip_delay = 150,
-			-- (The chips' glyph size, 12 across its ink, so it reads as one of
-			-- them rather than a size up.)
-			ui.canvas {
-				w = 12,
-				h = 12,
-				shrink = 0,
-				draw = function(c, w, h)
-					local f = fraction()
-					c:stroke(ui.path():arc(w / 2, h / 2, 5.25, 0, 360), "$border.strong", 1.5)
-					if f > 0 then
-						c:stroke(ui.path():arc(w / 2, h / 2, 5.25, -90, 360 * f), fill_color(f), 1.5, { cap = "round" })
-					end
-				end,
-			},
+			context_usage.Ring { fraction = fraction },
 		}
 	end
 	if not usage then
@@ -712,6 +771,8 @@ end
 -- PROJECT_MIN; folded, the glyph alone. Its ink is the chip's own (the
 -- chevron a step quieter), so the chip's hover lifts all of it.
 type Place = {
+	-- The device it runs on, by name (nil: none to say).
+	device: (() -> string?)?,
 	-- The project (nil: none named), and whether it works in one at all.
 	project: () -> Project?,
 	in_project: () -> boolean,
@@ -721,7 +782,9 @@ type Place = {
 	glyph: () -> Icon.Name?,
 	folded: () -> boolean,
 	-- Told the name's own width as it's laid out (the footer's fold reads it).
-	on_name: ((size: Size, el: Element) -> ())?,
+	-- What the line takes of the name and the branch: their own widths, or 0
+	-- for one it doesn't show.
+	on_measures: ((name: number, branch: number, device: number) -> ())?,
 }
 local function place_line(p: Place): { Child }
 	local function has_project(): boolean
@@ -736,9 +799,28 @@ local function place_line(p: Place): { Child }
 	end
 	-- The name's and the branch's own widths, measured unseen: each keeps
 	-- its least of itself, or all of a shorter one (never padded out).
-	local natural, branch_natural = ui.ref(), ui.ref()
+	local natural, branch_natural, device_natural = ui.ref(), ui.ref(), ui.ref()
+	local function device_name(): string
+		return if p.device then p.device() or "" else ""
+	end
+	local function has_device(): boolean
+		return device_name() ~= ""
+	end
 	local function branch_min(): number
 		return math.min(BRANCH_FLOOR, math.ceil(branch_natural.width or BRANCH_FLOOR))
+	end
+	if p.on_measures then
+		local on_measures = p.on_measures
+		ui.effect(function()
+			local name_w, branch_w = natural.width, branch_natural.width
+			if name_w and branch_w then
+				on_measures(
+					if has_project() or not p.in_project() then name_w else 0,
+					if p.in_project() then branch_w else 0,
+					if has_device() then (device_natural.width or 0) + PLACE_CHEVRON else 0
+				)
+			end
+		end)
 	end
 	-- What leads: where it runs (a worktree's glyph, Cloud's, or a folder:
 	-- a local checkout's, or no project's).
@@ -749,7 +831,6 @@ local function place_line(p: Place): { Child }
 		ui.text {
 			name,
 			ref = natural,
-			on_resize = p.on_name,
 			absolute = true,
 			left = 0,
 			top = 0,
@@ -767,10 +848,45 @@ local function place_line(p: Place): { Child }
 			pointer_events = "none",
 			aria_hidden = true,
 		},
+		ui.text {
+			device_name,
+			ref = device_natural,
+			absolute = true,
+			left = 0,
+			top = 0,
+			opacity = 0,
+			pointer_events = "none",
+			aria_hidden = true,
+		},
 		ui.presence(lead, function(kind: string): Node
 			-- (Its kind named, for tests: "place-lead-worktree".)
 			return ui.div { class = `place-lead-{kind}`, Icon { name = kind :: Icon.Name, size = 12 } }
 		end, { shrink = 0, w = 12, h = 12, items = "center", justify = "center", id = "composer-place-lead" }),
+		ui.show(function(): boolean
+			return unfolded() and has_device()
+		end, ui.row {
+			shrink = 1,
+			min_w = function(): number
+				return PLACE_CHEVRON + math.min(DEVICE_MIN, math.ceil(device_natural.width or DEVICE_MIN))
+			end :: any,
+			gap = "$space.1",
+			items = "center",
+			FadeText {
+				device_name,
+				roll = true,
+				id = "composer-place-device",
+				mb = LIFT,
+				max_w = DEVICE_MAX,
+				shrink = 1,
+				fade = 16,
+			},
+			ui.div {
+				shrink = 0,
+				color = "$text.disabled",
+				aria_hidden = true,
+				Icon { name = "alt-arrow-right-bold", size = 10 },
+			},
+		}),
 		ui.show(function(): boolean
 			return unfolded() and (has_project() or not p.in_project())
 		end, FadeText {
@@ -818,7 +934,8 @@ local function place_line(p: Place): { Child }
 	}
 end
 
--- The voice, while dictating: bars across the track, each breathing on
+-- The voice, while dictating with no levels to follow (the gallery, fixtures:
+-- ds/voice_wave draws the microphone): bars across the track, each breathing on
 -- its own, from the time alone (no script per frame). params[0]: the ink.
 local VOICE = ui.shader([[
 fn fill(input: FillInput) -> vec4<f32> {
@@ -839,93 +956,10 @@ fn fill(input: FillInput) -> vec4<f32> {
 }
 ]], { fps = 30 })
 
--- The notice line: its words on the draft's own left edge, in the tone's
--- ink (a warning amber, a failure red, the rest the secondary ink), a
--- spinner before them while something is on its way, an action, and the ×
--- that puts it away. No dot, no badge: the words say it.
--- One line while there is a notice, following it in place as it changes
--- (its words, its tone, a spinner, an action): a notice that moves on
--- ("Uploading 2 of 5", "3 of 5") never fades out and in again. Going, it
--- keeps the last it said as it fades.
-local function notice_line(notice: State<Notice?>, on_action: (() -> ())?, on_dismiss: (() -> ())?): Node
-	return ui.presence(function(): string?
-		return if notice:get() then "notice" else nil
-	end, function(): Node
-		local last = notice:peek() :: Notice
-		local function now(): Notice
-			local n = notice:get()
-			if n then
-				last = n
-			end
-			return last
-		end
-		return ui.row {
-			h = 24,
-			pl = "$zeron.composer.chip.inset",
-			pr = "$space.2",
-			gap = "$space.2",
-			items = "center",
-			role = "status",
-			ui.show(function(): boolean
-				return now().spinner == true
-			end, status.StatusIcon { kind = "working", size = 14 }),
-			FadeText {
-				function(): string
-					return now().text
-				end,
-				grow = 1,
-				text_size = "$font.size.sm",
-				color = function(): string
-					local tone = now().tone or "neutral"
-					return if tone == "danger" or tone == "warning" then `$zeron.tone.{tone}.ink` else "$text.secondary"
-				end,
-			},
-			ui.show(
-				function(): boolean
-					return now().action ~= nil
-				end,
-				Button {
-					function(): string
-						return now().action or ""
-					end,
-					size = "sm",
-					tone = "ghost",
-					h = 22,
-					px = "$space.2",
-					text_size = "$font.size.xs",
-					on_click = on_action,
-				}
-			),
-			ui.show(function(): boolean
-				return now().dismissable == true
-			end, IconButton {
-				icon = "close",
-				label = locale.t("ds.composer.dismiss"),
-				tooltip = locale.s("ds.composer.dismiss"),
-				size = "sm",
-				tone = "quiet",
-				on_click = on_dismiss,
-			}),
-		}
-	end, {
-		w_full = true,
-		enter = { opacity = { 0, 1 }, y = { 4, 0 }, duration = 180, ease = "outCubic" },
-		exit = { opacity = 0, duration = 120 },
-	})
-end
-
 -- Composers' lightbox groups, each its own.
 local lightboxes = 0
 
 return ui.component(function(props: Props): Node
-	-- Opened out, the controls' inset: from the theme's corner, as this one
-	-- is built.
-	local INSET_OPEN = open_inset()
-	-- On the tray, the chips' inset from the pill's edge above them, the
-	-- tray's foot and its sides: the pill's own controls' (+ and Send sit
-	-- this far in from its edge, its hairline and INSET_OPEN), so the row
-	-- keeps the pill's spacing and its chips line up with those buttons.
-	local TRAY_INSET = INSET_OPEN + HAIRLINES / 2
 	-- On the tray, the step under the pill and above the tray's foot (one
 	-- token: the footer's margins and the tray's height both read it), and
 	-- how far the tray tucks up behind the pill, its top hidden there.
@@ -939,7 +973,11 @@ return ui.component(function(props: Props): Node
 	end
 	local value = props.value
 	local running = props.running
-	local field = ui.ref()
+	local spoken = props.dictation
+	if spoken then
+		props.dictating, props.on_cancel_dictation = spoken.dictating, spoken.cancel
+	end
+	local field = if spoken then spoken.editor else ui.ref()
 	local pill = ui.ref()
 
 	-- What it is laid out from, as layout last measured it (0: not yet):
@@ -950,15 +988,38 @@ return ui.component(function(props: Props): Node
 		return if props.keep then ui.state(`composer:{props.keep}:{key}`, initial) else ui.use_state(initial)
 	end
 	local pill_w = kept("pill_w", 0)
-	local line_w = kept("line_w", 0)
-	local wrapped_h = kept("wrapped_h", 0)
+	local metrics = TextMetrics.use {
+		value = value,
+		keep = props.keep,
+		editor = field,
+		width = function(peek: boolean?): number
+			-- The surface's content box excludes its two hairlines. Both
+			-- expanded text insets come out of that, never the eased field.
+			return Layout.measurement(if peek then pill_w:peek() else pill_w:get()).width
+		end,
+		-- Past the cap a draft is measured no more: its size changes nothing
+		-- (Layout.estimate). The type's line height changed (tracked), it is
+		-- measured again.
+		estimate = function(text: string, line_height: number): Layout.Sample?
+			local line = ui.theme.get("zeron.composer.line")
+			if type(line) == "number" and math.abs(line - line_height) > 0.01 then
+				return nil
+			end
+			return Layout.estimate(text, line_height)
+		end,
+	}
 	local head_h_seen = kept("head_h", 0)
 	local trailing_seen = kept("trailing_w", 0)
 	local footer_w = kept("footer_w", 0)
 	local right_w = kept("right_w", 0)
+	local model_w = kept("model_w", 0)
 	local access_w = kept("access_w", 0)
 	local where_w = kept("where_w", 0)
 	local name_w = kept("name_w", 0)
+	local branch_w = kept("branch_w", 0)
+	local device_w = kept("device_w", 0)
+	-- (The line has said what it takes: until then, BRANCH_MIN.)
+	local place_known = kept("place_known", false)
 	local folded = kept("fold", { level = 0, access_at = {} } :: Folded)
 	local function measure(into: State<number>, axis: "w" | "h"): (size: Size, _el: Element) -> ()
 		return function(size: Size, _el: Element)
@@ -966,6 +1027,21 @@ return ui.component(function(props: Props): Node
 			if math.abs(into:peek() - v) >= 0.5 then
 				into:set(v)
 			end
+		end
+	end
+
+	local function place_measures(name: number, branch: number, device: number)
+		if math.abs(name_w:peek() - name) >= 0.5 then
+			name_w:set(name)
+		end
+		if math.abs(device_w:peek() - device) >= 0.5 then
+			device_w:set(device)
+		end
+		if math.abs(branch_w:peek() - branch) >= 0.5 then
+			branch_w:set(branch)
+		end
+		if not place_known:peek() then
+			place_known:set(true)
 		end
 	end
 
@@ -1024,6 +1100,9 @@ return ui.component(function(props: Props): Node
 		value:set("")
 	end
 	local function send()
+		if spoken and spoken.before_send() then
+			return
+		end
 		local text = value:peek()
 		if asking() then
 			answer()
@@ -1037,8 +1116,11 @@ return ui.component(function(props: Props): Node
 		end
 		value:set("")
 	end
+	if spoken then
+		spoken.send = send
+	end
 	local function stopping(): boolean
-		return running ~= nil and running:get() and not has_text() and not has_cargo() and not asking()
+		return running ~= nil and running:get() and not has_text() and not has_cargo() and not asking() and not dictating()
 	end
 
 	-- Mentions at the caret.
@@ -1049,6 +1131,11 @@ return ui.component(function(props: Props): Node
 		enabled = props.mention_enabled,
 		empty = props.mention_empty,
 		on_choose = props.on_mention,
+		key = props.draft_key,
+		sections = props.mention_sections,
+		in_view = function(): boolean
+			return (pill_w:get() or 0) > 0
+		end,
 	}
 	-- Asked to: the keys, the caret at the end.
 	if props.focus then
@@ -1072,128 +1159,62 @@ return ui.component(function(props: Props): Node
 		return (if w > 0 then w else 1000) < NARROW
 	end
 
-	-- One line or opened out. On one line the text has the pill less the
-	-- leading control and the trailing ones; opened out, it folds back only
-	-- once comfortably short again. Anything over the draft opens it out.
-	-- The controls at the right, as measured; until they are (a composer
-	-- just made, a reload's), their usual two (the microphone and Send),
-	-- so the text is laid out where it rests from the first frame rather
-	-- than easing in from the full width.
-	local function trailing_w(): number
-		local w = trailing_seen:get()
-		return if w > 0 then w else CONTROL * 2 + 8
+	-- A pure calculation owns all target geometry. The effect commits the
+	-- explicit text-hysteresis state; rendering/computeds mutate no history.
+	local previous_text_expanded = ui.use_state(read(props.expanded) == true)
+	local function layout_input(): Layout.Input
+		local _ = ui.theme.current:get()
+		return {
+			width = pill_w:get(),
+			-- Retain the last complete sample while a request is stale.
+			sample = metrics.sample:get(),
+			trailing_width = trailing_seen:get(),
+			control_corner = control.nest("$zeron.composer.radius", Layout.BORDER),
+			header_height = head_h_seen:get(),
+			header_gap = head_gap(),
+			expanded = read(props.expanded) == true,
+			cargo = has_cargo(),
+			asking = asking(),
+			dictating = dictating(),
+			multiline = string.find(value:get(), "\n") ~= nil,
+		}
 	end
-	local function expanded(): boolean
-		return read(props.expanded) == true
-	end
-	local was_open = expanded()
-	local open = ui.computed(function(): boolean
-		-- Dictating, the words land in the draft over the track.
-		if expanded() or has_cargo() or asking() or dictating() then
-			return true
-		end
-		local text = value:get()
-		local width = pill_w:get()
-		local tail = trailing_w()
-		local need = line_w:get()
-		if width <= 0 then
-			return false
-		end
-		local room = width - HAIRLINES - (INSET_LINE + CONTROL + TEXT_SIDE) - (TEXT_SIDE + tail + INSET_LINE)
-		local want
-		if string.find(text, "\n") then
-			want = true
-		elseif was_open then
-			want = need > room - HYSTERESIS
-		else
-			want = need > room
-		end
-		was_open = want
-		return want
-	end)
-
-	-- What is over the draft: nothing, or its measured height.
-	local head_h = ui.computed(function(): number
-		if not has_cargo() and not asking() then
-			return 0
-		end
-		return head_h_seen:get()
-	end)
-	-- The text box opened out: the wrapped text with its insets, between
-	-- the floor and the cap.
-	local box = ui.computed(function(): number
-		local h = math.max(wrapped_h:get(), LINE)
-		return math.clamp(h + TEXT_TOP + TEXT_BOTTOM, TEXT_MIN, TEXT_MAX)
-	end)
-	local HEAD_GAP = head_gap()
-	local height = ui.computed(function(): number
-		if open:get() then
-			local head = head_h:get()
-			-- With something over it, the draft's box starts under that
-			-- with the strip's own gap rather than the pill's top.
-			return head + (if head > 0 then box:get() - TEXT_TOP + HEAD_GAP else box:get()) + actions() + HAIRLINES
-		end
-		return ONE_LINE + HAIRLINES
-	end)
-	-- Where the text sits: beside the controls on one line, over them
-	-- opened out, under whatever is over it.
-	local text_left = ui.computed(function(): number
-		return if open:get() then TEXT_OPEN_SIDE else INSET_LINE + CONTROL + TEXT_SIDE
-	end)
-	local text_right = ui.computed(function(): number
-		return if open:get() then TEXT_OPEN_SIDE else TEXT_SIDE + trailing_w() + INSET_LINE
-	end)
-	local text_top = ui.computed(function(): number
-		if not open:get() then
-			return (ONE_LINE - LINE) / 2
-		end
-		local head = head_h:get()
-		return if head > 0 then head + HEAD_GAP else TEXT_TOP
-	end)
-	local text_h = ui.computed(function(): number
-		return if open:get() then box:get() - TEXT_TOP - TEXT_BOTTOM else LINE
-	end)
-	local EASE: TweenOptions = { duration = 220, ease = "out(3)" }
-	-- Each of the pill's measures as it shows: eased (EASE) as it grows or
-	-- shrinks in place; at once for a moment after `snap` moves (what
-	-- settles its size, measured, lands over a frame or two), and with
-	-- motion reduced.
-	local SNAP_MS = 400
-	local snap_seen = if props.snap then props.snap:peek() else nil
-	local snap_until = 0
-	local function at_once(): boolean
-		if props.snap then
-			local n = props.snap:get()
-			if n ~= snap_seen then
-				snap_seen = n
-				snap_until = ui.now() + SNAP_MS
+	local target_geometry = ui.use_state(Layout.calculate(layout_input(), previous_text_expanded:peek()))
+	ui.effect(function()
+		local next = Layout.calculate(layout_input(), previous_text_expanded:peek())
+		ui.batch(function()
+			previous_text_expanded:set(next.next_text_expanded)
+			-- Only a target laid out differently: a pane resized changes the
+			-- widths layout applies itself, and a new target at each of its
+			-- frames woke the motion, its frame and every binding of it.
+			if not Layout.same_target(target_geometry:peek(), next) then
+				target_geometry:set(next)
 			end
-		end
-		return motion.reduced_now() or ui.now() < snap_until
-	end
-	local function eased(src: ReadOnlyState<number>): State<number>
-		local value = ui.use_state(src:peek())
-		local run: any = nil
-		ui.effect(function()
-			local v = src:get()
-			local now = at_once()
-			if run then
-				run:cancel()
-				run = nil
-			end
-			if now or math.abs(value:peek() - v) < 0.01 then
-				value:set(v)
-				return
-			end
-			run = anime.animate(value, { value = v, duration = EASE.duration, ease = EASE.ease })
 		end)
-		return value
-	end
-	-- (One on a line, another opened out.)
-	local function by_open(line: number, opened: number): State<number>
-		return eased(ui.computed(function(): number
-			return if open:get() then opened else line
-		end))
+	end)
+	local settlement = ui.computed(function()
+		local metrics_now = metrics.result:get()
+		local actual = pill.height
+		return { revision = metrics_now.revision,
+			status = if metrics_now.status == "ready" and actual ~= nil
+				and math.abs(actual - target_geometry:get().height) < 0.5 then "ready" else "pending" }
+	end)
+	local transition = ComposerMotion.use(target_geometry, props.snap, settlement)
+	local frame_geometry = transition.frame
+	-- Width is applied by layout, not a view binding. Project the presented
+	-- snapshot once so width/measurement metadata alone cannot wake every
+	-- height, inset and control binding in each split composer.
+	local view_geometry = ui.computed(function(): ViewGeometry
+		local g = frame_geometry:get()
+		return { height = g.height, header_height = g.header_height,
+			text = { left = g.text.left, right = g.text.right, top = g.text.top, height = g.text.height },
+			controls = g.controls, tray_inset = g.tray_inset }
+	end)
+	-- Every binding reads the same frame snapshot; none starts an animation.
+	local function presented(select: (ViewGeometry) -> number): () -> number
+		return function(): number
+			return select(view_geometry:get())
+		end
 	end
 
 	-- +, as a secondary button: a fill of its own, so it reads as a control
@@ -1228,24 +1249,12 @@ return ui.component(function(props: Props): Node
 		local on = if type(below) == "function" then below() else below == true
 		return if on then "bottom" else "top"
 	end
-	local model = ui.presence(side, function(at: string): Node
-		return ModelPicker {
-			model = props.model,
-			effort = props.effort,
-			fast = props.fast,
-			options = props.options,
-			harnesses = props.harnesses :: any,
-			models = props.models :: any,
-			placement = { side = at, align = "end", offset = 6 },
-			open_with = props.open_model,
-			showing = props.model_open,
-		}
-	end)
 	-- The footer folds a step at a time as it runs short of room, the
-	-- fullest that fits: 0, all of it; 1, the access mode without "Plan";
-	-- 2, the access mode's icon alone; 3, where it works as its icon too.
-	-- Until 3 where it works keeps the project's name and BRANCH_KEEP of the
-	-- branch's (`where_min`, fading past it).
+	-- fullest that fits: 0, all of it; 1, the model without its effort; 2,
+	-- the access mode without "Plan" too; 3, the access mode's icon alone; 4,
+	-- where it works as its icon too; 5, the model's icon alone. Until 4 where
+	-- it works keeps the project's name and BRANCH_KEEP of the branch's
+	-- (`where_min`, fading past it).
 	--
 	-- Its measures: the footer's width, the right group's, and each chip's.
 	-- A chip's width at each of its folds is kept from when it was last at
@@ -1258,16 +1267,22 @@ return ui.component(function(props: Props): Node
 	-- name (to its most) and some of the branch (none without a project).
 	-- Folded to the access mode's icon (2), it may go further: the branch
 	-- to its sliver, the name to its least.
+	-- What a footer's fold makes of the chips on the left, and of the model.
+	local function left_fold(lv: number): number
+		return math.clamp(lv - 1, 0, 3)
+	end
+	local function model_fold(lv: number): number
+		return if lv == 0 then 0 elseif lv >= 5 then 2 else 1
+	end
 	local function where_min(lv: number): number
-		local n = name_w:get()
-		if n <= 0 then
+		if not place_known:get() then
 			return BRANCH_MIN
 		end
-		local named = props.project == nil or props.project:get() ~= NO_PROJECT
+		local n, b, d = name_w:get(), branch_w:get(), device_w:get()
 		if lv >= 2 then
-			return PLACE_CHROME + math.min(n, PROJECT_MIN) + (if named then BRANCH_FLOOR else 0)
+			return PLACE_CHROME + math.min(n, PROJECT_MIN) + math.min(b, BRANCH_FLOOR) + math.min(d, DEVICE_MIN + PLACE_CHEVRON)
 		end
-		return PLACE_CHROME + math.min(n, PROJECT_MAX) + (if named then BRANCH_KEEP else 0)
+		return PLACE_CHROME + math.min(n, PROJECT_MAX) + math.min(b, BRANCH_KEEP) + math.min(d, DEVICE_KEEP + PLACE_CHEVRON)
 	end
 	local was = folded:peek()
 	local access_at: { [number]: number } = {}
@@ -1275,6 +1290,12 @@ return ui.component(function(props: Props): Node
 		access_at[tonumber(k) :: number] = v
 	end
 	local where_icon: number? = was.where_icon
+	local model_at: { [number]: number } = {}
+	for k, v in was.model_at or {} do
+		model_at[tonumber(k) :: number] = v
+	end
+	-- (What the model's chip says: another pick, its other folds measure again.)
+	local model_says: string? = nil
 	local level = was.level
 	-- Bumped a frame after trying a fold not yet measured: its chip may lay
 	-- out no wider or narrower (the access mode without "Plan" when plan
@@ -1285,9 +1306,9 @@ return ui.component(function(props: Props): Node
 	local retry = false
 	local fold = ui.computed(function(): number
 		tried:get()
-		local f, r = footer_w:get(), right_w:get()
+		local f, r, m = footer_w:get(), right_w:get(), model_w:get()
 		-- (Not laid out yet: as it was.)
-		if f <= 0 or r <= 0 then
+		if f <= 0 or r <= 0 or m <= 0 then
 			return level
 		end
 		local a = if props.access then access_w:get() else 0
@@ -1295,27 +1316,38 @@ return ui.component(function(props: Props): Node
 		if (props.access and a <= 0) or (props.branch and w <= 0) then
 			return level
 		end
-		access_at[math.min(level, 2)] = a
-		if level >= 3 then
-			where_icon = w
+		local says = `{props.model:get()}/{props.effort:get()}`
+		if says ~= model_says then
+			if model_says ~= nil then
+				table.clear(model_at)
+			end
+			model_says = says
 		end
-		-- The room for the chips that fold (the left group): the footer less
-		-- its sides, the right group, and the gaps.
+		access_at[math.min(left_fold(level), 2)] = a
+		-- (Its widest: with no room at all it's squeezed under the icon's width.)
+		if left_fold(level) >= 3 then
+			where_icon = math.max(where_icon or 0, w)
+		end
+		model_at[model_fold(level)] = m
+		-- The footer's room: less its sides, what's on the right but the model,
+		-- and the gaps.
 		local chips = (if props.branch then 1 else 0) + (if props.access then 1 else 0)
-		local room = f - FOOTER_SIDES - FOOTER_GAP * math.max(chips, 1) - r
+		local room = f - FOOTER_SIDES - FOOTER_GAP * math.max(chips, 1) - (r - m)
 		-- What fold `lv` takes; nil, not yet measured.
 		local function needs(lv: number): number?
-			local access_w = access_at[math.min(lv, 2)]
-			local where_w = if not props.branch then 0 elseif lv >= 3 then where_icon else where_min(lv)
-			if access_w == nil or where_w == nil then
+			local left = left_fold(lv)
+			local access_w = access_at[math.min(left, 2)]
+			local where_w = if not props.branch then 0 elseif left >= 3 then where_icon else where_min(left)
+			local chip_w = model_at[model_fold(lv)]
+			if access_w == nil or where_w == nil or chip_w == nil then
 				return nil
 			end
-			return access_w + where_w
+			return access_w + where_w + chip_w
 		end
 		-- Unfolding needs a little more than folding took, so a width at
 		-- the edge cannot flicker.
-		local next = 3
-		for lv = 0, 2 do
+		local next = 5
+		for lv = 0, 4 do
 			local need = needs(lv)
 			if need == nil or need + (if lv < level then 8 else 0) <= room then
 				next = lv
@@ -1340,7 +1372,35 @@ return ui.component(function(props: Props): Node
 		for k, v in access_at do
 			at[tostring(k)] = v
 		end
-		folded:set { level = now, access_at = at, where_icon = where_icon }
+		local chip_at: { [string]: number } = {}
+		for k, v in model_at do
+			chip_at[tostring(k)] = v
+		end
+		folded:set { level = now, access_at = at, where_icon = where_icon, model_at = chip_at }
+	end)
+
+	local model = ui.presence(side, function(at: string): Node
+		return ModelPicker {
+			model = props.model,
+			effort = props.effort,
+			fast = props.fast,
+			options = props.options,
+			harnesses = props.harnesses :: any,
+			models = props.models :: any,
+			loading = props.models_loading,
+			model_label = props.model_label,
+			default_model = props.default_model,
+			accounts = props.accounts,
+			account_group = props.account_group,
+			on_account = props.on_account,
+			on_accounts_open = props.on_accounts_open,
+			placement = { side = at, align = "end", offset = 6 },
+			open_with = props.open_model,
+			showing = props.model_open,
+			fold = function(): number
+				return model_fold(fold:get())
+			end,
+		}
 	end)
 
 	-- The access mode: its icon and name; with plan mode on, "Plan" after it
@@ -1350,7 +1410,7 @@ return ui.component(function(props: Props): Node
 		local plan = props.plan
 		access = Dropdown {
 			fold = function()
-				return math.min(fold:get(), 2)
+				return math.min(left_fold(fold:get()), 2)
 			end,
 			accent = if plan
 				then function()
@@ -1398,8 +1458,9 @@ return ui.component(function(props: Props): Node
 			return locale.s(if running and running:get() then "ds.composer.queue_message" else "ds.composer.send_message")
 		end,
 		disabled = function()
-			return disabled() or not (has_text() or has_cargo())
+			return disabled() or not (has_text() or has_cargo() or dictating())
 		end,
+		on_press = if spoken then spoken.on_send_press else nil,
 		on_click = send,
 		Icon { name = "arrow-up", size = 14 },
 	}
@@ -1520,16 +1581,16 @@ return ui.component(function(props: Props): Node
 		return ui.div {
 			absolute = true,
 			-- (Insets take points: the control, the sides, and a breath.)
-			left = by_open(INSET_LINE + CONTROL + 8, INSET_OPEN + CONTROL + 8),
-			right = by_open(INSET_LINE + CONTROL * 2 + 8 + 8, INSET_OPEN + CONTROL * 2 + 8 + 8),
-			bottom = by_open(INSET_LINE, INSET_OPEN),
+			left = presented(function(g) return g.controls.voice.left end),
+			right = presented(function(g) return g.controls.voice.right end),
+			bottom = presented(function(g) return g.controls.voice.bottom end),
 			h = "$zeron.composer.voice.h",
 			ref = track_w,
 			overflow = "hidden",
 			rounded = "$radius.full",
 			pointer_events = "none",
 			ui.presence(function(): string?
-				return if dictating() then "on" else nil
+				return if dictating() then `on:{ui.theme.current:get()}` else nil
 			end, function(_k: string): Node
 				return ui.row {
 					absolute = true,
@@ -1553,19 +1614,17 @@ return ui.component(function(props: Props): Node
 						bg = "$zeron.composer.voice.ink",
 						opacity = ui.loop { from = 0.35, to = 1, duration = 900, fps = 30 },
 					},
-					ui.text {
-						locale.t("ds.composer.listening"),
-						shrink = 0,
-						text_size = "$font.size.sm",
-						weight = "$font.weight.medium",
-						color = "$text.primary",
-					},
-					ui.div {
+					if spoken and spoken.levels and spoken.phase then VoiceWave { levels = spoken.levels, phase = spoken.phase } else ui.div {
 						grow = 1,
 						h = 16,
 						min_w = 24,
 						bg_shader = VOICE,
-						shader_params = { "$zeron.composer.voice.ink", { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } },
+						-- (The engine steps its time: without it, it holds its first frame.)
+						shader_clock = true,
+						-- (Its ink as a colour, not a token: a clocked shader's parameters
+						-- drop theme tokens, zgx 4809bcce. Its presence's key holds the
+						-- theme, so the bar is made again as that changes.)
+						shader_params = { ui.theme.get("zeron.composer.voice.ink"), { 0, 0, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } },
 					},
 					ui.text {
 						clock,
@@ -1682,35 +1741,51 @@ return ui.component(function(props: Props): Node
 		return if type(own) == "string" then own else own:get()
 	end
 
+	-- A press on the composer's blank room (the pill's padding, its controls'
+	-- rows between them, under the draft): the draft takes the keys, its
+	-- caret at its end.
+	local function to_draft()
+		local el = field:peek()
+		if el then
+			el:focus()
+			local n = #value:peek()
+			el:set_selection_bytes(n, n)
+		end
+	end
+
 	local surface = ui.div {
 		ref = pill,
 		on_resize = measure(pill_w, "w"),
 		relative = true,
 		w_full = true,
-		h = eased(height),
+		h = presented(function(g) return g.height end),
 		overflow = "hidden",
+		-- (Its glass, edge and shadow are the frame's, round it and the deck
+		-- over it: one surface. Its own corner only clips what's in it, and
+		-- its edge, clear, keeps the room the frame's takes, so everything in
+		-- it sits where it always has.)
 		rounded = "$zeron.composer.radius",
-		border = 1,
-		border_color = "$zeron.composer.edge",
-		bg = function()
-			return if material.frosted:get() then "$zeron.composer.tint" else "$zeron.composer.solid"
-		end,
-		backdrop_blur = function()
-			return if material.frosted:get() then 16 else 0
-		end,
-		shadow = function()
-			return if material.frosted:get() then "$zeron.composer.rest" else "$zeron.composer.shadow"
-		end,
-		on_file_hover = function(inside: boolean)
-			dropping:set(inside)
-		end,
-		on_file_drop = function(files: { any })
-			dropping:set(false)
-			if props.on_files then
-				props.on_files(files)
+		border = Layout.BORDER,
+		border_color = "#00000000",
+		-- (Neither `on_files` nor its overlay: files are what's around it to
+		-- take, the drop going on up to it.)
+		on_file_hover = if props.on_files or props.drop_overlay ~= false
+			then function(inside: boolean)
+				dropping:set(inside)
 			end
-		end,
-		-- A press anywhere but a control goes to the draft.
+			else nil,
+		on_file_drop = if props.on_files or props.drop_overlay ~= false
+			then function(files: { any })
+				dropping:set(false)
+				if props.on_files then
+					props.on_files(files)
+				end
+			end
+			else nil,
+		-- A press anywhere but a control goes to the draft (its caret at
+		-- its end). (Under the pill's controls and draft, which take their
+		-- own; `focus_on_press = false`, so zgx doesn't move focus off it
+		-- to what's under the press after.)
 		ui.div {
 			absolute = true,
 			left = 0,
@@ -1718,76 +1793,30 @@ return ui.component(function(props: Props): Node
 			top = 0,
 			bottom = 0,
 			cursor = "text",
-			on_press = function()
-				local el = field:peek()
-				if el then
-					el:focus()
-				end
-			end,
+			focus_on_press = false,
+			on_press = to_draft,
 		},
-		-- The measures: the draft on one line, and wrapped as it would be
-		-- opened out (a mark after it, so a last empty line counts).
-		ui.text {
-			on_resize = measure(line_w, "w"),
-			absolute = true,
-			left = 0,
-			top = 0,
-			opacity = 0,
-			pointer_events = "none",
-			text_size = "$zeron.composer.text",
-			line_height = "$zeron.composer.line",
-			function()
-				return value:get()
-			end,
+		-- Measure the natural header inside a separate presented clip. The
+		-- clip's animated height must never feed the header measurement.
+		ui.div {
+			absolute = true, left = 0, right = 0, top = 0,
+			h = presented(function(g) return g.header_height end),
+			overflow = "hidden",
+			head,
 		},
-		ui.text {
-			on_resize = measure(wrapped_h, "h"),
-			absolute = true,
-			left = TEXT_OPEN_SIDE,
-			right = TEXT_OPEN_SIDE,
-			top = 0,
-			opacity = 0,
-			pointer_events = "none",
-			wrap = true,
-			text_size = "$zeron.composer.text",
-			line_height = "$zeron.composer.line",
-			function()
-				return value:get() .. "\u{200B}"
-			end,
-		},
-		head,
 		-- The draft.
 		ui.div {
 			absolute = true,
-			left = eased(text_left),
-			right = eased(text_right),
-			top = eased(text_top),
-			h = eased(text_h),
-			-- Its placeholder, the composer's own (it changes with what is
-			-- asked): over the empty draft, taking no pointer.
-			ui.show(
-				function()
-					return value:get() == ""
-				end,
-				ui.text {
-					placeholder,
-					absolute = true,
-					left = 0,
-					top = 0,
-					right = 0,
-					truncate = true,
-					pointer_events = "none",
-					aria_hidden = true,
-					text_size = "$zeron.composer.text",
-					line_height = "$zeron.composer.line",
-					color = "$text.tertiary",
-				}
-			),
+			left = presented(function(g) return g.text.left end),
+			right = presented(function(g) return g.text.right end),
+			top = presented(function(g) return g.text.top end),
+			h = presented(function(g) return g.text.height end),
 			ui.textarea(EditorMenu.on({
 				ref = field,
 				value = value,
 				label = locale.t("ds.composer.message"),
-				placeholder = "",
+				placeholder = placeholder,
+				placeholder_color = "$text.tertiary",
 				read_only = disabled,
 				w_full = true,
 				h_full = true,
@@ -1809,7 +1838,26 @@ return ui.component(function(props: Props): Node
 				-- behind each file, command or skill mentioned.
 				highlight = mentions.highlight,
 				active_descendant = m.descendant,
-				on_caret = m.on_caret,
+				on_caret = if spoken
+					then function(line, column, anchor, focus)
+						m.on_caret(line, column, anchor, focus)
+						spoken.on_caret()
+					end
+					else m.on_caret,
+				on_change = if spoken then spoken.on_change else nil,
+				on_focus = function()
+					m.on_focus(true)
+					if spoken and spoken.on_focus then
+						spoken.on_focus()
+					end
+				end,
+				on_blur = function()
+					m.on_focus(false)
+					if spoken and spoken.on_blur then
+						spoken.on_blur()
+					end
+				end,
+				on_key_up = if spoken then spoken.on_key_up else nil,
 				on_paste = function(e)
 					-- (Files first: a copied file puts its name in `text` too.)
 					if e.files and #e.files > 0 and props.on_files then
@@ -1911,8 +1959,8 @@ return ui.component(function(props: Props): Node
 		-- The controls, on the pill's foot.
 		ui.div {
 			absolute = true,
-			left = by_open(INSET_LINE, INSET_OPEN),
-			bottom = by_open(INSET_LINE, INSET_OPEN),
+			left = presented(function(g) return g.controls.leading.left end),
+			bottom = presented(function(g) return g.controls.leading.bottom end),
 			ui.show(function()
 				return not asking()
 			end, attach),
@@ -1921,10 +1969,10 @@ return ui.component(function(props: Props): Node
 		ui.row {
 			on_resize = measure(trailing_seen, "w"),
 			absolute = true,
-			right = by_open(INSET_LINE, INSET_OPEN),
+			right = presented(function(g) return g.controls.trailing.right end),
 			-- (Its row is 32: the control centred in it.)
-			bottom = by_open(INSET_LINE - 2, INSET_OPEN - 2),
-			h = 32,
+			bottom = presented(function(g) return g.controls.trailing.bottom end),
+			h = presented(function(g) return g.controls.trailing.height end),
 			items = "center",
 			gap = "$space.2",
 			ui.show(asking, ask_controls()),
@@ -1933,7 +1981,7 @@ return ui.component(function(props: Props): Node
 			end, ui.row {
 				items = "center",
 				gap = "$space.2",
-				mic,
+				if spoken then spoken.mic() else mic,
 				ui.show(stopping, stop_button),
 				ui.show(function()
 					return not stopping()
@@ -2018,10 +2066,27 @@ return ui.component(function(props: Props): Node
 				if on_cloud(props.device, props.devices) then
 					return "cloud"
 				end
+				local chosen = chosen_project()
+				if chosen and chosen.plain then
+					return nil
+				end
 				return if checkout and checkout:get() == "local" then nil else "worktree"
 			end
 			local function folded(): boolean
-				return fold:get() >= 3
+				return left_fold(fold:get()) >= 3
+			end
+			-- The device chosen, by name, leading the chip.
+			local function chosen_device(): string?
+				if not props.device or not props.devices then
+					return nil
+				end
+				local v = props.device:get()
+				for _, d in list_of(props.devices) :: { Device } do
+					if d.value == v then
+						return d.label
+					end
+				end
+				return nil
 			end
 			local picker = Dropdown {
 				value = props.branch,
@@ -2054,12 +2119,13 @@ return ui.component(function(props: Props): Node
 						active = { bg = "$pressed", color = "$text.secondary" },
 						on_click = menu.toggle,
 						table.unpack(place_line {
+							device = chosen_device,
 							project = chosen_project,
 							in_project = in_project,
 							branch = branch_name,
 							glyph = runs_in,
 							folded = folded,
-							on_name = measure(name_w, "w"),
+							on_measures = place_measures,
 						}),
 					}
 				end,
@@ -2081,6 +2147,10 @@ return ui.component(function(props: Props): Node
 						return locale.s("ds.composer.branch.fixed", { name = if f and f.name then f.name else "" })
 					end,
 					table.unpack(place_line {
+						device = function(): string?
+							local f = fixed()
+							return if f then f.device else nil
+						end,
 						project = function(): Project?
 							local f = fixed()
 							if f and f.project then
@@ -2100,7 +2170,7 @@ return ui.component(function(props: Props): Node
 							return if f and f.worktree then "worktree" else nil
 						end,
 						folded = folded,
-						on_name = measure(name_w, "w"),
+						on_measures = place_measures,
 					}),
 				}
 				else nil
@@ -2120,6 +2190,7 @@ return ui.component(function(props: Props): Node
 		footer = ui.row {
 			id = props.toolbar_id,
 			on_resize = measure(footer_w, "w"),
+			relative = true,
 			h = 24,
 			-- On the tray: a tight step under the pill and above the tray's
 			-- foot (the pill's full control inset read too airy there), and
@@ -2132,14 +2203,28 @@ return ui.component(function(props: Props): Node
 				return if on_tray() then `${TRAY_GAP}` else 0
 			end :: any,
 			px = function(): any
-				return if on_tray() then ui.raw(TRAY_INSET, "the pill's controls' inset") else "$zeron.space.snug"
+				return if on_tray() then ui.raw(view_geometry:get().tray_inset, "the pill's controls' inset") else "$zeron.space.snug"
 			end :: any,
 			items = "center",
 			gap = "$space.1",
+			-- Its blank room, between and beside its controls: the draft's,
+			-- as the pill's is.
+			ui.div {
+				absolute = true,
+				left = 0,
+				right = 0,
+				top = 0,
+				bottom = 0,
+				focus_on_press = false,
+				on_press = to_draft,
+			},
 			-- Clipped: past every fold, it gives way under the right group
 			-- rather than running beneath it.
 			ui.row {
 				hook = "chat.composer.toolbar.start",
+				-- (Its blank room passes the press on, to the draft's;
+				-- its controls take their own.)
+				pointer_events = "none",
 				gap = "$space.1",
 				items = "center",
 				min_w = 0,
@@ -2149,10 +2234,11 @@ return ui.component(function(props: Props): Node
 			},
 			ui.row {
 				hook = "chat.composer.toolbar.end",
+				pointer_events = "none",
 				on_resize = measure(right_w, "w"),
 				items = "center",
 				shrink = 0,
-				model,
+				ui.row { on_resize = measure(model_w, "w"), items = "center", shrink = 0, model },
 				if props.usage
 					then ui.show(function(): boolean
 						local u = (props.usage :: () -> Usage?)()
@@ -2166,8 +2252,40 @@ return ui.component(function(props: Props): Node
 
 	-- The trays, behind the pill.
 	local trays: Node? = nil
-	if props.queue or props.todos or props.tasks then
-		trays = dock.Dock {
+	-- (Folded, what waits is a pill floating over the conversation.)
+	local tray_pill: Node? = nil
+	-- The notice (not connected, a send that failed, a draft restored) is
+	-- an alert of the deck's, first, in its tone; it goes only as what it
+	-- says is over, unless it says it may be let go.
+	local NOTICE = "\0notice"
+	local alerts: any = props.alerts
+	if props.notice then
+		local notice = props.notice
+		alerts = ui.computed(function(): { dock.Alert }
+			local out: { dock.Alert } = {}
+			local n = notice:get()
+			if n then
+				local tone: dock.AlertTone = if n.tone == "danger" then "danger" elseif n.tone == "warning" then "warning" else "info"
+				table.insert(out, {
+					id = NOTICE,
+					tone = tone,
+					title = n.text,
+					action = n.action,
+					spinner = n.spinner,
+					dismissable = n.dismissable == true,
+					quiet = n.quiet == true,
+				})
+			end
+			if props.alerts then
+				for _, x in props.alerts:get() do
+					table.insert(out, x)
+				end
+			end
+			return out
+		end)
+	end
+	if props.queue or props.todos or props.tasks or alerts then
+		trays, tray_pill = dock.parts {
 			queue = props.queue,
 			can_steer = props.can_steer,
 			on_queue_send = props.on_queue_send,
@@ -2184,13 +2302,36 @@ return ui.component(function(props: Props): Node
 			tasks = props.tasks,
 			on_stop_task = props.on_stop_task,
 			on_stop_all = props.on_stop_all,
+			on_open_task = props.on_open_task,
 			open = props.tray,
 			narrow = narrow,
+			aside = props.aside,
+			alerts = alerts,
+			on_alert_action = function(id: string)
+				if id == NOTICE then
+					if props.on_notice_action then
+						props.on_notice_action()
+					end
+				elseif props.on_alert_action then
+					props.on_alert_action(id)
+				end
+			end,
+			on_dismiss_alert = function(id: string)
+				if id == NOTICE then
+					if props.on_dismiss_notice then
+						props.on_dismiss_notice()
+					end
+				elseif props.on_dismiss_alert then
+					props.on_dismiss_alert(id)
+				end
+			end,
+			on_pill_width = props.on_pill_width,
 		}
 	end
 
 	-- The pill (the mentions' popover anchored on it: its panel opens at
 	-- the caret inside), its trays behind, the footer under.
+	local footer_size, deck_size, outer_size = ui.ref(), ui.ref(), ui.ref()
 	local body = ui.column {
 		w_full = true,
 		relative = true,
@@ -2201,7 +2342,7 @@ return ui.component(function(props: Props): Node
 		-- footer, tucked behind the pill (its top hidden under it, its sides
 		-- the pill's), so the chips sit on the composer's surface rather than
 		-- on the art. They sit as far in from its sides as the pill's own
-		-- controls sit in it (TRAY_INSET), a tight step (TRAY_GAP) below the
+		-- controls sit in it, a tight step (TRAY_GAP) below the
 		-- pill and above its foot; its height is theirs (tray_h), its corner
 		-- the trays'.
 		ui.presence(function(): string?
@@ -2223,10 +2364,10 @@ return ui.component(function(props: Props): Node
 				rounded_tl = 0,
 				rounded_tr = 0,
 				bg = function(): string
-					return if material.frosted:get() then "$zeron.composer.tint" else "$zeron.composer.solid"
+					return if material.see_through() then "$zeron.composer.tint" else "$zeron.composer.solid"
 				end,
 				backdrop_blur = function(): number
-					return if material.frosted:get() then 16 else 0
+					return if material.see_through() then 16 else 0
 				end,
 			}
 		end, {
@@ -2239,15 +2380,102 @@ return ui.component(function(props: Props): Node
 			enter = { opacity = { 0, 1 }, duration = 220, ease = "out(3)" },
 			exit = { opacity = 0, duration = 160 },
 		}),
-		trays,
-		ui.popover(m.popover(surface)),
-		footer,
+		-- The frame: the pill's glass, edge and shadow, round the deck (what
+		-- waits on the agent, the composer's own top) and the pill, so the two
+		-- read as one surface growing upward.
+		ui.column {
+			w_full = true,
+			shrink = 0,
+			relative = true,
+			-- (The glass is a layer behind what's in it, not this column's own:
+			-- a backdrop blur on the column took in its children too, blurring
+			-- the draft and its controls.)
+			ui.div {
+				absolute = true,
+				left = 0,
+				right = 0,
+				top = 0,
+				bottom = 0,
+				pointer_events = "none",
+				rounded = "$zeron.composer.radius",
+				border = 1,
+				border_color = "$zeron.composer.edge",
+				bg = function()
+					return if material.see_through() then "$zeron.composer.tint" else "$zeron.composer.solid"
+				end,
+				backdrop_blur = function()
+					return if material.see_through() then 16 else 0
+				end,
+				shadow = function()
+					return if material.see_through() then "$zeron.composer.rest" else "$zeron.composer.shadow"
+				end,
+			},
+			ui.column { ref = deck_size, w_full = true, shrink = 0, trays },
+			ui.popover(m.popover(surface)),
+		},
+		ui.column { ref = footer_size, w_full = true, shrink = 0, footer },
+		-- Folded, what waits on the agent: a pill floating just over the
+		-- composer's middle, out of the layout (the conversation shows under
+		-- it, as under "Scroll to end", which it moves aside for).
+		if tray_pill
+			then ui.row {
+				absolute = true,
+				left = 0,
+				right = 0,
+				justify = "center",
+				top = ui.raw(-(dock.PILL_H + dock.PILL_GAP), "the pill's height and its gap over the composer"),
+				h = dock.PILL_H,
+				pointer_events = "none",
+				tray_pill,
+			}
+			else nil,
 	}
 
+	if props.on_sizes then
+		local on_sizes = props.on_sizes
+		-- Each its own computed, so what changes and leaves it the same (the
+		-- pill's width, a keystroke, a new metrics revision) wakes nothing.
+		local rest = ui.computed(function(): number
+			local _ = ui.theme.current:get()
+			return Layout.calculate({
+				-- (Its height is the same at any width: it is never measured.)
+				width = pill_w:peek(), sample = nil, trailing_width = trailing_seen:get(),
+				control_corner = control.nest("$zeron.composer.radius", Layout.BORDER),
+				header_height = 0, header_gap = 0, expanded = read(props.expanded) == true,
+				cargo = false, asking = false, dictating = false, multiline = false,
+			}, false).height
+		end)
+		local ready = ui.computed(function(): boolean
+			return settlement:get().status == "ready"
+		end)
+		local target_h = ui.computed(function(): number
+			return target_geometry:get().height
+		end)
+		local last: Sizes? = nil
+		ui.effect(function()
+			local footer_h, deck_h, actual = footer_size.height, deck_size.height, outer_size.height
+			local context = if props.snap then props.snap:get() else 0
+			if footer_h == nil or deck_h == nil or not actual or actual <= 0 then
+				return
+			end
+			local sizes: Sizes = { rest = rest:get() + footer_h + deck_h, target = target_h:get() + footer_h + deck_h,
+				presented = actual, active = transition.active:get(), ready = ready:get(),
+				settling = transition.settling:get(), context = context }
+			local was = last
+			if was and was.rest == sizes.rest and was.target == sizes.target and was.presented == sizes.presented
+				and was.active == sizes.active and was.ready == sizes.ready and was.settling == sizes.settling
+				and was.context == sizes.context then
+				return
+			end
+			last = sizes
+			on_sizes(sizes)
+		end)
+	end
+
 	return ui.column {
+		ref = outer_size,
 		w_full = true,
 		gap = 0,
-		if props.notice then notice_line(props.notice, props.on_notice_action, props.on_dismiss_notice) else nil,
 		body,
 	}
 end)

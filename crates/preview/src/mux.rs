@@ -196,6 +196,10 @@ impl Mux {
     pub fn is_closed(&self) -> bool {
         self.0.stop.is_cancelled()
     }
+    /// Streams open on this connection right now.
+    pub fn stream_count(&self) -> usize {
+        self.0.slots.lock().unwrap().len()
+    }
     async fn send(&self, frame: Frame) -> anyhow::Result<()> {
         tokio::select! { _ = self.0.stop.cancelled() => anyhow::bail!("preview connection closed"), result = self.0.outgoing.send(frame) => { result?; Ok(()) } }
     }
@@ -365,7 +369,7 @@ impl Mux {
                         !frame.data.is_empty()
                             && slot
                                 .receive_credit
-                                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n
+                                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n
                                     .checked_sub(frame.data.len()))
                                 .is_ok(),
                         "preview receive window exceeded"

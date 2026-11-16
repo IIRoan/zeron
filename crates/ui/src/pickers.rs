@@ -200,11 +200,10 @@ pub fn resolve_access(wanted: AccessMode, offered: &[AccessMode]) -> AccessMode 
 // Pure: default resolution (no "Default" placeholders — a concrete pick always)
 // ---------------------------------------------------------------------------
 
-/// The harness's default model: the first catalog row (both curated catalogs
-/// lead with the flagship — zeron's `pickDefaultModel` Opus preference maps to
-/// the same row here).
+/// The harness's default model: the row its catalog marks `default` (Claude
+/// lists best-first and marks the CLI's own default), else the first row.
 pub fn default_model(models: &[Model]) -> Option<&Model> {
-    models.first()
+    models.iter().find(|m| m.default).or_else(|| models.first())
 }
 
 /// An explicit selection never silently becomes a different model after refresh.
@@ -1245,6 +1244,7 @@ impl Pickers {
         // restart (stale rows stay visible while the reload runs).
         let catalog_observe = cx.observe_global::<HarnessCatalogChanged>(|this: &mut Self, cx| {
             this.ensure_harnesses(true, cx);
+            this.prefetch_models(true, cx);
             cx.notify();
         });
         // Dev/testing knob: `ZERON_OPEN_PICKER=model|traits|repo|branch|access` boots
@@ -2876,8 +2876,10 @@ impl Pickers {
                         selected_only: true,
                         ambiguous: false,
                         model: Model {
+                            default: false,
                             id: id.into(),
                             label,
+                            provider: None,
                             description: Some(
                                 "Selected in this chat; absent from the current model list".into(),
                             ),
@@ -4596,17 +4598,15 @@ impl Pickers {
         // right after send mints it) still renders the DRAFT footer — the
         // values are identical, so the toolbar never blinks through a
         // half-empty locked state.
-        let (space, session, change_request) = {
+        let (space, session) = {
             let state = self.state.read(cx);
             let space = state.selected_space_row().cloned();
             let session = state
                 .selected_chat
                 .as_ref()
                 .and_then(|_| state.selected_chat_row().cloned());
-            let change_request = session
-                .as_ref()
-                .and_then(|chat| state.change_request_for_chat(chat).cloned());
-            (space, session, change_request)
+
+            (space, session)
         };
         let row = || {
             // The composer owns the row's animated reveal and negative bottom
@@ -4662,25 +4662,13 @@ impl Pickers {
                         .unwrap_or_else(|| SharedString::from("No ref")),
                     &theme,
                 ));
-            // Checkout + branch stay together. PR and usage form the trailing
-            // status group, independently of the branch label's length.
+            // Keep checkout and branch together.
             return Some(
                 row()
                     .pr_0()
                     .child(left)
                     .child(right)
                     .child(div().flex_1().min_w_0())
-                    .when_some(change_request, |el, summary| {
-                        el.child(div().flex_none().child(
-                            crate::change_requests::pull_request_badge(
-                                "composer-pull-request".into(),
-                                summary,
-                                crate::change_requests::ChangeRequestBadgeSurface::Composer,
-                                Some(chat.device_id.clone()),
-                                &theme,
-                            ),
-                        ))
-                    })
                     .into_any_element(),
             );
         }
@@ -7919,6 +7907,7 @@ mod tests {
             background_tasks: Vec::new(),
             last_turn_outcome: None,
             terminal_activity: None,
+            waiting: None,
         }
     }
 
@@ -8615,6 +8604,7 @@ mod tests {
                     private: true,
                     description: None,
                     pushed_at: 0,
+                    ..Default::default()
                 }]);
                 state
             });
@@ -9296,8 +9286,10 @@ mod tests {
 
     fn bare_model(id: &str, label: &str) -> Model {
         Model {
+            default: false,
             id: id.into(),
             label: label.into(),
+            provider: None,
             description: None,
             reasoning_levels: Vec::new(),
             options: Vec::new(),
@@ -11071,18 +11063,36 @@ mod tests {
                 bare_model("default", "Default (recommended)"),
                 bare_model("opus[1m]", "Opus (1M context)"),
                 bare_model("claude-fable-5[1m]", "Fable"),
+                bare_model("fable", "Fable"),
                 bare_model("sonnet", "Sonnet"),
                 bare_model("haiku", "Haiku"),
                 bare_model("claude-nova-1", "Nova 1"),
             ],
         );
+        // A bare alias takes its family's newest curated row (the catalog is
+        // best-first): fable is Fable 5.2, sonnet Sonnet 5.5, haiku Haiku 5.5,
+        // as the CLI resolves them. An exact id keeps its own version.
         assert_eq!(
             models.iter().map(|m| m.label.as_str()).collect::<Vec<_>>(),
-            vec!["Opus 5.5", "Fable 5", "Sonnet 5", "Haiku 4.5", "Nova 1"]
+            vec![
+                "Opus 5.5",
+                "Fable 5",
+                "Fable 5.2",
+                "Sonnet 5.5",
+                "Haiku 5.5",
+                "Nova 1"
+            ]
         );
         assert_eq!(
             models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
-            vec!["opus", "claude-fable-5", "sonnet", "haiku", "claude-nova-1"]
+            vec![
+                "opus",
+                "claude-fable-5",
+                "fable",
+                "sonnet",
+                "haiku",
+                "claude-nova-1"
+            ]
         );
     }
 
@@ -11471,15 +11481,19 @@ mod tests {
     fn default_model_is_first_catalog_row() {
         let models = vec![
             Model {
+                default: false,
                 id: "flagship".into(),
                 label: "Flagship".into(),
+                provider: None,
                 description: None,
                 reasoning_levels: vec![],
                 options: vec![],
             },
             Model {
+                default: false,
                 id: "fast".into(),
                 label: "Fast".into(),
+                provider: None,
                 description: None,
                 reasoning_levels: vec![],
                 options: vec![],
@@ -11487,6 +11501,9 @@ mod tests {
         ];
         assert_eq!(default_model(&models).map(|m| &*m.id), Some("flagship"));
         assert!(default_model(&[]).is_none());
+        let mut marked = models.clone();
+        marked[1].default = true;
+        assert_eq!(default_model(&marked).map(|m| &*m.id), Some("fast"));
     }
 
     #[test]

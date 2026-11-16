@@ -375,6 +375,8 @@ async fn snapshot_git(
     cmd.arg("-C").arg(root).args(args);
     cmd.env("GIT_INDEX_FILE", index);
     store.apply_to(&mut cmd);
+    // Last: a sandboxed checkout's git is jailed with this index and store.
+    crate::sandbox::pin_git(&mut cmd, root);
     cmd.stdin(if stdin.is_some() {
         std::process::Stdio::piped()
     } else {
@@ -384,6 +386,8 @@ async fn snapshot_git(
     cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
     let mut child = cmd.spawn()?;
+    // A timed-out snapshot drops this future; take the real git down with it.
+    let _tree = crate::git_tree::GitTree::adopt(&child);
     if let Some(input) = stdin
         && let Some(mut pipe) = child.stdin.take()
     {

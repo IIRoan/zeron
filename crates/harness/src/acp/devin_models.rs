@@ -462,6 +462,7 @@ fn parse_catalog(bytes: &[u8]) -> Result<(Vec<Model>, Vec<Group>), HarnessError>
                 Vec::new()
             };
             models.push(Model {
+                default: false,
                 id: members
                     .iter()
                     .find(|m| !m.fast)
@@ -469,6 +470,7 @@ fn parse_catalog(bytes: &[u8]) -> Result<(Vec<Model>, Vec<Group>), HarnessError>
                     .id
                     .clone(),
                 label,
+                provider: None,
                 description,
                 reasoning_levels,
                 options,
@@ -492,8 +494,10 @@ fn parse_catalog(bytes: &[u8]) -> Result<(Vec<Model>, Vec<Group>), HarnessError>
             options.push(speed_option("Fast Mode"));
         }
         let fusion = Model {
+            default: false,
             id: FUSION.into(),
             label: fusion_label.unwrap_or_else(|| "Fusion".into()),
+            provider: None,
             description: fusion_description,
             reasoning_levels: fusion_levels,
             options,

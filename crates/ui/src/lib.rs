@@ -12,6 +12,7 @@
 //! - [`shell`] — sidebar + main panel + right-pane scaffold + gate;
 //! - [`loaders`] — zeron pulse loader, gradient spinner, boot splash.
 
+mod account_avatar;
 mod account_usage;
 pub mod app_menus;
 pub mod app_update;
@@ -22,7 +23,6 @@ mod asset_http;
 pub mod attachments;
 pub mod badges;
 pub mod browser;
-pub mod change_requests;
 pub mod changes;
 pub mod cloud;
 mod comment_ui;
@@ -39,7 +39,7 @@ pub mod files;
 pub mod frost;
 mod glass;
 mod haptics;
-pub mod history;
+pub use plugins::git::history;
 pub mod icons;
 pub(crate) mod image_media;
 pub(crate) mod image_viewer;
@@ -59,12 +59,6 @@ pub mod overscroll;
 pub mod pickers;
 pub mod popover;
 pub mod project_actions;
-pub mod pull_request_detail;
-mod pull_request_media;
-mod pull_request_skeleton;
-#[cfg(test)]
-mod pull_request_test_support;
-pub mod pull_requests;
 pub mod queue;
 pub mod rail;
 pub(crate) mod reply_images;
@@ -74,7 +68,8 @@ pub mod settings;
 pub mod shell;
 pub mod smooth_scroll;
 pub mod sound;
-pub mod source_control;
+pub mod plugins;
+pub use plugins::git::source_control;
 pub mod state;
 mod subagents;
 pub(crate) mod surface_chrome;

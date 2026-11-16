@@ -29,13 +29,28 @@ async fn initialize_is_shared_and_curated_metadata_survives_the_live_union() {
     let catalog = catalog.unwrap();
     assert_eq!(catalog.source, "live");
     assert_eq!(commands.unwrap()[0].name, "review");
-    assert_eq!(catalog.models[0].id, "claude-opus-5-5[1m]");
-    assert_eq!(catalog.models[1].id, "claude-opus-5-5");
+    // The fake CLI is 2.1.228: too old for Fable 5.2, Sonnet 5.5 and Haiku
+    // 5.5, which it doesn't report, so their curated rows are dropped. It
+    // reports Fable 5.1 and Opus 5.5 (newer than it, too), which stay.
+    // Best-first, the CLI's default marked rather than moved: its `[1m]`
+    // row folds into the listed base in pickers, so the base carries it.
+    assert_eq!(catalog.models[0].id, "claude-fable-5-1");
+    for gone in ["claude-fable-5-2", "claude-sonnet-5-5", "claude-haiku-5-5"] {
+        assert!(catalog.models.iter().all(|m| m.id != gone), "{gone}");
+    }
+    let defaults: Vec<_> = catalog
+        .models
+        .iter()
+        .filter(|m| m.default)
+        .map(|m| m.id.as_str())
+        .collect();
+    assert_eq!(defaults, ["claude-opus-5-5"]);
+    let at = |id: &str| catalog.models.iter().position(|m| m.id == id).unwrap();
+    assert_eq!(at("claude-opus-5-5") + 1, at("claude-opus-5-5[1m]"));
     for curated in zeron_harness::claude::catalog::static_models() {
-        assert_eq!(
-            catalog.models.iter().find(|m| m.id == curated.id),
-            Some(&curated)
-        );
+        if let Some(row) = catalog.models.iter().find(|m| m.id == curated.id) {
+            assert_eq!(row, &curated);
+        }
     }
     let new = catalog
         .models
@@ -67,10 +82,66 @@ async fn initialize_is_shared_and_curated_metadata_survives_the_live_union() {
         );
     }
     harness.commands().await.unwrap();
-    harness.model_catalog(true).await.unwrap();
+    harness.model_catalog(false).await.unwrap();
     assert_eq!(
         std::fs::read_to_string(dir.path().join("calls")).unwrap(),
         "initialize\n"
+    );
+}
+
+#[tokio::test]
+async fn forced_refresh_discovers_new_models_and_options_without_cli_or_login_changes() {
+    let response = |id: &str| {
+        json!({"subtype":"success","response":{"models":[{
+            "value":"default", "resolvedModel":id, "displayName":"Nova 7",
+            "supportsEffort":true, "supportedEffortLevels":["low","xhigh","max"],
+            "supportsFastMode":true, "supportsThinkingOff":true
+        }]}})
+    };
+    let (dir, harness) = fixture(response("claude-nova-7"));
+    let first = harness.model_catalog(false).await.unwrap();
+    let nova = first
+        .models
+        .iter()
+        .find(|model| model.id == "claude-nova-7")
+        .unwrap();
+    assert!(nova.default);
+    assert!(nova.options.iter().any(|option| option.id == "fastMode"));
+    assert!(nova.options.iter().any(|option| option.id == "thinking"));
+    assert!(nova.reasoning_levels.contains(&ReasoningLevel::XHigh));
+
+    // The initialize cache is still fresh and the binary and credentials are
+    // unchanged. A normal read stays cached, but picker-open refresh must probe.
+    std::fs::write(
+        dir.path().join("response.json"),
+        response("claude-nova-7-1").to_string(),
+    )
+    .unwrap();
+    assert!(
+        harness
+            .model_catalog(false)
+            .await
+            .unwrap()
+            .models
+            .iter()
+            .any(|model| model.id == "claude-nova-7")
+    );
+    let refreshed = harness.model_catalog(true).await.unwrap();
+    assert!(
+        refreshed
+            .models
+            .iter()
+            .any(|model| model.id == "claude-nova-7-1" && model.default)
+    );
+    assert!(
+        refreshed
+            .models
+            .iter()
+            .all(|model| model.id != "claude-nova-7")
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("calls")).unwrap(),
+        "initialize\ninitialize\n"
     );
 }
 

@@ -230,7 +230,8 @@ fn main() -> anyhow::Result<()> {
     let result = failure.clone();
     gpui_platform::application().with_assets(icons::Assets).run(move |cx| {
         gpui_tokio::init(cx); gpui_base::init(cx);
-        let settings = settings::UiSettings::default();
+        let mut settings = settings::UiSettings::default();
+        settings.onboarding_completed = true;
         settings::init(settings.clone(), data.clone(), cx);
         let fonts = typography::register_fonts(cx);
         typography::init(settings.ui_font_family.clone(), settings.ui_font_size, settings.terminal_font_family.clone(), settings.terminal_font_size, settings.code_font_family.clone(), settings.code_font_size, fonts, cx);
@@ -264,6 +265,7 @@ fn main() -> anyhow::Result<()> {
             app_id: Some("zeron-browser-fixture".into()),
             ..Default::default()
         }, |_, cx| cx.new(|cx| shell::Shell::new(state.clone(), boot, cx))).unwrap();
+        window.update(cx, |_, window, _| window.set_window_title("Zeron Browser Fixture")).unwrap();
         state.update(cx, |_, cx| cx.notify());
         cx.activate(true);
         cx.spawn(async move |cx| {

@@ -32,6 +32,9 @@ pub mod consent;
 pub mod elements;
 #[cfg(target_os = "macos")]
 pub mod file_events;
+#[cfg(windows)]
+#[path = "file_events_windows.rs"]
+pub mod file_events;
 pub mod grants;
 pub mod live;
 pub mod records;
@@ -52,6 +55,7 @@ pub mod template_consent;
 pub mod preview;
 pub mod host_bar;
 pub mod locales;
+pub mod network;
 pub mod plugin_menus;
 pub mod workbench;
 pub mod highlight;
@@ -75,7 +79,7 @@ use crate::engine::{
 };
 
 /// How often the templates folder is looked at for a change, where the
-/// kernel doesn't say (not macOS, or its watch couldn't be made). A look
+/// kernel doesn't say (not macOS or Windows, or its watch couldn't be made). A look
 /// that finds nothing changed is a stat of each file, off the UI thread,
 /// and composes nothing.
 const TEMPLATES_LOOK: Duration = Duration::from_secs(2);
@@ -136,6 +140,12 @@ impl Item {
     pub fn permissions(&self) -> Vec<String> {
         self.list(&self.json["permissions"])
     }
+    /// The hosts its requests may reach, as its manifest names them (none:
+    /// any public address). What the window's requests are held to
+    /// (`network`), and the engine's for its service.
+    pub fn network_hosts(&self) -> Vec<String> {
+        self.list(&self.json["network_hosts"])
+    }
     /// Its "ui.change" targets, as its manifest lists them.
     pub fn change(&self) -> Vec<String> {
         self.list(&self.json["ui"]["change"])
@@ -192,21 +202,13 @@ type Store = (Shared, serde_json::Map<String, Json>);
 struct Gh {
     shared: Option<Shared>,
     prs: serde_json::Map<String, Json>,
-    watches: HashMap<String, PrWatch>,
-}
-
-/// A session's pull request watch: what it's of (`key`, `params`), the
-/// watch (none while it waits to start again, having ended), and how long
-/// it waits when it ends.
-struct PrWatch {
-    key: String,
-    params: Json,
-    watch: Option<Watch>,
-    retry: github::Retry,
+    watches: github::Watches<Watch>,
 }
 
 pub struct Bridge {
     host: ScriptHost,
+    /// Where each plugin's requests may go, as its manifest names them.
+    network: network::Network,
     windows: WindowFactory,
     page: Shared,
     menus: Shared,
@@ -224,7 +226,9 @@ pub struct Bridge {
     inbox: RefCell<HashMap<String, Inbox>>,
     item_menus: RefCell<BTreeMap<String, Vec<Value>>>,
     toasted: RefCell<HashMap<String, Instant>>,
-    /// Plugins whose waiting you were told of (id and what it was).
+    /// What was said once this run: a signing key's notice (`key-notice:<id>`),
+    /// and a template package whose window opened as it arrived
+    /// (`template:<name>`: no notice for it as well).
     told: RefCell<HashSet<String>>,
     /// `<data>/templates`, as the engine's data dir says (from its config).
     templates_root: Option<PathBuf>,
@@ -301,8 +305,12 @@ pub struct Bridge {
 /// What plugins may read and ask of the app, each behind its permission,
 /// and every declared hook behind "ui.add".
 pub fn expose_surface(host: &ScriptHost) {
+    // Names under `zeron` are the app's alone, whatever a plugin is called
+    // (its slots and commands are its own names anyway).
+    host.reserve_prefix("zeron");
     // Adding before or after any element, by any selector, is "ui.add"'s
-    // (replacing is "ui.change"'s, an Override of the selector as written).
+    // (replacing is "ui.change"'s, an OverrideElement of the selector as
+    // written).
     host.require_contribution_capability(Capability::Named(grants::UI_ADD.into()));
     // What a file or a reply's block is, as an element gives it: a token
     // (`tokens`), never the path or the text.
@@ -451,11 +459,98 @@ pub(crate) fn comment(asked: &Value, shown: &str) -> Option<Value> {
     Some(json_value(&out))
 }
 
+/// The longest key a plugin keeps a taken draft under.
+const DRAFT_KEY: usize = 64;
+
+/// A plugin's ask of the composer's draft (`zeron.take_draft`,
+/// `put_draft`, `swap_draft`, `drop_draft`), held to `{ op, key }`: `op`
+/// one of "take", "put", "swap" or "drop", `key` 1 to 64 characters with
+/// no control characters. Anything else is refused.
+pub(crate) fn draft_ask(asked: &Value) -> Option<Value> {
+    let op = asked.field("op").map(text)?;
+    let key = asked.field("key").map(text)?;
+    let valid_key = !key.is_empty() && key.chars().count() <= DRAFT_KEY && !key.chars().any(char::is_control);
+    if !matches!(op.as_str(), "take" | "put" | "swap" | "drop") || !valid_key {
+        return None;
+    }
+    Some(Value::record([("op", Value::from(op.as_str())), ("key", Value::from(key.as_str()))]))
+}
+
+/// What `zeron.compose` asks of the composer: its words alone (added to
+/// the draft shown, as ever), or with `{ text, replace, session }` (the
+/// draft's words replaced, or a chat named other than the one shown).
+pub(crate) fn compose(asked: &Value) -> Value {
+    let Some(words) = asked.field("text") else {
+        return Value::from(text(asked).as_str());
+    };
+    let words = match words {
+        Value::Str(_) | Value::Text(_) => words.clone(),
+        _ => Value::from(""),
+    };
+    let mut fields = vec![
+        ("text", words),
+        ("replace", Value::from(matches!(asked.field("replace"), Some(Value::Bool(true))))),
+    ];
+    if let Some(session) = asked.field("session").map(text).filter(|s| !s.is_empty()) {
+        fields.push(("session", Value::from(session.as_str())));
+    }
+    Value::record(fields)
+}
+
+/// The app's shared states a chat's draft lives in (screens/chat/shared),
+/// each read with the value the app starts it at: read before the app has
+/// made one, it's made as the app would.
+const DRAFT_HERE: &str = "chat.composer.here";
+const DRAFT_TEXT: &str = "chat.composer.text";
+const DRAFT_CARGO: &str = "chat.composer.cargo";
+const DRAFTS_KEPT: &str = "chat.composer.drafts";
+
+/// What a draft carries, as plugins are told it (as `zeron.draft()` says
+/// it, screens/plugins): each chip's kind and name, never a file's path.
+fn draft_attachments(cargo: &Value) -> Value {
+    let said = |item: &Value, field: &str, or: &str| match item.field(field) {
+        Some(v @ Value::Str(_)) => v.clone(),
+        _ => Value::from(or),
+    };
+    vlist(cargo.items().iter().map(|item| Value::record([("kind", said(item, "kind", "file")), ("name", said(item, "name", ""))])).collect())
+}
+
+/// Chat `session`'s draft, for `zeron.draft_of` ("draft"): out in the
+/// composer (`here` its chat, "" a new chat's; `shown` its words, `cargo`
+/// its chips) or kept for it (`kept`, by chat). Its words as typed, what it
+/// carries, and its chat (none for a new chat's). A chat with no draft has
+/// no words and carries nothing.
+pub(crate) fn draft_of(session: &str, here: &Value, shown: &Value, cargo: &Value, kept: &Value) -> Value {
+    let (words, carried) = if session == text(here) {
+        (shown.clone(), cargo.clone())
+    } else {
+        let d = kept.field(session);
+        (
+            d.and_then(|d| d.field("text")).cloned().unwrap_or_default(),
+            d.and_then(|d| d.field("cargo")).cloned().unwrap_or_default(),
+        )
+    };
+    let words = match words {
+        Value::Str(_) | Value::Text(_) => words,
+        _ => Value::from(""),
+    };
+    let mut fields = vec![("text", words), ("attachments", draft_attachments(&carried))];
+    if !session.is_empty() {
+        fields.push(("session", Value::from(session)));
+    }
+    Value::record(fields)
+}
+
 /// Plugins for the main window `cx` shows `host` in.
 pub fn install(cx: &mut WindowContext, host: &ScriptHost) {
     expose_surface(host);
+    let plugin_network = network::Network::default();
+    host.fetch_policy(plugin_network.clone());
+    // What the app's VM (a template in preview, while it is one) may reach.
+    host.guard(preview::guard);
     let bridge = Rc::new(Bridge {
         host: host.clone(),
+        network: plugin_network,
         windows: cx.windows.clone(),
         page: host.shared("plugins", page_value("loading", None, &[], &[])),
         menus: host.shared("plugins.menus", vlist(Vec::new())),
@@ -515,8 +610,9 @@ pub fn install(cx: &mut WindowContext, host: &ScriptHost) {
     let weak = Rc::downgrade(&bridge);
     let effect = cx.ui.runtime.effect(move || {
         if let Some(b) = weak.upgrade() {
-            let sources = b.sources(true);
-            b.publish_records(&sources);
+            let (sources, list) = b.sources(true);
+            b.publish_records(&sources, &list);
+            b.github_wake(&list);
         }
     });
     *bridge.records_effect.borrow_mut() = Some(effect);
@@ -538,17 +634,22 @@ pub fn install(cx: &mut WindowContext, host: &ScriptHost) {
     });
 
     // Your templates, looked at as they change: as the kernel says they
-    // did (macOS), so an idle window doesn't wake for them; elsewhere,
-    // looked at twice a second.
+    // did (macOS's FSEvents, Windows' directory change notifications), so
+    // an idle window doesn't wake for them; elsewhere, looked at every
+    // `TEMPLATES_LOOK`. (On Windows the timed look cost about 6% of a core
+    // at idle: each look's `publish_page` → `elements_report` walks, reads
+    // and scans every script on the UI thread.) Where Windows may not hear a
+    // change (a folder it can't read, a reader that stopped), it looks on the
+    // timer too until it can.
     let weak = Rc::downgrade(&bridge);
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     let events = file_events::FileEvents::new();
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     if let Some(events) = &events {
         *bridge.rewatch.borrow_mut() = Some(events.poke());
     }
     cx.tasks.spawn(async move {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         if let Some(mut events) = events {
             loop {
                 {
@@ -559,7 +660,11 @@ pub fn install(cx: &mut WindowContext, host: &ScriptHost) {
                     events.watch(files, dirs);
                     b.look();
                 }
-                if !events.changed().await {
+                #[cfg(windows)]
+                let more = events.changed_or_every(TEMPLATES_LOOK).await;
+                #[cfg(target_os = "macos")]
+                let more = events.changed().await;
+                if !more {
                     return;
                 }
             }
@@ -624,7 +729,7 @@ thread_local! {
 
 /// `work` on a thread of its own, its result once done (none if it panicked):
 /// a look's file work, which reads folders of a thousand files.
-async fn off_thread<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+pub(crate) async fn off_thread<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
     let (tell, mut heard) = zgx::task::latest::<T>();
     std::thread::spawn(move || {
         tell.send(work());
@@ -779,6 +884,7 @@ pub(crate) fn shortcut_notice(lost: &[crate::menu_bar::Dropped], name_of: impl F
         Why::Zerons(title) => format!("Its {key} for “{}” is already Zeron's ({title}), so it's in the menu bar without one.", first.title),
         Why::Plugins(other) => format!("Its {key} for “{}” is already {}'s, so it's in the menu bar without one.", first.title, name_of(other)),
         Why::NoKey => format!("Its {key} for “{}” isn't a key a menu can show, so it's in the menu bar without one.", first.title),
+        Why::NoModifier => format!("Its {key} for “{}” has no ⌘, ⌃ or ⌥, so it would take that key from everything you type in. It's in the menu bar without one.", first.title),
     };
     match lost.len() {
         1 => {}
@@ -847,6 +953,9 @@ pub fn builtin_dir() -> PathBuf {
 pub fn dev_plugins(host: &ScriptHost) {
     let Some(dirs) = crate::dev::switch("ZERON_ZGX_DEV_PLUGINS") else { return };
     expose_surface(host);
+    let plugin_network = network::Network::default();
+    host.fetch_policy(plugin_network.clone());
+    let mut hosts = Vec::new();
     let mut plugins = Vec::new();
     for dir in std::env::split_paths(&dirs) {
         let Ok(text) = std::fs::read_to_string(dir.join("zeron-plugin.json")) else {
@@ -860,8 +969,10 @@ pub fn dev_plugins(host: &ScriptHost) {
                 "id": id, "name": manifest["name"], "status": "on", "entry": manifest["entry"],
                 "snapshot": dir, "permissions": manifest["permissions"],
                 "ui": manifest.get("ui").cloned().unwrap_or(json!({})),
+                "network_hosts": manifest["network"]["hosts"],
             }),
         };
+        hosts.push((id.clone(), item.network_hosts()));
         expose_own(host, &id);
         locales::publish(host, &id, &dir);
         // Its settings, at their defaults (a fixture sets them as it likes).
@@ -891,6 +1002,7 @@ pub fn dev_plugins(host: &ScriptHost) {
         eprintln!("zeron-zgx: dev plugin {id} from {}", dir.display());
         plugins.extend(item.plugin());
     }
+    plugin_network.set(hosts);
     host.set_plugins(plugins);
 }
 
@@ -998,6 +1110,33 @@ pub fn use_zeron_template() {
         b.chose.set(true);
         b.look();
         b.rewatch();
+    }
+}
+
+/// Who the sidebar says narrows it (`sidebar.filter_by`, the shell's
+/// notice): the name, as Settings → Plugins shows it, of the one plugin
+/// loading (`want`) that may set `sidebar.filter`; none (the shell's "A
+/// plugin") for none or several. Never the `by` a plugin writes in the
+/// filter, which could say it's Zeron or another plugin.
+fn filter_by(want: &[Plugin], items: &[Item]) -> Value {
+    let filter = Capability::Named("zeron.sidebar.filter".into());
+    let mut allowed = want.iter().filter(|p| p.grants.contains(&filter));
+    match (allowed.next(), allowed.next()) {
+        (Some(one), None) => items.iter().find(|i| i.id() == one.name).map_or(Value::Nil, |i| Value::from(i.name())),
+        _ => Value::Nil,
+    }
+}
+
+/// Plugin `id`'s state in the window's host gone: its `ui.state` and
+/// `ui.persist` values zgx holds, the writes it hasn't made yet (after which
+/// none brings the folder back), and its saved folder. (Removing the folder
+/// alone left zgx's values, so one put back this run had them again, and a
+/// write still waiting wrote the folder back.)
+pub(crate) fn forget_state(host: &ScriptHost, id: &str) {
+    host.forget_state(&format!("plugin:{id}"));
+    // (Where the host had no storage set, its folder as zgx names it.)
+    if let Some(dir) = zgx_script::app_data_dir(crate::APP_ID) {
+        let _ = std::fs::remove_dir_all(dir.join("script-state").join(format!("plugin%3A{id}")));
     }
 }
 
@@ -1158,22 +1297,13 @@ impl Bridge {
                 host_bar::notice(host_bar::Notice::key(notice["kind"].as_str().unwrap_or(""), notice["device"].as_str(), words));
             }
         }
-        // Each one newly waiting for you: said once.
-        for item in &list {
-            if matches!(item.status(), "pending" | "tampered") {
-                let what = format!("{}@{}", item.id(), item.json["hash"].as_str().unwrap_or(""));
-                if self.told.borrow_mut().insert(what) {
-                    self.request("waiting", item.name(), Value::from(item.id()));
-                }
-            }
-        }
         // One removed, or put back from elsewhere under the same id, starts
         // afresh: nothing it left (its queues, what it set, its saved state)
         // reaches what's installed now.
         let gone = gone(&self.items.borrow(), &list);
         *self.items.borrow_mut() = list;
-        for (id, old) in gone {
-            self.forget(&id, &old);
+        for (id, old) in &gone {
+            self.forget(id, old);
         }
         self.state.set("ready");
         // `ZERON_ZGX_REVIEW=<id>` (development): that plugin's sheet at
@@ -1187,14 +1317,22 @@ impl Bridge {
             c.follow(self);
         }
         self.apply();
+        // One removed is unloaded now: what its VM held to the last (a
+        // `ui.persist` it set as it went) goes too.
+        for (id, _) in &gone {
+            if !self.loaded.borrow().iter().any(|p| &p.name == id) {
+                forget_state(&self.host, id);
+            }
+        }
     }
 
     /// Plugin `id` (as `old` was) is gone: what this side keeps of it goes
     /// too. Its calls and messages waiting, its records, its problems and
     /// failure, the sidebar's filter if it could set it, and its scripts'
-    /// saved state (`ui.persist`, `<app data>/script-state/plugin:<id>/`).
-    /// (What its VM holds in memory this run goes when zgx forgets a
-    /// script's state, asked of zgx; its storage is the engine's to remove.)
+    /// state (`ui.state`, `ui.persist`: what zgx holds of it this run, its
+    /// writes waiting, and `<app data>/script-state/plugin:<id>/`), before
+    /// the reload that unloads it or loads the one put back, so that one
+    /// starts from its `initial`s. (Its storage is the engine's to remove.)
     fn forget(&self, id: &str, old: &Item) {
         if let Some(calls) = self.calls.borrow_mut().get_mut(id) {
             calls.list.clear();
@@ -1213,7 +1351,6 @@ impl Bridge {
         self.problems.borrow_mut().remove(id);
         self.costs.borrow_mut().remove(id);
         self.failed_plugins.borrow_mut().forget(id);
-        self.told.borrow_mut().retain(|t| !t.starts_with(&format!("{id}@")));
         // (Set with no borrow held: a plugin's effects run at once.)
         for s in shared {
             s.set(vlist(Vec::new()));
@@ -1226,9 +1363,7 @@ impl Bridge {
         if changed_sidebar {
             self.host.shared("sidebar.filter", Value::Nil).set(Value::Nil);
         }
-        if let Some(dir) = zgx_script::app_data_dir(crate::APP_ID) {
-            let _ = std::fs::remove_dir_all(dir.join("script-state").join(format!("plugin%3A{id}")));
-        }
+        forget_state(&self.host, id);
     }
 
     /// What zgx should load, from the list and your templates: set and
@@ -1243,6 +1378,8 @@ impl Bridge {
         for plugin in &want {
             self.expose(&plugin.name);
         }
+        // Where each may reach, before anything of it runs.
+        self.network.set(items.iter().filter(|i| want.iter().any(|p| p.name == i.id())).map(|i| (i.id().to_string(), i.network_hosts())));
         // Each one's own words (`locales/`, read again: a new version brings
         // its own), for the SDK's `zeron.t`.
         for item in items.iter().filter(|i| want.iter().any(|p| p.name == i.id())) {
@@ -1252,6 +1389,7 @@ impl Bridge {
         }
         // Menus of plugins no longer loaded go with them.
         let loading: HashSet<String> = want.iter().map(|p| p.name.clone()).collect();
+        self.host.shared("sidebar.filter_by", Value::Nil).set(filter_by(&want, &items));
         let before = self.item_menus.borrow().len();
         self.item_menus.borrow_mut().retain(|id, _| loading.contains(id));
         if self.item_menus.borrow().len() != before {
@@ -1280,8 +1418,8 @@ impl Bridge {
             self.publish_pages();
         }
         self.publish_page();
-        let sources = self.sources(false);
-        self.publish_records(&sources);
+        let (sources, list) = self.sources(false);
+        self.publish_records(&sources, &list);
         if *self.loaded.borrow() == want {
             return;
         }
@@ -1336,6 +1474,11 @@ impl Bridge {
     }
 
     fn blame_as(&self, error: &str, loading: bool) {
+        // A preview asking for what it can't have yet isn't broken. (One that
+        // can't load without it makes way like any, until it's kept.)
+        if !loading && preview::refused(error) {
+            return;
+        }
         let loaded = self.loaded.borrow().clone();
         if let Some(id) = recovery::blame(error, &loaded) {
             self.plugin_failed(&id, error);
@@ -1358,7 +1501,7 @@ impl Bridge {
     /// new version or an edit of it arrives.
     pub(crate) fn plugin_failed(&self, id: &str, error: &str) {
         let Some(item) = self.item(id) else { return };
-        if !self.failed_plugins.borrow_mut().fail(id, item.hash(), error) {
+        if !self.failed_plugins.borrow_mut().fail(id, item.hash(), &recovery::reason(error)) {
             return;
         }
         eprintln!("zeron-zgx: plugin {id} failed and is withdrawn: {}", recovery::first_line(error));
@@ -1491,7 +1634,23 @@ impl Bridge {
         let was = self.laid.borrow().id.clone();
         let name = template_name(root, &id);
         preview::set_template_running(id != live::BUILTIN);
+        // What a preview saved is kept with it, or goes with it; what failed
+        // only because it was one is tried again (`Bridge::blame_as`).
+        let was_previewing = preview::current();
+        let kept = trusted && was_previewing.as_ref().is_some_and(|p| p.id == id);
+        if kept {
+            self.host.keep_held_state();
+        } else if was_previewing.as_ref().is_some_and(|p| trusted || p.id != id) {
+            self.host.drop_held_state();
+        }
         preview::set((!trusted).then(|| preview::Preview { id: id.clone(), name: name.clone() }));
+        let retry = kept && {
+            let files = self.failed_files.borrow_mut().forget_under(&format!("{id}:"));
+            let whole = self.broken.borrow().why(&id).is_some();
+            self.broken.borrow_mut().forget(&id);
+            self.fallbacks.borrow_mut().remove(&id);
+            files || whole
+        };
         // A switch you didn't make here (an agent's use_template, a file
         // written by hand): said by the host, whatever the template shows.
         if was != id && !self.chose.replace(false) {
@@ -1518,12 +1677,15 @@ impl Bridge {
         }
         self.publish_templates();
         self.publish_page();
-        if changed > 0
-            && template
+        if (kept || (changed > 0 && template))
             && let Err(error) = self.host.reload()
         {
             eprintln!("zeron-zgx: the window didn't reload: {}", recovery::first_line(&error));
             self.blame_as(&error, true);
+        }
+        // What failed as a preview, laid down as it is now.
+        if retry {
+            self.look();
         }
     }
 
@@ -1608,13 +1770,12 @@ impl Bridge {
             list.push(Value::record(fields));
         }
         // Packages waiting for you to allow them (an agent's import_template,
-        // or one brought in here): each newly waiting said once.
-        let pending = live::pending(&root);
-        for p in &pending {
-            let (name, title) = (p["pending"].as_str().unwrap_or(""), p["name"].as_str().unwrap_or("A template"));
-            if self.told.borrow_mut().insert(format!("template:{name}")) {
-                self.request("template_waiting", title, Value::from(name));
-            }
+        // or one brought in here). `here`: its window opened as it came, so
+        // the app gives it no notice as well (screens/plugins/waiting).
+        let mut pending = live::pending(&root);
+        for p in &mut pending {
+            let name = p["pending"].as_str().unwrap_or("").to_string();
+            p["here"] = json!(self.told.borrow().contains(&format!("template:{name}")));
         }
         templates::write_if_changed(&root.join(live::STATUS), &Json::Object(status));
         self.templates_page.set(Value::record([
@@ -1711,40 +1872,42 @@ impl Bridge {
     /// What records are made from, as the window has it: followed (`track`,
     /// from the records' effect) or only read. The open chat's messages are
     /// followed only while a plugin may read them.
-    fn sources(&self, track: bool) -> records::Sources {
+    fn sources(&self, track: bool) -> (records::Sources, Value) {
         let read = |key: &str| {
             let signal = self.host.shared(key, Value::Nil).signal();
             let value = if track { signal.get() } else { signal.with_untracked(Value::clone) };
             value_json(&value)
         };
         let messages_wanted = self.items.borrow().iter().any(|i| i.status() == "on" && records::reads_messages(&i.permissions()));
-        let messages = if messages_wanted {
-            read("chat.messages")
-        } else {
-            value_json(&self.host.shared("chat.messages", Value::Nil).signal().with_untracked(Value::clone))
-        };
-        records::Sources {
-            sessions: read("sessions"),
+        // (No plugin reading them: nothing is made of a whole transcript.)
+        let messages = if messages_wanted { read("chat.messages") } else { Json::Null };
+        // The session list itself: records are made from it directly (no text of a
+        // whole account, on the main thread, each time the list moves).
+        let signal = self.host.shared("sessions", Value::Nil).signal();
+        let all = if track { signal.get() } else { signal.with_untracked(Value::clone) };
+        let sources = records::Sources {
+            sessions: Json::Null,
             messages,
             profile: read("plugins.profile"),
             hide_emails: read("plugins.hide_emails").as_bool().unwrap_or(false),
-        }
+        };
+        (sources, all)
     }
 
     /// Each plugin's records, from `sources`, holding what it may read.
-    fn publish_records(&self, sources: &records::Sources) {
+    fn publish_records(&self, sources: &records::Sources, list: &Value) {
         let items = self.items.borrow().clone();
-        let shared: Vec<(Shared, Json)> = items
+        let shared: Vec<(Shared, Value)> = items
             .iter()
             .filter(|i| i.status() == "on")
             .filter_map(|i| {
                 let shared = self.records.borrow().get(i.id()).cloned()?;
-                Some((shared, records::records_with(&i.permissions(), &i.change(), sources)))
+                Some((shared, records::published(&i.permissions(), &i.change(), sources, list)))
             })
             .collect();
         // (Set with no borrow held: a plugin's effects run at once.)
         for (shared, value) in shared {
-            shared.set(json_value(&value));
+            shared.set(value);
         }
     }
 
@@ -2030,6 +2193,62 @@ impl Bridge {
                 }
             }
         });
+        // Its agents' usage, accounts and models (`zeron.usage`,
+        // `zeron.switch_account`, `zeron.set_model`, `zeron.on`, …): the
+        // engine checks what this device, or the device named, allowed it
+        // (plugins/agents there). A refusal fails the promise as "<reason>:
+        // <words>". A default for new chats the engine allowed is this
+        // window's to keep: the composer takes it (`plugins.new_chat_model`).
+        host.async_action(format!("plugin.{id}.agents"), {
+            let (me, plugin) = (me.clone(), plugin.clone());
+            move |asked| {
+                let (me, plugin) = (me.clone(), plugin.clone());
+                async move {
+                    let asked = value_json(&asked);
+                    let op = asked["op"].as_str().unwrap_or_default().to_owned();
+                    let mut params = json!({ "plugin": plugin, "op": op, "args": asked["args"] });
+                    let device = asked["device"].as_str().filter(|d| !d.is_empty()).map(str::to_owned);
+                    if let Some(device) = &device {
+                        params["device"] = json!(device);
+                    }
+                    if op == "listen" {
+                        // (An empty list may come as an empty table: none.)
+                        params["listeners"] = if asked["listeners"].is_array() { asked["listeners"].clone() } else { json!([]) };
+                    }
+                    let reply = call("PluginAgents", params).await.map_err(|e| {
+                        if e.contains("unknown method") {
+                            "old_engine: This device's Zeron is from before plugins could read usage".to_string()
+                        } else {
+                            e
+                        }
+                    })?;
+                    if reply["ok"].as_bool() != Some(true) {
+                        return Err(format!(
+                            "{}: {}",
+                            reply["reason"].as_str().unwrap_or("failed"),
+                            reply["message"].as_str().unwrap_or("Zeron didn't answer")
+                        ));
+                    }
+                    let value = &reply["value"];
+                    if op == "set_default_model"
+                        && device.is_none()
+                        && let (Some(b), Some(harness), Some(model)) =
+                            (me.upgrade(), value["provider"].as_str(), value["model"].as_str())
+                    {
+                        let at = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_millis() as i64);
+                        b.host.shared("plugins.new_chat_model", Value::Nil).set(json_value(&json!({
+                            "model": format!("{harness}/{model}"),
+                            "effort": value["effort"],
+                            "seq": at,
+                            "by": plugin,
+                        })));
+                    }
+                    Ok(json_value(value))
+                }
+            }
+        });
         host.action(format!("plugin.{id}.menus"), {
             let (me, plugin) = (me.clone(), plugin.clone());
             move |list| {
@@ -2140,7 +2359,7 @@ impl Bridge {
                 async move {
                     let bridge = me.upgrade().ok_or("The window closed")?;
                     let item = bridge.item(&plugin).ok_or("This plugin isn't on")?;
-                    let records = bridge.sources(false).sessions;
+                    let records = bridge.sources(false).0.sessions;
                     let request = workbench::prepare(&item, &records, &value_json(&asked))?;
                     let reply = if request.method == "HighlightGitDiff" {
                         off_thread(move || highlight::diff(&request.params)).await.ok_or("The highlighter stopped")??
@@ -2287,6 +2506,49 @@ impl Bridge {
                         Some(asked) => b.request("compose_comment", &plugin, asked),
                         None => eprintln!("zeron-zgx: plugin {plugin}: a comment for a chat not shown, refused"),
                     }
+                }
+            }
+        });
+        // The composer's draft taken (its words, its chips, the passages
+        // quoted in it), put back or let go, under a key of the plugin's,
+        // for a plugin allowed "draft": screens/plugins keeps what's taken
+        // (the plugin never holds its files' paths) and tells it what it
+        // keeps as `plugin.<id>.drafts`.
+        host.action(format!("plugin.{id}.draft"), {
+            let (me, plugin) = (me.clone(), plugin.clone());
+            move |asked| {
+                if let Some(b) = me.upgrade()
+                    && b.item(&plugin).is_some_and(|i| i.may("draft"))
+                {
+                    match draft_ask(&asked) {
+                        Some(asked) => b.request("draft", &plugin, asked),
+                        None => eprintln!("zeron-zgx: plugin {plugin}: a draft ask that isn't take, put, swap or drop with a key, refused"),
+                    }
+                }
+            }
+        });
+        // Another chat's draft, as it is (`zeron.draft_of`, "draft"): read
+        // where the app keeps it, once, never followed.
+        host.async_action(format!("plugin.{id}.draft_of"), {
+            let (me, plugin) = (me.clone(), plugin.clone());
+            move |asked| {
+                let (me, plugin) = (me.clone(), plugin.clone());
+                async move {
+                    let b = me.upgrade().ok_or("This plugin isn't on")?;
+                    let item = b.item(&plugin).ok_or("This plugin isn't on")?;
+                    if !item.may("draft") {
+                        return Err("This plugin wasn't allowed to read what you type in the message box".to_string());
+                    }
+                    let session = text(&asked);
+                    if session.chars().count() > 200 {
+                        return Err("That isn't a chat".to_string());
+                    }
+                    let read = |name: &str, initial: Value| b.host.shared(name, initial).signal().with_untracked(Value::clone);
+                    let here = read(DRAFT_HERE, Value::from(""));
+                    let shown = read(DRAFT_TEXT, Value::from(""));
+                    let cargo = read(DRAFT_CARGO, vlist(Vec::new()));
+                    let kept = read(DRAFTS_KEPT, Value::record(Vec::<(&str, Value)>::new()));
+                    Ok(draft_of(&session, &here, &shown, &cargo, &kept))
                 }
             }
         });
@@ -2467,7 +2729,10 @@ impl Bridge {
                 let mut all = b.gh.borrow_mut();
                 let Some(gh) = all.get_mut(&plugin) else { return };
                 let keep: HashSet<&str> = wanted.iter().map(|(id, _)| id.as_str()).collect();
-                gh.watches.retain(|id, _| keep.contains(id.as_str()));
+                for (session, key, params) in gh.watches.want(&wanted, Instant::now(), MAX_KEPT_PRS) {
+                    let watch = Self::pr_watch(&b, &rpc, &plugin, &session, &key, &params);
+                    gh.watches.started(&session, &key, watch);
+                }
                 // What each session's pull request was last heard as stays
                 // while its row is away (Settings, another page): back, its
                 // badge is there at once, and the new watch brings it up to
@@ -2479,16 +2744,7 @@ impl Bridge {
                 // (Published only as what's kept changed: rows coming into
                 // view as a list scrolls ask this often, and each publish
                 // runs every reader of it.)
-                let trimmed = gh.prs.len() != kept;
-                for (id, params) in &wanted {
-                    let key = github::watch_key(params);
-                    if gh.watches.get(id).is_some_and(|w| w.key == key) {
-                        continue;
-                    }
-                    let watch = Self::pr_watch(&b, &rpc, &plugin, id, &key, params);
-                    gh.watches.insert(id.clone(), PrWatch { key, params: params.clone(), watch: Some(watch), retry: github::Retry::new() });
-                }
-                if !trimmed {
+                if gh.prs.len() == kept {
                     return;
                 }
                 gh.shared.clone().map(|s| (s, json_value(&Json::Object(gh.prs.clone()))))
@@ -2523,21 +2779,43 @@ impl Bridge {
 
     /// A session's pull request watch ended of itself (an error, the
     /// engine gone): started again after its wait, if it's still wanted
-    /// as it was.
+    /// as it was. One whose chat isn't there to watch (its folder isn't a
+    /// checkout on its device, the device is offline) is set aside instead,
+    /// until its chat or device changes (`github_wake`).
     fn github_ended(self: &Rc<Self>, plugin: &str, session: &str, key: &str, why: &str) {
-        let wait = {
+        let ended = {
             let mut all = self.gh.borrow_mut();
-            let Some(w) = all.get_mut(plugin).and_then(|gh| gh.watches.get_mut(session)).filter(|w| w.key == key) else {
-                return;
-            };
-            w.watch = None;
-            w.retry.ended()
+            let Some(gh) = all.get_mut(plugin) else { return };
+            gh.watches.ended(session, key, why, Instant::now())
+        };
+        let wait = match ended {
+            github::Ended::Stale => return,
+            github::Ended::Parked => {
+                return eprintln!("zeron-zgx: plugin {plugin}: {session}'s pull request watch ended ({why}); set aside until its chat or device changes");
+            }
+            github::Ended::Wait(wait) => wait,
         };
         eprintln!("zeron-zgx: plugin {plugin}: {session}'s pull request watch ended ({why}); again in {}s", wait.as_secs());
         let me = Rc::downgrade(self);
         let (plugin, session, key) = (plugin.to_string(), session.to_string(), key.to_string());
         self.tasks.spawn(async move {
             zgx::timer::sleep(wait).await;
+            if let Some(b) = me.upgrade() {
+                b.github_start(&plugin, &session, &key);
+            }
+        });
+    }
+
+    /// Session `session`'s watch of `key` started again, if it's still
+    /// shown as it was, and neither watched nor set aside.
+    fn github_start(self: &Rc<Self>, plugin: &str, session: &str, key: &str) {
+        let due = |b: &Bridge| b.gh.borrow().get(plugin).and_then(|gh| gh.watches.due(session, key));
+        if due(self).is_none() {
+            return;
+        }
+        let me = Rc::downgrade(self);
+        let (plugin, session, key) = (plugin.to_string(), session.to_string(), key.to_string());
+        self.tasks.spawn(async move {
             let Some(rpc) = engine::get().connection(Duration::from_secs(5)).await else {
                 // (No engine yet: waited for again, longer.)
                 if let Some(b) = me.upgrade() {
@@ -2546,20 +2824,46 @@ impl Bridge {
                 return;
             };
             let Some(b) = me.upgrade() else { return };
-            let params = {
-                let all = b.gh.borrow();
-                match all.get(&plugin).and_then(|gh| gh.watches.get(&session)) {
-                    Some(w) if w.key == key && w.watch.is_none() => w.params.clone(),
-                    _ => return,
-                }
-            };
-            let watch = Self::pr_watch(&b, &rpc, &plugin, &session, &key, &params);
             let mut all = b.gh.borrow_mut();
-            match all.get_mut(&plugin).and_then(|gh| gh.watches.get_mut(&session)) {
-                Some(w) if w.key == key && w.watch.is_none() => w.watch = Some(watch),
-                _ => {}
-            }
+            let Some(gh) = all.get_mut(&plugin) else { return };
+            let Some(params) = gh.watches.due(&session, &key) else { return };
+            let watch = Self::pr_watch(&b, &rpc, &plugin, &session, &key, &params);
+            gh.watches.started(&session, &key, watch);
         });
+    }
+
+    /// The session list moved: each set-aside watch whose chat changed
+    /// (its folder, branch or device) or whose device came back online is
+    /// started again. Nothing is read when none is set aside.
+    fn github_wake(self: &Rc<Self>, sessions: &Value) {
+        let mut start = Vec::new();
+        {
+            let mut all = self.gh.borrow_mut();
+            for (plugin, gh) in all.iter_mut() {
+                if !gh.watches.any_parked() {
+                    continue;
+                }
+                let params = |id: &str| -> Option<Json> {
+                    let chats = sessions.field("chats")?.list();
+                    let chat = chats.iter().find(|c| c.field("id").map(text).as_deref() == Some(id))?;
+                    github::watch_params(&value_json(chat))
+                };
+                let online = |device: &str| -> Option<bool> {
+                    let devices = sessions.field("devices")?.list();
+                    let found = devices.iter().find(|d| d.field("id").map(text).as_deref() == Some(device))?;
+                    match found.field("online") {
+                        Some(Value::Bool(online)) => Some(*online),
+                        _ => None,
+                    }
+                };
+                for (session, key, _) in gh.watches.wake(params, online) {
+                    start.push((plugin.clone(), session, key));
+                }
+            }
+        }
+        for (plugin, session, key) in start {
+            self.github_start(&plugin, &session, &key);
+        }
     }
 
     /// A session's pull request, as its watch heard it.
@@ -2567,10 +2871,9 @@ impl Bridge {
         let publish = {
             let mut all = self.gh.borrow_mut();
             let Some(gh) = all.get_mut(plugin) else { return };
-            let Some(w) = gh.watches.get_mut(session) else {
+            if !gh.watches.heard(session) {
                 return;
-            };
-            w.retry.heard();
+            }
             gh.prs.insert(session.to_string(), github::summary(status));
             gh.shared.clone().map(|s| (s, json_value(&Json::Object(gh.prs.clone()))))
         };
@@ -2798,18 +3101,7 @@ impl Bridge {
             }
         });
         // (Each of these acts on the device it names, `device`, or this one.)
-        host.async_action("plugins.set_off", {
-            let me = me.clone();
-            move |arg| {
-                let me = me.clone();
-                async move {
-                    let (id, device) = remote::id_and_device(&arg);
-                    let off = arg.field("off").is_some_and(Value::truthy);
-                    eprintln!("zeron-zgx: plugins: {id} turned {} from Settings", if off { "off" } else { "on" });
-                    call_on(&me, device, "SetPluginOff", json!({ "id": id, "off": off })).await.map(|_| Value::Nil)
-                }
-            }
-        });
+        set_off_action(host, me.clone());
         host.async_action("plugins.remove", {
             let me = me.clone();
             move |arg| {
@@ -2866,8 +3158,8 @@ impl Bridge {
         });
         // Someone else's plugin, from a .zeron-plugin file or a link (a
         // package, a GitHub release, a git repository). The engine verifies
-        // it first; anyone else's waits for the consent window. Another
-        // device installs from a link only: a file here isn't there.
+        // it first; anyone else's waits for the consent window. A file here
+        // installed on another device is sent there (remote::send_file).
         host.async_action("plugins.install", {
             let me = me.clone();
             move |arg| {
@@ -2876,7 +3168,10 @@ impl Bridge {
                     let given = |name: &str| arg.field(name).map(text).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
                     let device = remote::device_of(&arg);
                     let params = match (given("path"), given("url")) {
-                        (Some(_), _) if device.is_some() => return Err("Another device installs a plugin from a link".into()),
+                        (Some(path), _) if device.is_some() => {
+                            let upload = remote::send_file(&path, |piece| call_on(&me, device.clone(), "StagePluginPackage", piece)).await?;
+                            remote::install_sent(&path, &upload)
+                        }
                         (Some(path), _) => json!({ "path": path }),
                         (None, Some(url)) => json!({ "url": url }),
                         _ => return Err("Choose a plugin file or paste a link".into()),
@@ -3157,9 +3452,9 @@ impl Bridge {
         });
         host.action("zeron.compose.insert", {
             let me = me.clone();
-            move |text_| {
+            move |asked| {
                 if let Some(b) = me.upgrade() {
-                    b.request("compose", "", Value::from(text(&text_).as_str()));
+                    b.request("compose", "", compose(&asked));
                 }
             }
         });
@@ -3214,6 +3509,25 @@ async fn call(method: &str, params: Json) -> Result<Json, String> {
 
 /// `call`, on `device` (none: this one). A device out of reach says
 /// "offline", and the page showing it says so too.
+#[cfg(test)]
+pub(crate) fn set_off_action_for_tests(host: &ScriptHost) {
+    set_off_action(host, Weak::new());
+}
+
+/// `plugins.set_off`: a plugin off, or back on. Never an unkept preview's.
+fn set_off_action(host: &ScriptHost, me: Weak<Bridge>) {
+    host.async_action("plugins.set_off", move |arg| {
+        let me = me.clone();
+        async move {
+            preview::refuse("plugins.set_off")?;
+            let (id, device) = remote::id_and_device(&arg);
+            let off = arg.field("off").is_some_and(Value::truthy);
+            eprintln!("zeron-zgx: plugins: {id} turned {} from Settings", if off { "off" } else { "on" });
+            call_on(&me, device, "SetPluginOff", json!({ "id": id, "off": off })).await.map(|_| Value::Nil)
+        }
+    });
+}
+
 async fn call_on(me: &Weak<Bridge>, device: Option<String>, method: &str, params: Json) -> Result<Json, String> {
     let Some(device) = device else { return call(method, params).await };
     call(method, remote::addressed(Some(&device), params)).await.map_err(|error| {
@@ -3282,6 +3596,52 @@ mod tests {
         assert_eq!(gone, vec!["clock".to_string(), "ping".to_string()]);
     }
 
+    /// `zeron.compose(text)` adds its words as ever; with options, it says
+    /// whether they replace the draft and which chat's (none: the shown).
+    #[test]
+    fn compose_takes_words_alone_or_with_replace_and_a_chat() {
+        assert_eq!(compose(&Value::from("hello")), Value::from("hello"));
+        let asked = json_value(&json!({ "text": "clearer", "replace": true, "session": "s2" }));
+        let out = compose(&asked);
+        assert_eq!(text(out.field("text").unwrap()), "clearer");
+        assert_eq!(out.field("replace"), Some(&Value::from(true)));
+        assert_eq!(text(out.field("session").unwrap()), "s2");
+        // (Only `true` replaces; a blank chat is the one shown; words that
+        // aren't text are none.)
+        let loose = json_value(&json!({ "text": 5, "replace": "yes", "session": "" }));
+        let out = compose(&loose);
+        assert_eq!(text(out.field("text").unwrap()), "");
+        assert_eq!(out.field("replace"), Some(&Value::from(false)));
+        assert!(out.field("session").is_none());
+    }
+
+    /// `zeron.draft_of`: the chat shown's draft (from the composer), or
+    /// another chat's (kept), with its chat and its chips by kind and name
+    /// alone; a new chat's has no chat; a chat with none, nothing.
+    #[test]
+    fn a_chats_draft_is_read_where_it_is_kept_without_paths() {
+        let kept = json_value(&json!({
+            "s2": { "text": "kept words", "cargo": [{ "kind": "file", "name": "a.rs", "path": "/Users/me/a.rs" }] },
+            "": { "text": "new chat words", "cargo": [] },
+        }));
+        let (here, shown) = (Value::from("s1"), Value::from("typing now"));
+        let cargo = json_value(&json!([{ "kind": "image", "name": "shot.png", "path": "/tmp/shot.png" }]));
+        let out = draft_of("s1", &here, &shown, &cargo, &kept);
+        assert_eq!(value_json(&out), json!({ "text": "typing now", "session": "s1", "attachments": [{ "kind": "image", "name": "shot.png" }] }));
+        let out = draft_of("s2", &here, &shown, &cargo, &kept);
+        assert_eq!(value_json(&out), json!({ "text": "kept words", "session": "s2", "attachments": [{ "kind": "file", "name": "a.rs" }] }));
+        assert!(!out.to_json().contains("/Users/me"), "never a path");
+        // A chat with no draft: nothing written, nothing carried.
+        let out = draft_of("s9", &here, &shown, &cargo, &kept);
+        assert_eq!(value_json(&out), json!({ "text": "", "session": "s9", "attachments": [] }));
+        // A new chat's draft, kept while a chat shows: no chat.
+        let out = draft_of("", &here, &shown, &cargo, &kept);
+        assert_eq!(value_json(&out), json!({ "text": "new chat words", "attachments": [] }));
+        // Before the app has made its states: nothing, not an error.
+        let out = draft_of("s1", &Value::Nil, &Value::Nil, &Value::Nil, &Value::Nil);
+        assert_eq!(text(out.field("text").unwrap()), "");
+    }
+
     /// R21: a plugin's review comment goes on the chat shown alone, with
     /// at most the 40 lines of code that are sent (a 20,000-character
     /// snippet once rode along unseen, onto any chat's draft).
@@ -3302,6 +3662,23 @@ mod tests {
         assert!(text(comment(&wide, "s1").unwrap().field("snippet").unwrap()).len() <= COMMENT_BYTES);
     }
 
+    /// A plugin's ask of the draft is take, put, swap or drop, under a key
+    /// of 1 to 64 characters; nothing else rides along to the app.
+    #[test]
+    fn a_draft_ask_is_take_put_or_drop_with_a_key() {
+        let ask = |v: Json| draft_ask(&json_value(&v));
+        let took = ask(json!({ "op": "take", "key": "stash", "extra": "dropped" })).expect("a take");
+        assert_eq!(value_json(&took), json!({ "op": "take", "key": "stash" }));
+        assert!(ask(json!({ "op": "put", "key": "k".repeat(64) })).is_some());
+        assert!(ask(json!({ "op": "drop", "key": "é" })).is_some());
+        assert!(ask(json!({ "op": "swap", "key": "stash" })).is_some());
+        assert!(ask(json!({ "op": "send", "key": "stash" })).is_none(), "not an op");
+        assert!(ask(json!({ "op": "take", "key": "" })).is_none(), "no key");
+        assert!(ask(json!({ "op": "take" })).is_none(), "no key");
+        assert!(ask(json!({ "op": "take", "key": "k".repeat(65) })).is_none(), "too long");
+        assert!(ask(json!({ "op": "take", "key": "a\nb" })).is_none(), "a control character");
+    }
+
     #[test]
     fn only_a_plugin_on_loads_from_its_snapshot_with_its_grants() {
         let on = item(json!({
@@ -3312,12 +3689,29 @@ mod tests {
         let p = on.plugin().unwrap();
         assert_eq!(p.name, "focus");
         assert_eq!(p.entry, PathBuf::from("/d/plugins/.loaded/focus/0123/init.luau"));
-        assert!(p.grants.contains(&Capability::Override("#sidebar-actions".into())));
+        assert!(p.grants.contains(&Capability::OverrideElement("#sidebar-actions".into())));
         for status in ["off", "pending", "tampered", "broken"] {
             let mut json = on.json.clone();
             json["status"] = json!(status);
             assert!(item(json).plugin().is_none(), "{status} must not load");
         }
+    }
+
+    /// B10 (R26): the sidebar's notice names the plugin allowed to narrow
+    /// it, as installed, never what the plugin writes in `by`.
+    #[test]
+    fn the_sidebar_filter_is_named_by_the_one_plugin_allowed_to_set_it() {
+        let at = |id: &str, name: &str, change: &[&str]| {
+            item(json!({ "id": id, "name": name, "status": "on", "snapshot": "/s", "permissions": ["ui.change"], "ui": { "change": change } }))
+        };
+        let focus = at("focus", "Focus", &["#sidebar"]);
+        let badge = at("badge", "Badge", &["#bar"]);
+        let quiet = at("quiet", "Quiet", &[".session-row"]);
+        let want = |items: &[&Item]| items.iter().filter_map(|i| i.plugin()).collect::<Vec<_>>();
+        let items = vec![focus.clone(), badge.clone(), quiet.clone()];
+        assert_eq!(filter_by(&want(&[&focus, &badge]), &items), Value::from("Focus"));
+        assert_eq!(filter_by(&want(&[&badge]), &items), Value::Nil, "none allowed");
+        assert_eq!(filter_by(&want(&[&focus, &quiet]), &items), Value::Nil, "two allowed: which one isn't known");
     }
 
     #[test]
@@ -3346,6 +3740,8 @@ mod examples_tests;
 mod hotkeys_tests;
 #[cfg(test)]
 mod markdown_tests;
+#[cfg(test)]
+mod network_tests;
 
 #[cfg(test)]
 mod menu_tests {

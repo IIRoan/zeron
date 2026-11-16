@@ -408,7 +408,8 @@ fn terminal_entrypoint_and_browser_respect_navigation_regions(cx: &mut TestAppCo
         let shell = shell.read(cx);
         let terminal = if cfg!(target_os = "linux") {
             assert!(shell.terminal_open(cx));
-            assert!(!shell.right_tabs.values().flatten().any(|surface| matches!(surface, RightSurface::Terminal(_))));
+            assert!(matches!(shell.resolved_right_active(cx), RightSurface::Terminal(_)));
+            assert_eq!(shell.right_tabs.values().flatten().filter(|surface| matches!(surface, RightSurface::Terminal(_))).count(), 1);
             shell.terminal.as_ref().unwrap().read(cx)
         } else {
             shell.right_terminal.as_ref().unwrap().read(cx)
@@ -416,14 +417,9 @@ fn terminal_entrypoint_and_browser_respect_navigation_regions(cx: &mut TestAppCo
         assert!(terminal.focus_handle().is_focused(window));
     });
     press(cx, true);
-    if cfg!(target_os = "linux") {
-        shell.read_with(cx, |shell, cx| {
-            assert_eq!(shell.state.read(cx).selected_chat.as_deref(), Some("other"));
-        });
-        shell.update(cx, |shell, cx| shell.open_chat("parent".into(), cx));
-    } else {
-        assert_surface(&shell, cx, RightSurface::Subagent(1));
-    }
+    // Terminals now share the tools region on Linux, so the shortcut cycles
+    // surface tabs and retains the current conversation.
+    assert_surface(&shell, cx, RightSurface::Subagent(1));
     cx.update(|window, cx| {
         shell.update(cx, |shell, cx| {
             shell.add_browser_surface(None, window, cx);
@@ -446,7 +442,7 @@ fn terminal_entrypoint_and_browser_respect_navigation_regions(cx: &mut TestAppCo
 }
 
 #[gpui::test]
-fn bottom_terminal_keeps_session_navigation(cx: &mut TestAppContext) {
+fn terminal_navigation_matches_its_sidebar_or_bottom_dock(cx: &mut TestAppContext) {
     let (shell, cx) = setup(cx);
     cx.update(|window, cx| {
         shell.update(cx, |shell, cx| {
@@ -470,9 +466,13 @@ fn bottom_terminal_keeps_session_navigation(cx: &mut TestAppContext) {
         );
     });
     press(cx, true);
-    shell.read_with(cx, |shell, cx| {
-        assert_eq!(shell.state.read(cx).selected_chat.as_deref(), Some("other"));
-    });
+    if cfg!(target_os = "linux") {
+        assert_surface(&shell, cx, RightSurface::Subagent(1));
+    } else {
+        shell.read_with(cx, |shell, cx| {
+            assert_eq!(shell.state.read(cx).selected_chat.as_deref(), Some("other"));
+        });
+    }
 }
 
 #[gpui::test]
@@ -586,99 +586,4 @@ fn ctrl_c_in_a_terminal_is_not_taken_by_a_transcript_selection(cx: &mut TestAppC
     cx.simulate_keystrokes("ctrl-c");
     assert_eq!(clipboard_text(cx).as_deref(), Some("sentinel"));
     clear_transcript_selection();
-}
-
-#[gpui::test]
-fn pull_requests_from_a_chat_open_as_tabs_beside_the_focused_session(cx: &mut TestAppContext) {
-    use crate::markdown::render::{LinkAction, LinkActivation, LinkOutcome, LinkTarget};
-    let (shell, cx) = setup(cx);
-    let link = |url: &str| LinkActivation {
-        target: LinkTarget::new(url, url),
-        action: LinkAction::Primary,
-        source_session: Some("parent".into()),
-    };
-    let pull_requests = |shell: &Shell| -> Vec<String> {
-        shell.right_tabs["parent"]
-            .iter()
-            .filter_map(|surface| match surface {
-                RightSurface::PullRequest(id) => Some(shell.chat_pull_requests[id].url.clone()),
-                _ => None,
-            })
-            .collect()
-    };
-    cx.update(|window, cx| {
-        shell.update(cx, |shell, cx| {
-            // A link into a pull request opens its view in this session's pane.
-            assert_eq!(
-                shell.activate_session_link(
-                    &link("https://github.com/a/b/pull/1/files"),
-                    window,
-                    cx
-                ),
-                LinkOutcome::Internal
-            );
-            // Another session's sidebar badge opens here too, so pull requests
-            // can be compared side by side; the same one reuses its tab.
-            shell.open_chat_pull_request("https://github.com/c/d/pull/2".into(), None, window, cx);
-            shell.activate_session_link(&link("https://github.com/a/b/pull/1"), window, cx);
-            assert_eq!(
-                pull_requests(shell),
-                [
-                    "https://github.com/a/b/pull/1",
-                    "https://github.com/c/d/pull/2"
-                ]
-            );
-            assert!(matches!(shell.route, Route::Chat));
-            assert!(shell.right_pane_open(cx));
-            let active = shell.resolved_right_active(cx);
-            let RightSurface::PullRequest(id) = active else {
-                panic!("a pull request tab is active: {active:?}");
-            };
-            assert_eq!(
-                shell.chat_pull_requests[&id].url,
-                "https://github.com/a/b/pull/1"
-            );
-            // Closing the tab drops its view.
-            shell.close_right_surface(active, window, cx);
-            assert!(!shell.chat_pull_requests.contains_key(&id));
-        });
-    });
-    // Pull requests sent to the default browser in Settings open there, even
-    // while other links open in Zeron.
-    cx.update(|window, cx| {
-        settings::update(SavePolicy::Immediate, cx, |settings| {
-            settings.pull_request_destination = settings::PullRequestDestination::External;
-        });
-        assert!(settings::current(cx).open_web_links_in_zeron);
-        shell.update(cx, |shell, cx| {
-            let before = (shell.chat_pull_requests.len(), shell.browsers.len());
-            assert_eq!(
-                shell.activate_session_link(&link("https://github.com/e/f/pull/3"), window, cx),
-                LinkOutcome::External("https://github.com/e/f/pull/3".into())
-            );
-            assert_eq!(
-                (shell.chat_pull_requests.len(), shell.browsers.len()),
-                before
-            );
-        });
-    });
-    // With "Open links in Zeron" off, a pull request link leaves Zeron too,
-    // even with the pull request view selected.
-    cx.update(|window, cx| {
-        settings::update(SavePolicy::Immediate, cx, |settings| {
-            settings.pull_request_destination = settings::PullRequestDestination::Native;
-            settings.open_web_links_in_zeron = false;
-        });
-        shell.update(cx, |shell, cx| {
-            let before = (shell.chat_pull_requests.len(), shell.browsers.len());
-            assert_eq!(
-                shell.activate_session_link(&link("https://github.com/g/h/pull/4"), window, cx),
-                LinkOutcome::External("https://github.com/g/h/pull/4".into())
-            );
-            assert_eq!(
-                (shell.chat_pull_requests.len(), shell.browsers.len()),
-                before
-            );
-        });
-    });
 }

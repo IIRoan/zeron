@@ -11,6 +11,10 @@ pub struct ProjectTerminalService {
     pub directory: String,
     #[serde(default)]
     pub restart_on_failure: bool,
+    /// Service ids that must start first. Older app entries without this field
+    /// keep waiting for all shared databases; an empty list needs none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depends_on: Option<Vec<String>>,
     /// Present on shared databases: project infrastructure that runs in the
     /// main folder and must pass this check before setup or app services.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -40,6 +44,59 @@ fn default_readiness_timeout() -> u64 {
 #[serde(rename_all = "camelCase")]
 pub struct ProjectTerminalConfig {
     pub services: Vec<ProjectTerminalService>,
+}
+
+/// A single-entry edit. Omitted update fields keep their saved values.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProjectServicePatch {
+    pub name: Option<String>,
+    pub command: Option<String>,
+    pub directory: Option<String>,
+    pub restart_on_failure: Option<bool>,
+    pub depends_on: Option<Vec<String>>,
+    pub readiness_command: Option<String>,
+    pub readiness_timeout_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProjectServiceKind {
+    #[default]
+    Service,
+    Database,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(
+    tag = "op",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum ProjectServiceEdit {
+    Add {
+        #[serde(default)]
+        kind: ProjectServiceKind,
+        name: String,
+        command: String,
+        #[serde(default = "default_service_directory")]
+        directory: String,
+        #[serde(default)]
+        restart_on_failure: bool,
+        #[serde(default)]
+        depends_on: Option<Vec<String>>,
+        readiness_command: Option<String>,
+        readiness_timeout_seconds: Option<u64>,
+    },
+    Update {
+        service_id: String,
+        changes: ProjectServicePatch,
+    },
+}
+
+fn default_service_directory() -> String {
+    ".".into()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,4 +141,14 @@ pub struct ProjectTerminalsSnapshot {
     /// The one checkout currently owning this project's service processes.
     #[serde(default)]
     pub checkout: Option<String>,
+    /// Transient startup progress. Reading it never starts a service.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub startups: Vec<ProjectServiceStartup>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectServiceStartup {
+    pub service_id: String,
+    pub message: String,
 }

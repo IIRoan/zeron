@@ -144,6 +144,58 @@ and opens either in the right pane.
 On Linux, agents can also control explicitly enabled browser tabs in their own
 chat. See [Browser automation](browser-automation.md) for tools, consent,
 platform support, and validation.
+
+Agents also have `service_list`, `service_status`, `service_start`,
+`service_restart`, and `service_stop`. They use the desktop's service manager
+for the calling chat's project and checkout, including its configured databases.
+These controls are available directly; no browser consent toggle is required.
+`service_list {}` returns ids, names, process status, database readiness, exit
+codes and restart counts. The status/control tools take `{"serviceId":"<listed id>"}`.
+Status reads never activate a checkout. Starting a service runs the usual setup
+and readiness checks and respects the project's Follow active / Parallel mode.
+Databases have `scope: "project"`: stopping or restarting one affects every
+checkout sharing it. App services have `scope: "checkout"`. Use `service_status`
+to check readiness after an action. A service with no run is reported as stopped.
+`service_list {"includeConfig":true}` also returns each entry's `configuration`
+(name, command, directory, restart policy, and database readiness check).
+`service_add` creates one entry and returns its generated id; `service_update`
+takes a listed `serviceId` and only the fields to change. Both merge into the
+latest configuration without replacing other entries or environment/setup settings.
+App edits from a worktree create an override for that checkout; edits from the
+main folder change project defaults. Database edits always change the project's
+shared entry. Readiness checks cannot be removed from databases or added to app
+services to change their kind. Commands and relative directories follow the UI's
+validation rules. Saving starts nothing and leaves running processes unchanged;
+call `service_start` for a new entry or `service_restart` to apply an edited command.
+Editing shell commands requires full access outside read-only/plan mode.
+
+For example, add an app with `service_add {"name":"API","command":"bun run dev",
+"directory":"apps/api"}`, then pass its returned id to `service_start`.
+
+Set `dependsOn` to service ids from `service_list`, for example `service_update {"serviceId":"<api id>","dependsOn":["<database id>"]}`. An empty list removes startup requirements. New entries default to no requirements; existing entries retain their previous database requirements until their requirements are edited. Startup follows only those dependencies. Status includes `progress` while queued, preparing, or waiting, and `service_stop` can cancel startup before it finishes.
+
+Add a database with `{"kind":"database","name":"Postgres","command":"…",
+"readinessCommand":"pg_isready","readinessTimeoutSeconds":120}`. Update just its
+check with `service_update {"serviceId":"<listed id>","readinessCommand":"…"}`.
+
+`worktree_settings_get {}` returns the calling chat's project worktree settings:
+the project `defaults`, the `settings` its checkout uses (`hasOverrides` when it
+has its own), detected env files, dependency folders and install command, every
+worktree's setup state, and the folder new worktrees go in. `mainFolder` is true
+in the project's main folder. `worktree_settings_update` takes a required
+`scope` (`project` for the defaults, `checkout` for this chat's worktree) plus
+only the fields to change, merged into the latest saved settings under the same
+lock as the settings page. Lists and maps (`envFiles`, `dependencyPaths`,
+`variables`) replace the saved ones. `{"scope":"checkout","reset":true}` drops a
+worktree's own settings. `serviceMode` is project-only, and services and
+databases stay with the service tools. Saving runs nothing. Because workflow
+commands run outside the agent sandbox, editing requires full access outside
+read-only/plan mode.
+
+These tools never take arbitrary project or checkout paths.
+A chat without a project receives an explanatory error. An older daemon asks
+the agent to update Zeron rather than claiming the action succeeded.
+
 Chat status uses the same shared derivation as the sidebar, including OSC 7501
 reports from chat-owned terminals. `status` is `working`, `awaitingInput`,
 `completed` (an unseen result), `errored`, or `idle`; `sessionStatus` retains the
@@ -176,6 +228,15 @@ name (default: the local engine's device).
 | `archive_chat`     | `Mutate setChatArchived`                                  |
 | `show_visual`      | `PublishVisual {chatId, title, script, assets}` (origin chat only; assets base64 by name, read by the MCP server from the agent's cwd) |
 | `show_image`       | `PublishImage {chatId, name, data}` (origin chat only; the file base64, read by the MCP server from the agent's cwd) |
+| `service_list`, `service_status` | `GetChatServices {chatId}` (origin chat only) |
+| `service_start`, `service_restart`, `service_stop` | `ControlChatService {chatId, serviceId, action}` (origin chat only; mutations are not replayed on reconnect) |
+| `service_add`, `service_update` | `EditChatService {chatId, edit}` (origin chat only; one entry, no reconnect replay) |
+| `worktree_settings_get` | `GetChatWorktreeSettings {chatId}` (origin chat only) |
+| `worktree_settings_update` | `EditChatWorktreeSettings {chatId, scope, changes, reset}` (origin chat only; named fields only, no reconnect replay) |
+| `sandbox_status` | `GetSandboxes {chatId}` (origin chat only) |
+| `sandbox_enable`, `sandbox_disable` | `SetSandbox {chatId, spaceId?, enabled, config?, hostPorts?, publishPorts?, readOnly?}` (origin chat only; full access, refused inside a sandbox; no reconnect replay). See [Project sandboxes](sandboxes.md) |
+| `vm_status`, `vm_diagnostics`, `vm_screenshot` | `ChatWindowsVm {chatId, action}` (origin chat only; the project must be connected to a Windows VM by the person) |
+| `vm_start`, `vm_stop`, `vm_exec`, `vm_launch`, `vm_input` | `ChatWindowsVm {chatId, action, command?, cwd?, timeoutSeconds?, input?, x?, y?, text?, keys?}` (origin chat only; full access; no reconnect replay). See [Windows VM](windows-vm.md) |
 
 Watch streams are the engine's only read surface (there is no one-shot "get
 transcript" RPC); a snapshot is "subscribe, take the first item, drop" — drop

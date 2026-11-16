@@ -93,6 +93,31 @@ pub fn any_can_do_anything(commands: &[String]) -> bool {
     commands.iter().any(|c| risk(c) == Risk::Anything)
 }
 
+/// Shells and interpreters, by [`normalized`] name without a version: naming
+/// one lets a plugin run anything at all, so the rules below hold nothing back
+/// and the words for it are plain.
+const FULL_CONTROL: &[&str] = &[
+    "ash", "bash", "bun", "cmd", "csh", "dash", "deno", "elixir", "erl", "fish", "ksh", "lua", "luajit", "node", "nodejs",
+    "osascript", "perl", "php", "powershell", "pwsh", "python", "pypy", "ruby", "sh", "swift", "tclsh",
+    "tcsh", "wscript", "cscript", "zsh",
+];
+
+/// Whether naming `program` gives a plugin full control of your computer: a
+/// shell or an interpreter (`python3`, `python3.12`, `node`, `sh`), which run
+/// whatever they're given. Every one is [`Risk::Anything`], as anything unknown
+/// is; this says which of those to say it of plainly.
+pub fn full_control(program: &str) -> bool {
+    let name = normalized(program);
+    FULL_CONTROL.contains(&name.as_str()) || FULL_CONTROL.contains(&name.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.'))
+}
+
+/// Whether `program` is one this runner holds to rules of its own (`git`,
+/// `gh`: [`git_args`], [`gh_args`]), so it's said as what it does rather than
+/// as anything you can do. It's still [`Risk::Anything`], and always asked.
+pub fn held_to_its_own_rules(program: &str) -> bool {
+    matches!(family(program), Family::Git | Family::Gh)
+}
+
 /// A program's name as the system finds it: lowercase (macOS and Windows
 /// find `Git` as `git`), without a Windows extension.
 pub fn normalized(program: &str) -> String {
@@ -645,8 +670,30 @@ pub fn run_trusting(asked: &Json, allowed: &[String], trusted: &dyn Fn(&Path) ->
     run_on(asked, allowed, user_path(), trusted)
 }
 
+/// [`run_trusting`], with variables the caller (never the plugin) sets on a
+/// git-family run over everything else: for a sandboxed checkout, its own
+/// git folder (`GIT_DIR`, …), so git can't be pointed at one an agent wrote.
+pub fn run_pinned(
+    asked: &Json,
+    allowed: &[String],
+    trusted: &dyn Fn(&Path) -> bool,
+    pinned: &[(String, String)],
+) -> Result<Json, String> {
+    run_with(asked, allowed, user_path(), trusted, pinned)
+}
+
 /// [`run_trusting`], finding programs on `path`.
 pub fn run_on(asked: &Json, allowed: &[String], path: &str, trusted: &dyn Fn(&Path) -> bool) -> Result<Json, String> {
+    run_with(asked, allowed, path, trusted, &[])
+}
+
+fn run_with(
+    asked: &Json,
+    allowed: &[String],
+    path: &str,
+    trusted: &dyn Fn(&Path) -> bool,
+    pinned: &[(String, String)],
+) -> Result<Json, String> {
     let program = asked["program"].as_str().unwrap_or_default();
     if !valid_name(program) || !allowed.iter().any(|a| a == program) {
         return Err(format!("This plugin doesn't run \"{program}\": its manifest's \"commands\" names what it may run"));
@@ -699,12 +746,19 @@ pub fn run_on(asked: &Json, allowed: &[String], path: &str, trusted: &dyn Fn(&Pa
     }
     // (Over the plugin's: git, and the git gh starts, always hardened.)
     if is(Family::Git) || is(Family::GitTool) || is(Family::Gh) {
-        for (key, value) in git_env(hooks) {
+        for (key, value) in git_env(hooks).into_iter().chain(pinned.iter().cloned()) {
             command.env(key, value);
         }
     }
     if let Some(cwd) = &cwd {
         command.current_dir(cwd);
+    }
+    // (No console of its own: run from a windowless app, gh and git would
+    // each open one on Windows.)
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
     let stdin = asked["stdin"].as_str().map(str::to_string);
     command.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() });

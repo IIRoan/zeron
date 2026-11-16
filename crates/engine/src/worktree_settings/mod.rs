@@ -505,7 +505,17 @@ impl WorktreeSettingsStore {
     }
 
     fn setup_token(&self, cwd: &str) -> CancellationToken {
-        let token = CancellationToken::new();
+        self.setup_token_with_parent(cwd, None)
+    }
+
+    fn setup_token_with_parent(
+        &self,
+        cwd: &str,
+        parent: Option<&CancellationToken>,
+    ) -> CancellationToken {
+        let token = parent
+            .map(CancellationToken::child_token)
+            .unwrap_or_default();
         let mut tokens = self
             .inner
             .cancellation
@@ -597,7 +607,7 @@ impl WorktreeSettingsStore {
         let operation = self.operation(&root_key);
         let _guard = operation.lock().await;
         self.capture_active(root)?;
-        self.prepare_locked(root, checkout, retry).await
+        self.prepare_locked(root, checkout, retry, None, None).await
     }
 
     /// Agent dispatch prepares only worktrees Zeron created. A worktree made
@@ -631,6 +641,8 @@ impl WorktreeSettingsStore {
         root: &Path,
         checkout: &Path,
         retry: bool,
+        prerequisites: Option<&HashSet<String>>,
+        parent: Option<&CancellationToken>,
     ) -> Result<(), EngineError> {
         self.ensure_running()?;
         let root_key = canonical(root)?;
@@ -654,6 +666,9 @@ impl WorktreeSettingsStore {
                     .and_then(|p| p.checkouts.get(&cwd))
                     .is_some_and(|c| c.prepared_hash == digest))
             })?;
+        // Setup is about to run here: it needs every database up, whichever
+        // services are being started.
+        let prerequisites = prerequisites.filter(|_| already_prepared);
         let project_services = self
             .inner
             .project_services
@@ -661,11 +676,12 @@ impl WorktreeSettingsStore {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         if already_prepared
-            && !project_services
-                .as_ref()
-                .map(|(services, _)| services.has_setup_services(root))
-                .transpose()?
-                .unwrap_or(false)
+            && (prerequisites.is_some_and(HashSet::is_empty)
+                || !project_services
+                    .as_ref()
+                    .map(|(services, _)| services.has_setup_services(root))
+                    .transpose()?
+                    .unwrap_or(false))
         {
             self.state(
                 &root_key,
@@ -697,7 +713,7 @@ impl WorktreeSettingsStore {
             }
             Ok(())
         })?;
-        let token = self.setup_token(&cwd);
+        let token = self.setup_token_with_parent(&cwd, parent);
         let mut guard = SetupGuard {
             store: self.clone(),
             root: root_key.clone(),
@@ -725,7 +741,7 @@ impl WorktreeSettingsStore {
         let result = async {
             if let Some((services, terminals)) = project_services {
                 services
-                    .ensure_setup_services(&terminals, root, &defaults, &log, &token)
+                    .ensure_setup_services_for(&terminals, root, &defaults, &log, &token, prerequisites)
                     .await?;
             }
             if already_prepared {
@@ -979,14 +995,31 @@ impl WorktreeSettingsStore {
     /// Called only by foreground selection or an explicit Start, after service
     /// teardown. Background polls have no environment side effects.
     pub async fn activate(&self, root: &Path, checkout: &Path) -> Result<(), EngineError> {
+        self.activate_for_services(root, checkout, None, None).await
+    }
+
+    pub(crate) async fn activate_for_services(
+        &self,
+        root: &Path,
+        checkout: &Path,
+        prerequisites: Option<&HashSet<String>>,
+        parent: Option<&CancellationToken>,
+    ) -> Result<(), EngineError> {
         let key = canonical(root)?;
         let cwd = canonical(checkout)?;
         let operation = self.operation(&key);
-        let _guard = operation.lock().await;
+        let _guard = match parent {
+            Some(token) => tokio::select! {
+                biased;
+                _ = token.cancelled() => return Err(EngineError::Other("Service startup was cancelled.".into())),
+                guard = operation.lock() => guard,
+            },
+            None => operation.lock().await,
+        };
         let previous = Some(self.active(&key)?);
         self.capture_active(root)?;
         if cwd != key {
-            self.prepare_locked(root, checkout, false).await?;
+            self.prepare_locked(root, checkout, false, prerequisites, parent).await?;
         }
         let settings = self.effective(root, checkout)?;
         let defaults = self.defaults(root)?;
@@ -1006,7 +1039,7 @@ impl WorktreeSettingsStore {
                 self.follow_file(root, checkout, &settings, &rule.path)?;
             }
             if !settings.activate_command.trim().is_empty() {
-                let token = self.setup_token(&cwd);
+                let token = self.setup_token_with_parent(&cwd, parent);
                 let mut guard = SetupGuard {
                     store: self.clone(),
                     root: key.clone(),
@@ -1188,7 +1221,7 @@ impl WorktreeSettingsStore {
         let log = self.log_path(&key, &cwd);
         self.state(&key, &cwd, WorktreeSetupPhase::Preparing, step, None)?;
         let result = commands::run_with_refs(
-            root, checkout, settings, command, &log, &token, in_project, refs,
+            root, checkout, settings, command, &log, &token, in_project, refs, false,
         )
         .await;
         self.state(

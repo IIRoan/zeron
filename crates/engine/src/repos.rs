@@ -284,10 +284,11 @@ impl Repos {
             // Let Git handle long native paths without persisting user config.
             cmd.args(["-c", "core.longpaths=true"]);
         }
+        cmd.args(args);
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
+            crate::sandbox::pin_git(&mut cmd, cwd);
         }
-        cmd.args(args);
         cmd.stdin(std::process::Stdio::null());
         let output = cmd.output().await.map_err(|e| {
             EngineError::Other(format!("git {args:?} in {cwd:?} failed to start: {e}"))
@@ -325,6 +326,7 @@ impl Repos {
         cmd.args(args);
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
+            crate::sandbox::pin_git(&mut cmd, cwd);
         }
         cmd.stdin(std::process::Stdio::null());
         let output = cmd
@@ -367,6 +369,21 @@ impl Repos {
             .ok()?;
         let (owner, name) = parse_github_remote(&remote)?;
         Some(format!("{owner}/{name}"))
+    }
+
+    /// [`Self::github_repo`], telling "no GitHub origin" (`Ok(None)`) from
+    /// a git call that failed (`Err`).
+    pub async fn github_repo_checked(&self, path: &Path) -> Result<Option<String>, EngineError> {
+        // Exit 1 with nothing said: no `origin` configured.
+        if self
+            .git_probe(&["config", "--get", "remote.origin.url"], Some(path))
+            .await?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let remote = self.git(&["remote", "get-url", "origin"], Some(path)).await?;
+        Ok(parse_github_remote(&remote).map(|(owner, name)| format!("{owner}/{name}")))
     }
 
     pub async fn is_repo(&self, path: &Path) -> bool {
@@ -1420,14 +1437,22 @@ impl Repos {
         // Snapshot the destination once per creation. Changes never relocate
         // existing worktrees or alter the cwd already stored on a chat.
         let root = self.inner.worktrees.root();
-        let base = root.join(&repo_name);
+        // A sandboxed project's go where its container mounts them, whatever
+        // the location setting says now.
+        let sandboxed = crate::sandbox::for_path(repo_path)?;
+        let base = match &sandboxed {
+            Some(sandbox) => sandbox.worktrees.clone(),
+            None => root.join(&repo_name),
+        };
         // A location that contains the repository (e.g. its parent folder)
         // would nest checkouts inside the primary one, where they show up as
         // untracked embedded repositories.
-        if let (Ok(root), Ok(repo)) = (
-            std::fs::canonicalize(&root),
-            std::fs::canonicalize(repo_path),
-        ) && root.join(&repo_name).starts_with(&repo)
+        if sandboxed.is_none()
+            && let (Ok(root), Ok(repo)) = (
+                std::fs::canonicalize(&root),
+                std::fs::canonicalize(repo_path),
+            )
+            && root.join(&repo_name).starts_with(&repo)
         {
             return Err(EngineError::Other(format!(
                 "Worktrees for {repo_name} would be created inside the repository at {}. Choose a different worktree location in Settings.",
@@ -1908,7 +1933,7 @@ impl Repos {
         self.inner.worktree_settings.clone()
     }
 
-    async fn workspace_checkout_root(&self, cwd: &Path) -> Result<PathBuf, EngineError> {
+    pub(crate) async fn workspace_checkout_root(&self, cwd: &Path) -> Result<PathBuf, EngineError> {
         let output = self
             .git(&["worktree", "list", "--porcelain", "-z"], Some(cwd))
             .await?;

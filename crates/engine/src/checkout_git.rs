@@ -46,6 +46,7 @@ fn command(root: &Path, args: &[&str]) -> tokio::process::Command {
     ] {
         command.env_remove(name);
     }
+    crate::sandbox::pin_git(&mut command, root);
     #[cfg(unix)]
     // SAFETY: the hook only calls setsid, which is async-signal-safe.
     unsafe {

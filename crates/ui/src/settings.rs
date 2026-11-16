@@ -28,6 +28,7 @@ pub mod devices;
 pub mod files;
 pub mod harnesses;
 pub mod notifications;
+pub mod plugins;
 pub(crate) mod project_icons;
 pub mod search;
 pub mod shortcuts;
@@ -54,9 +55,6 @@ pub const FILES_PANEL_MAX: f32 = 440.0;
 /// for the conversation and any docked file explorer.
 pub const RIGHT_PANE_MIN: f32 = 360.0;
 pub const RIGHT_PANE_DEFAULT: f32 = 520.0;
-/// The Pull requests route's side pane defaults wider than the chat's: the
-/// detail's Code tab needs room beside the board.
-pub const PULL_REQUEST_PANE_DEFAULT: f32 = 640.0;
 /// Minimum width retained for the conversation when the right pane is open.
 pub const CHAT_PANEL_MIN: f32 = 300.0;
 
@@ -418,78 +416,6 @@ pub enum SavePolicy {
     Immediate,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum PullRequestDestination {
-    #[default]
-    Native,
-    /// A Browser tab beside the conversation. Without one on screen, the
-    /// pull request opens in the default browser.
-    Browser,
-    External,
-}
-
-impl PullRequestDestination {
-    pub const ALL: [Self; 3] = [Self::Native, Self::Browser, Self::External];
-
-    /// The name stored in the settings file.
-    const fn key(self) -> &'static str {
-        match self {
-            Self::Native => "native",
-            Self::Browser => "browser",
-            Self::External => "external",
-        }
-    }
-
-    /// The value written to the legacy `pullRequestDestination` key. Builds
-    /// up to v0.2.122 read only that key and reset every UI setting on a
-    /// name they don't know, so it never holds `browser`: an in-app browser
-    /// pick reads there as the view, the closest destination they have.
-    const fn legacy_key(self) -> &'static str {
-        match self {
-            Self::External => "external",
-            Self::Native | Self::Browser => "native",
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Native => "Pull request view",
-            Self::Browser => "In-app browser",
-            Self::External => "Default browser",
-        }
-    }
-
-    pub fn description(self) -> &'static str {
-        match self {
-            Self::Native => {
-                "Inspect them in Zeron, beside the conversation or the Pull requests board."
-            }
-            Self::Browser => {
-                "Open them in a Browser tab beside the conversation, or in the default browser when none is shown."
-            }
-            Self::External => "Open them in the default browser.",
-        }
-    }
-}
-
-impl Serialize for PullRequestDestination {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.key())
-    }
-}
-
-/// A destination this build doesn't know (written by a newer one) reads as
-/// the default rather than failing the whole settings file.
-impl<'de> Deserialize<'de> for PullRequestDestination {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let stored = serde_json::Value::deserialize(deserializer)?;
-        Ok(Self::ALL
-            .into_iter()
-            .find(|destination| stored == destination.key())
-            .unwrap_or_default())
-    }
-}
-
 /// The sole in-process owner and writer of `ui-settings.json`.
 ///
 /// Mutations land in `current` before any timer starts. Replacing a pending
@@ -561,6 +487,16 @@ pub fn init(settings: UiSettings, data_dir: impl Into<PathBuf>, cx: &mut App) {
 pub fn current(cx: &App) -> UiSettings {
     cx.try_global::<SettingsStore>()
         .map(|store| store.current.clone())
+        .unwrap_or_default()
+}
+
+pub fn plugin_enabled(id: crate::plugins::PluginId, cx: &App) -> bool {
+    cx.try_global::<SettingsStore>().is_none_or(|store| store.current.plugins.enabled(id))
+}
+
+pub fn plugin_preferences(cx: &App) -> crate::plugins::Preferences {
+    cx.try_global::<SettingsStore>()
+        .map(|store| store.current.plugins.clone())
         .unwrap_or_default()
 }
 
@@ -1056,9 +992,82 @@ pub const SKILL_COMPLETION_HARNESSES: [(zeron_proto::HarnessId, &str); 10] = [
     (zeron_proto::HarnessId::Opencode, "OpenCode"),
 ];
 
+/// One chat's panel sizes (see [`UiSettings::chat_panel_sizes`]); `None`
+/// keeps the latest size set anywhere.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PanelSizes {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub right: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<f32>,
+    /// When it was last resized (Unix seconds): the oldest go first past
+    /// [`PANEL_SIZES_KEPT`].
+    pub resized_at: u64,
+}
+
+/// Chats whose panel sizes are kept.
+// ponytail: deleted chats' sizes stay until they're the oldest of this many;
+// prune against the chat list if that ever matters.
+pub const PANEL_SIZES_KEPT: usize = 300;
+
+impl UiSettings {
+    /// The chat `key`'s panel sizes, each falling back to the latest one.
+    pub fn panel_sizes_for(&self, key: &str) -> PanelSizes {
+        let own = self.chat_panel_sizes.get(key).copied().unwrap_or_default();
+        let latest = self.latest_panel_sizes;
+        PanelSizes {
+            files: own.files.or(latest.files),
+            right: own.right.or(latest.right),
+            terminal: own.terminal.or(latest.terminal),
+            resized_at: own.resized_at,
+        }
+    }
+
+    /// Keep a resize (`set` on the sizes) for the chat `key` and as the
+    /// latest one, dropping the longest-unresized chat past
+    /// [`PANEL_SIZES_KEPT`].
+    pub fn remember_panel_size(&mut self, key: String, now: u64, set: impl Fn(&mut PanelSizes)) {
+        for sizes in [
+            self.chat_panel_sizes.entry(key).or_default(),
+            &mut self.latest_panel_sizes,
+        ] {
+            set(sizes);
+            sizes.resized_at = now;
+        }
+        if self.chat_panel_sizes.len() > PANEL_SIZES_KEPT
+            && let Some(oldest) = self
+                .chat_panel_sizes
+                .iter()
+                .min_by_key(|(_, sizes)| sizes.resized_at)
+                .map(|(key, _)| key.clone())
+        {
+            self.chat_panel_sizes.remove(&oldest);
+        }
+    }
+}
+
+impl PanelSizes {
+    /// Each size in its legal range; one that isn't a number is dropped.
+    fn clamped(self) -> Self {
+        let legal = |value: Option<f32>, min: f32, max: f32| {
+            value.filter(|v| v.is_finite()).map(|v| v.clamp(min, max))
+        };
+        Self {
+            files: legal(self.files, FILES_PANEL_MIN, FILES_PANEL_MAX),
+            right: legal(self.right, RIGHT_PANE_MIN, f32::MAX),
+            terminal: legal(self.terminal, TERMINAL_MIN_HEIGHT, TERMINAL_ABS_MAX_HEIGHT),
+            resized_at: self.resized_at,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiSettings {
+    pub plugins: crate::plugins::Preferences,
     pub dictation_enabled: bool,
     /// Dictation microphone as a `zeron_voice::InputDevice` id; `None`
     /// follows the system default.
@@ -1093,7 +1102,7 @@ pub struct UiSettings {
     pub project_icons_by_profile: HashMap<String, HashMap<String, project_icons::CustomProjectIcon>>,
     pub sidebar_show_harness: bool,
     pub sidebar_show_branch: bool,
-    pub sidebar_show_pull_request: bool,
+
     /// The project filter row at the top of the sidebar.
     pub sidebar_show_project_filter: bool,
     /// The Archived accordion below the active session list.
@@ -1152,8 +1161,7 @@ pub struct UiSettings {
     /// remain enabled independently of this preference.
     pub agent_update_notifications: bool,
     pub right_pane_width: f32,
-    /// Width of the pull request pane beside the board.
-    pub pull_request_pane_width: f32,
+
     /// Legacy: panel *open* flags are session-scoped in-memory state now
     /// (`shell::SessionPanels`, zeron `sessionPanels` parity). Kept for file
     /// compatibility; no longer read or written by the shell.
@@ -1161,6 +1169,14 @@ pub struct UiSettings {
     pub terminal_height: f32,
     /// Legacy — see [`Self::right_pane_open`].
     pub terminal_open: bool,
+    /// Panel sizes a chat keeps (the files panel, the right pane, the
+    /// terminal), keyed like the session panels: a chat id, or the new-chat
+    /// canvas key. Set by resizing a panel in that chat.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub chat_panel_sizes: std::collections::BTreeMap<String, PanelSizes>,
+    /// The sizes last set by a resize in any chat: what a chat without its
+    /// own opens with.
+    pub latest_panel_sizes: PanelSizes,
     /// Customizable shortcut combos (feature-inventory §1.4).
     pub keymap: KeymapConfig,
     /// macOS viewer-side Appshot capture. Device-local because the shortcut
@@ -1223,26 +1239,12 @@ pub struct UiSettings {
     /// Maximum message and docked composer surface width in logical pixels.
     /// The centered new-chat composer keeps its own width.
     pub transcript_width: f32,
-    /// Open a normal web-link activation in the session Browser. Explicit
-    /// context-menu actions remain available regardless of this preference.
-    /// Off, pull request links leave Zeron too; on, they open where
-    /// [`Self::pull_request_destination`] says.
-    pub open_web_links_in_zeron: bool,
+
     /// Compact transcript: a turn's working steps (thinking, tool calls, and
     /// the narration between them) fold into one collapsed accordion, so only
     /// the reply text stays visible.
     pub transcript_compact_mode: bool,
-    /// Destination shared by PR badges, the pull-request board, and pull
-    /// request links in messages while [`Self::open_web_links_in_zeron`] is on.
-    /// Stored as `pullRequestOpenIn`; [`Self::save`] also writes the legacy
-    /// `pullRequestDestination` for older builds sharing this file.
-    #[serde(rename = "pullRequestOpenIn")]
-    pub pull_request_destination: PullRequestDestination,
-    /// Last explicitly selected PR scope, restored when no project is selected.
-    pub last_pull_request_repository: Option<String>,
-    pub last_pull_request_device: Option<String>,
-    /// Device-local bookmarks, keyed by provider/repository/PR, never GitHub mutations.
-    pub pull_request_stars: Vec<String>,
+
     /// Save edited workspace files automatically after the configured delay.
     pub files_autosave_enabled: bool,
     /// Idle time before an edited workspace file is saved automatically.
@@ -1292,6 +1294,7 @@ pub struct UiSettings {
 impl Default for UiSettings {
     fn default() -> Self {
         Self {
+            plugins: crate::plugins::Preferences::default(),
             dictation_enabled: false,
             dictation_input: None,
             window_geometry: None,
@@ -1306,7 +1309,7 @@ impl Default for UiSettings {
             project_icons_by_profile: HashMap::new(),
             sidebar_show_harness: true,
             sidebar_show_branch: true,
-            sidebar_show_pull_request: true,
+
             sidebar_show_project_filter: true,
             sidebar_show_archived: true,
             github_star_banner_dismissed: false,
@@ -1327,10 +1330,12 @@ impl Default for UiSettings {
             files_panel_width: FILES_PANEL_DEFAULT,
             agent_update_notifications: true,
             right_pane_width: RIGHT_PANE_DEFAULT,
-            pull_request_pane_width: PULL_REQUEST_PANE_DEFAULT,
+
             right_pane_open: false,
             terminal_height: TERMINAL_DEFAULT_HEIGHT,
             terminal_open: false,
+            chat_panel_sizes: Default::default(),
+            latest_panel_sizes: PanelSizes::default(),
             keymap: KeymapConfig::default(),
             escape_stops_active_agent: false,
             settings_section: crate::shell::SettingsSection::default(),
@@ -1368,12 +1373,9 @@ impl Default for UiSettings {
             math_font: MathFont::Fira,
             math_size: MATH_SIZE_DEFAULT,
             transcript_width: TRANSCRIPT_WIDTH_DEFAULT,
-            open_web_links_in_zeron: true,
+
             transcript_compact_mode: false,
-            pull_request_destination: PullRequestDestination::Native,
-            last_pull_request_repository: None,
-            last_pull_request_device: None,
-            pull_request_stars: Vec::new(),
+
             files_autosave_enabled: false,
             files_autosave_delay_ms: FILES_AUTOSAVE_DELAY_DEFAULT_MS,
             files_word_wrap: false,
@@ -2142,6 +2144,7 @@ impl UiSettings {
             }};
         }
         merge!(
+            plugins,
             dictation_enabled,
             dictation_input,
             window_geometry,
@@ -2160,7 +2163,6 @@ impl UiSettings {
             project_icons_by_profile,
             sidebar_show_harness,
             sidebar_show_branch,
-            sidebar_show_pull_request,
             sidebar_show_project_filter,
             sidebar_show_archived,
             github_star_banner_dismissed,
@@ -2181,10 +2183,11 @@ impl UiSettings {
             files_panel_width,
             agent_update_notifications,
             right_pane_width,
-            pull_request_pane_width,
             right_pane_open,
             terminal_height,
             terminal_open,
+            chat_panel_sizes,
+            latest_panel_sizes,
             keymap,
             appshots_enabled,
             appshot_sound_enabled,
@@ -2211,7 +2214,6 @@ impl UiSettings {
             math_font,
             math_size,
             transcript_width,
-            open_web_links_in_zeron,
             transcript_compact_mode,
             files_autosave_enabled,
             files_autosave_delay_ms,
@@ -2233,10 +2235,6 @@ impl UiSettings {
             codex_voice,
             codex_voice_device,
             legacy_accent_color,
-            pull_request_destination,
-            last_pull_request_repository,
-            last_pull_request_device,
-            pull_request_stars,
         );
         current
     }
@@ -2260,17 +2258,20 @@ impl UiSettings {
             FILES_PANEL_DEFAULT,
         );
         self.right_pane_width = min_or(self.right_pane_width, RIGHT_PANE_MIN, RIGHT_PANE_DEFAULT);
-        self.pull_request_pane_width = min_or(
-            self.pull_request_pane_width,
-            RIGHT_PANE_MIN,
-            PULL_REQUEST_PANE_DEFAULT,
-        );
+
         self.terminal_height = clamp_or(
             self.terminal_height,
             TERMINAL_MIN_HEIGHT,
             TERMINAL_ABS_MAX_HEIGHT,
             TERMINAL_DEFAULT_HEIGHT,
         );
+        for sizes in self
+            .chat_panel_sizes
+            .values_mut()
+            .chain(std::iter::once(&mut self.latest_panel_sizes))
+        {
+            *sizes = sizes.clamped();
+        }
         self.files_autosave_delay_ms = self
             .files_autosave_delay_ms
             .clamp(FILES_AUTOSAVE_DELAY_MIN_MS, FILES_AUTOSAVE_DELAY_MAX_MS);
@@ -2315,11 +2316,6 @@ impl UiSettings {
                         // size; it now drives every code surface.
                         if let Some(legacy) = settings.remove("filesEditorFontSize") {
                             settings.entry("codeFontSize").or_insert(legacy);
-                        }
-                        // A file an older build wrote last holds only the
-                        // legacy destination key (see `save`).
-                        if let Some(legacy) = settings.remove("pullRequestDestination") {
-                            settings.entry("pullRequestOpenIn").or_insert(legacy);
                         }
                     }
                     if let Some(keymap) = value
@@ -2422,20 +2418,8 @@ impl UiSettings {
         std::fs::create_dir_all(data_dir)?;
         let path = Self::path(data_dir);
         let tmp = path.with_extension("json.tmp");
-        // Flattened, not through `serde_json::Value`, which would widen
-        // every `f32` (`1.8` → `1.7999999523162842`).
-        #[derive(Serialize)]
-        struct Saved<'a> {
-            #[serde(flatten)]
-            settings: &'a UiSettings,
-            #[serde(rename = "pullRequestDestination")]
-            legacy_pull_request_destination: &'static str,
-        }
-        let json = serde_json::to_string_pretty(&Saved {
-            settings: self,
-            legacy_pull_request_destination: self.pull_request_destination.legacy_key(),
-        })
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         std::fs::write(&tmp, json)?;
         std::fs::rename(&tmp, &path)
     }
@@ -2476,6 +2460,52 @@ pub use zeron_proto::SidebarSection;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_chat_keeps_its_panel_sizes_and_others_open_with_the_latest() {
+        let mut settings = UiSettings::default();
+        assert_eq!(
+            settings.panel_sizes_for("new").files,
+            None,
+            "nothing kept yet"
+        );
+        settings.remember_panel_size("a".into(), 1, |sizes| sizes.files = Some(300.0));
+        settings.remember_panel_size("b".into(), 2, |sizes| sizes.files = Some(400.0));
+        settings.remember_panel_size("b".into(), 3, |sizes| sizes.right = Some(700.0));
+        assert_eq!(settings.panel_sizes_for("a").files, Some(300.0));
+        assert_eq!(settings.panel_sizes_for("a").right, Some(700.0), "latest");
+        assert_eq!(settings.panel_sizes_for("b").files, Some(400.0));
+        assert_eq!(settings.panel_sizes_for("new").files, Some(400.0), "latest");
+
+        let saved = serde_json::to_string(&settings).unwrap();
+        let loaded = serde_json::from_str::<UiSettings>(&saved)
+            .unwrap()
+            .clamped();
+        assert_eq!(loaded.panel_sizes_for("a").files, Some(300.0));
+        let wild: UiSettings =
+            serde_json::from_str(r#"{"chatPanelSizes":{"x":{"files":99999,"terminal":-1}}}"#)
+                .unwrap();
+        let wild = wild.clamped().panel_sizes_for("x");
+        assert_eq!(wild.files, Some(FILES_PANEL_MAX));
+        assert_eq!(wild.terminal, Some(TERMINAL_MIN_HEIGHT));
+
+        for i in 0..PANEL_SIZES_KEPT + 2 {
+            settings.remember_panel_size(format!("c{i}"), 10 + i as u64, |sizes| {
+                sizes.terminal = Some(300.0)
+            });
+        }
+        // 304 chats for 300 places: the four resized longest ago go.
+        assert_eq!(settings.chat_panel_sizes.len(), PANEL_SIZES_KEPT);
+        for gone in ["a", "b", "c0", "c1"] {
+            assert!(!settings.chat_panel_sizes.contains_key(gone), "{gone}");
+        }
+        assert!(settings.chat_panel_sizes.contains_key("c2"));
+        assert!(
+            settings
+                .chat_panel_sizes
+                .contains_key(&format!("c{}", PANEL_SIZES_KEPT + 1))
+        );
+    }
 
     #[test]
     fn skill_completion_defaults_overrides_and_persistence_are_per_harness() {
@@ -2542,106 +2572,39 @@ mod tests {
         assert!(!loaded.compact_model_picker);
     }
 
-    /// Every build shares `ui-settings.json`, and up to v0.2.122 an unknown
-    /// `pullRequestDestination` reset every UI setting. A saved file keeps
-    /// that key to the names those builds know, and the full pick survives.
     #[test]
-    fn saved_pull_request_destination_stays_readable_by_older_builds() {
-        // `PullRequestDestination` and the fields read here, as v0.2.122
-        // derives them.
-        #[derive(Debug, PartialEq, Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        enum OldDestination {
-            Native,
-            External,
-        }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct OldBuild {
-            pull_request_destination: OldDestination,
-            sidebar_width: f32,
-        }
+    fn removed_pr_preferences_are_ignored_without_resetting_other_settings() {
         let dir = tempfile::tempdir().unwrap();
-        for (destination, old) in [
-            (PullRequestDestination::Native, OldDestination::Native),
-            (PullRequestDestination::Browser, OldDestination::Native),
-            (PullRequestDestination::External, OldDestination::External),
-        ] {
-            let settings = UiSettings {
-                pull_request_destination: destination,
-                sidebar_width: 300.0,
-                ..UiSettings::default()
-            };
-            settings.save(dir.path()).unwrap();
-            let text = std::fs::read_to_string(UiSettings::path(dir.path())).unwrap();
-            let read: OldBuild = serde_json::from_str(&text).unwrap();
-            assert_eq!(read.pull_request_destination, old, "{destination:?}");
-            assert_eq!(read.sidebar_width, 300.0);
-            assert_eq!(
-                UiSettings::load(dir.path()).pull_request_destination,
-                destination
-            );
-        }
-        // A file an older build wrote last: its legacy key is the pick.
-        let write = |text: &str| std::fs::write(UiSettings::path(dir.path()), text).unwrap();
-        write(r#"{"pullRequestDestination":"external"}"#);
-        assert_eq!(
-            UiSettings::load(dir.path()).pull_request_destination,
-            PullRequestDestination::External
-        );
-        // Both keys: the full pick wins over its legacy stand-in.
-        write(r#"{"pullRequestDestination":"native","pullRequestOpenIn":"browser"}"#);
-        assert_eq!(
-            UiSettings::load(dir.path()).pull_request_destination,
-            PullRequestDestination::Browser
-        );
-    }
-
-    #[test]
-    fn pull_request_destination_defaults_to_the_native_view_and_round_trips() {
-        let existing: UiSettings = serde_json::from_str(r#"{"sidebarWidth":300}"#).unwrap();
-        assert_eq!(
-            existing.pull_request_destination,
-            PullRequestDestination::Native
-        );
-        for (destination, stored) in PullRequestDestination::ALL
-            .into_iter()
-            .zip(["native", "browser", "external"])
-        {
-            let settings = UiSettings {
-                pull_request_destination: destination,
-                ..existing.clone()
-            };
-            let text = serde_json::to_string(&settings).unwrap();
-            assert!(
-                text.contains(&format!(r#""pullRequestOpenIn":"{stored}""#)),
-                "{text}"
-            );
-            let loaded: UiSettings = serde_json::from_str(&text).unwrap();
-            assert_eq!(loaded.pull_request_destination, destination);
+        for destination in ["native", "browser", "external", "future-destination"] {
+            let old = serde_json::json!({
+                "sidebarWidth": 300, "soundEnabled": false,
+                "openWebLinksInZeron": true, "pullRequestOpenIn": destination,
+                "pullRequestDestination": destination, "sidebarShowPullRequest": true,
+                "pullRequestPaneWidth": 820, "lastPullRequestRepository": "acme/repo",
+                "lastPullRequestDevice": "local", "pullRequestStars": ["https://github.com/acme/repo/pull/1"],
+            });
+            std::fs::write(UiSettings::path(dir.path()), old.to_string()).unwrap();
+            let loaded = UiSettings::load(dir.path());
             assert_eq!(loaded.sidebar_width, 300.0);
-        }
-        // Unknown names and malformed values read as the native view without
-        // defaulting the rest of the file.
-        let dir = tempfile::tempdir().unwrap();
-        for raw in [
-            r#""sidePanel""#,
-            "42",
-            "null",
-            r#"{"destination":"external"}"#,
-        ] {
-            std::fs::write(
-                UiSettings::path(dir.path()),
-                format!(r#"{{"sidebarWidth": 300, "pullRequestDestination": {raw}}}"#),
+            assert!(!loaded.sound_enabled);
+            loaded.save(dir.path()).unwrap();
+            let saved: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(UiSettings::path(dir.path())).unwrap(),
             )
             .unwrap();
-            let loaded = UiSettings::load(dir.path());
-            assert_eq!(
-                loaded.pull_request_destination,
-                PullRequestDestination::Native,
-                "{raw}"
-            );
-            assert_eq!(loaded.sidebar_width, 300.0, "{raw}");
+            for key in [
+                "openWebLinksInZeron",
+                "pullRequestOpenIn",
+                "pullRequestDestination",
+                "sidebarShowPullRequest",
+                "pullRequestPaneWidth",
+                "lastPullRequestRepository",
+                "lastPullRequestDevice",
+                "pullRequestStars",
+            ] {
+                assert!(saved.get(key).is_none(), "obsolete setting {key} was saved");
+            }
+            assert_eq!(UiSettings::load(dir.path()).sidebar_width, 300.0);
         }
     }
 
@@ -2656,7 +2619,6 @@ mod tests {
 
         let loaded = UiSettings::load(dir.path());
         assert_eq!(loaded.composer_send_behavior, ComposerSendBehavior::Enter);
-        assert!(loaded.open_web_links_in_zeron);
         assert!(loaded.new_thread_composer_background.is_none());
         assert_eq!(
             loaded.new_thread_background_effect,
@@ -3313,6 +3275,7 @@ mod tests {
     fn round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let settings = UiSettings {
+            plugins: crate::plugins::Preferences::default(),
             dictation_enabled: false,
             dictation_input: Some("coreaudio:usb-mic".into()),
             window_geometry: None,
@@ -3329,7 +3292,7 @@ mod tests {
             sidebar_show_project_label: false,
             sidebar_show_harness: false,
             sidebar_show_branch: false,
-            sidebar_show_pull_request: false,
+
             sidebar_show_project_filter: false,
             sidebar_show_archived: false,
             github_star_banner_dismissed: true,
@@ -3365,10 +3328,26 @@ mod tests {
             files_panel_width: 310.0,
             agent_update_notifications: false,
             right_pane_width: 700.0,
-            pull_request_pane_width: 820.0,
+
             right_pane_open: true,
             terminal_height: 320.0,
             terminal_open: true,
+            chat_panel_sizes: [(
+                "chat-1".to_string(),
+                PanelSizes {
+                    files: Some(300.0),
+                    right: None,
+                    terminal: Some(240.0),
+                    resized_at: 7,
+                },
+            )]
+            .into(),
+            latest_panel_sizes: PanelSizes {
+                files: Some(300.0),
+                right: Some(640.0),
+                terminal: Some(240.0),
+                resized_at: 7,
+            },
             keymap: KeymapConfig {
                 toggle_sidebar: "mod-shift-s".into(),
                 ..KeymapConfig::default()
@@ -3419,12 +3398,9 @@ mod tests {
             math_font: MathFont::StixTwo,
             math_size: 135,
             transcript_width: 960.0,
-            open_web_links_in_zeron: false,
+
             transcript_compact_mode: true,
-            pull_request_destination: PullRequestDestination::External,
-            last_pull_request_repository: Some("acme/zeron".into()),
-            last_pull_request_device: Some("remote-device".into()),
-            pull_request_stars: vec!["https://github.com/acme/zeron/pull/123".into()],
+
             files_autosave_enabled: true,
             files_autosave_delay_ms: 1_500,
             files_word_wrap: true,
@@ -3465,7 +3441,7 @@ mod tests {
         assert!(json.contains(r#""renderMath": false"#));
         assert!(json.contains(r#""mathFont": "stixTwo""#));
         assert!(json.contains(r#""mathSize": 135"#));
-        assert!(json.contains(r#""openWebLinksInZeron": false"#));
+        assert!(!json.contains("openWebLinksInZeron"));
         assert!(json.contains(r#""newThreadBackgroundEffect": "ascii""#));
         assert!(json.contains(r#""focalX": 0.25"#));
         assert!(json.contains(r#""focalY": 0.75"#));

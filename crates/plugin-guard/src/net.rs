@@ -155,19 +155,23 @@ impl HostRule {
     }
 
     fn matches(&self, host: &str, port: u16) -> bool {
+        self.matches_host(host) && self.port.is_none_or(|p| p == port)
+    }
+
+    fn matches_host(&self, host: &str) -> bool {
         let host = host.trim_end_matches('.');
-        let named = if self.wildcard {
+        if self.wildcard {
             host.len() > self.host.len() && host.ends_with(&self.host) && host[..host.len() - self.host.len()].ends_with('.')
         } else {
             host == self.host
-        };
-        named && self.port.is_none_or(|p| p == port)
+        }
     }
 }
 
 /// Whether a `network.hosts` entry reaches this device or your network
 /// (consent words it so): `localhost`, a private address, `.local`,
-/// `.internal`, `.lan`, `.home.arpa`, or a one-label name.
+/// `.internal`, `.lan`, `.home.arpa`, a one-label name, or a name ending in a
+/// number, which a resolver reads as an address (`127.1`, `0x7f.1`).
 pub fn risky(entry: &str) -> bool {
     let Ok(rule) = HostRule::parse(entry) else { return true };
     if let Ok(ip) = rule.host.parse::<IpAddr>() {
@@ -176,9 +180,25 @@ pub fn risky(entry: &str) -> bool {
     let host = rule.host.as_str();
     host == "localhost"
         || !host.contains('.')
+        || ends_in_a_number(host)
         || [".localhost", ".local", ".internal", ".lan", ".home.arpa", ".intranet", ".corp"]
             .iter()
             .any(|tail| host.ends_with(tail))
+}
+
+/// Whether `host`'s last label is a number (decimal, or `0x` hex).
+fn ends_in_a_number(host: &str) -> bool {
+    let last = host.trim_end_matches('.').rsplit('.').next().unwrap_or(host);
+    let hex = last.strip_prefix("0x").map(|digits| digits.bytes().all(|b| b.is_ascii_hexdigit()));
+    hex.unwrap_or_else(|| !last.is_empty() && last.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Whether a `network.hosts` entry names one host exactly, and so may reach a
+/// private address it resolves to ([`Policy::resolved`]): any but `*.` and
+/// the any-host `*`. A person is asked about each of these, because nothing
+/// can tell from a name where it will point.
+pub fn names_exactly(entry: &str) -> bool {
+    entry != "*" && !entry.trim_start().starts_with("*.")
 }
 
 /// A plugin's network rules: open (any public host) or its manifest's
@@ -242,6 +262,17 @@ impl Policy {
     /// shapes the connection; credentials (`Authorization`, `Cookie`) only
     /// to a host the manifest names.
     pub fn header(&self, host: &str, port: u16, name: &str) -> Result<(), String> {
+        self.header_if(host, name, |rule, host| rule.matches(host, port))
+    }
+
+    /// [`Policy::header`] where the port isn't known (what a transport asks
+    /// as it sends to a host): credentials go to a host named on any port,
+    /// [`Policy::host`] having already held the request to the port named.
+    pub fn header_to(&self, host: &str, name: &str) -> Result<(), String> {
+        self.header_if(host, name, |rule, host| rule.matches_host(host))
+    }
+
+    fn header_if(&self, host: &str, name: &str, named: impl Fn(&HostRule, &str) -> bool) -> Result<(), String> {
         let lower = name.to_ascii_lowercase();
         if matches!(
             lower.as_str(),
@@ -253,7 +284,7 @@ impl Policy {
         }
         if matches!(lower.as_str(), "authorization" | "cookie") {
             let host = unbracket(host);
-            if !self.hosts.iter().any(|r| r.matches(&host, port)) {
+            if !self.hosts.iter().any(|r| named(r, &host)) {
                 return Err(format!(
                     "A plugin sends {name} only to a host its manifest names (\"network\": {{ \"hosts\": [\"{host}\"] }})"
                 ));
@@ -363,6 +394,19 @@ mod tests {
         assert!(open.header("example.com", 443, "Accept").is_ok());
         let named = Policy::new(&["api.example.com".into()]).unwrap();
         assert!(named.header("api.example.com", 443, "Authorization").is_ok());
+        // The same, for a transport that knows the host and not the port.
+        let ported = Policy::new(&["localhost:8080".into()]).unwrap();
+        for (policy, host, name, allowed) in [
+            (&open, "example.com", "Accept", true),
+            (&open, "example.com", "Authorization", false),
+            (&open, "example.com", "Host", false),
+            (&named, "api.example.com", "Cookie", true),
+            (&named, "evil.example.com", "Cookie", false),
+            (&ported, "localhost", "Authorization", true),
+            (&ported, "localhost", "Proxy-Authorization", false),
+        ] {
+            assert_eq!(policy.header_to(host, name).is_ok(), allowed, "{host} {name}");
+        }
     }
 
     #[test]
@@ -375,5 +419,16 @@ mod tests {
         }
         assert!(risky("localhost:8080") && risky("10.0.0.5") && risky("nas.local") && risky("printer") && risky("[::1]"));
         assert!(!risky("api.example.com") && !risky("*.example.org"));
+        // A resolver reads these as this device.
+        for numeric in ["127.1", "127.1:8080", "0x7f.1", "0x7f.0x1", "2130706433", "1.2.3", "example.0x1"] {
+            assert!(risky(numeric), "{numeric}");
+        }
+        for name in ["a1.example.com", "1.example.com", "example.x1", "0x7f.example.com", "box.tail1234.ts.net"] {
+            assert!(!risky(name), "{name}");
+        }
+        for exact in ["api.example.com", "localhost:8080", "box.tail1234.ts.net", "10.0.0.5"] {
+            assert!(names_exactly(exact), "{exact}");
+        }
+        assert!(!names_exactly("*.example.org") && !names_exactly("*"));
     }
 }

@@ -1095,7 +1095,7 @@ impl CloudPage {
                 .gap(px(12.0))
                 // Under the header's tile, so the list reads as its children.
                 .pl(px(8.0))
-                .child(crate::pull_request_media::avatar(
+                .child(crate::account_avatar::avatar(
                     owner,
                     SharedString::from(format!("cloud-repo-avatar-{ix}")),
                     20.0,
@@ -1523,6 +1523,7 @@ mod tests {
                         max_awake_sessions: 5,
                         available,
                         credits: [Some(1240.0), Some(0.0), None][ix % 3],
+                        ..Default::default()
                     });
                     page.vault = Loadable::Ready(vault);
                     let days = if ix % 2 == 0 { 7 } else { 90 };

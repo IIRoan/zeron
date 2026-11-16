@@ -17,6 +17,8 @@
 --     zeron.device   { id, name } where you're working
 --     zeron.devices  { { id, name, here } } your devices
 --     zeron.appearance  "light" | "dark"
+--     zeron.draft    { session?, text, attachments = { { kind, name } } }
+--                    the composer's draft ("draft")
 -- - **What records are made from**, for the host alone (no plugin reads
 --   these; each reads its own `plugin.<id>.records`, holding only what it
 --   was allowed, src/plugins/records.rs):
@@ -43,7 +45,6 @@ local store = require("@app/screens/settings/store")
 local PrivateText = require("@ds/private_text")
 local state = require("@app/screens/plugins/state")
 local page = require("@app/screens/plugins/page")
-local chat = require("@app/screens/chat")
 local ChatShared = require("@app/screens/chat/shared")
 local Cargo = require("@ds/composer_cargo")
 
@@ -86,6 +87,9 @@ require("@app/screens/templates")
 -- Each plugin's own settings: a page of its own under "Plugins", while
 -- it's on (screens/plugins/settings).
 require("@app/screens/plugins/settings")
+
+-- What's waiting for you to allow it: a notice each, until it's dealt with.
+require("@app/screens/plugins/waiting")
 
 -- What plugins see, written as it changes (each a steady table, so a
 -- plugin reading one hears only real changes).
@@ -145,11 +149,10 @@ ui.effect(function()
 	put(out.project, if p then { id = p.id, name = p.name or "" } else nil)
 end)
 ui.effect(function()
-	local now = sessions.now:get()
 	local id = route.device:get()
 	local list = {}
 	local here: any = nil
-	for _, d in now.devices or {} do
+	for _, d in sessions.devices:get() or {} do
 		table.insert(list, { id = d.id, name = d.name, here = d.here })
 		if d.id == id then
 			here = { id = d.id, name = d.name }
@@ -162,6 +165,133 @@ ui.effect(function()
 	ui.theme.current:get()
 	local kind = ui.theme.kind()
 	put(out.appearance, if kind == "light" or kind == "high-contrast-light" then "light" else "dark")
+end)
+
+-- What a draft carries, as plugins are told it: each chip's kind and name
+-- alone, never a file's path.
+local function attachments_of(cargo: { any }): { any }
+	local list = {}
+	for _, item in cargo do
+		table.insert(list, { kind = tostring(item.kind or "file"), name = tostring(item.name or "") })
+	end
+	return list
+end
+
+-- The composer's draft, for plugins allowed "draft" (`zeron.draft()`): the
+-- chat it's for (nil, a new chat), its words, and what it carries.
+-- Written only while a plugin that's on may read it: otherwise no key
+-- typed copies the draft (a long one, every key) for no one.
+local draft_out = ui.shared("zeron.draft", nil :: any)
+local draft_read = ui.computed(function(): boolean
+	for _, it in state.now:get().list or {} do
+		if it.status == "on" and table.find(it.permissions or {}, "draft") then
+			return true
+		end
+	end
+	return false
+end)
+ui.effect(function()
+	if not draft_read:get() then
+		if draft_out:peek() ~= nil then
+			put(draft_out, nil)
+		end
+		return
+	end
+	local key = ChatShared.showing_now()
+	put(draft_out, {
+		session = if key ~= "" then key else ui.null,
+		text = ChatShared.text:get(),
+		attachments = attachments_of(ChatShared.cargo:get()),
+	})
+end)
+
+-- The drafts plugins took (`zeron.take_draft`), each plugin's by its own
+-- keys, kept whole here so a plugin never holds its files' paths. Kept for
+-- the run, as chats' drafts are; a reload of the scripts keeps them.
+-- Each plugin is told what it keeps (`plugin.<id>.drafts`): by key, the
+-- chat it was taken from, its words, what it carries and when.
+local DRAFTS_KEPT = 16
+local shelves = ui.shared("plugins.drafts", {} :: { [string]: { [string]: any } })
+local shelves_told: { [string]: boolean } = {}
+ui.effect(function()
+	local all = shelves:get()
+	for plugin in all do
+		shelves_told[plugin] = true
+	end
+	for plugin in shelves_told do
+		local told: { [string]: any } = {}
+		for key, d in all[plugin] or {} do
+			told[key] = {
+				session = d.session or ui.null,
+				text = d.text,
+				attachments = attachments_of(d.cargo),
+				at = d.at,
+			}
+		end
+		ui.shared(`plugin.{plugin}.drafts`, {} :: any):set(told)
+	end
+end)
+
+-- A plugin's ask of the draft (the host checked "draft" and that it's
+-- take, put, swap or drop with a key).
+local function draft_asked(plugin: string, op: string, key: string)
+	local all = table.clone(shelves:peek())
+	local mine = table.clone(all[plugin] or {})
+	-- (Room for one more, unless it goes where that key kept one.)
+	local count = 0
+	for _ in mine do
+		count += 1
+	end
+	local full = mine[key] == nil and count >= DRAFTS_KEPT
+	local function kept_now(d: any, from: string): any
+		return { text = d.text, cargo = d.cargo, quotes = d.quotes, session = if from ~= "" then from else nil, at = os.time() }
+	end
+	if op == "take" then
+		if full then
+			return
+		end
+		local from = ChatShared.showing()
+		local d = ChatShared.lift()
+		if d == nil then
+			return
+		end
+		mine[key] = kept_now(d, from)
+	elseif op == "swap" then
+		-- The draft shown and what `key` kept, traded: either may be
+		-- nothing, so one call sets a draft aside, brings it back, or both.
+		local was = mine[key]
+		local from = ChatShared.showing()
+		if full then
+			return
+		end
+		local d = ChatShared.lift()
+		if d == nil and was == nil then
+			return
+		end
+		if was ~= nil then
+			ChatShared.lay(was)
+		end
+		mine[key] = if d ~= nil then kept_now(d, from) else nil
+	elseif op == "put" then
+		local d = mine[key]
+		if d == nil then
+			return
+		end
+		mine[key] = nil
+		ChatShared.lay(d)
+	elseif op == "drop" then
+		if mine[key] == nil then
+			return
+		end
+		mine[key] = nil
+	end
+	all[plugin] = if next(mine) ~= nil then mine else nil
+	shelves:set(all)
+end
+
+-- What a failed plugin's notice offers (a toast's action: `ds/toast`).
+ds.toast.action("plugins.open_folder", function(id: string)
+	state.open_folder(id)
 end)
 
 -- What plugins asked for, done here in order. The host numbers each;
@@ -178,8 +308,26 @@ local function run(r: any)
 		elseif type(to) == "table" and type(to.settings) == "string" and to.settings ~= "account" then
 			route.settings(to.settings)
 		end
-	elseif r.kind == "compose" and type(r.value) == "string" then
-		chat.store.insert(string.sub(r.value, 1, 20000))
+	elseif r.kind == "compose" and (type(r.value) == "string" or (type(r.value) == "table" and type(r.value.text) == "string")) then
+		-- `zeron.compose(text, { replace, session })` (the host checked
+		-- "compose"; its words alone come as a string): the words put in a
+		-- chat's draft, the one shown unless it names another ("" a new
+		-- chat's), in place of its words (its chips stay) or after them, on
+		-- a line of their own. Unsent: the person sends it. Shown, the
+		-- composer takes the keys.
+		local v = if type(r.value) == "string" then { text = r.value } else r.value
+		local words = string.sub(v.text, 1, 20000)
+		local shown = ChatShared.showing()
+		local key = if type(v.session) == "string" and #v.session <= 200 then v.session else shown
+		if v.replace ~= true then
+			local now = ChatShared.peek_text_of(key)
+			local sep = if now == "" or string.sub(now, -1) == "\n" then "" else "\n"
+			words = now .. sep .. words
+		end
+		ChatShared.set_draft_of(key, "text", words)
+		if key == shown then
+			ChatShared.focus:add(1)
+		end
 	elseif r.kind == "compose_comment" and type(r.value) == "table" and type(r.title) == "string" then
 		-- A plugin's review comment on a file or a diff (the host checked
 		-- "compose"): a comment chip on the session's draft, as the files
@@ -200,6 +348,13 @@ local function run(r: any)
 				session = if type(c.session) == "string" then c.session else nil,
 			}
 		end
+	elseif r.kind == "draft" and type(r.value) == "table" and type(r.title) == "string" and r.title ~= "" then
+		-- A plugin taking the draft, putting one back, swapping the two, or
+		-- letting one go.
+		local op, key = r.value.op, r.value.key
+		if type(op) == "string" and type(key) == "string" then
+			draft_asked(r.title, op, key)
+		end
 	elseif r.kind == "panel_tab" and type(r.value) == "table" then
 		-- A plugin's tab in a chat's panel (the host checked "panel.tabs").
 		local ok, Panel = pcall(require, "@app/screens/panel")
@@ -208,35 +363,14 @@ local function run(r: any)
 		end
 	elseif r.kind == "link" and type(r.value) == "string" then
 		-- A plugin's link (the host checked "links.open" and that it's a web
-		-- link): where Zeron opens links.
-		require("@ds/links").open(r.value)
+		-- link): where Zeron opens links, never back into a plugin's tab (the
+		-- GitHub viewer's Open on GitHub is a pull request's link too).
+		local url = r.value
+		require("@app/screens/shell/plugin_links").unclaimed(function()
+			require("@ds/links").open(url)
+		end)
 	elseif r.kind == "toast" then
 		ds.toast.show { title = r.title, body = r.value }
-	elseif r.kind == "waiting" then
-		ds.toast.show {
-			title = ui.t("plugins.init.waiting", { name = r.title }),
-			tone = "info",
-			action = {
-				label = ui.t("plugins.init.review"),
-				run = function()
-					state.review(r.value)
-				end,
-			},
-		}
-	elseif r.kind == "template_waiting" then
-		-- Someone else's template, brought in (an agent's import_template):
-		-- its consent window, the host's, installs it.
-		ds.toast.show {
-			title = ui.t("plugins.init.waiting", { name = r.title }),
-			body = ui.t("plugins.init.template_waiting_body"),
-			tone = "info",
-			action = {
-				label = ui.t("plugins.init.review"),
-				run = function()
-					ui.invoke("templates.review", r.value)
-				end,
-			},
-		}
 	elseif r.kind == "plugin_failed" then
 		ds.toast.show {
 			title = ui.t("plugins.init.failed", { name = r.title }),
@@ -244,9 +378,8 @@ local function run(r: any)
 			tone = "warning",
 			action = {
 				label = ui.t("plugins.init.show_folder"),
-				run = function()
-					state.open_folder(r.value.id)
-				end,
+				run = "plugins.open_folder",
+				value = r.value.id,
 			},
 		}
 	elseif r.kind == "template_failed" then

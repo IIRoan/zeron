@@ -19,6 +19,16 @@ pub mod capabilities {
     /// Shared databases are saved separately from app services, so either
     /// editor preserves the other's settings.
     pub const PROJECT_DATABASES_V1: &str = "project-databases-v1";
+    /// Chat-scoped agent tools for configured services and shared databases.
+    pub const PROJECT_SERVICE_CONTROL_V1: &str = "project-service-control-v1";
+    pub const PROJECT_SERVICE_EDIT_V1: &str = "project-service-edit-v1";
+    pub const PROJECT_SERVICE_STARTUP_V1: &str = "project-service-startup-v1";
+    /// Chat-scoped agent tools for the project's worktree settings.
+    pub const CHAT_WORKTREE_SETTINGS_V1: &str = "chat-worktree-settings-v1";
+    /// `GetSandboxes` / `SetSandbox`: project sandboxes over RPC (and MCP).
+    pub const PROJECT_SANDBOX_V1: &str = "project-sandbox-v1";
+    /// `*ProjectWindowsVm` / `ChatWindowsVm`: a project's Windows VM.
+    pub const WINDOWS_VM_V1: &str = "windows-vm-v1";
     /// The host creates a projectless chat's scratch folder
     /// (`crate::projectless`) when it runs; older hosts only know `~`.
     pub const PROJECTLESS_SCRATCH_V1: &str = "projectless-scratch-v1";
@@ -45,6 +55,15 @@ pub mod capabilities {
     /// interface asks for it on connect and offers Stable on an engine
     /// without it.
     pub const ZGX_INTERFACE_V1: &str = "zgx-interface-v1";
+    /// The host's `UpdateStatus` says how it's installed and whether another
+    /// device can update it (`install`, `canApplyRemotely`, and why not).
+    /// Older hosts don't say: a client can't tell without trying.
+    pub const UPDATE_ABILITY_V1: &str = "update-ability-v1";
+    /// The host looks in the edge's attachment store for bytes a message names
+    /// (`/blob/{chatId}/attachments/{uploadId}`). A sender holds a message for
+    /// such a host until its bytes are stored; older hosts get them over the
+    /// peer link, as they always did.
+    pub const ATTACHMENT_STORE_V1: &str = "attachment-store-v1";
 
     pub const CURRENT: &[&str] = &[
         BROWSER_CONTROL_V1,
@@ -56,11 +75,19 @@ pub mod capabilities {
         MESSAGE_QUEUE_EDIT_LEASE_V1,
         HARNESS_UPDATES_V1,
         PROJECT_DATABASES_V1,
+        PROJECT_SERVICE_CONTROL_V1,
+        PROJECT_SERVICE_EDIT_V1,
+        PROJECT_SERVICE_STARTUP_V1,
+        CHAT_WORKTREE_SETTINGS_V1,
+        PROJECT_SANDBOX_V1,
+        WINDOWS_VM_V1,
         PROJECTLESS_SCRATCH_V1,
         SIDEBAR_SECTION_ORDER_V1,
         PROVIDER_SWITCH_V1,
         BACKGROUND_TASKS_V1,
         ZGX_INTERFACE_V1,
+        UPDATE_ABILITY_V1,
+        ATTACHMENT_STORE_V1,
         crate::voice::remote::CAPABILITY,
     ];
 
@@ -151,11 +178,19 @@ mod tests {
                     "message-queue-edit-lease-v1",
                     "harness-updates-v1",
                     "project-databases-v1",
+                    "project-service-control-v1",
+                    "project-service-edit-v1",
+                    "project-service-startup-v1",
+                    "chat-worktree-settings-v1",
+                    "project-sandbox-v1",
+                    "windows-vm-v1",
                     "projectless-scratch-v1",
                     "sidebar-section-order-v1",
                     "provider-switch-v1",
                     "background-tasks-v1",
                     "zgx-interface-v1",
+                    "update-ability-v1",
+                    "attachment-store-v1",
                     "voice-client-media-v1"
                 ],
             })

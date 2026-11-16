@@ -1,0 +1,2 @@
+# A patch keeps the blank context lines it was made with.
+*.patch -whitespace

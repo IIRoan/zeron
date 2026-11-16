@@ -2,13 +2,19 @@
 //!
 //! Requests are handled concurrently (a `wait_for_turn` may block for
 //! minutes while the client keeps pinging); responses are serialized through
-//! one writer task so frames never interleave. Notifications from the client
-//! (`notifications/initialized`, `notifications/cancelled`) are accepted and
-//! ignored — there is no server-side state to initialize or cancel. The one
-//! notification the server sends, `notifications/tools/list_changed` (when
-//! the engine's plugin tools change), goes through the same writer.
+//! one writer task so frames never interleave. The one notification the server
+//! sends on its own, `notifications/tools/list_changed` (when the engine's
+//! plugin tools change), goes through the same writer.
+//!
+//! The server must outlive anything its client sends: a client never restarts
+//! a stdio server that exits (its agent loses the tools for the session), so
+//! a bad line is skipped, never fatal, and a reply too big for the client to
+//! read is cut down rather than sent whole. A long call reports progress, as
+//! clients abort a call that goes quiet; `notifications/cancelled` stops one.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -28,6 +34,24 @@ The user must enable the bot button on a tab before you can control it. Use \
 browser_snapshot for current element refs, browser_wait after navigation, and \
 browser_screenshot to inspect the rendered page. Refresh a snapshot after a stale \
 ref error. A timeout can occur after an action took effect; inspect before retrying.\n\
+\n\
+When service tools are available, call service_list to find configured services \
+and databases in your chat's project and checkout. Use their ids with service_status, \
+service_start, service_restart and service_stop. You can control these directly. \
+Use service_add to add a service or database, or service_update with a listed id \
+and only the fields to change. service_list with includeConfig:true shows editable \
+configuration. Saving does not start or restart anything; service_restart applies \
+new settings to a running process. \
+Databases are shared across project checkouts; app services respect the project's \
+checkout mode. Check status and database readiness after an action; after a timeout \
+or lost connection inspect status before retrying.\n\
+\n\
+When the chat's project is connected to a Windows VM (vm_status says so), call vm_start \
+before the other vm tools. vm_exec runs PowerShell there and returns its output; a program \
+with a window needs vm_launch. vm_diagnostics reads the VM's health (processes, ports, recent errors) \
+in one call. vm_screenshot shows the screen and vm_input clicks and types \
+on it, in screenshot pixels. The VM has its own disk, and its localhost reaches only the \
+ports vm_status lists.\n\
 \n\
 Zeron runs coding agents in chats, each hosted on a device, optionally in a project \
 (a folder on that specific device). These tools operate the local Zeron engine: \
@@ -71,21 +95,42 @@ The reader sees the visual above that reply, so don't announce or restate it. To
 reader an image file (a screenshot, a rendered PNG), call `show_image` with its path; don't \
 draw images through `show_visual`.";
 
+/// Appended to [`INSTRUCTIONS`] where the agent is offered
+/// `wait_on_background` ([`zeron_proto::McpServer::WAITS_ON_BACKGROUND_ENV`]).
+const WAITS_ON_BACKGROUND: &str = "\n\n\
+Before ending a turn while a background command you started is still running and you'll carry on \
+once it ends (tests, a build), call `wait_on_background` with its task id, so the person sees the \
+chat waiting rather than finished. Not for anything you leave running (a dev server, a watcher).";
+
 /// Appended to [`INSTRUCTIONS`] when the host launched the agent without its
 /// own subagent tools ([`zeron_proto::McpServer::SIDE_CHATS_ONLY_ENV`]).
 const SIDE_CHATS_ONLY: &str = "\n\n\
 Your own subagent tools are turned off in Zeron's settings: where you would start a \
 subagent, delegate through Zeron chats instead, with `create_chats` (or `create_chat`).";
 
-/// What `initialize` tells the agent, with the side-chat rule when its host
-/// turned the agent's own subagents off.
-fn instructions(side_chats_only: bool) -> std::borrow::Cow<'static, str> {
-    if side_chats_only {
-        format!("{INSTRUCTIONS}{SIDE_CHATS_ONLY}").into()
-    } else {
-        INSTRUCTIONS.into()
+/// What `initialize` tells the agent: with when to say it waits where it's
+/// offered `wait_on_background`, and the side-chat rule when its host turned
+/// the agent's own subagents off.
+fn instructions(waits: bool, side_chats_only: bool) -> std::borrow::Cow<'static, str> {
+    if !waits && !side_chats_only {
+        return INSTRUCTIONS.into();
     }
+    let waits = if waits { WAITS_ON_BACKGROUND } else { "" };
+    let side_chats = if side_chats_only { SIDE_CHATS_ONLY } else { "" };
+    format!("{INSTRUCTIONS}{waits}{side_chats}").into()
 }
+
+/// How often a call still running reports progress. Clients abort a call
+/// that sends nothing for long enough (Claude Code: 30 minutes); a Zeron
+/// wait may run an hour.
+const PROGRESS_EVERY: Duration = Duration::from_secs(30);
+
+/// The largest reply this server writes. Claude Code drops its stdio
+/// connection, for good, on a message past 16 MiB.
+const MAX_REPLY_BYTES: usize = 8 * 1024 * 1024;
+
+/// Requests in flight, by id, so `notifications/cancelled` can stop one.
+type InFlight = Arc<Mutex<HashMap<String, tokio::task::AbortHandle>>>;
 
 const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
@@ -108,8 +153,23 @@ pub async fn serve_stdio(tools: Arc<Tools>) -> anyhow::Result<()> {
         }
     });
 
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
+    let in_flight = InFlight::default();
+    let mut stdin = BufReader::new(tokio::io::stdin());
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match stdin.read_until(b'\n', &mut buf).await {
+            Ok(0) => break, // the client closed stdin: we're done
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => {
+                tracing::warn!(error = %err, "mcp: stdin failed");
+                break;
+            }
+        }
+        // A line that isn't UTF-8 fails to parse below, and is answered as
+        // such, rather than ending the server.
+        let line = String::from_utf8_lossy(&buf);
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -126,7 +186,7 @@ pub async fn serve_stdio(tools: Arc<Tools>) -> anyhow::Result<()> {
                 continue;
             }
         };
-        let Some(response) = route(&tools, message, &out_tx) else {
+        let Some(response) = route(&tools, message, &out_tx, &in_flight) else {
             continue;
         };
         let _ = out_tx.send(response.to_string()).await;
@@ -170,7 +230,12 @@ fn spawn_tool_list_watch(
 
 /// Classify one inbound message. Requests are answered asynchronously via
 /// `out`; an immediate `Some` is a synchronous error reply.
-fn route(tools: &Arc<Tools>, message: Value, out: &mpsc::Sender<String>) -> Option<Value> {
+fn route(
+    tools: &Arc<Tools>,
+    message: Value,
+    out: &mpsc::Sender<String>,
+    in_flight: &InFlight,
+) -> Option<Value> {
     let Some(object) = message.as_object() else {
         return Some(error_response(
             Value::Null,
@@ -188,10 +253,35 @@ fn route(tools: &Arc<Tools>, message: Value, out: &mpsc::Sender<String>) -> Opti
         (Some(id), Some(method)) => {
             let tools = tools.clone();
             let out = out.clone();
-            tokio::spawn(async move {
+            let key = id.to_string();
+            let token = params
+                .get("_meta")
+                .and_then(|meta| meta.get("progressToken"))
+                .cloned();
+            let registry = in_flight.clone();
+            let done_key = key.clone();
+            // Held across the spawn, so a request that finishes at once
+            // can't remove its entry before it is made.
+            let mut requests = lock(in_flight);
+            let task = tokio::spawn(async move {
+                let progress = token.map(|token| spawn_progress(token, out.clone()));
                 let response = handle_request(&tools, id, &method, params).await;
-                let _ = out.send(response.to_string()).await;
+                if let Some(progress) = progress {
+                    progress.abort();
+                }
+                let _ = out.send(cap_reply(response).to_string()).await;
+                lock(&registry).remove(&done_key);
             });
+            requests.insert(key, task.abort_handle());
+            None
+        }
+        (None, Some(method)) if method == "notifications/cancelled" => {
+            // The client gave up on a request: stop it (a wait holding a
+            // subscription to the engine releases it) and send nothing back.
+            let key = params.get("requestId").map(Value::to_string);
+            if let Some(task) = key.and_then(|key| lock(in_flight).remove(&key)) {
+                task.abort();
+            }
             None
         }
         (None, Some(method)) => {
@@ -231,7 +321,7 @@ pub async fn handle_request(tools: &Tools, id: Value, method: &str, params: Valu
                         "name": "zeron",
                         "version": env!("CARGO_PKG_VERSION"),
                     },
-                    "instructions": instructions(tools.side_chats_only()),
+                    "instructions": instructions(tools.waits_on_background(), tools.side_chats_only()),
                 }),
             )
         }
@@ -249,11 +339,11 @@ pub async fn handle_request(tools: &Tools, id: Value, method: &str, params: Valu
                 .cloned()
                 .unwrap_or_else(|| json!({}));
             match tools.call(name, arguments).await {
-                Ok(value) if name == "browser_screenshot" => {
+                Ok(value) if name == "browser_screenshot" || name == "vm_screenshot" => {
                     if let (Some(mime), Some(data)) = (value["mimeType"].as_str(), value["data"].as_str()) {
                         ok_response(id, json!({"content":[{"type":"image","mimeType":mime,"data":data}],"isError":false}))
                     } else {
-                        ok_response(id, json!({"content":[{"type":"text","text":"browser_screenshot_failed: invalid image response"}],"isError":true}))
+                        ok_response(id, json!({"content":[{"type":"text","text":format!("{name}_failed: invalid image response")}],"isError":true}))
                     }
                 }
                 Ok(value) => ok_response(
@@ -279,6 +369,57 @@ pub async fn handle_request(tools: &Tools, id: Value, method: &str, params: Valu
         "prompts/list" => ok_response(id, json!({ "prompts": [] })),
         other => error_response(id, METHOD_NOT_FOUND, &format!("unknown method: {other}")),
     }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Report progress on token `token` every [`PROGRESS_EVERY`] until aborted.
+fn spawn_progress(token: Value, out: mpsc::Sender<String>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut beat = 0u64;
+        loop {
+            tokio::time::sleep(PROGRESS_EVERY).await;
+            beat += 1;
+            let note = json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/progress",
+                "params": { "progressToken": token, "progress": beat, "message": "still working" },
+            });
+            if out.send(note.to_string()).await.is_err() {
+                return;
+            }
+        }
+    })
+}
+
+/// `response`, cut down to [`MAX_REPLY_BYTES`] when it is bigger: the
+/// structured copy goes, and the text is truncated with a pointer to paging.
+fn cap_reply(response: Value) -> Value {
+    if response.to_string().len() <= MAX_REPLY_BYTES {
+        return response;
+    }
+    let Some(result) = response.get("result") else {
+        return response;
+    };
+    let text = result["content"][0]["text"].as_str().unwrap_or_default();
+    let mut end = (MAX_REPLY_BYTES / 2).min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cut = format!(
+        "{}\n… (reply cut short: too large to send whole. Ask for less, e.g. a smaller `limit` with `offset`.)",
+        &text[..end]
+    );
+    json!({
+        "jsonrpc": "2.0",
+        "id": response["id"],
+        "result": {
+            "content": [{ "type": "text", "text": cut }],
+            "isError": result["isError"],
+        },
+    })
 }
 
 /// `structuredContent` must be an object; arrays and scalars are wrapped.
@@ -326,7 +467,7 @@ mod browser_tests {
     }
     #[tokio::test]
     async fn browser_screenshots_are_mcp_image_content() {
-        let tools = Tools::new(Arc::new(crate::Zeron::with_client(zeron_rpc::memory_client(Arc::new(ScreenshotEngine)), crate::Origin {chat_id:Some("chat".into()),device_id:None,side_chats_only:false})));
+        let tools = Tools::new(Arc::new(crate::Zeron::with_client(zeron_rpc::memory_client(Arc::new(ScreenshotEngine)), crate::Origin {chat_id:Some("chat".into()),device_id:None,side_chats_only:false,waits_on_background:false})));
         let response = handle_request(&tools, json!(1), "tools/call", json!({"name":"browser_screenshot","arguments":{"browserId":"host/1"}})).await;
         assert_eq!(response["result"]["content"][0]["type"], "image");
         assert_eq!(response["result"]["content"][0]["mimeType"], "image/png");
@@ -421,9 +562,56 @@ mod tests {
 
     #[test]
     fn side_chats_only_instructions_add_the_delegation_rule() {
-        assert_eq!(instructions(false), INSTRUCTIONS);
-        let side_chats = instructions(true);
+        assert_eq!(instructions(false, false), INSTRUCTIONS);
+        let side_chats = instructions(false, true);
         assert!(side_chats.starts_with(INSTRUCTIONS));
         assert!(side_chats.ends_with("with `create_chats` (or `create_chat`)."));
+    }
+
+    #[test]
+    fn a_reply_too_big_to_send_is_cut_down_not_dropped() {
+        let small = ok_response(json!(1), json!({ "content": [{ "type": "text", "text": "hi" }], "isError": false }));
+        assert_eq!(cap_reply(small.clone()), small);
+        let huge = "é".repeat(MAX_REPLY_BYTES);
+        let big = ok_response(
+            json!(2),
+            json!({
+                "content": [{ "type": "text", "text": huge }],
+                "structuredContent": { "messages": huge },
+                "isError": false,
+            }),
+        );
+        let cut = cap_reply(big);
+        assert!(cut.to_string().len() <= MAX_REPLY_BYTES);
+        assert_eq!(cut["id"], 2);
+        assert!(cut["result"].get("structuredContent").is_none());
+        assert!(cut["result"]["content"][0]["text"].as_str().unwrap().ends_with("`offset`.)"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_long_call_reports_progress_until_it_ends() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let progress = spawn_progress(json!("tok-1"), tx);
+        tokio::time::sleep(PROGRESS_EVERY * 2 + Duration::from_secs(1)).await;
+        let first: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(first["method"], "notifications/progress");
+        assert_eq!(first["params"]["progressToken"], "tok-1");
+        assert_eq!(first["params"]["progress"], 1);
+        let second: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(second["params"]["progress"], 2);
+        progress.abort();
+        tokio::time::sleep(PROGRESS_EVERY * 2).await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn only_an_agent_offered_wait_on_background_is_told_when_to_use_it() {
+        assert!(!INSTRUCTIONS.contains("wait_on_background"));
+        let waits = instructions(true, false);
+        assert!(waits.starts_with(INSTRUCTIONS));
+        assert!(waits.contains("call `wait_on_background`"));
+        let both = instructions(true, true);
+        assert!(both.contains("call `wait_on_background`"));
+        assert!(both.ends_with("with `create_chats` (or `create_chat`)."));
     }
 }
