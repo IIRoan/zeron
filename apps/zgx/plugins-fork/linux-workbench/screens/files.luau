@@ -335,15 +335,19 @@ local function folder(w: Workspace, v: View, props: Props, here: () -> Where?): 
 	local function open_external(path: string)
 		Workspace.open_external(w, path)
 	end
+	-- (The pane's toggle, for the directory bar's button.)
+	local pane_commands: { [string]: any } = {}
 	local pane = FilesPane {
 		id = "files-pane",
 		hook = "files.pane",
 		shown = tree_shown,
+		commands = pane_commands,
 		-- Narrow with a file open, the tree over it: kept by the view, so a
 		-- pane made again shows it as it was.
 		over = ui.state(`files_tree_over:{v.id}`, false),
 		room = w.pane_room,
-		head = "line",
+		-- (No band: its tree's toggle is in the directory bar.)
+		head = "none",
 		w_full = true,
 		grow = 1,
 		min_h = 0,
@@ -560,7 +564,10 @@ local function folder(w: Workspace, v: View, props: Props, here: () -> Where?): 
 		h_full = true,
 		min_h = 0,
 		ui.row {id="fork-files-directory",w_full=true,h=30,shrink=0,px="$space.2",gap="$space.2",items="center",border_sides={0,0,1,0},border_color="$border.subtle",
-			ds.Icon {name="folder",size=14,color="$text.tertiary"},
+			-- (The file tree's toggle, the pane having no band of its own.)
+			ds.IconButton {label="Toggle file tree",tooltip="Toggle file tree",size="sm",tone="quiet",
+				on_click=function() if pane_commands.toggle then pane_commands.toggle() end end,
+				ds.SidebarIcon {open=tree_shown,size=14}},
 			ds.FadeText {w.target.root or w.name,grow=1,min_w=0,text_size="$font.size.xs",color="$text.secondary",tooltip=w.target.root or w.name},
 			ds.IconButton {icon="copy",label="Copy directory path",size="sm",on_click=function() ui.clipboard.write(w.target.root or w.name) end},
 			ds.IconButton {icon="magnifer",label="Find in Files",size="sm",on_click=function() Search.show() end},

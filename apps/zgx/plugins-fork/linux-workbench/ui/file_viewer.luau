@@ -64,7 +64,7 @@ local Motion = require("@ds/motion")
 local locale = require("@ds/locale")
 
 export type Status = "modified" | "added" | "untracked" | "renamed" | "deleted" | "conflict" | "ignored"
-export type Head = "line" | "stack" | "path"
+export type Head = "line" | "stack" | "path" | "none"
 export type Doc = {
 	path: string,
 	-- "loading", "ready", or why it can't show: "binary", "large", "gone",
@@ -1414,6 +1414,8 @@ local function component(props: Props): Node
 	local header = ui.row {
 		id = "file-viewer-head",
 		ref = bar,
+		-- (The Linux fork's pane has none: `head = "none"`.)
+		hidden = props.head == "none",
 		w_full = true,
 		h = head_height(props.head),
 		shrink = 0,

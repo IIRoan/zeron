@@ -657,5 +657,11 @@ fn find_in_files_is_the_explorer_s_code_view() {
     // Files: the tree again.
     app.click("#fork-code-search >> role:button \"Search files\"");
     assert!(app.wait_until(|a| a.find("fork-code-search").is_none()), "{}", app.tree());
+    // No band over the tree and the file (its filter, tools and the file's
+    // name); the tree's toggle is the directory bar's.
+    assert!(app.find("#files-pane >> role:textbox \"Filter files\"").is_none(), "{}", app.tree());
+    assert!(!app.shown("file-viewer-head"), "{}", app.tree());
+    app.click("#fork-files-directory >> role:button \"Toggle file tree\"");
+    app.frames(60);
     assert_eq!(app.error(), None);
 }

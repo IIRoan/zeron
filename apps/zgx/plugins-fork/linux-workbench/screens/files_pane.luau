@@ -76,7 +76,10 @@ M.keys = KEYS
 local made = ui.component(function(props: Props): Node
 	local shown = props.shown
 	local tree_w = props.width or num("zeron.files.tree", 288)
-	local head_h = num(if props.head == "stack" then "zeron.files.stack" else "zeron.files.head", 40)
+	-- (The Linux fork's: no band at all (`head = "none"`), its toggle the
+	-- caller's to place, by `commands.toggle`.)
+	local bare = props.head == "none"
+	local head_h = if bare then 0 else num(if props.head == "stack" then "zeron.files.stack" else "zeron.files.head", 40)
 	local square = num("zeron.icon_button.lg", 28)
 	local pad = num("space.2", 8)
 	-- Room the heads keep at their start: the inset, the toggle, a step.
@@ -219,7 +222,10 @@ local made = ui.component(function(props: Props): Node
 				opened(path)
 			end
 		end
-		tp.head = head_h
+		tp.head = if bare then nil else head_h
+		if bare then
+			tp.search = false
+		end
 		tp.lead = lead_w
 		-- The toggle's room, in the tree's own points as it slides (its
 		-- right edge less where the tree's start is): the head is cut
@@ -258,7 +264,7 @@ local made = ui.component(function(props: Props): Node
 			ui.presence(function(): string
 				return require("./files_search").mode:get()
 			end, function(mode: string): Node
-				return if mode == "code" then require("./code_search")({ head = head_h, lead = lead_w }) else FileTree(tree_props())
+				return if mode == "code" then require("./code_search")({ head = if bare then nil else head_h, lead = if bare then nil else lead_w }) else FileTree(tree_props())
 			end, { w_full = true, h_full = true }),
 			-- Its edge, from under the band (the band's hairline runs across
 			-- both heads).
@@ -344,7 +350,9 @@ local made = ui.component(function(props: Props): Node
 	}
 	-- (The toggle and the tree first, as they stand left of the file: Tab
 	-- reaches them before it. Drawn over it by `z`.)
-	box[#box + 1] = toggle_button
+	if not bare then
+		box[#box + 1] = toggle_button
+	end
 	box[#box + 1] = tree
 	box[#box + 1] = FileViewer(viewer_props)
 	return ui.row(box)
