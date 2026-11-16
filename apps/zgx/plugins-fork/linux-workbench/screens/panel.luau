@@ -1703,10 +1703,12 @@ M.Panel = ui.component(function(props: Props): Node
 		min_h = 0,
 		relative = true,
 		overflow = "hidden",
-		rounded = "$zeron.inset.radius",
-		bg = "$zeron.inset.bg",
+		-- (The Linux fork's tools panel: flush, the theme's background, a
+		-- hairline at its right where the chat begins.)
+		bg = "$zeron.window",
 		border = CARD_EDGE,
-		border_color = "$zeron.inset.edge",
+		border_color = "#00000000",
+		border_sides = { 0, CARD_EDGE, 0, 0 },
 		ui.column(inner),
 	}
 	box[#box + 1] = question

@@ -3,7 +3,7 @@
 --   { available, sandbox = Status?, build = { running, log }, suggestedConfig? }
 -- Status: { root, config, hostPorts, publishPorts, readOnly, shareGithub,
 --   signCommits, container, state, imageBuilt, ... }.
--- One model per project, shared by its settings sheet and its panel tab.
+-- One model per project, shared by its settings section and its panel tab.
 local STEP = "▸"
 
 return function(zeron: any)
@@ -82,9 +82,8 @@ return function(zeron: any)
 			reply = ui.state(`sandbox.{key}.reply`, nil :: any),
 			error = ui.state(`sandbox.{key}.error`, ""),
 			-- "" | "on" | "off": a SetProjectSandbox still running (a build
-			-- takes minutes; it carries on if its sheet closes).
+			-- takes minutes; it carries on if its page closes).
 			requesting = ui.state(`sandbox.{key}.requesting`, ""),
-			settings = ui.state(`sandbox.{key}.settings`, false),
 			log = ui.state(`sandbox.{key}.log`, false),
 			loading = false,
 		}

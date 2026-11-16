@@ -49,10 +49,12 @@ local TITLE_H = 38
 -- The top bar over the cards: a tab on the bar's line, the window's gap over
 -- and under it.
 local TOP_BAR = 42
-local WINDOW_EDGE = 5
+-- (The original Linux fork's columns are flush: no gap at the window's
+-- edges or beside the chat list.)
+local WINDOW_EDGE = 0
 -- The window's gap before the sidebar's card, part of the sidebar's move
 -- (screens/shell/sidebar `before`).
-local SIDEBAR_GAP = 5
+local SIDEBAR_GAP = 0
 -- The panel's Expand on the top bar (the bar's controls' size).
 local EXPAND = 24
 -- What the title line's right end keeps for the bar's controls there. (The
@@ -199,7 +201,7 @@ return function(props: Props): Node
 	-- pane's card, letting the pointer through to it but for the composer.)
 	-- (Whole corners: the cards' token, which follows the window's own corner
 	-- where the host says it: ds/tokens.)
-	pane.rounded = "$zeron.inset.radius"
+	-- (The Linux fork's: square, flush.)
 	-- (Its edge's room; the edge itself is drawn with the fill, below.)
 	pane.border = 1
 	pane.border_color = "#00000000"
@@ -219,10 +221,7 @@ return function(props: Props): Node
 		top = ui.raw(-1, "over the card's 1-point edge"),
 		bottom = ui.raw(-1, "over the card's 1-point edge"),
 		pointer_events = "none",
-		bg = "$zeron.inset.bg",
-		border = 1,
-		border_color = "$zeron.inset.edge",
-		rounded = "$zeron.inset.radius",
+		-- (The Linux fork's chat has no card: the window's own colour.)
 		opacity = card_shown,
 	})
 	pane.pointer_events = function(): any
@@ -673,8 +672,9 @@ return function(props: Props): Node
 	-- (Open for this session, and the window has room for it: hidden for
 	-- room, it stays open, and comes back as the window widens.)
 	-- (A plugin's page has a panel of its own too: its plugin's tabs.)
+	-- (The Linux fork's tools step aside for settings, as the chat list does.)
 	local shown = ui.computed(function(): boolean
-		return props.files:get() and (in_session() or on_plugin() or home()) and fit.current:get().right
+		return props.files:get() and (in_session() or on_plugin() or home()) and fit.current:get().right and not away()
 	end)
 	-- Where the sidebar settles in the window's fit (its width, or none).
 	local function sidebar_settled(): number
@@ -1185,7 +1185,11 @@ return function(props: Props): Node
 		hook = "shell.files",
 		w = open_w,
 		shrink = 0,
-		h_full = true,
+		-- (The Linux fork's tools run the window's full height, their band
+		-- the top bar's line: up over the page's room for the bar, stretched
+		-- by it, not held to the room under it.)
+		self = "stretch",
+		mt = ui.raw(-TOP_BAR, "the window's top, over the page's room for the bar"),
 		overflow = "hidden",
 		relative = true,
 		-- (A card of its own beside the page's, the window between
@@ -2014,6 +2018,8 @@ return function(props: Props): Node
 			min_w = 0,
 			min_h = 0,
 			h_full = true,
+			-- (Settings take the page's place: the chat out of their way.)
+			hidden = away,
 			split_area,
 			require("./fork_layout").Dock({ room = conversation_box }),
 		},
@@ -2032,25 +2038,27 @@ return function(props: Props): Node
 				props.settings(),
 			}
 			else nil,
-		-- The sessions open, along the whole top bar: from just past the sidebar's
-		-- "…" (with it shut, past Back and Forward) to the panel toggle.
+		-- The sessions open, along the top bar: from just past Back and Forward
+		-- to the panel toggle.
 		session_tabs.Strip {
+			-- (The Linux fork's page starts past the tools rail, 44 wide
+			-- (fork_layout.Activity), whatever the chat list at the right is
+			-- doing: upstream's "what the page's width leaves" was the right
+			-- sidebar's width here, and put the tabs under Back and Forward.)
 			window_x = function(): number
-				-- (The row ends at the window's right: where it starts is what its
-				-- width leaves, followed as the sidebar moves.)
-				return props.width() - (row_ref.width or props.width())
+				return 44
 			end,
+			-- (Past the tools panel at the left while it's open, whose own band
+			-- the top of it is, else past the rail.)
 			start = function(): number
-				local past = ds.TitleBar.last_control_end() + 8
-				if sidebar_settled() <= 0 then
-					return past
-				end
-				local button = (ui.theme.get("zeron.icon_button.md") :: number?) or 24
-				return past + button + 8
+				return 44 + (if shown:get() then open_w:get() + gap_before:get() else 0) + 8
 			end,
-			-- (Clear of the panel toggle, and of Expand while the panel's open.)
+			-- (Clear of the title bar's box where it stands over the page (the
+			-- chat list folded: screens/title_bar), and of Expand while the
+			-- panel's open.)
 			right = function(): number
-				local toggle = 34 + 8 - 10 + ds.TitleBar.actions_right()
+				local fork_layout = require("./fork_layout")
+				local toggle = fork_layout.bar_w() - fork_layout.list_w() + 8
 				local right = if shown:get() then toggle + EXPAND + 8 else toggle
 				-- (And of what there is to update.)
 				local button = updates.width()

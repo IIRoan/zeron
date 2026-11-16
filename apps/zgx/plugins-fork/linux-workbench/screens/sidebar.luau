@@ -1333,6 +1333,7 @@ local function project_menu(id: string): { any }?
 	return {
 		{label="Choose image…",icon="gallery",on_select=function() require("./project_icons").choose(p) end},
 		{label="Reset icon",icon="refresh",disabled=require("./project_icons").of(p)==nil,on_select=function() require("./project_icons").reset(p) end},
+		{label="Project settings…",icon="settings",on_select=function() require("@app/screens/settings/projects").open(id) end},
 		{
 			label = locale.s("shell.sidebar.menu.edit_project"),
 			icon = "pen",

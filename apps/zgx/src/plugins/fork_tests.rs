@@ -61,7 +61,7 @@ fn every_fork_plugin_loads_into_the_shell() {
     let _ = std::fs::remove_dir_all(broken);
 }
 
-/// The Linux Workbench replaces seven of Zeron's screens with the fork's
+/// The Linux Workbench replaces eight of Zeron's screens with the fork's
 /// layout, kept in step with upstream's own (three-way merged): with a chat
 /// open its panel, page, sidebar and files all run, and none may fail.
 #[test]
@@ -184,9 +184,11 @@ assert(Model.ran({}) == "Ended without an exit code")
 
 type Calls = std::rc::Rc<std::cell::RefCell<Vec<(String, serde_json::Value)>>>;
 
-/// A fork plugin's tab view alone in a window with the design system: the
-/// project "Atlas" on device d1, its project tools answered by `reply`
-/// (method, params → the engine's reply) and every call kept in order.
+/// A fork plugin's tab view (`view`), or its section of a project's settings
+/// page (`settings`), alone in a window with the design system: the project
+/// "Atlas" on device d1, its project tools answered by `reply` (method,
+/// params → the engine's reply) and every call kept in order (a
+/// `zeron.open` among them, as "open").
 fn mount(
     plugin: &str,
     files: &[&str],
@@ -211,12 +213,18 @@ local fake = {{
 		return {{ id = id }}
 	end,
 	toast = function(text) ui.invoke("test.toast", text) end,
+	open = function(to) ui.invoke("test.open", to) end,
 }}
 local zeron = require("./fork_sdk")(fake, "{plugin}")
 local Model = require("./model")(zeron)
-local Settings = require("./settings")(zeron, Model)
-local View = require("./view")(zeron, Model, Settings)
-return ui.div {{ w_full = true, h_full = true, View {{ project = "p1" }} }}
+local shown
+if "{view}" == "settings" then
+	local Settings = require("./settings")(zeron, Model)
+	shown = ui.scroll {{ w_full = true, h_full = true, Settings {{ model = Model.get(Model.context(nil, "p1")) }} }}
+else
+	shown = require("./view")(zeron, Model) {{ project = "p1" }}
+end
+return ui.div {{ w_full = true, h_full = true, shown }}
 "#
         ),
     )
@@ -229,6 +237,8 @@ return ui.div {{ w_full = true, h_full = true, View {{ project = "p1" }} }}
     let app = TestApp::new(move |runtime| {
         let host = super::lend_design_system(ScriptHost::new(runtime, entry.clone()), &ui_dir.join("app.luau"));
         host.action("test.toast", |_| {});
+        let opened = kept.clone();
+        host.action("test.open", move |to: zgx_script::Value| opened.borrow_mut().push(("open".into(), super::value_json(&to))));
         let (calls, reply) = (kept.clone(), reply.clone());
         host.async_action(action.clone(), move |asked: zgx_script::Value| {
             let asked = super::value_json(&asked);
@@ -283,6 +293,11 @@ fn the_sandbox_tab_says_off_and_offers_to_set_it_up() {
     assert!(shows(&mut app, "run on this machine"));
     // Project-wide: it asks with the project's context, nothing else.
     assert_eq!(calls.borrow()[0].0, "GetProjectSandbox");
+    // Set up: the project's settings page, where its sandbox section is.
+    app.click("role:button \"Set up\"");
+    assert!(app.wait_until(|_| calls.borrow().iter().any(|(m, _)| m == "open")));
+    let to = calls.borrow().iter().find(|(m, _)| m == "open").unwrap().1.clone();
+    assert_eq!(to, json!({ "settings": "project:p1" }));
 }
 
 #[test]
@@ -318,17 +333,15 @@ fn the_sandbox_tab_shows_its_container_and_rebuilds_only_when_asked_twice() {
 
 #[test]
 fn the_sandbox_settings_refuse_a_relative_config_and_send_what_the_form_says() {
-    let (mut app, calls) = mount("project-sandbox", SANDBOX_FILES, "view", |method, _| match method {
+    let (mut app, calls) = mount("project-sandbox", SANDBOX_FILES, "settings", |method, _| match method {
         "GetProjectSandbox" => json!({ "available": true, "sandbox": null, "build": { "running": false, "log": "" },
             "suggestedConfig": "/work/atlas/.devcontainer/devcontainer.json" }),
         "SetProjectSandbox" => sandbox_on(),
         _ => json!({}),
     });
-    assert!(app.wait_until(|a| shows(a, "Set up")));
-    app.click("role:button \"Set up\"");
+    assert_eq!(app.error(), None);
     assert!(app.wait_until(|a| shows(a, "Turn on")), "{}", app.tree());
-    // (The sheet slides in from the window's edge: done before it's used.)
-    app.frames(90);
+    assert!(shows(&mut app, "Off · agents run on this machine."));
     // Filled with the project's own devcontainer, as the engine suggests.
     assert!(shows(&mut app, "/work/atlas/.devcontainer/devcontainer.json"));
     app.fill("role:textbox \"Devcontainer config\"", "devcontainer.json");
@@ -351,13 +364,41 @@ const VM_FILES: &[&str] = &["fork_sdk.luau", "model.luau", "settings.luau", "vie
 
 #[test]
 fn the_vm_tab_offers_to_connect_a_project_that_has_none() {
-    let (mut app, _) = mount("windows-vm", VM_FILES, "view", |method, _| match method {
+    let (mut app, calls) = mount("windows-vm", VM_FILES, "view", |method, _| match method {
         "GetProjectWindowsVm" => json!({ "available": true, "settings": null, "vm": null, "result": null }),
         _ => json!({}),
     });
     assert_eq!(app.error(), None);
     assert!(app.wait_until(|a| shows(a, "Connect in settings")), "{}", app.tree());
     assert!(shows(&mut app, "Not connected"));
+    app.click("role:button \"Connect in settings\"");
+    assert!(app.wait_until(|_| calls.borrow().iter().any(|(m, _)| m == "open")));
+    assert_eq!(calls.borrow().iter().find(|(m, _)| m == "open").unwrap().1, json!({ "settings": "project:p1" }));
+}
+
+#[test]
+fn the_vm_settings_connect_the_ports_the_form_says() {
+    let (mut app, calls) = mount("windows-vm", VM_FILES, "settings", |method, _| match method {
+        "GetProjectWindowsVm" => json!({ "available": true, "settings": null, "vm": null, "result": null }),
+        "SetProjectWindowsVm" => json!({ "available": true, "settings": { "root": "/work/atlas", "toVm": [3000], "fromVm": [], "viewer": true, "startWith": ["web"], "autoPorts": true },
+            "vm": { "state": "stopped" }, "result": null }),
+        _ => json!({}),
+    });
+    assert_eq!(app.error(), None);
+    assert!(app.wait_until(|a| shows(a, "Off · this project's agents have no Windows VM.")), "{}", app.tree());
+    app.fill("role:textbox \"More ports into the VM\"", "3000, nope");
+    app.click("role:button \"Connect\"");
+    app.frames(5);
+    assert!(shows(&mut app, "More ports into the VM: nope isn't a port or a range of ports"), "{}", app.tree());
+    assert!(!calls.borrow().iter().any(|(m, _)| m == "SetProjectWindowsVm"));
+    app.fill("role:textbox \"More ports into the VM\"", "3000");
+    app.fill("role:textbox \"Start with services\"", "web");
+    app.click("role:button \"Connect\"");
+    assert!(app.wait_until(|_| calls.borrow().iter().any(|(m, _)| m == "SetProjectWindowsVm")));
+    let sent = calls.borrow().iter().find(|(m, _)| m == "SetProjectWindowsVm").unwrap().1.clone();
+    assert_eq!(sent["toVm"], json!([3000]));
+    assert_eq!(sent["startWith"], json!(["web"]));
+    assert_eq!(sent["autoPorts"], true);
 }
 
 #[test]
@@ -398,4 +439,67 @@ fn the_vm_tab_shows_a_running_vm_and_runs_a_command_in_it() {
     assert!(shows(&mut app, "Finished · exit code 0 · hostname"));
     let sent = calls.borrow().iter().find(|(m, p)| m == "ControlProjectWindowsVm" && p["action"] == "exec").unwrap().1.clone();
     assert_eq!(sent["command"], "hostname");
+}
+
+/// Each plugin's records, from the shell's sessions (as the bridge's).
+fn publish(app: &TestApp, items: &[Item]) {
+    let sessions = app.host.shared("sessions", zgx_script::Value::Nil).signal().with_untracked(zgx_script::Value::clone);
+    let sources = super::records::Sources { sessions: super::value_json(&sessions), ..Default::default() };
+    for item in items {
+        let value = super::records::records_with(&item.permissions(), &item.change(), &sources);
+        app.host.shared(&format!("plugin.{}.records", item.id()), zgx_script::Value::Nil).set(super::json_value(&value));
+    }
+    app.frames(10);
+}
+
+/// Settings → Projects is Linux Workbench's: a project's row, its gear in
+/// the sidebar and a plugin's `zeron.open { settings = "project:<id>" }`
+/// open its page, where Sandbox, Windows VM and Project Services each put
+/// their section, asked for that project.
+#[test]
+fn a_project_s_settings_page_holds_each_fork_plugin_s_section() {
+    let world: World = std::rc::Rc::new(std::cell::RefCell::new(json!({ "viewer": "ada" })));
+    let items = vec![fork("linux-workbench"), fork("project-services"), fork("project-sandbox"), fork("windows-vm")];
+    let (mut app, heard) = shell_with(items.clone(), world);
+    publish(&app, &items);
+    let asked: Calls = Calls::default();
+    for id in ["project-services", "project-sandbox", "windows-vm"] {
+        let asked = asked.clone();
+        app.host.async_action(format!("plugin.{id}.workbench"), move |v: zgx_script::Value| {
+            let v = super::value_json(&v);
+            let method = v["method"].as_str().unwrap_or_default().to_string();
+            asked.borrow_mut().push((method.clone(), v["project"].clone()));
+            let answer = match method.as_str() {
+                "GetProjectSandbox" => json!({ "available": true, "sandbox": null, "build": { "running": false, "log": "" }, "suggestedConfig": null }),
+                "GetProjectWindowsVm" => json!({ "available": true, "settings": null, "vm": null, "result": null }),
+                "GetWorktreeSettings" => json!({ "settings": { "branchPrefix": "zeron/" }, "databases": [], "worktrees": [] }),
+                _ => json!({}),
+            };
+            async move { Ok(super::json_value(&answer)) }
+        });
+    }
+    // A plugin's link (the sandbox tab's Set up): Atlas's page.
+    app.host.shared("app.link", zgx_script::Value::Nil).set(super::json_value(&json!({ "seq": 1, "settings": "project:atlas" })));
+    assert!(app.wait_until(|a| a.find("project-settings").is_some() && shows(a, "Worktrees and services")), "{}", app.tree());
+    assert!(app.wait_until(|a| shows(a, "Branch names") && shows(a, "Off · agents run on this machine.")), "{}", app.tree());
+    for words in ["/work/atlas", "Sandbox", "Windows VM", "Devcontainer config", "More ports into the VM", "Project defaults"] {
+        assert!(shows(&mut app, words), "{words}: {}", app.tree());
+    }
+    for method in ["GetProjectSandbox", "GetProjectWindowsVm", "GetWorktreeSettings"] {
+        assert!(asked.borrow().iter().any(|(m, project)| m == method && project == "atlas"), "{method}: {:?}", asked.borrow());
+    }
+    // Back to the list; a row opens its own project's page (its tile still
+    // only changes its icon).
+    app.click("#project-settings-back");
+    assert!(app.wait_until(|a| a.find("project-settings").is_none() && shows(a, "Borealis")), "{}", app.tree());
+    app.click("role:button \"Change icon for Borealis\"");
+    app.frames(30);
+    assert!(app.find("project-settings").is_none(), "the tile opened the page: {}", app.tree());
+    app.keys("Escape");
+    app.frames(30);
+    app.click("role:button \"Project settings: Borealis\"");
+    assert!(app.wait_until(|a| a.find("project-settings").is_some() && shows(a, "/srv/borealis")), "{}", app.tree());
+    assert_eq!(app.error(), None);
+    let problems: Vec<_> = heard.borrow().iter().filter(|(key, _)| key.ends_with(".problem")).cloned().collect();
+    assert!(problems.is_empty(), "{problems:?}");
 }

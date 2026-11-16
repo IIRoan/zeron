@@ -536,8 +536,14 @@ return function(): Node
 				(panel.focus_moved :: any)()
 			end
 		end,
-		-- The window's glass, or (opaque) its colour.
-		bg = ui.tween(frosted, { from = "$zeron.window", to = "$background", duration = 320, ease = "outQuad" }),
+		-- The Linux fork's window: the theme's chrome (its `shell`, which
+		-- the menus' tint is made of), opaque, as the desktop app's was;
+		-- the chats on it with no card of their own.
+		bg = function(): string
+			local tint = tostring(ui.theme.get("zeron.menu.tint") or "")
+			local rgb = string.match(tint, "^#(%x%x%x%x%x%x)")
+			return if rgb then ui.raw(`#{rgb}`, "the theme's chrome, opaque: its menus' tint without the alpha") else "$zeron.window"
+		end,
 		-- The chats: the sidebar, the page (its composer, a session's files),
 		-- the rail and the title bar. Kept while settings shows, out of
 		-- sight and out of the way, so they come back as they were (scroll,

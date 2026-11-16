@@ -7,6 +7,7 @@ local Dialog = require("./ui/dialog")
 local Dropdown = require("@ds/dropdown")
 local Icon = require("@ds/icon")
 local FadeText = require("@ds/fade_text")
+local Settings = require("@ds/settings")
 
 return function(zeron: any, Model: any)
     local Field = ui.component(function(p: any): Node
@@ -27,12 +28,10 @@ return function(zeron: any, Model: any)
     local Worktrees=require("./worktrees")(zeron,Model,Field,Toggle,function(model: any,done: any): Node return Editor {model=model,kind="services",on_saved=done} end)
     Editor=ui.component(function(p: any): Node
         local m = p.model
-        local worktrees=Worktrees(m)
         local open = m.editor
         local mode = ui.use_state("services")
         local draft = ui.use_state({} :: {any})
         local setup = ui.use_state(nil :: any)
-        local settings = ui.use_state(nil :: any)
         local original = ui.use_state("")
         local error_text = ui.use_state("")
         local discard = ui.use_state(false)
@@ -46,10 +45,9 @@ return function(zeron: any, Model: any)
             selected:set(if items[1] then items[1].id else "")
         end
         local function value(): any
-            return if mode:peek() == "setup" then settings:peek() else draft:peek()
+            return draft:peek()
         end
         local function dirty(): boolean
-            if mode:peek()=="setup" then return worktrees.dirty() end
             return original:peek() ~= "" and ui.json.encode(value()) ~= original:peek()
         end
         local function close()
@@ -60,8 +58,7 @@ return function(zeron: any, Model: any)
             loading+=1
             local request=loading
             mode:set(kind); error_text:set("")
-            original:set("");draft:set({});settings:set(nil);setup:set(nil)
-            if kind=="setup" then original:set("worktrees");worktrees.load();return end
+            original:set("");draft:set({});setup:set(nil)
             local snapshot = m.snapshot:peek()
             if kind == "services" then
                 local function services_loaded(result: any)
@@ -80,8 +77,7 @@ return function(zeron: any, Model: any)
                 zeron.workbench("GetWorktreeSettings",context,{}):after(function(result: any)
                     if request~=loading or not open:peek() then return end
                     setup:set(result)
-                    if kind == "databases" then draft:set(Model.clone(result.databases or {}));select_current(draft:peek());original:set(ui.json.encode(draft:peek()))
-                    else settings:set(Model.clone(result.settings));original:set(ui.json.encode(settings:peek())) end
+                    draft:set(Model.clone(result.databases or {}));select_current(draft:peek());original:set(ui.json.encode(draft:peek()))
                     epoch:add(1)
                 end,function(e: any) error_text:set(Model.message(e)) end)
             end
@@ -108,11 +104,6 @@ return function(zeron: any, Model: any)
             else next[index][key] = value end
             draft:set(next)
         end
-        local function change_setting(key: string, value: any)
-            local now = settings:peek()
-            if not now or (now[key]==nil and value=="") or ui.json.encode(now[key]) == ui.json.encode(value) then return end
-            local next = Model.clone(now);next[key] = value;settings:set(next)
-        end
         local function add()
             serial += 1
             local list = Model.clone(draft:peek())
@@ -124,15 +115,12 @@ return function(zeron: any, Model: any)
             selected:set(s.id)
         end
         local function save()
-            if mode:peek()=="setup" then worktrees.save();return end
             if original:peek()=="" then return end
             error_text:set("")
-            if mode:peek() ~= "setup" then
-                for _, s in draft:peek() do
-                    if not string.find(s.name or "","%S") or not string.find(s.command or "","%S") then error_text:set("Give every service a name and command.");return end
-                    if s.setupPrerequisite and (not string.find(s.setupPrerequisite.command or "","%S") or (s.setupPrerequisite.timeoutSeconds or 0)<=0) then
-                        error_text:set("Shared databases need a readiness command and a positive timeout.");return
-                    end
+            for _, s in draft:peek() do
+                if not string.find(s.name or "","%S") or not string.find(s.command or "","%S") then error_text:set("Give every service a name and command.");return end
+                if s.setupPrerequisite and (not string.find(s.setupPrerequisite.command or "","%S") or (s.setupPrerequisite.timeoutSeconds or 0)<=0) then
+                    error_text:set("Shared databases need a readiness command and a positive timeout.");return
                 end
             end
             local function done() original:set(ui.json.encode(value()));open:set(false);m.refresh();if p.on_saved then p.on_saved() end end
@@ -144,8 +132,7 @@ return function(zeron: any, Model: any)
             else
                 if m.busy(nil) then return end
                 local context = if mode:peek()=="databases" then Model.context(nil,m.context.project) else m.context
-                local params = {settings = if mode:peek()=="databases" then setup:peek().defaults else settings:peek(),
-                    databases = if mode:peek()=="databases" then draft:peek() else ui.null}
+                local params = {settings = setup:peek().defaults, databases = draft:peek()}
                 m.saving:set(true)
                 zeron.workbench("SaveWorktreeSettings",context,params):after(function(_result: any)
                     m.saving:set(false);done()
@@ -250,18 +237,17 @@ return function(zeron: any, Model: any)
                 end),
             }
         end
-        local function setup_fields(): Node return worktrees.View() end
         return ui.div {
-            Dialog.Sheet {open=open,size=560,title=function() return if mode:get()=="databases" then "Shared databases" elseif mode:get()=="setup" then "Project settings" else "Project services" end,
+            Dialog.Sheet {open=open,size=560,title=function() return if mode:get()=="databases" then "Shared databases" else "Project services" end,
                 dismissable=false,on_close=close,
                 foot=ui.row {w_full=true,justify="end",gap="$space.2",
                     Button {"Cancel",tone="secondary",disabled=function() return m.saving:get() end,on_click=close},
-                    if m.context.checkoutPath or m.context.scope.cwd~=m.context.root then ui.show(function() return mode:get()~="setup" end,Button {"Use project services",tone="secondary",disabled=function() return m.busy(nil) end,on_click=function() m.inherit(function() original:set("");open:set(false) end) end}) else nil,
-                    Button {"Save",busy=m.saving,disabled=function() return m.saving:get() or original:get()=="" or (mode:get()=="setup" and worktrees.busy:get()) end,on_click=save},
+                    if m.context.checkoutPath or m.context.scope.cwd~=m.context.root then Button {"Use project services",tone="secondary",disabled=function() return m.busy(nil) end,on_click=function() m.inherit(function() original:set("");open:set(false) end) end} else nil,
+                    Button {"Save",busy=m.saving,disabled=function() return m.saving:get() or original:get()=="" end,on_click=save},
                 },
                 ui.column {w_full=true,gap="$space.3",pointer_events=function() return if m.saving:get() then "none" else "auto" end,on_key=function(e: any) if e.key=="Escape" then close();return true end;return false end,
                     ui.presence(function() return `{mode:get()}:{epoch:get()}` end,function(): Node
-                        return if mode:peek()=="setup" then setup_fields() else cards()
+                        return cards()
                     end),
                     ui.show(function() return error_text:get()~="" or m.error:get()~="" end,ui.text {function() return if error_text:get()~="" then error_text:get() else m.error:get() end,color="$danger",wrap=true}),
                 },
@@ -270,5 +256,25 @@ return function(zeron: any, Model: any)
                 confirm={label="Discard",on_click=function() original:set("");open:set(false) end}},
         }
     end)
-    return Editor
+    -- The project's worktree settings (project defaults, then each
+    -- worktree's own), a section of its page in Settings → Projects.
+    local Setup=ui.component(function(p: any): Node
+        local m=p.model
+        local w=Worktrees(m)
+        w.live=true
+        ui.after(0,w.load)
+        local function changed(): boolean
+            w.drafts:get();w.busy:get()
+            return w.dirty()
+        end
+        return Settings.Section {title="Worktrees and services",
+            description="How Zeron prepares this project's checkouts and runs its services. Project defaults apply to every worktree without settings of its own.",
+            ui.column {id="project-setup",w_full=true,gap="$space.3",
+                w.View(),
+                ui.row {w_full=true,justify="end",gap="$space.2",px=Settings.inset(),
+                    Button {"Revert",tone="secondary",size="sm",disabled=function() return not changed() end,on_click=w.revert},
+                    Button {"Save",size="sm",busy=w.busy,disabled=function() return not changed() end,on_click=w.save}},
+            }}
+    end)
+    return {Editor=Editor,Setup=Setup}
 end

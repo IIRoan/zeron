@@ -26,7 +26,7 @@ return function(zeron: any,Model: any,Field: any,Toggle: any,ServiceEditor: any)
             w.snapshots:set({});w.drafts:set({});w.originals={};w.selected:set("");w.error:set("");w.fetch("")
         end
         ui.every(2000,function()
-            if m.editor:peek() and w.selected:peek()~="" and w.drafts:peek()[w.selected:peek()] then w.fetch(w.selected:peek()) end
+            if (m.editor:peek() or w.live) and w.selected:peek()~="" and w.drafts:peek()[w.selected:peek()] then w.fetch(w.selected:peek()) end
         end)
         function w.value(): any return w.drafts:peek() end
         function w.dirty(): boolean
@@ -35,8 +35,14 @@ return function(zeron: any,Model: any,Field: any,Toggle: any,ServiceEditor: any)
         end
         function w.change(key: string,value: any)
             local page=w.selected:peek();local current=w.drafts:peek()[page];if not current then return end
-            if ui.json.encode(current.settings[key])==ui.json.encode(value) then return end
+            -- (An empty field over an unset setting is no change.)
+            if (current.settings[key]==nil and value=="") or ui.json.encode(current.settings[key])==ui.json.encode(value) then return end
             local drafts=Model.clone(w.drafts:peek());drafts[page].settings[key]=value;w.drafts:set(drafts)
+        end
+        -- The page shown back as it was saved.
+        function w.revert()
+            local key=w.selected:peek();local drafts=table.clone(w.drafts:peek());drafts[key]=nil;w.drafts:set(drafts);w.originals[key]=nil
+            w.error:set("");w.fetch(key);w.epoch:add(1)
         end
         local function database(id: string,key: string,value: any)
             local drafts=Model.clone(w.drafts:peek());local page=w.selected:peek()

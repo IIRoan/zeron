@@ -6,3 +6,5 @@ ui.override {module="@app/screens/panel",with="./screens/panel"}
 ui.override {module="@app/screens/files",with="./screens/files"}
 ui.override {module="@app/screens/shell/project_look",with="./screens/project_look"}
 ui.override {module="@app/screens/settings/about",with="./screens/about"}
+ui.override {module="@app/screens/settings/projects",with="./screens/projects"}
+ui.override {module="@app/screens/shell/title_bar",with="./screens/title_bar"}

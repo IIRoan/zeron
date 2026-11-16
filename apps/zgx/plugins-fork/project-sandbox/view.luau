@@ -12,7 +12,7 @@ local Spinner = require("@ds/status").Spinner
 local CONFIRM_SECONDS = 6
 local LOG_LINES = 600
 
-return function(zeron: any, Model: any, Settings: any)
+return function(zeron: any, Model: any)
 	local function Fact(label: string, value: () -> string): Node
 		return ui.row {
 			w_full = true,
@@ -106,7 +106,7 @@ return function(zeron: any, Model: any, Settings: any)
 							return r == nil or not r.available
 						end,
 						on_click = function()
-							m.settings:set(true)
+							zeron.open { settings = `project:{m.context.project}` }
 						end,
 					},
 				},
@@ -170,7 +170,7 @@ return function(zeron: any, Model: any, Settings: any)
 						tone = "ghost",
 						size = "sm",
 						on_click = function()
-							m.settings:set(true)
+							zeron.open { settings = `project:{m.context.project}` }
 						end,
 					},
 				},
@@ -205,7 +205,7 @@ return function(zeron: any, Model: any, Settings: any)
 					label = "Sandbox settings",
 					size = "sm",
 					on_click = function()
-						m.settings:set(true)
+						zeron.open { settings = `project:{m.context.project}` }
 					end,
 				},
 			},
@@ -287,7 +287,6 @@ return function(zeron: any, Model: any, Settings: any)
 					},
 				}),
 			},
-			Settings { model = m },
 		}
 	end)
 

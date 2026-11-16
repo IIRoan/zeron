@@ -20,7 +20,7 @@ local STATES = {
 }
 local LEVEL_INK = { normal = "$success", warning = "$warning", critical = "$danger" }
 
-return function(zeron: any, Model: any, Settings: any)
+return function(zeron: any, Model: any)
 	local function Section(title: string, ...: Node?): Node
 		return ui.column {
 			w_full = true,
@@ -126,7 +126,6 @@ return function(zeron: any, Model: any, Settings: any)
 	local Pane = ui.component(function(p: any): Node
 		local m = Model.get(p.context)
 		local command = ui.use_state("")
-		local settings_open = ui.use_state(false)
 		ui.after(0, function()
 			m.refresh()
 		end)
@@ -261,7 +260,7 @@ return function(zeron: any, Model: any, Settings: any)
 						tone = "secondary",
 						size = "sm",
 						on_click = function()
-							settings_open:set(true)
+							zeron.open { settings = `project:{m.context.project}` }
 						end,
 					})
 				elseif kind == "checking" then
@@ -555,7 +554,7 @@ return function(zeron: any, Model: any, Settings: any)
 						label = "Windows VM settings",
 						size = "sm",
 						on_click = function()
-							settings_open:set(true)
+							zeron.open { settings = `project:{m.context.project}` }
 						end,
 					},
 				},
@@ -585,8 +584,7 @@ return function(zeron: any, Model: any, Settings: any)
 				ui.show(function()
 					return m.state() == "running"
 				end, healthy()),
-				Settings.Sheet { model = m, open = settings_open },
-			},
+				},
 		}
 	end)
 

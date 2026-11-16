@@ -1,7 +1,7 @@
 {
   "id": "linux-workbench",
   "name": "Linux Workbench",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Linux workbench with tools and services on the left, project chats on the right, directory navigation, workspace search, and an optional shell terminal dock.",
   "icon": "icon.svg",
   "entry": "init.luau",
@@ -16,7 +16,9 @@
       "@app/screens/panel",
       "@app/screens/files",
       "@app/screens/shell/project_look",
-      "@app/screens/settings/about"
+      "@app/screens/settings/about",
+      "@app/screens/settings/projects",
+      "@app/screens/shell/title_bar"
     ]
   }
 }

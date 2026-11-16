@@ -10,7 +10,7 @@ local Dialog = require("@ds/dialog").Dialog
 local TextField = require("@ds/text_field")
 
 return function(zeron: any, Model: any)
-    local Editor = require("./editor")(zeron,Model)
+    local Editor = require("./editor")(zeron,Model).Editor
     local Pane = ui.component(function(p: any): Node
         local m = Model.get(p.context)
         local box = ui.ref()
@@ -196,7 +196,7 @@ return function(zeron: any, Model: any)
                     {separator=true},
                     {label="Edit services…",icon="settings",on_select=function() edit("services") end},
                     {label="Shared databases",icon="remote-server",on_select=function() edit("databases") end},
-                    {label="Project settings…",icon="worktree",on_select=function() edit("setup") end},
+                    {label="Project settings…",icon="worktree",on_select=function() zeron.open {settings=`project:{p.context.project}`} end},
                     {label="Refresh",icon="refresh",on_select=function() m.refresh() end},
                 } end,
                     IconButton {icon="more-horizontal",label="Service actions",size="sm",on_mount=function(el: any) action_button=el end,on_click=function()

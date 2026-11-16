@@ -1,12 +1,13 @@
 --!strict
--- The project's sandbox settings: a sheet with the devcontainer config, the
--- ports either way, read-only files and the logins it may use. Applying
--- builds the image and starts the container (minutes); turning it off
--- removes the container. Both carry on if the sheet closes.
+-- The project's sandbox settings, a section of its page in Settings →
+-- Projects: the devcontainer config, the ports either way, read-only files
+-- and the logins it may use. Applying builds the image and starts the
+-- container (minutes); turning it off removes the container. Both carry on
+-- if the page closes.
 local Button = require("@ds/button")
 local TextField = require("@ds/text_field")
 local Switch = require("@ds/switch")
-local Sheet = require("@ds/dialog").Sheet
+local Settings = require("@ds/settings")
 local Spinner = require("@ds/status").Spinner
 
 local function trim(text: string): string
@@ -14,16 +15,8 @@ local function trim(text: string): string
 end
 
 return function(zeron: any, Model: any)
-	local function Note(text: string): Node
-		return ui.text { text, wrap = true, color = "$text.tertiary", text_size = "$font.size.xs" }
-	end
-
 	return ui.component(function(p: any): Node
 		local m = p.model
-		-- Its own open state where it's placed more than once (the project's
-		-- actions and the tab), its model shared: a build started in one
-		-- shows in the other.
-		local open = p.open or m.settings
 		local show_log = ui.use_state(false)
 		local config = ui.use_state("")
 		local host_ports = ui.use_state("")
@@ -32,8 +25,8 @@ return function(zeron: any, Model: any)
 		local share_github = ui.use_state(false)
 		local sign_commits = ui.use_state(false)
 		local problem = ui.use_state("")
-		-- The form is filled once a sheet opens (and after an apply answers),
-		-- never under the person's typing.
+		-- The form is filled once the reply comes (and after an apply
+		-- answers), never under the person's typing.
 		local filled = false
 
 		local function fill(reply: any)
@@ -46,20 +39,13 @@ return function(zeron: any, Model: any)
 			sign_commits:set(s ~= nil and s.signCommits == true)
 		end
 
-		local was = false
-		ui.effect(function()
-			local showing = open:get()
-			if showing and not was then
-				filled = false
-				problem:set("")
-				m.error:set("")
-				m.refresh()
-			end
-			was = showing
+		ui.after(0, function()
+			m.error:set("")
+			m.refresh()
 		end)
 		ui.effect(function()
 			local reply = m.reply:get()
-			if open:get() and reply and not filled then
+			if reply and not filled then
 				filled = true
 				fill(reply)
 			end
@@ -68,7 +54,7 @@ return function(zeron: any, Model: any)
 		local tick = 0
 		ui.every(1000, function()
 			tick += 1
-			if open:peek() and (m.building_now() or tick % 5 == 0) then
+			if m.building_now() or tick % 5 == 0 then
 				m.refresh()
 			end
 		end)
@@ -130,118 +116,42 @@ return function(zeron: any, Model: any)
 			return if r == "off" then "Turning the sandbox off…" else "Building the image and starting the container…"
 		end
 
-		local function field(label: string, value: any, placeholder: string, mono: boolean?, hint: string?): Node
-			return ui.column {
-				gap = "$space.1",
-				w_full = true,
-				TextField {
-					value = value,
-					label = label,
-					placeholder = placeholder,
-					w_full = true,
-					font = if mono then "$font.mono" else nil,
-				},
-				if hint then Note(hint) else nil,
+		local function field(label: string, value: any, placeholder: string, hint: string): Node
+			return Settings.Row {
+				label = label,
+				description = hint,
+				stacked = true,
+				control = TextField { value = value, name = label, placeholder = placeholder, w_full = true, font = "$font.mono" },
 			}
 		end
 
-		local function switch(label: string, value: any): Node
-			return ui.row {
-				w_full = true,
-				items = "center",
-				gap = "$space.3",
-				ui.column {
-					grow = 1,
-					gap = ui.raw(2, "a label and its note"),
-					ui.text { label, text_size = "$font.size.sm" },
-					Note("Takes effect when you apply."),
-				},
-				Switch { value = value, label = label },
-			}
+		local function switch(label: string, value: any, hint: string): Node
+			return Settings.Row { label = label, description = hint, control = Switch { value = value, label = label } }
 		end
 
 		local blocked = function(): boolean
 			return m.building() or m.reply:get() == nil
 		end
 
-		return Sheet {
-			open = open,
-			size = 560,
-			title = function()
-				return `Sandbox · {m.context.name}`
-			end,
-			foot = ui.row {
-				w_full = true,
-				gap = "$space.2",
-				items = "center",
-				ui.show(function()
-					local r = m.reply:get()
-					return r ~= nil and r.build ~= nil and (r.build.log or "") ~= ""
-				end, Button {
-					function()
-						return if show_log:get() then "Hide log" else "Show log"
-					end,
-					tone = "ghost",
-					size = "sm",
-					on_click = function()
-						show_log:set(not show_log:peek())
-					end,
-				}),
-				ui.div { grow = 1 },
-				ui.show(function()
-					return m.on()
-				end, Button {
-					"Turn off",
-					tone = "secondary",
-					disabled = blocked,
-					on_click = function()
-						m.apply(false, nil, function()
-							filled = false
-						end)
-					end,
-				}),
-				Button {
-					function()
-						return if m.on() then "Apply and rebuild" else "Turn on"
-					end,
-					busy = function()
-						return m.requesting:get() == "on"
-					end,
-					disabled = function()
-						local r = m.reply:get()
-						return blocked() or (r ~= nil and not r.available and r.sandbox == nil)
-					end,
-					on_click = apply,
-				},
-			},
+		return Settings.Section {
+			title = "Sandbox",
+			description = "Run this project's agents, services and terminals in a container built from its devcontainer.",
 			ui.column {
+				id = "sandbox-settings",
 				w_full = true,
-				gap = "$space.4",
-				ui.column {
-					gap = "$space.1",
-					ui.text { "Run this project in a container", weight = "$font.weight.semibold" },
-					ui.text { status, wrap = true, color = "$text.secondary", text_size = "$font.size.sm" },
+				gap = "$space.3",
+				ui.text { status, px = Settings.inset(), wrap = true, color = "$text.secondary", text_size = "$font.size.sm" },
+				Settings.Group {
+					field("Devcontainer config", config, "/path/to/.devcontainer/devcontainer.json", "The image is built from it. Give its full path."),
+					field("Host ports", host_ports, "5432, 6379", "Ports of this machine the container may reach (a database here)."),
+					field("Published ports", publish_ports, "Automatic", "Ports of the container this machine reaches. Empty: every port a server opens."),
+					field("Read-only files", read_only, "compose.yaml, bunfig.toml", "Files of the project its agents may read but not change."),
+					switch("Share GitHub login", share_github, "Takes effect when you apply."),
+					switch("Sign commits", sign_commits, "Takes effect when you apply."),
 				},
-				field(
-					"Devcontainer config",
-					config,
-					"/path/to/.devcontainer/devcontainer.json",
-					true,
-					"The image is built from it. Give its full path."
-				),
-				field("Host ports", host_ports, "5432, 6379", true, "Ports of this machine the container may reach (a database here)."),
-				field(
-					"Published ports",
-					publish_ports,
-					"Automatic",
-					true,
-					"Ports of the container this machine reaches. Empty: every port a server opens."
-				),
-				field("Read-only files", read_only, "compose.yaml, bunfig.toml", true, "Files of the project its agents may read but not change."),
-				switch("Share GitHub login", share_github),
-				switch("Sign commits", sign_commits),
 				ui.show(m.building, ui.column {
 					w_full = true,
+					px = Settings.inset(),
 					gap = "$space.1",
 					ui.row { gap = "$space.2", items = "center", Spinner { size = 14 }, ui.text { busy_text, text_size = "$font.size.sm" } },
 					ui.text {
@@ -279,11 +189,65 @@ return function(zeron: any, Model: any)
 					function()
 						return if problem:get() ~= "" then problem:get() else m.error:get()
 					end,
+					px = Settings.inset(),
 					color = "$danger",
 					wrap = true,
 					text_size = "$font.size.sm",
 				}),
-				Note("Applying builds the image, which can take minutes. It keeps going if you close this sheet."),
+				ui.row {
+					w_full = true,
+					px = Settings.inset(),
+					gap = "$space.2",
+					items = "center",
+					ui.text {
+						"Applying builds the image, which can take minutes. It keeps going if you leave this page.",
+						grow = 1,
+						basis = 0,
+						wrap = true,
+						color = "$text.tertiary",
+						text_size = "$font.size.xs",
+					},
+					ui.show(function()
+						local r = m.reply:get()
+						return r ~= nil and r.build ~= nil and (r.build.log or "") ~= ""
+					end, Button {
+						function()
+							return if show_log:get() then "Hide log" else "Show log"
+						end,
+						tone = "ghost",
+						size = "sm",
+						on_click = function()
+							show_log:set(not show_log:peek())
+						end,
+					}),
+					ui.show(function()
+						return m.on()
+					end, Button {
+						"Turn off",
+						tone = "secondary",
+						size = "sm",
+						disabled = blocked,
+						on_click = function()
+							m.apply(false, nil, function()
+								filled = false
+							end)
+						end,
+					}),
+					Button {
+						function()
+							return if m.on() then "Apply and rebuild" else "Turn on"
+						end,
+						size = "sm",
+						busy = function()
+							return m.requesting:get() == "on"
+						end,
+						disabled = function()
+							local r = m.reply:get()
+							return blocked() or (r ~= nil and not r.available and r.sandbox == nil)
+						end,
+						on_click = apply,
+					},
+				},
 			},
 		}
 	end)

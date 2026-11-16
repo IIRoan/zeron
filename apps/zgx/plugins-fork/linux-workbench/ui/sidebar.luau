@@ -3494,8 +3494,13 @@ local places: State<Places> = props.places or ui.use_state({ pinned = pinned_ids
 		-- A project's: its menu on a right click (Zeron's Rename…, Remove…).
 		local project, menu = g.project, props.project_menu
 		if project then
+			-- Its settings (Settings → Projects, its page: environment,
+			-- worktrees, services), and what plugins put beside it.
 			header = ui.row {w_full=true,items="center",provide={project=project},
 				ui.div {grow=1,min_w=0,header},
+				IconButton {icon="settings",label="Project settings",size="sm",tone="quiet",shrink=0,on_click=function()
+					require("@app/screens/settings/projects").open(if type(project)=="table" then project.id else project)
+				end},
 				ui.slot("linux-workbench.project-actions",{shrink=0})}
 		end
 		if project and menu then
@@ -5191,13 +5196,17 @@ fn layer(input:LayerInput)->vec4<f32> {
 				absolute = true,
 				left = 0,
 				right = 0,
-				top = props.top or 0,
-				bottom = 5,
+				top = 0,
+				bottom = 0,
 				overflow = "hidden",
-				rounded = "$zeron.inset.radius",
-				-- (Frosted, its own wash over the window's glass, Zeron's
-				-- sidebar tone; opaque, the page's card's fill.)
-				bg = material.pick("$zeron.sidebar.tint", "$zeron.sidebar.solid"),
+				-- (The Linux fork's chat list: the window's full height, Zeron's
+				-- sidebar tone washed over the window as the desktop app's
+				-- was, a hairline at its left; its list under the title bar's
+				-- line.)
+				bg = "$zeron.sidebar.tint",
+				border_sides = { 1, 0, 0, 0 },
+				border_color = "$border",
+				pt = ui.raw(props.top or 0, "under the title bar's line"),
 				ui.column(body),
 			}
 			else ui.column(body),

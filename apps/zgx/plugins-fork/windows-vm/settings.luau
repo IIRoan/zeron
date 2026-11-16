@@ -1,11 +1,12 @@
 --!strict
--- How a project uses the Windows VM: which of its ports reach the VM and
--- back, which of its services start it, whether its viewer opens. The VM
--- itself is one machine (scripts/winvm); a project connects to it.
+-- How a project uses the Windows VM, a section of its page in Settings →
+-- Projects: which of its ports reach the VM and back, which of its
+-- services start it, whether its viewer opens. The VM itself is one
+-- machine (scripts/winvm); a project connects to it.
 local Button = require("@ds/button")
 local TextField = require("@ds/text_field")
 local Switch = require("@ds/switch")
-local Sheet = require("@ds/dialog").Sheet
+local Settings = require("@ds/settings")
 local Spinner = require("@ds/status").Spinner
 
 local BUSY = {
@@ -17,10 +18,6 @@ local BUSY = {
 }
 
 return function(zeron: any, Model: any)
-	local function Note(text: string): Node
-		return ui.text { text, wrap = true, color = "$text.tertiary", text_size = "$font.size.xs" }
-	end
-
 	-- What the VM is to this project now, in a line.
 	local function status(m: any): string
 		local r = m.reply:get()
@@ -54,15 +51,16 @@ return function(zeron: any, Model: any)
 		return line
 	end
 
-	local Sheet_ = ui.component(function(p: any): Node
+	return ui.component(function(p: any): Node
 		local m = p.model
-		local open = p.open or m.settings
 		local auto_ports = ui.use_state(true)
 		local to_vm = ui.use_state("")
 		local from_vm = ui.use_state("")
 		local start_with = ui.use_state("")
 		local viewer = ui.use_state(true)
 		local problem = ui.use_state("")
+		-- Filled once the reply comes (and after a save answers), never
+		-- under the person's typing.
 		local filled = false
 
 		local function fill(settings: any?)
@@ -73,29 +71,18 @@ return function(zeron: any, Model: any)
 			viewer:set(not settings or settings.viewer ~= false)
 		end
 
-		local was = false
-		ui.effect(function()
-			local showing = open:get()
-			if showing and not was then
-				filled = false
-				problem:set("")
-				m.error:set("")
-				m.refresh()
-			end
-			was = showing
+		ui.after(0, function()
+			m.error:set("")
+			m.refresh()
 		end)
 		ui.effect(function()
 			local r = m.reply:get()
-			if open:get() and r and not filled then
+			if r and not filled then
 				filled = true
 				fill(r.settings)
 			end
 		end)
-		ui.every(5000, function()
-			if open:peek() then
-				m.refresh()
-			end
-		end)
+		ui.every(5000, m.refresh)
 
 		local function save()
 			problem:set("")
@@ -129,117 +116,46 @@ return function(zeron: any, Model: any)
 		end
 
 		local function field(label: string, value: any, placeholder: string, hint: string): Node
-			return ui.column {
-				gap = "$space.1",
-				w_full = true,
-				TextField { value = value, label = label, placeholder = placeholder, w_full = true, font = "$font.mono" },
-				Note(hint),
+			return Settings.Row {
+				label = label,
+				description = hint,
+				stacked = true,
+				control = TextField { value = value, name = label, placeholder = placeholder, w_full = true, font = "$font.mono" },
 			}
 		end
 		local function switch(label: string, value: any, hint: string): Node
-			return ui.row {
-				w_full = true,
-				items = "center",
-				gap = "$space.3",
-				ui.column { grow = 1, gap = ui.raw(2, "a label and its note"), ui.text { label, text_size = "$font.size.sm", wrap = true }, Note(hint) },
-				Switch { value = value, label = label },
-			}
+			return Settings.Row { label = label, description = hint, control = Switch { value = value, label = label } }
 		end
 
-		return Sheet {
-			open = open,
-			size = 560,
-			title = function()
-				return `Windows VM · {m.context.name}`
-			end,
-			foot = ui.row {
-				w_full = true,
-				gap = "$space.2",
-				items = "center",
-				ui.show(m.connected, Button { "Disconnect", tone = "ghost", size = "sm", disabled = busy, on_click = m.disconnect }),
-				ui.div { grow = 1 },
-				ui.show(function()
-					return m.connected() and running()
-				end, ui.row {
-					gap = "$space.2",
-					Button {
-						"Reconnect ports",
-						tone = "secondary",
-						size = "sm",
-						disabled = busy,
-						on_click = function()
-							m.control("start")
-						end,
-					},
-					Button {
-						"Open viewer",
-						tone = "secondary",
-						size = "sm",
-						disabled = busy,
-						on_click = function()
-							m.control("view")
-						end,
-					},
-					Button {
-						"Stop VM",
-						tone = "secondary",
-						size = "sm",
-						disabled = busy,
-						on_click = function()
-							m.control("stop")
-						end,
-					},
-				}),
-				ui.show(function()
-					return m.connected() and not running()
-				end, Button {
-					"Start VM",
-					tone = "secondary",
-					size = "sm",
-					disabled = busy,
-					on_click = function()
-						m.control("start")
-					end,
-				}),
-				Button {
-					function()
-						return if m.connected() then "Apply" else "Connect"
-					end,
-					busy = function()
-						return m.busy:get() == "save"
-					end,
-					disabled = function()
-						local r = m.reply:get()
-						return busy() or r == nil or (not r.available and not r.settings)
-					end,
-					on_click = save,
-				},
-			},
+		return Settings.Section {
+			title = "Windows VM",
+			description = "Give this project a Windows machine. Agents use it through their tools (vm_exec, vm_screenshot, …), starting it when they need it.",
 			ui.column {
+				id = "windows-vm-settings",
 				w_full = true,
-				gap = "$space.4",
-				ui.column {
-					gap = "$space.1",
-					ui.text { "Give this project a Windows machine", weight = "$font.weight.semibold" },
-					ui.text {
-						function()
-							return status(m)
-						end,
-						wrap = true,
-						color = "$text.secondary",
-						text_size = "$font.size.sm",
-					},
+				gap = "$space.3",
+				ui.text {
+					function()
+						return status(m)
+					end,
+					px = Settings.inset(),
+					wrap = true,
+					color = "$text.secondary",
+					text_size = "$font.size.sm",
 				},
-				switch(
-					"Connect the ports of this project's servers automatically",
-					auto_ports,
-					"A server this project starts (in any worktree, or in its sandbox) reaches Windows on its own port."
-				),
-				field("More ports into the VM", to_vm, "3000, 3001", "Ports of this machine Windows reaches as its own localhost."),
-				field("Ports from the VM", from_vm, "None", "Ports of a server in Windows this machine reaches."),
-				field("Start with services", start_with, "None", "Services of this project that start the VM when they start (their names)."),
-				switch("Open the viewer window when the VM starts", viewer, "Windows' screen in a window of its own on this machine."),
+				Settings.Group {
+					switch(
+						"Connect this project's servers automatically",
+						auto_ports,
+						"A server this project starts (in any worktree, or in its sandbox) reaches Windows on its own port."
+					),
+					field("More ports into the VM", to_vm, "3000, 3001", "Ports of this machine Windows reaches as its own localhost."),
+					field("Ports from the VM", from_vm, "None", "Ports of a server in Windows this machine reaches."),
+					field("Start with services", start_with, "None", "Services of this project that start the VM when they start (their names)."),
+					switch("Open the viewer when the VM starts", viewer, "Windows' screen in a window of its own on this machine."),
+				},
 				ui.show(busy, ui.row {
+					px = Settings.inset(),
 					gap = "$space.2",
 					items = "center",
 					Spinner { size = 14 },
@@ -257,14 +173,78 @@ return function(zeron: any, Model: any)
 					function()
 						return if problem:get() ~= "" then problem:get() else m.error:get()
 					end,
+					px = Settings.inset(),
 					color = "$danger",
 					wrap = true,
 					text_size = "$font.size.sm",
 				}),
-				Note("Agents in this project use the VM through their tools (vm_exec, vm_screenshot, …), starting it when they need it."),
+				ui.row {
+					w_full = true,
+					px = Settings.inset(),
+					gap = "$space.2",
+					items = "center",
+					flex_wrap = true,
+					ui.show(m.connected, Button { "Disconnect", tone = "ghost", size = "sm", disabled = busy, on_click = m.disconnect }),
+					ui.div { grow = 1 },
+					ui.show(function()
+						return m.connected() and running()
+					end, ui.row {
+						gap = "$space.2",
+						Button {
+							"Reconnect ports",
+							tone = "secondary",
+							size = "sm",
+							disabled = busy,
+							on_click = function()
+								m.control("start")
+							end,
+						},
+						Button {
+							"Open viewer",
+							tone = "secondary",
+							size = "sm",
+							disabled = busy,
+							on_click = function()
+								m.control("view")
+							end,
+						},
+						Button {
+							"Stop VM",
+							tone = "secondary",
+							size = "sm",
+							disabled = busy,
+							on_click = function()
+								m.control("stop")
+							end,
+						},
+					}),
+					ui.show(function()
+						return m.connected() and not running()
+					end, Button {
+						"Start VM",
+						tone = "secondary",
+						size = "sm",
+						disabled = busy,
+						on_click = function()
+							m.control("start")
+						end,
+					}),
+					Button {
+						function()
+							return if m.connected() then "Apply" else "Connect"
+						end,
+						size = "sm",
+						busy = function()
+							return m.busy:get() == "save"
+						end,
+						disabled = function()
+							local r = m.reply:get()
+							return busy() or r == nil or (not r.available and not r.settings)
+						end,
+						on_click = save,
+					},
+				},
 			},
 		}
 	end)
-
-	return { Sheet = Sheet_, status = status }
 end

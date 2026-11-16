@@ -77,7 +77,6 @@ return function(zeron: any)
 			health_at = ui.state(`windows-vm.{key}.health-at`, 0),
 			reading = ui.state(`windows-vm.{key}.reading`, false),
 			ran = ui.state(`windows-vm.{key}.ran`, nil :: any),
-			settings = ui.state(`windows-vm.{key}.settings`, false),
 			loading = false,
 			capturing = false,
 		}

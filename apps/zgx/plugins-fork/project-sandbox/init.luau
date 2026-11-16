@@ -5,36 +5,22 @@
 local zeron = require("./fork_sdk")(require("./zeron")("project-sandbox"), "project-sandbox")
 local Model = require("./model")(zeron)
 local Settings = require("./settings")(zeron, Model)
-local View = require("./view")(zeron, Model, Settings)
+local View = require("./view")(zeron, Model)
 local PanelHome = require("@ds/panel_home")
-local IconButton = require("@ds/icon_button").IconButton
 
 local ICON = "shield-check"
 
--- Beside a project's other actions (Linux Workbench's project row): its
--- sandbox settings.
+-- Its settings, a section of the project's page in Settings → Projects
+-- (Linux Workbench's).
 zeron.place {
-	at = "slot:linux-workbench.project-actions",
+	at = "slot:linux-workbench.project-environment",
 	after = function(): Node
 		local project = zeron.context("project")
 		local context = Model.context(nil, if type(project) == "table" then project.id else project)
 		if not context then
 			return ui.div {}
 		end
-		local m = Model.get(context)
-		local open = ui.state(`sandbox.{context.key}.actions-sheet`, false)
-		return ui.row {
-			items = "center",
-			IconButton {
-				icon = ICON,
-				label = `Sandbox: {context.name}`,
-				size = "sm",
-				on_click = function()
-					open:set(true)
-				end,
-			},
-			Settings { model = m, open = open },
-		}
+		return Settings { model = Model.get(context) }
 	end,
 }
 

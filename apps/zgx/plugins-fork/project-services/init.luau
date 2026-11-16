@@ -3,8 +3,7 @@ local zeron = require("./fork_sdk")(require("./zeron")("project-services"), "pro
 local Model = require("./model")(zeron)
 local View = require("./view")(zeron, Model)
 local PanelHome = require("@ds/panel_home")
-local Editor = require("./editor")(zeron,Model)
-local IconButton = require("@ds/icon_button").IconButton
+local Setup = require("./editor")(zeron,Model).Setup
 
 -- Foreground chat selection owns the checkout handoff. Polling and opening
 -- settings never activates an environment; shells can stay selected below.
@@ -30,15 +29,13 @@ ui.effect(function()
     handoff()
 end)
 
-zeron.place {at="slot:linux-workbench.project-actions",after=function(): Node
+-- Its worktree settings, a section of the project's page in Settings →
+-- Projects (Linux Workbench's).
+zeron.place {at="slot:linux-workbench.project-settings",after=function(): Node
     local project=zeron.context("project")
-    if not project then return ui.div {} end
     local context=Model.context(nil,if type(project)=="table" then project.id else project);if not context then return ui.div {} end
-    context.key ..= ":project-settings"
-    local m=Model.get(context)
-    return ui.row {items="center",
-        IconButton {icon="settings",label=`Project settings: {context.name}`,size="sm",on_click=function() m.editor:set(true) end},
-        Editor {model=m,kind=function() return "setup" end}}
+    context.key ..= ":settings-page"
+    return Setup {model=Model.get(context)}
 end}
 
 zeron.tab("services", function(tab: any): Node

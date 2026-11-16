@@ -9,13 +9,32 @@ function M.enabled(id: string): boolean
     for _,plugin in plugins:get().list or {} do if plugin.id==id then return plugin.status=="on" end end
     return false
 end
+-- The chat list's width as it shows (none while folded, hidden for room,
+-- or under settings).
+function M.list_w(): number
+    local fit=require("@app/screens/shell/fit");local view=require("@app/screens/shell/view")
+    if view.collapsed:get() or not fit.current:get().sidebar or route.current:get().name=="settings" then return 0 end
+    -- (Its width as the list keeps it (screens/sidebar), not its module:
+    -- loaded from here, it would declare its commands twice.)
+    return math.min(Prefs.persist("shell_sidebar_width",256):get(),fit.sidebar_room:get())
+end
+-- The title bar's box at the window's right (screens/title_bar): over the
+-- chat list, or, folded, what its controls, the page's and the window's
+-- buttons take (the panel toggle's 24 and its gap the page's).
+function M.bar_w(): number
+    return math.max(M.list_w(),ds.TitleBar.controls_end()+ds.TitleBar.actions_right()+32)
+end
+-- The tools rail: the theme's background, a hairline at its right, its
+-- tools from under the title bar's line down (the desktop app's 44 wide,
+-- a tool 44 high).
 function M.Activity(): Node
     local function panel(): any return require("@app/screens/panel") end
     local function git(which: string)
         local session=route.session:peek();if not session then return end
         panel().open_plugin_tab(session,{plugin="zeron-git",kind=`git-{which}`,title=if which=="history" then "History" else "Source control",data={session=session.id}})
     end
-    return ui.column {id="fork-activity",w=44,h_full=true,shrink=0,pt=ui.raw(42,"align tools below the title controls"),items="center",gap="$space.3",border_sides={0,1,0,0},border_color="$border.subtle",
+    return ui.column {id="fork-activity",w=44,h_full=true,shrink=0,pt=ui.raw(38,"the title bar's line"),items="center",gap=0,bg="$zeron.window",border_sides={0,1,0,0},border_color="$border",
+        theme={["zeron.icon_button.md"]=44},
         ds.IconButton {icon="folder",label="Explorer",disabled=function() return route.session:get()==nil end,tooltip="Explorer · open a chat to use its checkout",on_click=function() panel().show_files() end},
         ds.IconButton {icon="magnifer",label="Find in Files",disabled=function() return route.session:get()==nil end,tooltip="Find in Files · open a chat to search its checkout",on_click=function() require("./files_search").show() end},
         ui.show(function() return M.enabled("zeron-git") end,ds.IconButton {icon="git-branch",label="Source control",disabled=function() return route.session:get()==nil end,tooltip="Source control · open a chat to use its checkout",on_click=function() git("changes") end}),

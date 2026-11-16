@@ -160,3 +160,24 @@ zgx. Engine-side work needs no port: zgx runs the same engine.
   narrow files pane without a floating card) upstream's stands. After the
   next upstream merge, repeat this per file: `git merge-file` with base
   the upstream commit these were last merged from.
+- Project settings moved out of sheets onto a page, as the desktop app had
+  them: Linux Workbench overrides `@app/screens/settings/projects` (copied
+  from upstream v0.3.7, `ui/screens/settings/projects.luau` at
+  `2957ccbd`; its list view byte-identical, renamed `list_view`), whose
+  rows open a project's page with two slots. Sandbox and Windows VM put
+  their settings in `linux-workbench.project-environment`, Project
+  Services its worktree settings in `linux-workbench.project-settings`;
+  their tabs' Settings/Set up/Connect and the Services menu's Project
+  settings open it (`zeron.open { settings = "project:<id>" }`, the
+  `navigate` permission). The chat list's project gear (and its right-click
+  Project settings…) replaces the three per-plugin buttons there. Re-merge
+  this copy with the others.
+- The original Linux fork's look, theme-driven: the window and the chat in
+  the theme's chrome (`shell`, read as the menus' tint made opaque), the
+  tools rail and tools panel in its background, the chat list in Zeron's
+  sidebar wash with a hairline, all flush and full height (no cards, gaps
+  or rounded corners), the title bar's box over the chat list so toggle,
+  Back and Forward stand at its top left. The title bar isn't copied:
+  `screens/title_bar.luau` wraps `@app-original/screens/shell/title_bar`.
+  Under Dark+ this gives the desktop app's `#181818` / `#1e1e1e` / sidebar
+  wash exactly.
