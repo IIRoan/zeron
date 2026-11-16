@@ -33,8 +33,13 @@ function M.Activity(): Node
         local session=route.session:peek();if not session then return end
         panel().open_plugin_tab(session,{plugin="zeron-git",kind=`git-{which}`,title=if which=="history" then "History" else "Source control",data={session=session.id}})
     end
-    return ui.column {id="fork-activity",w=44,h_full=true,shrink=0,pt=ui.raw(38,"the title bar's line"),items="center",gap=0,bg="$zeron.window",border_sides={0,1,0,0},border_color="$border",
+    return ui.column {id="fork-activity",w=44,h_full=true,shrink=0,items="center",gap=0,bg="$zeron.window",border_sides={0,1,0,0},border_color="$border",
         theme={["zeron.icon_button.md"]=44},
+        -- The mark at its top, as tall as the title bar, a hairline under
+        -- it (the desktop app's workbench brand).
+        ui.div {id="fork-brand",w=44,h=ui.raw(38,"the title bar's line"),shrink=0,items="center",justify="center",
+            border_sides={0,0,1,0},border_color="$border",role="img",label="Solace",tooltip="Solace",tooltip_placement={side="right",align="center",offset=6},
+            ui.svg {src=`code:{require("../ui/solace_logo")}`,w=26,h=26,tint="$text.primary",aria_hidden=true}},
         ds.IconButton {icon="folder",label="Explorer",disabled=function() return route.session:get()==nil end,tooltip="Explorer · open a chat to use its checkout",on_click=function() panel().show_files() end},
         ds.IconButton {icon="magnifer",label="Find in Files",disabled=function() return route.session:get()==nil end,tooltip="Find in Files · open a chat to search its checkout",on_click=function() require("./files_search").show() end},
         ui.show(function() return M.enabled("zeron-git") end,ds.IconButton {icon="git-branch",label="Source control",disabled=function() return route.session:get()==nil end,tooltip="Source control · open a chat to use its checkout",on_click=function() git("changes") end}),
