@@ -1,6 +1,7 @@
 local ds={Button=require("@ds/button"),Dialog=require("@ds/dialog").Dialog,TextField=require("@ds/text_field"),
     Icon=require("@ds/icon"),FadeText=require("@ds/fade_text")}
 local choices=require("./branch_choices")
+local fm=require("./fork_motion")
 local titles={switchBranch="Checkout to…",pullFrom="Pull from…",merge="Merge branch…",rebase="Rebase onto…",deleteBranch="Delete branch…"}
 local M={}
 local function controller(m: any): any
@@ -51,17 +52,20 @@ M.View=ui.component(function(p: any): Node
                 ui.row {w_full=true,items="center",gap="$space.2",
                     ui.text {function() return if c.all:get() or c.query:get()~="" then "All matching branches" else "Recent branches" end,grow=1,color="$text.secondary"},
                     ds.Button {"Show all branches",size="xs",tone="ghost",on_click=function() c.all:set(true) end}},
-                ui.show(c.loading,ui.text {"Loading branches…",color="$text.secondary"}),
-                ui.show(function() return c.error:get()~="" end,ui.text {function() return c.error:get() end,wrap=true,color="$danger"}),
+                fm.show(c.loading,ui.text {"Loading branches…",color="$text.secondary"}),
+                fm.show(function() return c.error:get()~="" end,ui.text {function() return c.error:get() end,wrap=true,color="$danger"}),
                 ui.scroll {id="git-branch-picker-list",w_full=true,h=280,
-                    ui.column {w_full=true,gap="$space.1",ui.each(rows,function(b: any,index: number): Node
+                    -- (Rows narrowing to a search slide together; its place
+                    -- in the list, for the arrow keys, read as it changes.)
+                    ui.column {w_full=true,gap="$space.1",fm.each(rows,choices.ref,function(b: any): Node
+                        local function index(): number for i,r in rows:get() do if choices.ref(r)==choices.ref(b) then return i end end;return 0 end
                         return ui.button {w_full=true,h=34,px="$space.2",gap="$space.2",items="center",label=`{b.name}{if b.remote then " (remote)" else ""}`,
-                            bg=function() return if c.active:get()==index then "$hover" else "#00000000" end,
-                            on_hover=function(over: boolean) if over then c.active:set(index) end end,on_click=function() choose(b) end,
+                            bg=function() return if c.active:get()==index() then "$hover" else "#00000000" end,
+                            on_hover=function(over: boolean) if over then c.active:set(index()) end end,on_click=function() choose(b) end,
                             ds.Icon {name=if b.remote then "cloud" else "git-branch",size=14},
                             ds.FadeText {b.name,grow=1,min_w=0},if b.current then ui.text {"Current",color="$text.tertiary",text_size="$font.size.xs"} else nil}
-                    end,{key=choices.ref})}},
-                ui.show(function() return not c.loading:get() and c.error:get()=="" and #rows:get()==0 end,
+                    end)}},
+                fm.show(function() return not c.loading:get() and c.error:get()=="" and #rows:get()==0 end,
                     ui.column {w_full=true,gap="$space.2",
                         ui.text {"No matching branches. Search or show all branches.",color="$text.secondary",wrap=true},
                         ui.show(function() return c.kind:get()=="switchBranch" and string.find(c.query:get(),"%S")~=nil end,

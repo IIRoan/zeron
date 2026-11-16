@@ -264,8 +264,9 @@ local made = ui.component(function(props: Props): Node
 			ui.presence(function(): string
 				return require("./files_search").mode:get()
 			end, function(mode: string): Node
+				-- (Files and Code take each other's place with a fade.)
 				return if mode == "code" then require("./code_search")({ head = if bare then nil else head_h, lead = if bare then nil else lead_w }) else FileTree(tree_props())
-			end, { w_full = true, h_full = true }),
+			end, require("../ui/fork_motion").swap { w_full = true, h_full = true }),
 			-- Its edge, from under the band (the band's hairline runs across
 			-- both heads).
 			-- (None with no file's side to part it from.)

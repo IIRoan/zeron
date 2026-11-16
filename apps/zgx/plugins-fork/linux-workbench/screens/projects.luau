@@ -820,7 +820,7 @@ function M.view(): Node
 		return if id ~= "" and project(id) then id else ""
 	end, function(id: string): Node
 		return if id ~= "" then ui.column { w_full = true, items = "center", project_page(id) } else list_view()
-	end, { w_full = true, enter = { opacity = { 0, 1 }, duration = 120 }, mode = "wait" })
+	end, { w_full = true, enter = { opacity = { 0, 1 }, duration = 120 }, exit = { opacity = 0, duration = 60 }, mode = "wait" })
 end
 
 return M

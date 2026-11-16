@@ -8,6 +8,7 @@ local Dropdown = require("@ds/dropdown")
 local Icon = require("@ds/icon")
 local FadeText = require("@ds/fade_text")
 local Settings = require("@ds/settings")
+local fm = require("./fork_motion")
 
 return function(zeron: any, Model: any)
     local Field = ui.component(function(p: any): Node
@@ -209,8 +210,10 @@ return function(zeron: any, Model: any)
                             FadeText {function() for _,service in draft:get() do if service.id==s.id then return service.name end end;return "" end,grow=1,text_size="$font.size.sm",weight="$font.weight.medium"},
                             Icon {name="alt-arrow-right",size=12,color="$text.tertiary"},
                         }
-                    end,{key=function(s: any) return s.id end}),
-                    ui.show(function() return #draft:get()==0 end,ui.column {w_full=true,py="$space.5",gap="$space.2",items="center",
+                    -- (Its rows read their names live: added and removed
+                    -- ones slide the rest into place.)
+                    end,fm.rows {key=function(s: any) return s.id end}),
+                    fm.show(function() return #draft:get()==0 end,ui.column {w_full=true,py="$space.5",gap="$space.2",items="center",
                         Icon {name="terminal",size=24,color="$text.tertiary"},
                         ui.text {if mode:get()=="databases" then "No shared databases yet" else "No app services yet",color="$text.secondary",text_size="$font.size.sm"},
                     }),
@@ -234,7 +237,7 @@ return function(zeron: any, Model: any)
                             end},
                         },
                     }
-                end),
+                end,fm.swap {w_full=true}),
             }
         end
         return ui.div {
@@ -248,8 +251,8 @@ return function(zeron: any, Model: any)
                 ui.column {w_full=true,gap="$space.3",pointer_events=function() return if m.saving:get() then "none" else "auto" end,on_key=function(e: any) if e.key=="Escape" then close();return true end;return false end,
                     ui.presence(function() return `{mode:get()}:{epoch:get()}` end,function(): Node
                         return cards()
-                    end),
-                    ui.show(function() return error_text:get()~="" or m.error:get()~="" end,ui.text {function() return if error_text:get()~="" then error_text:get() else m.error:get() end,color="$danger",wrap=true}),
+                    end,fm.swap {w_full=true}),
+                    fm.show(function() return error_text:get()~="" or m.error:get()~="" end,ui.text {function() return if error_text:get()~="" then error_text:get() else m.error:get() end,color="$danger",wrap=true}),
                 },
             },
             Dialog.Dialog {open=discard,title="Discard unsaved changes?",body="Your changes haven't been saved.",tone="danger",cancel="Keep editing",

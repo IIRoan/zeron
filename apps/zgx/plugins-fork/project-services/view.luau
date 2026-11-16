@@ -8,6 +8,7 @@ local Dropdown = require("@ds/dropdown")
 local ContextMenu = require("./ui/context_menu")
 local Dialog = require("@ds/dialog").Dialog
 local TextField = require("@ds/text_field")
+local fm = require("./fork_motion")
 
 return function(zeron: any, Model: any)
     local Editor = require("./editor")(zeron,Model).Editor
@@ -75,7 +76,7 @@ return function(zeron: any, Model: any)
                 end,function(kind: string): Node
                     if kind=="busy" then return Status.Spinner {size=10,ink="$warning"} end
                     return ui.div {w=7,h=7,rounded="$radius.full",bg=function() return ink(id) end}
-                end),
+                end,fm.swap()),
             }
         end
         ui.effect(function()
@@ -116,7 +117,8 @@ return function(zeron: any, Model: any)
                 ui.div {w_full=true,p="$space.2",TextField {value=filter,label="Filter services",placeholder="Filter services",size="sm",w_full=true}},
                 ui.scroll {id="services-list",w_full=true,grow=1,min_h=0,on_key=step,
                     ui.column {w_full=true,p="$space.1",gap="$space.1",
-                        ui.each(visible,function(service: any,index: number): Node
+                        -- (Services added, removed or filtered slide into place.)
+                        fm.each(visible,function(service: any): string return service.id end,function(service: any): Node
                             return ContextMenu {w_full=true,items=function() return service_menu(service) end,
                                 ui.button {role="tab",label=service.name,w_full=true,min_w=0,h=42,selected=function() return m.selected:get()==service.id end,
                                     px="$space.3",py="$space.2",rounded="$radius.sm",justify="start",gap="$space.2",
@@ -130,12 +132,12 @@ return function(zeron: any, Model: any)
                                         ui.row {w_full=true,items="center",gap="$space.2",pl=ui.raw(15,"align status with the service name"),
                                             ui.text {function() return state_label(service.id) end,color=function() return ink(service.id) end,text_size="$font.size.xs"},
                                             if wide then FadeText {service.command,grow=1,font="$font.mono",text_size="$font.size.xs",color="$text.tertiary"} else nil}}}}
-                        end,{key=function(service: any) return service.id end}),
-                        ui.show(function() return #visible:get()==0 end,ui.text {"No matching services",p="$space.3",wrap=true,color="$text.secondary",text_size="$font.size.sm"})}}}
+                        end),
+                        fm.show(function() return #visible:get()==0 end,ui.text {"No matching services",p="$space.3",wrap=true,color="$text.secondary",text_size="$font.size.sm"})}}}
         end
         local function output(): Node
             return ui.column {w_full=true,h_full=true,grow=1,min_w=0,min_h=0,
-                ui.show(function() local s=m.snapshot:get();return s~=nil and #s.config.services>0 end,
+                fm.show(function() local s=m.snapshot:get();return s~=nil and #s.config.services>0 end,
                 ui.row {id="service-output-toolbar",w_full=true,h=42,shrink=0,px="$space.3",gap="$space.2",items="center",border_sides={0,0,1,0},border_color="$border.subtle",
                     Icon {name="terminal",size=14,color="$text.tertiary"},
                     FadeText {function() local s=selected_service();return if s then s.name else "Output" end,grow=1,weight="$font.weight.medium",text_size="$font.size.sm"},
@@ -175,7 +177,7 @@ return function(zeron: any, Model: any)
                         ui.text {function() local s=selected_service();return if s then s.command else "" end,font="$font.mono",text_size="$font.size.sm",color="$text.secondary",wrap=true,max_w=480,align="center"},
                         ui.text {function() local run=selected_run();return if output_error:get()~="" then output_error:get() elseif run then run.message or (if run.exitCode~=nil then `Exit code {run.exitCode}` else "") else "" end,color="$text.secondary",wrap=true,text_size="$font.size.xs"},
                     }
-                end,{w_full=true,grow=1,min_h=0}),
+                end,fm.swap {w_full=true,grow=1,min_h=0}),
             }
         end
         return ui.column {ref=box,id="project-services",w_full=true,h_full=true,min_h=0,
@@ -204,11 +206,11 @@ return function(zeron: any, Model: any)
                     end},
                 },
             },
-            ui.show(function() local s=m.snapshot:get();return s~=nil and s.checkout~=nil and s.checkout~=p.context.scope.cwd end,
+            fm.show(function() local s=m.snapshot:get();return s~=nil and s.checkout~=nil and s.checkout~=p.context.scope.cwd end,
                 ui.row {w_full=true,px="$space.3",py="$space.1",gap="$space.2",items="center",
                     ui.text {"Services are running in another checkout.",grow=1,text_size="$font.size.xs",color="$warning",wrap=true},
                     Button {"Use this checkout",size="xs",disabled=function() return m.busy(nil) end,on_click=function() activate:set(true) end}}),
-            ui.show(function() return m.error:get()~="" end,ui.text {function() return m.error:get() end,px="$space.3",py="$space.2",wrap=true,color="$danger",text_size="$font.size.sm"}),
+            fm.show(function() return m.error:get()~="" end,ui.text {function() return m.error:get() end,px="$space.3",py="$space.2",wrap=true,color="$danger",text_size="$font.size.sm"}),
             ui.presence(function() return if (box.width or 0)>=580 then "wide" else "narrow" end,function(kind: string): Node
                 return (if kind=="wide" then ui.row else ui.column) {w_full=true,grow=1,min_h=0,
                     ui.show(function() local s=m.snapshot:get();return s~=nil and #s.config.services>0 end,service_list(kind=="wide")),output()}
@@ -247,7 +249,7 @@ return function(zeron: any, Model: any)
             ui.presence(function() local c=Model.context(p.session,chosen());return if c then c.key else "" end,function(key: string): Node
                 if key=="" then return ui.text {"Choose a project to manage its services.",p="$space.3",wrap=true,color="$text.secondary"} end
                 return Pane {context=Model.context(p.session,chosen())}
-            end,{w_full=true,grow=1,min_h=0}),
+            end,fm.swap {w_full=true,grow=1,min_h=0}),
         }
     end)
 end

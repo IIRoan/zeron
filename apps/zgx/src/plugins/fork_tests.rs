@@ -50,7 +50,7 @@ fn every_fork_plugin_loads_into_the_shell() {
     let broken = std::env::temp_dir().join(format!("zeron-fork-broken-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&broken);
     std::fs::create_dir_all(&broken).unwrap();
-    for name in ["zeron-plugin.json", "zeron.luau", "fork_sdk.luau", "model.luau", "settings.luau", "view.luau"] {
+    for name in ["zeron-plugin.json", "zeron.luau", "fork_sdk.luau", "fork_motion.luau", "model.luau", "settings.luau", "view.luau"] {
         std::fs::copy(dir().join("project-sandbox").join(name), broken.join(name)).unwrap();
     }
     std::fs::write(broken.join("init.luau"), "local zeron = require(\"./zeron\")(\"project-sandbox\")\nerror(\"boom\")\n").unwrap();
@@ -82,19 +82,25 @@ fn the_workbench_runs_its_screens_with_a_chat_open() {
 /// The fork's plugins that use the SDK carry upstream's own unchanged
 /// (plugins-sdk/zeron.luau stays upstream's) and the fork's addition beside
 /// it (plugins-fork/fork_sdk.luau), byte for byte. Linux Workbench replaces
-/// screens and uses neither. Fix with
-/// `for d in apps/zgx/plugins-fork/*/; do [ -f "$d/zeron.luau" ] && cp apps/zgx/plugins-sdk/zeron.luau apps/zgx/plugins-fork/fork_sdk.luau "$d"; done`.
+/// screens and uses neither. Each carries the fork's motion
+/// (plugins-fork/fork_motion.luau) too, Linux Workbench in its ui/. Fix with
+/// `for d in apps/zgx/plugins-fork/*/; do [ -f "$d/zeron.luau" ] && cp apps/zgx/plugins-sdk/zeron.luau apps/zgx/plugins-fork/fork_sdk.luau apps/zgx/plugins-fork/fork_motion.luau "$d"; done; cp apps/zgx/plugins-fork/fork_motion.luau apps/zgx/plugins-fork/linux-workbench/ui/`.
 #[test]
 fn fork_plugins_carry_the_sdk_and_its_fork_addition() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let sdk = std::fs::read(root.join("plugins-sdk/zeron.luau")).unwrap();
     let addition = std::fs::read(dir().join("fork_sdk.luau")).unwrap();
+    let motion = std::fs::read(dir().join("fork_motion.luau")).unwrap();
     let mut stale = Vec::new();
+    let copy = dir().join("linux-workbench/ui/fork_motion.luau");
+    if std::fs::read(&copy).ok().as_ref() != Some(&motion) {
+        stale.push(copy.strip_prefix(root).unwrap().display().to_string());
+    }
     for id in FORK_PLUGINS {
         if *id == "linux-workbench" {
             continue;
         }
-        for (name, canonical) in [("zeron.luau", &sdk), ("fork_sdk.luau", &addition)] {
+        for (name, canonical) in [("zeron.luau", &sdk), ("fork_sdk.luau", &addition), ("fork_motion.luau", &motion)] {
             let copy = dir().join(id).join(name);
             if std::fs::read(&copy).ok().as_ref() != Some(canonical) {
                 stale.push(copy.strip_prefix(root).unwrap().display().to_string());
@@ -264,7 +270,7 @@ fn shows(app: &mut TestApp, words: &str) -> bool {
     app.texts().iter().any(|t| t.contains(words))
 }
 
-const SANDBOX_FILES: &[&str] = &["fork_sdk.luau", "model.luau", "settings.luau", "view.luau"];
+const SANDBOX_FILES: &[&str] = &["fork_sdk.luau", "fork_motion.luau", "model.luau", "settings.luau", "view.luau"];
 
 fn sandbox_on() -> serde_json::Value {
     json!({
@@ -360,7 +366,7 @@ fn the_sandbox_settings_refuse_a_relative_config_and_send_what_the_form_says() {
     assert_eq!(sent["shareGithub"], false);
 }
 
-const VM_FILES: &[&str] = &["fork_sdk.luau", "model.luau", "settings.luau", "view.luau"];
+const VM_FILES: &[&str] = &["fork_sdk.luau", "fork_motion.luau", "model.luau", "settings.luau", "view.luau"];
 
 #[test]
 fn the_vm_tab_offers_to_connect_a_project_that_has_none() {
@@ -492,6 +498,8 @@ fn a_project_s_settings_page_holds_each_fork_plugin_s_section() {
     // only changes its icon).
     app.click("#project-settings-back");
     assert!(app.wait_until(|a| a.find("project-settings").is_none() && shows(a, "Borealis")), "{}", app.tree());
+    // (The list fades back in: a node still at no opacity takes no click.)
+    app.frames(30);
     app.click("role:button \"Change icon for Borealis\"");
     app.frames(30);
     assert!(app.find("project-settings").is_none(), "the tile opened the page: {}", app.tree());
@@ -543,6 +551,54 @@ return ui.div { w_full = true, h_full = true, Chat {} }
     app.frames(20);
     assert_eq!(app.error(), None, "{}", app.tree());
     assert!(app.wait_until(|a| shows(a, "installing dependencies (npm ci)")), "{}", app.tree());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// The fork's moving lists (plugins-fork/fork_motion.luau, Source
+/// control's files among them): a row whose item changes under its key
+/// (a file staged: same path, another group) shows it as it is now, though
+/// a moving `ui.each` builds a row once; a row that goes fades out before
+/// it's gone.
+#[test]
+fn a_moving_list_row_follows_its_item_and_fades_out() {
+    let root = std::env::temp_dir().join(format!("zeron-fork-motion-{}-{}", std::process::id(), rand_suffix()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::copy(dir().join("fork_motion.luau"), root.join("fork_motion.luau")).unwrap();
+    let entry = root.join("app.luau");
+    std::fs::write(
+        &entry,
+        r#"
+local fm = require("./fork_motion")
+local rows = ui.state("rows", { { id = "notes.txt", group = "Changes" }, { id = "README.md", group = "Changes" } } :: any)
+local View = ui.component(function(): Node
+	return ui.column {
+		w = 300,
+		h = 200,
+		ui.button { label = "Stage notes", on_click = function() rows:set({ { id = "notes.txt", group = "Staged" }, { id = "README.md", group = "Changes" } }) end },
+		ui.button { label = "Discard readme", on_click = function() rows:set({ { id = "notes.txt", group = "Staged" } }) end },
+		fm.each(rows, function(r: any): string return r.id end, function(r: any): Node
+			return ui.text { `{r.id} in {r.group}` }
+		end, { w_full = true }),
+	}
+end)
+return View {}
+"#,
+    )
+    .unwrap();
+    let ui_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("ui");
+    let mut app = TestApp::new(move |runtime| super::lend_design_system(ScriptHost::new(runtime, entry.clone()), &ui_dir.join("app.luau")));
+    app.frames(5);
+    assert_eq!(app.error(), None, "{}", app.tree());
+    assert!(shows(&mut app, "notes.txt in Changes"), "{}", app.tree());
+    app.click("role:button \"Stage notes\"");
+    app.frames(30);
+    assert!(shows(&mut app, "notes.txt in Staged") && !shows(&mut app, "notes.txt in Changes"), "{}", app.tree());
+    app.click("role:button \"Discard readme\"");
+    app.frames(2);
+    assert!(shows(&mut app, "README.md in Changes"), "it went at once, no fade: {}", app.tree());
+    app.frames(40);
+    assert!(!shows(&mut app, "README.md in Changes"), "{}", app.tree());
+    assert_eq!(app.error(), None, "{}", app.tree());
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -641,15 +697,17 @@ fn find_in_files_is_the_explorer_s_code_view() {
     let sent = asked.borrow().last().unwrap().1.clone();
     assert_eq!(sent["query"], "needle");
     assert_eq!(sent["options"]["matchCase"], false);
-    // The file folds its lines away, and back.
+    // The file folds its lines away, and back. (Its rows fade in first: a
+    // node still at no opacity takes no click.)
+    app.frames(30);
     app.click("#fork-code-search >> .code-search-file");
-
-    app.frames(5);
+    // (Its lines fade out as the rows after them close up.)
+    app.frames(30);
     assert!(app.find("#fork-code-search >> role:button \"src/app.ts:3 const needle = 1;\"").is_none(), "{}", app.tree());
     // (Past a double click's time: another click.)
     app.frames(60);
     app.click("#fork-code-search >> .code-search-file");
-    app.frames(5);
+    app.frames(30);
     assert!(app.find("#fork-code-search >> role:button \"src/app.ts:3 const needle = 1;\"").is_some(), "{}", app.tree());
     // Aa asks again with the case matched.
     app.click("#fork-code-search >> role:button \"Match case\"");

@@ -8,6 +8,7 @@ local TextField = require("@ds/text_field")
 local Switch = require("@ds/switch")
 local Settings = require("@ds/settings")
 local Spinner = require("@ds/status").Spinner
+local fm = require("./fork_motion")
 
 local BUSY = {
 	save = "Saving…",
@@ -154,7 +155,7 @@ return function(zeron: any, Model: any)
 					field("Start with services", start_with, "None", "Services of this project that start the VM when they start (their names)."),
 					switch("Open the viewer when the VM starts", viewer, "Windows' screen in a window of its own on this machine."),
 				},
-				ui.show(busy, ui.row {
+				fm.show(busy, ui.row {
 					px = Settings.inset(),
 					gap = "$space.2",
 					items = "center",
@@ -167,7 +168,7 @@ return function(zeron: any, Model: any)
 						text_size = "$font.size.sm",
 					},
 				}),
-				ui.show(function()
+				fm.show(function()
 					return problem:get() ~= "" or m.error:get() ~= ""
 				end, ui.text {
 					function()
@@ -184,9 +185,9 @@ return function(zeron: any, Model: any)
 					gap = "$space.2",
 					items = "center",
 					flex_wrap = true,
-					ui.show(m.connected, Button { "Disconnect", tone = "ghost", size = "sm", disabled = busy, on_click = m.disconnect }),
+					fm.fade(m.connected, Button { "Disconnect", tone = "ghost", size = "sm", disabled = busy, on_click = m.disconnect }),
 					ui.div { grow = 1 },
-					ui.show(function()
+					fm.fade(function()
 						return m.connected() and running()
 					end, ui.row {
 						gap = "$space.2",
@@ -218,7 +219,7 @@ return function(zeron: any, Model: any)
 							end,
 						},
 					}),
-					ui.show(function()
+					fm.fade(function()
 						return m.connected() and not running()
 					end, Button {
 						"Start VM",

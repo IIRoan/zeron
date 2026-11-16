@@ -32,6 +32,23 @@ local zeron = require("./fork_sdk")(require("./zeron")("my-plugin"), "my-plugin"
 project tools gateway below, and `zeron.ports.parse`/`format` and
 `zeron.words` for port and name lists written as the engine reads them.
 
+## Motion
+
+Each plugin also carries `fork_motion.luau`, a copy of
+`plugins-fork/fork_motion.luau` (Linux Workbench's in its `ui/`; the same
+test checks them). Whatever moves content uses it, so it moves as Zeron's
+own lists and panels do (`@ds/motion`'s pace and ease, and Reduce motion):
+
+- `fm.each(list, key, build, opts)`: a keyed list whose rows slide to new
+  places, fade in and fade out (a staged file sliding to Staged). A row is
+  built again as its item changes (a moving `ui.each` builds a row once).
+  `fm.rows(opts)` gives `ui.each` the same motion when its rows read their
+  items live.
+- `fm.show(on, node, box?)`: `ui.show` whose room opens and closes as it
+  fades. `fm.fade(on, node)`: a control that fades where it stands.
+- `fm.swap(opts)`: `ui.presence` options for content replacing other
+  content (the old fades, then the new).
+
 ## The project tools gateway
 
 `zeron.workbench` calls one of a bounded list of engine methods through the

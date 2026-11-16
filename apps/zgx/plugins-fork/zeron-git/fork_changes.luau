@@ -10,7 +10,12 @@ local git=require("./ui/git")
 local Icon=require("@ds/icon")
 local IconButton=require("@ds/icon_button").IconButton
 local Selection=require("./selection")
+local fm=require("./fork_motion")
 local conflict=Selection.conflict
+-- Past this many rows the list is virtual (`ui.list`: rows built as they
+-- show) and its rows don't slide. ponytail: one cap; a virtual list that
+-- animates moves would lift it.
+local MANY=400
 local function status(row: any,repository: any): (string,string)
     if row.group=="conflicts" then return "!","$danger" end
     local value=if row.group=="staged" then row.file.index else row.file.worktree
@@ -72,7 +77,11 @@ return function(zeron: any,Repo: any)
                     if f.worktree~="unchanged" or f.index=="untracked" then table.insert(groups.unstaged,f) end
                 end
             end
-            local out={}
+            -- (`id`, the row's in the list: a file's path where it first
+            -- shows, so staging or unstaging it moves its row to its new
+            -- group; a file in both groups is twice there, the second by
+            -- group.)
+            local out={};local seen={}
             for _,group in {"conflicts","staged","unstaged"} do
                 local files=groups[group]
                 table.sort(files,function(a: any,b: any)
@@ -80,9 +89,12 @@ return function(zeron: any,Repo: any)
                     local bb=if by=="name" then string.match(b.path,"[^/]+$") elseif by=="status" then b.index .. b.worktree else b.path
                     return if aa==bb then a.path<b.path else aa<bb
                 end)
-                if #files>0 then table.insert(out,{key=group,group=group,title=`{string.upper(string.sub(group,1,1))}{string.sub(group,2)} ({#files})`}) end
+                if #files>0 then table.insert(out,{key=group,id=`#{group}`,group=group,title=`{string.upper(string.sub(group,1,1))}{string.sub(group,2)} ({#files})`}) end
                 if not folded:get()[`{w.repository:get()}:{group}`] then
-                    for _,f in files do table.insert(out,{key=`{group}:{f.path}`,group=group,file=f}) end
+                    for _,f in files do
+                        table.insert(out,{key=`{group}:{f.path}`,id=if seen[f.path] then `{group}:{f.path}` else f.path,group=group,file=f})
+                        seen[f.path]=true
+                    end
                 end
             end
             return out
@@ -137,10 +149,18 @@ return function(zeron: any,Repo: any)
         ui.effect(function()
             if m.discard_ask:get() then ui.after(0,function() m.discard_ask:set(nil);ask(paths(nil,true),true) end) end
         end)
-        local function select(row: any,index: number,event: any?)
+        -- Each file row's button, by its key: the chosen one is kept in view.
+        local row_els: {[string]: any}=setmetatable({},{__mode="v"}) :: any
+        local function select(row: any,event: any?)
             local next,next_anchor=Selection.choose(selected:peek(),anchor:peek(),row_list:peek(),row,event or {})
             selected:set(next);anchor:set(next_anchor);chosen:set(row);diff_offset:set(0)
-            local list=list_box:peek();if list then list:scroll_to_row(index,{align="nearest"}) end
+            local index=0;for i,r in row_list:peek() do if r.key==row.key then index=i end end
+            local list=list_box:peek()
+            -- (A virtual list scrolls to the row; otherwise the row, taking
+            -- focus, is scrolled to.)
+            if list and not list:scroll_to_row(index,{align="nearest"}) then
+                local el=row_els[row.key];if el then el:focus() end
+            end
         end
         ui.effect(function()
             local row=chosen:get();w.revision:get();local repo=w.repository:get()
@@ -170,7 +190,7 @@ return function(zeron: any,Repo: any)
             end,function(e: any) if last==key then w.error:set(tostring(e)) end end)
         end)
         local function menu(row: any): {any}
-            if not selected:peek()[row.key] then select(row,0,{}) end
+            if not selected:peek()[row.key] then select(row,{}) end
             local targets=Selection.paths(w.repo(),selected:peek(),row.group,false,row)
             local pin=w.capture()
             local function copy_paths(absolute: boolean)
@@ -208,16 +228,16 @@ return function(zeron: any,Repo: any)
             end
             if key~="arrowup" and key~="arrowdown" and key~="home" and key~="end" then return false end
             local files={};local current=0
-            for i,row in row_list:peek() do
+            for _,row in row_list:peek() do
                 if row.file then
-                    table.insert(files,{row=row,index=i})
+                    table.insert(files,row)
                     if chosen:peek() and chosen:peek().key==row.key then current=#files end
                 end
             end
             if #files==0 then return true end
             local index=if key=="home" then 1 elseif key=="end" then #files
                 elseif key=="arrowup" then math.max(1,current-1) else math.min(#files,current+1)
-            select(files[index].row,files[index].index,e);return true
+            select(files[index],e);return true
         end
         return ui.column {id="git-fork-changes",ref=box,w_full=true,grow=1,min_h=0,gap="$space.2",
             on_focus=function() focus_inside=true end,
@@ -237,7 +257,7 @@ return function(zeron: any,Repo: any)
             Commands {model=m,sort=sort,stage_all=stage_all,discard_all=function(all: boolean,pin: any) ask(paths(nil,true),all,pin) end,
                 open_commit=function(c: any) if p.panel then Repo.open_commit(p.panel,m.id,c) end end},
             -- (Which repository, where the checkout holds more than one.)
-            ui.show(function() return #w.repositories:get()>1 end,Dropdown {value=w.repository,label="Repository",items=function() local items={};for _,r in w.repositories:get() do table.insert(items,{value=r.path,label=r.name .. (if r.complete then "" else " (incomplete)")}) end;return items end}),
+            fm.show(function() return #w.repositories:get()>1 end,Dropdown {value=w.repository,label="Repository",items=function() local items={};for _,r in w.repositories:get() do table.insert(items,{value=r.path,label=r.name .. (if r.complete then "" else " (incomplete)")}) end;return items end}),
             -- The commit, first: its message (Ctrl+Enter commits) and the
             -- button, its ways (push, sync, amend) in the menu beside it.
             -- (One line: the message growing, Commit and its menu at its right.)
@@ -266,20 +286,20 @@ return function(zeron: any,Repo: any)
             },
             ui.row {class="git-branch-actions",w_full=true,provide={git_branch=branch_info},
                 zeron.slot("branch",{direction="row",gap="$space.1",items="center"})},
-            ui.show(function() return w.error:get()~="" end,ui.text {function() return w.error:get() end,color="$danger",wrap=true}),
-            ui.show(function() local r=w.repo();return r~=nil and not r.complete end,ui.text {"Repository status is incomplete. Refresh before changing files.",color="$warning",wrap=true}),
-            -- A clean tree says so, rather than an empty list and diff.
-            ui.show(function() local r=w.repo();return r~=nil and #row_list:get()==0 end,ui.column {id="git-fork-clean",w_full=true,grow=1,min_h=0,items="center",justify="center",gap="$space.1",
-                ui.text {"No changes",weight="$font.weight.semibold",color="$text.secondary"},
-                ui.text {function() local r=w.repo();local s=r and r.git;return if s and s.branch then `{s.branch} matches its last commit.` else "The working tree matches its last commit." end,text_size="$font.size.sm",color="$text.tertiary"},
-            }),
-            ui.show(function() return #row_list:get()>0 end,(if p.wide then ui.row else ui.column) {w_full=true,grow=1,min_h=0,gap="$space.2",
-                ui.list {id="git-source-control",ref=list_box,focusable=true,on_key=list_key,w=if p.wide then 300 else "100%",h=if p.wide then "100%" else 180,shrink=0,offset=list_offset,
-                    heights=function() local heights={};for _ in row_list:get() do table.insert(heights,32) end;return heights end,
-                    key=function(i: number) local r=row_list:get()[i];return if r then `{i}:{r.key}:{r.title or ""}:{w.revision:get()}` else tostring(i) end,
-                    row=function(key: string): Node
-                        local index=tonumber(string.match(key,"^(%d+):")) or 0;local row=row_list:peek()[index]
-                        if not row then return ui.div {} end
+            fm.show(function() return w.error:get()~="" end,ui.text {function() return w.error:get() end,color="$danger",wrap=true}),
+            fm.show(function() local r=w.repo();return r~=nil and not r.complete end,ui.text {"Repository status is incomplete. Refresh before changing files.",color="$warning",wrap=true}),
+            -- A clean tree says so, rather than an empty list and diff (the
+            -- one fading into the other).
+            ui.presence(function(): string?
+                local n=#row_list:get()
+                if n==0 then return if w.repo()~=nil then "clean" else nil end
+                return if n>MANY then "many" else "few"
+            end,function(kind: string): Node
+                if kind=="clean" then return ui.column {id="git-fork-clean",w_full=true,grow=1,min_h=0,items="center",justify="center",gap="$space.1",
+                    ui.text {"No changes",weight="$font.weight.semibold",color="$text.secondary"},
+                    ui.text {function() local r=w.repo();local s=r and r.git;return if s and s.branch then `{s.branch} matches its last commit.` else "The working tree matches its last commit." end,text_size="$font.size.sm",color="$text.tertiary"},
+                } end
+                local function file_row(row: any): Node
                         if not row.file then return ui.row {w_full=true,h=32,items="center",
                             ui.button {label=row.title,grow=1,h_full=true,justify="start",on_click=function()
                                 local key=`{w.repository:peek()}:{row.group}`;local next=table.clone(folded:peek());next[key]=not next[key];folded:set(next)
@@ -295,10 +315,12 @@ return function(zeron: any,Repo: any)
                                 bg=function() return if selected:get()[row.key] then "$zeron.secondary.bg" else "#00000000" end,
                                 hover={bg="$hover"},
                                 ui.button {label=`{row.group} {row.file.path}`,grow=1,min_w=0,h_full=true,items="center",justify="start",
-                                    bg="#00000000",on_key=list_key,on_click=function(e: any) select(row,index,e) end,
+                                    bg="#00000000",on_key=list_key,on_click=function(e: any) select(row,e) end,
+                                    on_mount=function(el: any) row_els[row.key]=el end,
                                     FadeText {if row.file.oldPath then `{row.file.oldPath} → {row.file.path}` else row.file.path,grow=1,color="$text.primary"},
                                 },
-                                ui.show(function() return w.staging_pending(row.file.path)~=nil end,ui.text {function() return if w.staging_pending(row.file.path) then "Staging…" else "Unstaging…" end,text_size="$font.size.xs",color="$text.secondary"}),
+                                fm.fade(function() return w.staging_pending(row.file.path)~=nil end,
+                                    ui.text {function() return if w.staging_pending(row.file.path) then "Staging…" else "Unstaging…" end,text_size="$font.size.xs",color="$text.secondary"}),
                                 IconButton {icon=if row.group=="staged" then "minus" else "plus",size="sm",
                                     label=function() local n=#Selection.paths(w.repo(),selected:get(),row.group,false,row)
                                         return `{if row.group=="staged" then "Unstage" else "Stage"} {if n>1 then `selected changes ({n} files)` else row.file.path}` end,
@@ -307,8 +329,27 @@ return function(zeron: any,Repo: any)
                                 ui.text {letter,w=16,align="center",color=color,font="$font.mono",text_size="$font.size.sm"},
                             },
                         }
-                    end,
-                },
+                end
+                local frame: {[any]: any}={id="git-source-control",ref=list_box,focusable=true,on_key=list_key,w=if p.wide then 300 else "100%",h=if p.wide then "100%" else 180,shrink=0}
+                local list: Node
+                if kind=="many" then
+                    frame.offset=list_offset
+                    frame.heights=function() local heights={};for _ in row_list:get() do table.insert(heights,32) end;return heights end
+                    frame.key=function(i: number) local r=row_list:get()[i];return if r then `{i}:{r.key}:{r.title or ""}:{w.revision:get()}` else tostring(i) end
+                    frame.row=function(key: string): Node
+                        local row=row_list:peek()[tonumber(string.match(key,"^(%d+):")) or 0]
+                        return if row then file_row(row) else ui.div {}
+                    end
+                    list=ui.list(frame :: any)
+                else
+                    -- Each row by its `id`: a file staged or unstaged slides
+                    -- to its new group, the rest closing up and making room;
+                    -- new files fade in and discarded ones out.
+                    table.insert(frame,fm.each(row_list,function(row: any): string return row.id end,file_row,{w_full=true}))
+                    list=ui.scroll(frame :: any)
+                end
+                return (if p.wide then ui.row else ui.column) {w_full=true,grow=1,min_h=0,gap="$space.2",
+                list,
                 ui.column {grow=1,min_w=0,min_h=0,gap="$space.1",
                     ui.text {function() local row=chosen:get();return if row then row.file.path else "" end,color="$text.secondary",font="$font.mono",text_size="$font.size.sm"},
                     Changes.list {id="git-fork-diff",bare=true,columns=2,offset=diff_offset,
@@ -331,9 +372,10 @@ return function(zeron: any,Repo: any)
                             end;return nil
                         end,
                         lines=function(_f: any) diff_version:get();return diff_cache or {} end},
-                    ui.show(function() local d=diff:get();return d~=nil and d.truncated end,ui.text {"Partial diff: the file exceeds the display limit.",color="$text.secondary"}),
+                    fm.show(function() local d=diff:get();return d~=nil and d.truncated end,ui.text {"Partial diff: the file exceeds the display limit.",color="$text.secondary"}),
                 },
-            }),
+            }
+            end,fm.swap {w_full=true,grow=1,min_h=0}),
             Dialog {open=discard,title="Discard these changes?",tone="danger",body=function() return `Discard {if preview then preview.fileCount else 0} files? A recovery copy will be kept for Undo discard.` end,
                 confirm={label="Discard",on_click=function() if preview then w.confirm_discard(preview,discard_pin) end end}},
             Dialog {open=w.conflict_open,title="Stage files with conflict markers?",tone="danger",

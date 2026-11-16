@@ -21,6 +21,7 @@ local TextField = require("@ds/text_field")
 local EmptyState = require("@ds/empty_state")
 local progress = require("@ds/progress")
 local Branches=require("./branches")
+local fm=require("./fork_motion")
 
 -- What Changes shows: the work tree, the branch, the last turn.
 local SCOPES = { "working", "branch", "turn" }
@@ -109,7 +110,7 @@ return function(zeron: any, Repo: any, words: any)
 			end
 			return out
 		end)
-		return ui.show(function(): boolean
+		return fm.show(function(): boolean
 			return m.scope:get() == "branch"
 		end, ui.row {
 			id = "git-base",
@@ -318,7 +319,7 @@ return function(zeron: any, Repo: any, words: any)
 			end
 			if m.scope:peek()=="working" then return ForkChanges {model=m,wide=wide,panel=props.panel} end
 			return ChangesView { model = m, wide = wide }
-		end, { w_full = true, grow = 1, min_h = 0 })
+		end, fm.swap { w_full = true, grow = 1, min_h = 0 })
 
 		return ui.column {
 			id = "git-tab",
@@ -355,7 +356,7 @@ return function(zeron: any, Repo: any, words: any)
 			-- (The head once there's a branch to say: until then, nothing
 			-- it would say is known.)
 			-- (A commit's tab has none: it's the commit's, not the checkout's.)
-			ui.show(function(): boolean
+			fm.show(function(): boolean
 				return view ~= "commit" and m.status:get() ~= nil
 			end, head),
 			content,

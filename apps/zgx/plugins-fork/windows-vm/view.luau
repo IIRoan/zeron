@@ -7,6 +7,7 @@ local IconButton = require("@ds/icon_button").IconButton
 local Icon = require("@ds/icon")
 local Badge = require("@ds/badge").Badge
 local Tag = require("@ds/badge").Tag
+local fm = require("./fork_motion")
 local Spinner = require("@ds/status").Spinner
 local TextField = require("@ds/text_field")
 
@@ -105,7 +106,7 @@ return function(zeron: any, Model: any)
 					text_size = "$font.size.xs",
 				},
 			},
-			ui.show(open, ui.column {
+			fm.show(open, ui.column {
 				w_full = true,
 				gap = 2,
 				pl = "$space.5",
@@ -272,7 +273,7 @@ return function(zeron: any, Model: any)
 					local e = vm().error
 					return if e and e ~= "" then e else "The VM can't be used on this machine yet."
 				end)
-			end)
+			end, fm.swap { w_full = true })
 		end
 
 		local function ports(title: string, list: () -> { number }?, empty: () -> string): Node
@@ -291,7 +292,7 @@ return function(zeron: any, Model: any)
 						table.insert(tags, Tag { port, size = "sm" })
 					end
 					return ui.row(tags)
-				end),
+				end, fm.swap()),
 			}
 		end
 
@@ -337,7 +338,7 @@ return function(zeron: any, Model: any)
 				end, function()
 					return "None"
 				end),
-				ui.show(function()
+				fm.show(function()
 					local e = vm().tunnelError
 					return e ~= nil and e ~= ""
 				end, ui.text {
@@ -471,7 +472,7 @@ return function(zeron: any, Model: any)
 							},
 						},
 					}
-				end)
+				end, fm.swap { w_full = true })
 			)
 		end
 
@@ -548,7 +549,7 @@ return function(zeron: any, Model: any)
 					end, function(state: string): Node
 						local look = (STATES :: any)[state] or STATES.unavailable
 						return Badge { look[1], tone = look[2], dot = true }
-					end),
+					end, fm.swap()),
 					IconButton {
 						icon = "settings",
 						label = "Windows VM settings",
@@ -559,11 +560,11 @@ return function(zeron: any, Model: any)
 					},
 				},
 				screen(),
-				ui.show(function()
+				fm.show(function()
 					local s = m.state()
 					return s == "running" or s == "starting"
 				end, machine()),
-				ui.show(busy, ui.row {
+				fm.show(busy, ui.row {
 					gap = "$space.2",
 					items = "center",
 					Spinner { size = 14 },
@@ -575,13 +576,13 @@ return function(zeron: any, Model: any)
 						text_size = "$font.size.sm",
 					},
 				}),
-				ui.show(function()
+				fm.show(function()
 					return m.error:get() ~= ""
 				end, ui.text { m.error, wrap = true, color = "$danger", text_size = "$font.size.sm" }),
-				ui.show(function()
+				fm.show(function()
 					return m.state() == "running"
 				end, run()),
-				ui.show(function()
+				fm.show(function()
 					return m.state() == "running"
 				end, healthy()),
 				},
@@ -602,6 +603,6 @@ return function(zeron: any, Model: any)
 				}
 			end
 			return Pane { context = c }
-		end)
+		end, fm.swap { w_full = true, h_full = true })
 	end)
 end

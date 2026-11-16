@@ -6,6 +6,7 @@ local catalog=require("./release_data")
 local about=ui.shared("about",{} :: any)
 local auto=Prefs.persist("release_notes.show_after_updates",true)
 local seen=Prefs.persist("release_notes.seen",{} :: any)
+local fm=require("../ui/fork_motion")
 local M={open=ui.state("fork.release_notes.open",false),selected=ui.state("fork.release_notes.selected",1)}
 local function digest(r: any): string return r.digest .. ":workbench-1.1.0" end
 local function current(): number
@@ -54,10 +55,10 @@ M.View=ui.component(function(): Node
                     ui.text {`Zeron {r.version}`,weight="$font.weight.semibold"},
                     ui.scroll {id="fork-release-notes",w_full=true,h=400,selectable=true,
                         ui.column {w_full=true,gap="$space.4",
-                            if index==current() then Markdown {text="### Workbench plugins\n- Original Linux layout, folder navigation and advanced workspace search.\n- Full Git menus, selection, syntax highlighting and commit drafts.\n- Services in the left tools panel, shared databases, worktree settings, what each service starts after, and an optional shell terminal dock.\n- The project's sandbox: its devcontainer, build progress and log.\n- The project's Windows VM: its screen, health, ports and commands.\n- Project settings on a page of their own (Settings → Projects, a project): its sandbox, Windows VM and worktree settings.\n\nThese changes are provided by five independent fork plugins."} else nil,
+                            if index==current() then Markdown {text="### Workbench plugins\n- Original Linux layout, folder navigation and advanced workspace search.\n- Full Git menus, selection, syntax highlighting and commit drafts.\n- Services in the left tools panel, shared databases, worktree settings, what each service starts after, and an optional shell terminal dock.\n- The project's sandbox: its devcontainer, build progress and log.\n- The project's Windows VM: its screen, health, ports and commands.\n- Project settings on a page of their own (Settings → Projects, a project): its sandbox, Windows VM and worktree settings.\n- Lists and panels move as Zeron's own: a staged file slides to Staged, rows fade in and out, notices and the terminal dock open and close.\n\nThese changes are provided by five independent fork plugins."} else nil,
                             Markdown {text=table.concat(changes,"\n")},
                             Markdown {text=`### Upstream\n{if r.notes_source=="git_history" then "Notes from the bundled Git history.\n\n" else ""}{r.upstream_notes}`}}}}
-            end),
+            end,fm.swap {w_full=true}),
             ds.Checkbox {value=auto,label="Show after updates"},
         }}
 end)

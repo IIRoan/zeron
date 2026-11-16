@@ -9,6 +9,7 @@ local TextField = require("@ds/text_field")
 local Switch = require("@ds/switch")
 local Settings = require("@ds/settings")
 local Spinner = require("@ds/status").Spinner
+local fm = require("./fork_motion")
 
 local function trim(text: string): string
 	return (string.gsub(text, "^%s*(.-)%s*$", "%1"))
@@ -149,7 +150,7 @@ return function(zeron: any, Model: any)
 					switch("Share GitHub login", share_github, "Takes effect when you apply."),
 					switch("Sign commits", sign_commits, "Takes effect when you apply."),
 				},
-				ui.show(m.building, ui.column {
+				fm.show(m.building, ui.column {
 					w_full = true,
 					px = Settings.inset(),
 					gap = "$space.1",
@@ -165,7 +166,7 @@ return function(zeron: any, Model: any)
 						wrap = true,
 					},
 				}),
-				ui.show(show_log, ui.scroll {
+				fm.show(show_log, ui.scroll {
 					w_full = true,
 					max_h = 280,
 					p = "$space.3",
@@ -183,7 +184,7 @@ return function(zeron: any, Model: any)
 						selectable = true,
 					},
 				}),
-				ui.show(function()
+				fm.show(function()
 					return problem:get() ~= "" or m.error:get() ~= ""
 				end, ui.text {
 					function()
@@ -207,7 +208,7 @@ return function(zeron: any, Model: any)
 						color = "$text.tertiary",
 						text_size = "$font.size.xs",
 					},
-					ui.show(function()
+					fm.fade(function()
 						local r = m.reply:get()
 						return r ~= nil and r.build ~= nil and (r.build.log or "") ~= ""
 					end, Button {
@@ -220,7 +221,7 @@ return function(zeron: any, Model: any)
 							show_log:set(not show_log:peek())
 						end,
 					}),
-					ui.show(function()
+					fm.fade(function()
 						return m.on()
 					end, Button {
 						"Turn off",

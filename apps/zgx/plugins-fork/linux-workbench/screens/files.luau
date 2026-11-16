@@ -30,6 +30,7 @@ local prefs = require("@app/screens/settings/prefs")
 local api = require("@app/screens/files/api")
 local paths = require("@app/screens/files/paths")
 local Search = require("./files_search")
+local fm = require("../ui/fork_motion")
 
 type Workspace = Workspace.Workspace
 type View = Workspace.View
@@ -187,7 +188,7 @@ local function notice(w: Workspace): Node
 		hook = "files.notice",
 		w_full = true,
 		shrink = 0,
-		ui.show(function(): boolean
+		fm.show(function(): boolean
 			local p = w.problem:get()
 			return p ~= nil and p.retry == true
 		end, ds.Banner {
@@ -210,7 +211,7 @@ local function notice(w: Workspace): Node
 				},
 			},
 		}),
-		ui.show(function(): boolean
+		fm.show(function(): boolean
 			local p = w.problem:get()
 			return p ~= nil and p.retry ~= true
 		end, ds.Banner { edge = true, tone = "warning", title = title, body = body, on_dismiss = dismiss }),
@@ -600,7 +601,7 @@ local function folder(w: Workspace, v: View, props: Props, here: () -> Where?): 
 					end,
 				},
 			}
-		end, { w_full = true, grow = 1, min_h = 0 }),
+		end, fm.swap { w_full = true, grow = 1, min_h = 0 }),
 		DeleteQuestion { w = w },
 	}
 end
@@ -666,7 +667,7 @@ local Folder = ui.component(function(props: Props): Node
 			title = ui.t("files.broken.title") :: any,
 			body = ui.t("files.broken.body") :: any,
 		}
-	end, { w_full = true, grow = 1, min_h = 0 })
+	end, fm.swap { w_full = true, grow = 1, min_h = 0 })
 	return ui.column(box)
 end)
 

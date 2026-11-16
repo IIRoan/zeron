@@ -2,6 +2,7 @@ local Button=require("@ds/button")
 local Dropdown=require("@ds/dropdown")
 local Dialog=require("@ds/dialog").Dialog
 local Checkbox=require("@ds/checkbox")
+local fm=require("./fork_motion")
 local unsaved=ui.shared("zeron.unsaved_editors",false)
 return function(zeron: any,Model: any,Field: any,Toggle: any,ServiceEditor: any)
     return function(m: any): any
@@ -180,7 +181,7 @@ return function(zeron: any,Model: any,Field: any,Toggle: any,ServiceEditor: any)
                     local list={{value="",label="Project defaults"}};local root=w.snapshots:get()[""]
                     for _,entry in (root and root.worktrees) or {} do if entry.path~=context.root then table.insert(list,{value=entry.path,label=`{entry.branch} — {entry.path}`}) end end;return list
                 end,on_choose=function(key: string) w.section:set("overview");w.fetch(key);w.epoch:add(1) end},
-                ui.show(function() return w.error:get()~="" end,ui.text {function() return w.error:get() end,wrap=true,color="$danger"}),
+                fm.show(function() return w.error:get()~="" end,ui.text {function() return w.error:get() end,wrap=true,color="$danger"}),
                 ui.row {w_full=true,gap="$space.4",items="start",
                     ui.column {id="project-settings-nav",w=140,shrink=0,gap="$space.1",ui.each(sections,function(item: any): Node
                         return ui.button {role="tab",label=item[2],w_full=true,h=32,px="$space.2",items="center",justify="start",rounded="$radius.sm",
@@ -189,7 +190,7 @@ return function(zeron: any,Model: any,Field: any,Toggle: any,ServiceEditor: any)
                             hover={bg="$hover"},on_click=function() w.section:set(item[1]) end,
                             ui.text {item[2],text_size="$font.size.sm"}}
                     end)},
-                    ui.presence(function() return `{w.selected:get()}:{w.section:get()}:{w.epoch:get()}` end,function() return form() end,{grow=1,min_w=0})},
+                    ui.presence(function() return `{w.selected:get()}:{w.section:get()}:{w.epoch:get()}` end,function() return form() end,fm.swap {grow=1,min_w=0})},
                 Dialog {open=w.remove,title="Remove worktree?",tone="danger",body="Services stop first, then the saved cleanup workflow runs. The Git branch and archived conversation history are kept.",
                     confirm={label="Remove worktree",on_click=remove},Checkbox {value=w.force,label="Discard uncommitted changes"}},
                 Dialog {open=w.log_open,title="Worktree setup log",size="lg",ui.scroll {w_full=true,h=360,ui.text {function() return w.log:get() end,font="$font.mono",wrap=true,text_size="$font.size.sm"}}},

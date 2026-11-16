@@ -10,6 +10,7 @@ local Icon = require("@ds/icon")
 local IconButton = require("@ds/icon_button").IconButton
 local FileIcon = require("@ds/file_icons")
 local S = require("./files_search")
+local fm = require("../ui/fork_motion")
 
 local ROW = 24
 
@@ -294,7 +295,7 @@ return ui.component(function(props: { head: number?, lead: number? }): Node
 				S.filters_open:set(not S.filters_open:peek())
 			end),
 		},
-		ui.show(function(): boolean
+		fm.show(function(): boolean
 			return S.filters_open:get()
 		end, ui.column {
 			id = "fork-code-search-filters",
@@ -323,7 +324,7 @@ return ui.component(function(props: { head: number?, lead: number? }): Node
 			gap = "$space.1",
 			items = "center",
 			ui.text { status, grow = 1, min_w = 0, text_size = "$font.size.xs", color = "$text.tertiary", truncate = true },
-			ui.show(function(): boolean
+			fm.fade(function(): boolean
 				return #matches() > 0
 			end, ui.row {
 				shrink = 0,
@@ -351,7 +352,10 @@ return ui.component(function(props: { head: number?, lead: number? }): Node
 			min_h = 0,
 			ui.column {
 				w_full = true,
-				ui.each(rows, function(row: any): Node
+				-- (Files folding and new results: the rest slide into place.)
+				fm.each(rows, function(row: any): string
+					return row.key
+				end, function(row: any): Node
 					if row.path then
 						local path = row.path
 						local name = string.match(path, "([^/]+)$") or path
@@ -402,11 +406,7 @@ return ui.component(function(props: { head: number?, lead: number? }): Node
 						ui.text { tostring(hit.line), w = 36, shrink = 0, align = "right", font = "$font.mono", text_size = "$font.size.xs", color = "$text.tertiary" },
 						ui.row { grow = 1, min_w = 0, overflow = "hidden", preview(hit) },
 					}
-				end, {
-					key = function(row: any): string
-						return row.key
-					end,
-				}),
+				end),
 			},
 		},
 	}

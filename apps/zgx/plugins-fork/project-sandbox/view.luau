@@ -7,6 +7,7 @@ local IconButton = require("@ds/icon_button").IconButton
 local Icon = require("@ds/icon")
 local Badge = require("@ds/badge").Badge
 local Spinner = require("@ds/status").Spinner
+local fm = require("./fork_motion")
 
 -- How long a first press of Rebuild waits for the second.
 local CONFIRM_SECONDS = 6
@@ -145,7 +146,7 @@ return function(zeron: any, Model: any)
 					local files = table.concat((s and s.readOnly) or {}, ", ")
 					return if files == "" then "None" else files
 				end),
-				ui.show(function()
+				fm.show(function()
 					return confirm_until:get() > 0
 				end, ui.text {
 					"Rebuilding stops the agents, services and terminals running in the container, and takes minutes. Press Rebuild again to go ahead.",
@@ -199,7 +200,7 @@ return function(zeron: any, Model: any)
 				end, function(key: string): Node
 					local word, tone = string.match(key, "^(.*)|(.*)$")
 					return Badge { word or "", tone = tone :: any, dot = true }
-				end),
+				end, fm.swap()),
 				IconButton {
 					icon = "settings",
 					label = "Sandbox settings",
@@ -217,8 +218,8 @@ return function(zeron: any, Model: any)
 					return ui.text { "Reading the project's sandbox…", color = "$text.tertiary", text_size = "$font.size.sm" }
 				end
 				return if kind == "on" then on() else off()
-			end),
-			ui.show(m.building, ui.row {
+			end, fm.swap { w_full = true }),
+			fm.show(m.building, ui.row {
 				w_full = true,
 				gap = "$space.2",
 				items = "center",
@@ -232,7 +233,7 @@ return function(zeron: any, Model: any)
 					text_size = "$font.size.sm",
 				},
 			}),
-			ui.show(function()
+			fm.show(function()
 				return m.error:get() ~= ""
 			end, ui.text { m.error, wrap = true, color = "$danger", text_size = "$font.size.sm" }),
 			ui.column {
@@ -267,7 +268,8 @@ return function(zeron: any, Model: any)
 						end,
 					},
 				},
-				ui.show(m.log, ui.scroll {
+				-- (The log opens and closes, filling what's left.)
+				fm.show(m.log, ui.scroll {
 					grow = 1,
 					min_h = 0,
 					w_full = true,
@@ -285,7 +287,7 @@ return function(zeron: any, Model: any)
 						wrap = true,
 						selectable = true,
 					},
-				}),
+				}, { grow = 1, min_h = 0, shrink = 1 }),
 			},
 		}
 	end)
@@ -304,6 +306,6 @@ return function(zeron: any, Model: any)
 				}
 			end
 			return Pane { context = c }
-		end)
+		end, fm.swap { w_full = true, h_full = true })
 	end)
 end

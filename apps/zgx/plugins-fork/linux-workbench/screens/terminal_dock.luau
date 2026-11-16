@@ -2,6 +2,7 @@ local ds=require("@ds")
 local route=require("@app/screens/shell/route")
 local state=require("@app/screens/panel/state")
 local Terminal=require("@app/screens/panel/terminal")
+local fm=require("../ui/fork_motion")
 return ui.component(function(p: any): Node
     local asking=ui.use_state(false);local pending: any=nil
     local initialized={}
@@ -31,13 +32,13 @@ return ui.component(function(p: any): Node
             ui.scroll_x {grow=1,min_w=0,h=30,
                 ui.row {h_full=true,items="center",gap="$space.1",ui.each(ui.computed(function() return state.of(key()).tabs end),function(tab: any): Node
                     return ds.Button {`{tab.n or 1}`,label=`Terminal {tab.n or 1}`,size="xs",tone="ghost",on_click=function() state.activate(key(),tab.id) end}
-                end,{key=function(tab: any) return tab.id end,direction="row"})}},
+                end,fm.rows {key=function(tab: any) return tab.id end,direction="row"})}},
             ds.IconButton {icon="plus",label="New terminal",size="sm",on_click=add},
             ds.IconButton {icon="close",label="Close terminal",size="sm",on_click=close}},
         ui.show(p.expanded,ui.presence(function() local t=active();return if t then `{key()}:{t.id}` else "" end,function(which: string): Node
             local tab=active();if not tab then return ui.column {w_full=true,grow=1,items="center",justify="center",ds.Button {"New terminal",tone="secondary",on_click=add}} end
             return Terminal.Terminal {key=key(),tab=tab.id,session=route.session,project=route.project}
-        end,{w_full=true,grow=1,min_h=0})),
+        end,fm.swap {w_full=true,grow=1,min_h=0})),
         ds.Dialog {open=asking,title="Close running terminal?",body="The terminal still has a running process. Closing it stops that process.",tone="danger",confirm={label="Close terminal",on_click=function()
             if pending then Terminal.close(pending.tab);state.close(pending.key,pending.tab.id);pending=nil end
         end}},

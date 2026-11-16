@@ -3,7 +3,7 @@ local Prefs=require("./prefs")
 -- right. Services is a left tool; ordinary shells have an optional dock.
 local ds=require("@ds")
 local route=require("@app/screens/shell/route")
-local M={terminal=Prefs.persist("fork.terminal_dock",false),height=Prefs.persist("fork.terminal_height",280)}
+local M={terminal=Prefs.persist("fork.terminal_dock",false),height=Prefs.persist("fork.terminal_height",280),open=ui.state("fork.terminal_open",0)}
 local plugins=ui.shared("plugins",{list={}} :: any)
 function M.enabled(id: string): boolean
     for _,plugin in plugins:get().list or {} do if plugin.id==id then return plugin.status=="on" end end
@@ -61,8 +61,20 @@ function M.Dock(props: any): Node
     local from_y,from_h=0,0;local dragging=false
     local function limit(): number return math.max(160,(props.room.height or 800)*0.55) end
     local function height(): number return math.clamp(M.height:get(),160,limit()) end
-    return ui.show(function() return M.terminal:get() and route.session:get()~=nil end,ui.column {
-        id="fork-terminal-container",w_full=true,h=height,shrink=0,relative=true,overflow="hidden",
+    -- How far open it is, 0 to 1: eased as it opens and closes, as the
+    -- shell's own columns are (@ds/motion, at once with motion reduced); a
+    -- drag sizes it at once.
+    local motion=require("@ds/motion")
+    local easing: any=nil;local first=true
+    ui.effect(function()
+        local to=if M.terminal:get() and route.session:get()~=nil then 1 else 0
+        if easing then easing:cancel();easing=nil end
+        -- (As it was left, at once, when the window opens.)
+        if first or motion.reduced_now() then M.open:set(to) else easing=anime.animate(M.open,{value=to,duration=motion.BASE,ease=motion.EASE}) end
+        first=false
+    end)
+    return ui.show(function() return M.open:get()>0 end,ui.column {
+        id="fork-terminal-container",w_full=true,h=function() return height()*M.open:get() end,shrink=0,relative=true,overflow="hidden",
         ui.div {h=5,w_full=true,cursor="row_resize",bg="$border.subtle",label="Resize terminal",
             on_press=function(e: any) dragging=true;from_y=e.y;from_h=height() end,
             on_pointer_move=function(e: any) if dragging then M.height:set(math.clamp(from_h+from_y-e.y,160,limit())) end end,
