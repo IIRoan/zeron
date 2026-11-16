@@ -55,6 +55,3 @@ zeron.place { at = "hook:panel.empty", after = function(): Node
         on_click = function() open(panel, session.id, session.project) end }
 end }
 
-zeron.page { id = "services", title = "Services", icon = "terminal", build = function(_page: any): Node
-    return View { choose_project = true }
-end }

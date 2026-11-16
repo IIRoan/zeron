@@ -599,6 +599,31 @@ local function project_filter(): Node
 			shared.project:set(if v == ALL then nil else v)
 		end,
 	}
+	local function items(): { any }
+		local out: { any } = { { value = ALL, label = locale.s("shell.sidebar.project_filter.all_projects"), icon = "folder-with-files" } }
+		-- (A repository once, as the list has it.)
+		local all = sessions.projects:get()
+		local seen: { [string]: boolean } = {}
+		for _, p in all do
+			local first = oldest_checkout(p, all)
+			if not seen[first.id] then
+				seen[first.id] = true
+				local l = route.look(first.id) or { hue = route.hue(first.id) }
+				table.insert(out, { value = first.id, label = first.name, hue = l.hue, src = l.src, emoji = l.emoji, project = first.id })
+			end
+		end
+		return out
+	end
+	-- What the trigger says: the chosen project's name, or All projects.
+	local function said(): string
+		local now = chosen:get()
+		for _, item in items() do
+			if item.value == now then
+				return item.label
+			end
+		end
+		return locale.s("shell.sidebar.project_filter.all_projects")
+	end
 	return ui.show(
 		function(): boolean
 			return shared.details.project_filter:get()
@@ -626,20 +651,34 @@ local function project_filter(): Node
 						end,
 					},
 				},
-				items = function(): { any }
-					local out: { any } = { { value = ALL, label = locale.s("shell.sidebar.project_filter.all_projects"), icon = "folder-with-files" } }
-					-- (A repository once, as the list has it.)
-					local all = sessions.projects:get()
-					local seen: { [string]: boolean } = {}
-					for _, p in all do
-						local first = oldest_checkout(p, all)
-						if not seen[first.id] then
-							seen[first.id] = true
-							local l = route.look(first.id) or { hue = route.hue(first.id) }
-							table.insert(out, { value = first.id, label = first.name, hue = l.hue, src = l.src, emoji = l.emoji, project = first.id })
-						end
-					end
-					return out
+				items = items,
+				-- (The list's whole width and a row's height: the chip's own
+				-- trigger is a fixed 26 and as wide as its words.)
+				trigger = function(menu: any): Node
+					return ui.button {
+						id = "sidebar-project-filter-button",
+						label = function(): string
+							return said()
+						end,
+						w_full = true,
+						h = 32,
+						px = "$space.2",
+						gap = "$space.2",
+						items = "center",
+						rounded = "$radius.md",
+						text_size = "$font.size.sm",
+						weight = "$font.weight.medium",
+						bg = function(): string
+							return if menu.open:get() then "$zeron.secondary.hover" else "$zeron.secondary.bg"
+						end,
+						color = "$text.secondary",
+						hover = { bg = "$zeron.secondary.hover", color = "$text.primary" },
+						active = { bg = "$zeron.secondary.active", color = "$text.primary" },
+						on_click = menu.toggle,
+						ds.Icon { name = "folder", size = 14 },
+						ui.text { said, grow = 1, min_w = 0, truncate = true, color = "$text.primary" },
+						ds.Icon { name = "alt-arrow-down", size = 12 },
+					}
 				end,
 			},
 		}
