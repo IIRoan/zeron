@@ -75,7 +75,7 @@ def main():
     fingerprint = hashlib.sha256(json.dumps({'sources': sources, 'binaries': binaries}, sort_keys=True).encode()).hexdigest()
     base = Path.home() / '.local/share/zeron-beta'
     release = base / 'releases' / f'{version}-{fingerprint[:10]}'
-    plugins = ['linux-workbench', 'project-services', 'zeron-git']
+    plugins = ['linux-workbench', 'project-services', 'project-sandbox', 'windows-vm', 'zeron-git']
     plan = {'app': 'Zeron Beta', 'version': version, 'release': str(release),
             'profile': str(base / 'profile'), 'port': 27946,
             'plugins': plugins, 'stock_plugins_off': ['git', 'github'],

@@ -1,6 +1,10 @@
 //! Project tools use the fork's existing engine implementations. A plugin
 //! receives only these named operations, in a chat/project scope resolved
 //! from the host's records. No RPC token or unrestricted engine call is lent.
+//!
+//! The groups: Git (`commands: ["git"]`), and Services, the project sandbox
+//! and the project's Windows VM (`commands: ["sh"]`: each runs processes,
+//! containers or a machine on the project's device as a shell would).
 use serde_json::{Value as Json, json};
 
 use super::Item;
@@ -10,6 +14,8 @@ pub enum Kind {
     Git,
     Services,
     ServiceTerminal,
+    Sandbox,
+    WindowsVm,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -27,6 +33,8 @@ fn kind(method: &str) -> Result<Kind, String> {
         | "GetWorktreeSettings" | "SaveWorktreeSettings" | "GetWorktreeSetupLog"
         | "PrepareWorktree" | "CancelWorktreeSetup" | "DeleteWorktree" => Kind::Services,
         "ProjectServiceTerminal" => Kind::ServiceTerminal,
+        "GetProjectSandbox" | "SetProjectSandbox" => Kind::Sandbox,
+        "GetProjectWindowsVm" | "SetProjectWindowsVm" | "ControlProjectWindowsVm" => Kind::WindowsVm,
         "HighlightGitDiff" | "GetCheckoutChanges" | "GetCheckoutChangeDiff" | "GetCheckoutDiff"
         | "GetCheckoutFileDiffText" | "GetCheckoutGitDetails" | "GetCheckoutBranches"
         | "GetCheckoutStashes" | "GetCheckoutConflictMarkers" | "SetCheckoutStaged"
@@ -35,6 +43,16 @@ fn kind(method: &str) -> Result<Kind, String> {
         | "SearchGitHistory" | "ListRefs" => Kind::Git,
         _ => return Err("That operation isn't available to workbench plugins".into()),
     })
+}
+
+/// What `ControlProjectWindowsVm` may be asked: the desktop Environment
+/// panel's actions (no raw input; that stays with agents' `vm_input`).
+const VM_ACTIONS: &[&str] = &["start", "stop", "view", "diagnostics", "screenshot", "exec", "launch"];
+
+/// The `host:` image a plugin's VM screenshot is published under, scoped to
+/// the plugin, the device and the project.
+pub fn screen_name(plugin: &str, device: &str, project: &str) -> String {
+    format!("plugin/{plugin}/windows-vm/{device}/{project}")
 }
 
 pub fn shell_allowed(item: &Item) -> bool {
@@ -76,7 +94,11 @@ pub fn prepare(item: &Item, records: &Json, asked: &Json) -> Result<Request, Str
     }
     let project = project_id.map(|id| row(records, "projects", id)).transpose()?;
     if kind != Kind::Git && project.is_none() {
-        return Err("Choose a project to manage its services".into());
+        return Err(match kind {
+            Kind::Sandbox => "Choose a project to set its sandbox up",
+            Kind::WindowsVm => "Choose a project to connect its Windows VM",
+            _ => "Choose a project to manage its services",
+        }.into());
     }
     let source = chat.or(project).ok_or("Choose a chat or project first")?;
     let device = nonempty(source, "device")?;
@@ -141,6 +163,16 @@ pub fn prepare(item: &Item, records: &Json, asked: &Json) -> Result<Request, Str
     }
     if matches!(method, "ListGitHistory" | "SearchGitHistory" | "ListRefs") {
         object.insert("repoPath".into(), json!(cwd));
+    }
+    // Project-wide: the sandbox and the VM belong to the project, addressed
+    // by its id alone (the engine resolves its folder on its own device).
+    if matches!(kind, Kind::Sandbox | Kind::WindowsVm) {
+        object.remove("cwd");
+        object.remove("chatId");
+    }
+    if method == "ControlProjectWindowsVm"
+        && !object.get("action").and_then(Json::as_str).is_some_and(|a| VM_ACTIONS.contains(&a)) {
+        return Err("That isn't something the Windows VM panel can do".into());
     }
     let service = params["serviceId"].as_str().map(str::to_owned);
     if kind == Kind::ServiceTerminal && service.as_ref().is_none_or(|id| id.is_empty()) {
@@ -247,6 +279,34 @@ mod tests {
         let mut main=ask;main["params"]["worktreePath"]=json!("/work/main");
         assert!(prepare(&item("sh"),&records(),&main).is_err());
         assert!(prepare(&item("git"),&records(),&main).is_err());
+    }
+
+    #[test]
+    fn sandbox_and_vm_are_project_scoped_and_need_the_shell_grant() {
+        for method in ["GetProjectSandbox", "SetProjectSandbox", "GetProjectWindowsVm", "SetProjectWindowsVm"] {
+            let r = prepare(&item("sh"), &records(), &json!({"method":method,"session":"c","params":{"spaceId":"other","cwd":"/private","enabled":true}})).unwrap();
+            assert_eq!(r.params["spaceId"], "p", "{method}");
+            assert_eq!(r.params["targetDeviceId"], "remote", "{method}");
+            assert!(r.params.get("cwd").is_none() && r.params.get("chatId").is_none(), "{method}");
+            assert_eq!(r.params["enabled"], true, "{method}");
+            // Git's grant isn't enough: these run containers and a machine.
+            assert!(prepare(&item("git"), &records(), &json!({"method":method,"session":"c"})).is_err(), "{method}");
+        }
+        let mut chat_only = records();
+        chat_only["chats"][0]["project"] = json!(null);
+        assert!(prepare(&item("sh"), &chat_only, &json!({"method":"GetProjectSandbox","session":"c"})).is_err());
+    }
+    #[test]
+    fn the_vm_panel_asks_only_its_own_actions() {
+        for action in VM_ACTIONS {
+            let ask = json!({"method":"ControlProjectWindowsVm","project":"p","params":{"action":action}});
+            assert!(prepare(&item("sh"), &records(), &ask).is_ok(), "{action}");
+        }
+        for action in [json!("input"), json!("status"), json!(""), json!(null)] {
+            let ask = json!({"method":"ControlProjectWindowsVm","project":"p","params":{"action":action}});
+            assert!(prepare(&item("sh"), &records(), &ask).is_err(), "{action}");
+        }
+        assert_eq!(screen_name("windows-vm", "remote", "p"), "plugin/windows-vm/windows-vm/remote/p");
     }
 
     fn run_fork_script(name: &str) {

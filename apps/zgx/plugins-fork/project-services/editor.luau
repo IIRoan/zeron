@@ -117,7 +117,9 @@ return function(zeron: any, Model: any)
             serial += 1
             local list = Model.clone(draft:peek())
             local s: any = {id=`service-{os.time()}-{serial}`,name=if mode:peek()=="databases" then "Database" else "New service",command="",directory="",restartOnFailure=false}
-            if mode:peek()=="databases" then s.setupPrerequisite={command="",timeoutSeconds=120} end
+            if mode:peek()=="databases" then s.setupPrerequisite={command="",timeoutSeconds=120}
+            -- A new app service starts after nothing until told otherwise.
+            else s.dependsOn={} end
             table.insert(list,s);draft:set(list)
             selected:set(s.id)
         end
@@ -149,6 +151,48 @@ return function(zeron: any, Model: any)
                     m.saving:set(false);done()
                 end,function(e: any) m.saving:set(false);error_text:set(Model.message(e)) end)
             end
+        end
+        -- What an app service starts after (`dependsOn`): databases, which
+        -- must pass their ready check, and other app services. Unset is the
+        -- engine's old default, every database.
+        local function databases(): {any}
+            local out={}
+            local snapshot=m.snapshot:peek()
+            for _,d in (snapshot and snapshot.config.services) or {} do if Model.database(d) then table.insert(out,d) end end
+            return out
+        end
+        local function depends(s: any): {string}
+            if s.dependsOn~=nil then return s.dependsOn end
+            local out={};for _,d in databases() do table.insert(out,d.id) end;return out
+        end
+        local function set_depends(id: string, other: string, on: boolean)
+            local s=nil;for _,x in draft:peek() do if x.id==id then s=x end end
+            if not s then return end
+            local list=table.clone(depends(s));local at=table.find(list,other)
+            if (at~=nil)==on then return end
+            if on then table.insert(list,other) else table.remove(list,at :: number) end
+            change(id,"dependsOn",list)
+        end
+        local function start_after(s: any): Node
+            local candidates={}
+            for _,d in databases() do table.insert(candidates,{id=d.id,name=d.name}) end
+            for _,o in draft:peek() do if o.id~=s.id then table.insert(candidates,{id=o.id,name=o.name}) end end
+            local chosen=depends(s)
+            -- One it waits for that's gone (deleted since), shown to be let go.
+            for _,id in chosen do
+                local known=false;for _,c in candidates do if c.id==id then known=true end end
+                if not known then table.insert(candidates,{id=id,name=`Missing service ({id})`}) end
+            end
+            local rows: any={w_full=true,gap="$space.2",pt="$space.3",border_sides={1,0,0,0},border_color="$border.subtle",
+                ui.text {"Start after",weight="$font.weight.semibold",text_size="$font.size.sm"},
+                ui.text {if #candidates==0 then "No other services configured."
+                    else "Only these services and their requirements start first. Databases must pass their ready check.",
+                    wrap=true,color="$text.tertiary",text_size="$font.size.xs"}}
+            for _,c in candidates do
+                table.insert(rows,Toggle {label=`Wait for {c.name}`,value=table.find(chosen,c.id)~=nil,
+                    changed=function(v: boolean) set_depends(s.id,c.id,v) end})
+            end
+            return ui.column(rows)
         end
         local function cards(): Node
             local function current(): any?
@@ -191,13 +235,14 @@ return function(zeron: any, Model: any)
                         Field {label="Command",placeholder="e.g. pnpm dev",code=true,value=s.command,description="Runs in a persistent terminal. Output stays available in Services.",changed=function(v: string) change(s.id,"command",v) end},
                         Field {label="Directory",placeholder="Project root",code=true,value=s.directory,description="A path relative to the project folder. Leave empty to use the root.",changed=function(v: string) change(s.id,"directory",v) end},
                         Toggle {label="Restart on failure",value=s.restartOnFailure,changed=function(v: boolean) change(s.id,"restartOnFailure",v) end},
+                        if not s.setupPrerequisite then start_after(s) else nil,
                         if s.setupPrerequisite then ui.column {w_full=true,gap="$space.3",pt="$space.3",border_sides={1,0,0,0},border_color="$border.subtle",
                             ui.text {"Readiness",weight="$font.weight.semibold",text_size="$font.size.sm"},
                             Field {label="Readiness command",code=true,value=s.setupPrerequisite.command,description="App services wait until this command succeeds.",changed=function(v: string) change(s.id,"readiness",v) end},
                             Field {label="Readiness timeout (seconds)",value=s.setupPrerequisite.timeoutSeconds,changed=function(v: string) change(s.id,"timeout",v) end},
                         } else nil,
                         ui.row {w_full=true,justify="end",pt="$space.2",
-                            Button {"Remove service",tone="ghost",size="sm",color="$status.danger",on_click=function()
+                            Button {"Remove service",tone="ghost",size="sm",color="$danger",on_click=function()
                                 local list=Model.clone(draft:peek());for i,item in list do if item.id==s.id then table.remove(list,i);break end end;draft:set(list)
                             end},
                         },
@@ -218,7 +263,7 @@ return function(zeron: any, Model: any)
                     ui.presence(function() return `{mode:get()}:{epoch:get()}` end,function(): Node
                         return if mode:peek()=="setup" then setup_fields() else cards()
                     end),
-                    ui.show(function() return error_text:get()~="" or m.error:get()~="" end,ui.text {function() return if error_text:get()~="" then error_text:get() else m.error:get() end,color="$status.danger",wrap=true}),
+                    ui.show(function() return error_text:get()~="" or m.error:get()~="" end,ui.text {function() return if error_text:get()~="" then error_text:get() else m.error:get() end,color="$danger",wrap=true}),
                 },
             },
             Dialog.Dialog {open=discard,title="Discard unsaved changes?",body="Your changes haven't been saved.",tone="danger",cancel="Keep editing",

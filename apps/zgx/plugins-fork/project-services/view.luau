@@ -39,7 +39,8 @@ return function(zeron: any, Model: any)
         end
         local function service_menu(service: any): {any}
             local id=service.id
-            local running=Model.active(Model.run(m.snapshot:peek(),id))
+            -- Running, or on its way: Stop ends a start too.
+            local running=Model.active(Model.run(m.snapshot:peek(),id)) or Model.startup(m.snapshot:peek(),id)~=nil
             local busy=m.busy(id)
             return {
                 {label="Start",icon="action-play",disabled=busy or running,on_select=function() m.control("start",id) end},
@@ -54,20 +55,25 @@ return function(zeron: any, Model: any)
         end
         local function ink(id: string): string
             local run=Model.run(m.snapshot:get(),id)
-            if run and (run.status=="failed" or run.readiness=="notReady") then return "$status.danger" end
-            if m.pending:get()[id] or m.pending:get()["*"] or (run and (run.status=="restarting" or run.readiness=="checking")) then return "$status.warning" end
-            return if Model.active(run) then "$status.success" else "$text.tertiary"
+            if run and (run.status=="failed" or run.readiness=="notReady") then return "$danger" end
+            if m.pending:get()[id] or m.pending:get()["*"] or Model.startup(m.snapshot:get(),id) or (run and (run.status=="restarting" or run.readiness=="checking")) then return "$warning" end
+            return if Model.active(run) then "$success" else "$text.tertiary"
         end
         local function state_label(id: string): string
-            return if m.pending:get()[id] or m.pending:get()["*"] then "Working…" else Model.label(Model.run(m.snapshot:get(),id))
+            if m.pending:get()[id] or m.pending:get()["*"] then return "Working…" end
+            return Model.startup(m.snapshot:get(),id) or Model.label(Model.run(m.snapshot:get(),id))
+        end
+        -- Running, or on its way (Stop ends a start too).
+        local function going(id: string, snapshot: any?): boolean
+            return Model.active(Model.run(snapshot,id)) or Model.startup(snapshot,id)~=nil
         end
         local function dot(id: string): Node
             return ui.div {w=10,h=10,shrink=0,items="center",justify="center",aria_hidden=true,
                 ui.presence(function()
                     local run=Model.run(m.snapshot:get(),id)
-                    return if m.pending:get()[id] or m.pending:get()["*"] or (run and (run.status=="restarting" or run.readiness=="checking")) then "busy" else "idle"
+                    return if m.pending:get()[id] or m.pending:get()["*"] or Model.startup(m.snapshot:get(),id) or (run and (run.status=="restarting" or run.readiness=="checking")) then "busy" else "idle"
                 end,function(kind: string): Node
-                    if kind=="busy" then return Status.Spinner {size=10,ink="$status.warning"} end
+                    if kind=="busy" then return Status.Spinner {size=10,ink="$warning"} end
                     return ui.div {w=7,h=7,rounded="$radius.full",bg=function() return ink(id) end}
                 end),
             }
@@ -134,10 +140,10 @@ return function(zeron: any, Model: any)
                     Icon {name="terminal",size=14,color="$text.tertiary"},
                     FadeText {function() local s=selected_service();return if s then s.name else "Output" end,grow=1,weight="$font.weight.medium",text_size="$font.size.sm"},
                     ui.text {function() return state_label(m.selected:get()) end,text_size="$font.size.xs",color=function() return ink(m.selected:get()) end},
-                    Button {function() return if Model.active(selected_run()) then "Stop" else "Start" end,size="xs",tone="secondary",
+                    Button {function() return if going(m.selected:get(),m.snapshot:get()) then "Stop" else "Start" end,size="xs",tone="secondary",
                         busy=function() return m.pending:get()[m.selected:get()]==true or m.pending:get()["*"]==true end,
                         disabled=function() return m.selected:get()=="" or m.busy(m.selected:get()) end,
-                        on_click=function() local id=m.selected:peek();m.control(if Model.active(Model.run(m.snapshot:peek(),id)) then "stop" else "start",id) end},
+                        on_click=function() local id=m.selected:peek();m.control(if going(id,m.snapshot:peek()) then "stop" else "start",id) end},
                     IconButton {icon="refresh",label="Restart service",size="sm",disabled=function() return m.selected:get()=="" or m.busy(m.selected:get()) end,
                         on_click=function() m.control("restart",m.selected:peek()) end},
                     IconButton {icon="settings",label="Selected service settings",size="sm",disabled=function() return m.selected:get()=="" end,
@@ -200,9 +206,9 @@ return function(zeron: any, Model: any)
             },
             ui.show(function() local s=m.snapshot:get();return s~=nil and s.checkout~=nil and s.checkout~=p.context.scope.cwd end,
                 ui.row {w_full=true,px="$space.3",py="$space.1",gap="$space.2",items="center",
-                    ui.text {"Services are running in another checkout.",grow=1,text_size="$font.size.xs",color="$status.warning",wrap=true},
+                    ui.text {"Services are running in another checkout.",grow=1,text_size="$font.size.xs",color="$warning",wrap=true},
                     Button {"Use this checkout",size="xs",disabled=function() return m.busy(nil) end,on_click=function() activate:set(true) end}}),
-            ui.show(function() return m.error:get()~="" end,ui.text {function() return m.error:get() end,px="$space.3",py="$space.2",wrap=true,color="$status.danger",text_size="$font.size.sm"}),
+            ui.show(function() return m.error:get()~="" end,ui.text {function() return m.error:get() end,px="$space.3",py="$space.2",wrap=true,color="$danger",text_size="$font.size.sm"}),
             ui.presence(function() return if (box.width or 0)>=580 then "wide" else "narrow" end,function(kind: string): Node
                 return (if kind=="wide" then ui.row else ui.column) {w_full=true,grow=1,min_h=0,
                     ui.show(function() local s=m.snapshot:get();return s~=nil and #s.config.services>0 end,service_list(kind=="wide")),output()}

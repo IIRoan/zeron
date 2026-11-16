@@ -606,6 +606,8 @@ return function(props: Props): Node
 	-- The width it would take, its tree docked: as last split (opening, a
 	-- neighbour opening or closing) or dragged. Kept across launches.
 	local files_w = Prefs.persist("shell_files_width", FILES_W)
+	-- Each chat keeps its own (and its shell dock's height): screens/chat_sizes.
+	require("./chat_sizes").follow(files_w)
 	-- Whether a width was chosen (its edge dragged, or keyed): from then on
 	-- it opens at that width, as Zeron's does (its `right_pane_width`), the
 	-- fit narrowing it only as it must. Until then each opening splits.

@@ -105,3 +105,45 @@ Verification receipts and the complete commit/path inventory are retained
 under `target/zgx-history-audit/`. The installed release bundles the receipts,
 source hashes, source patch and rollback metadata. No changes are committed
 or pushed by this porting task.
+
+## Since the port began (`b7218f40..bc24a14a`, upstream v0.3.7)
+
+The fork's 26 commits after the first port, each with where it lives in
+zgx. Engine-side work needs no port: zgx runs the same engine.
+
+| Commit(s) | Added behaviour | Destination |
+| --- | --- | --- |
+| `c8cdb7c9`, `771c2207`, `325ca85e`, `2e3bd6cd`, `e5c58ac6`, `0312d143`, `66d1ed78`, `05181c07` | Sandbox runtime: devcontainer build, logins handed in, jailed host git, ports published as servers open them, protected git folders, MCP relay, stop ordering | Shared engine, harness and `crates/sandbox` |
+| `055ef365` | Sandbox setup from Zeron MCP | Shared engine and MCP (`sandbox_*`) |
+| `4742d22f`, `36c40f74` | Sandbox settings in Project settings | `project-sandbox` settings sheet |
+| `e1a3838a`, `04f7db30` | Sandbox build progress and log; the Environment panel's sandbox card and two-press Rebuild | `project-sandbox` tab |
+| `e1a3838a`, `04f7db30` | Windows VM for projects: settings, ports, start with services, viewer | `windows-vm` settings sheet; shared engine (`windows_vm.rs`, port keeping) |
+| `e1a3838a`, `04f7db30` | The Environment panel's VM card: screen, state, health, ports, Run in Windows | `windows-vm` tab (screenshots as `host:` images) |
+| `e1a3838a`, `04f7db30` | Services' Start after and startup progress | `project-services` 1.2 |
+| `e1a3838a`, `04f7db30` | Sandboxed terminal reopens after a container restart | zgx's own terminal (host): not ported |
+| `953a39ab` | `winvm view` borrows the desktop session's display | `scripts/winvm` (shared) |
+| `9451bc3e`, `718ca29b`, `6058d115` | Agents control and edit services, databases and worktree settings | Shared engine and MCP (`service_*`, `worktree_settings_*`) |
+| `12cf01b7` | Archiving a chat soft-closes its worktree; deleting it removes it | Shared engine |
+| `04094428` | Never switch to a Claude login Claude Code ended | Shared engine (zgx's Providers page reads it) |
+| `c1f42839` | Claude models and capabilities discovered | Shared harness |
+| `70f05f9b` | Codex workspace identity checks | Shared engine |
+| `4f86b092` | Each chat's panel sizes | `linux-workbench` (`screens/chat_sizes.luau`) |
+| `d9157744`, `8038cf90`, `4684f1d8` | Native Git and Services plugins, PR integration removed, checkout UI fixes (desktop app) | Already ported: `zeron-git`, `project-services`; stock GitHub plugin off |
+| `d63ff21a` | Compiler warnings | Shared source |
+
+### Clean-plugin changes made with it
+
+- Upstream's own files are unchanged: the SDK (`plugins-sdk/zeron.luau`),
+  the stock and example plugins, `docs/plugins.md` and upstream's tests.
+  The fork's SDK addition is `plugins-fork/fork_sdk.luau`, carried beside
+  each plugin's SDK copy; the fork plugins' copies had fallen 250 lines
+  behind upstream's SDK and are current again.
+- Colours use the theme's tokens (`$danger`, `$warning`, `$success`):
+  `$status.*` isn't one in zgx 0.3.
+- The host's only additions for the new plugins are two gateway groups
+  (`src/plugins/workbench.rs`) and decoding a VM screenshot into a `host:`
+  image (`src/plugins/mod.rs`).
+- `src/plugins/fork_tests.rs`: every fork plugin loads into the shell (and a
+  broken one is caught), the SDK copies match, the ports and models read
+  the engine's replies, and the Sandbox and Windows VM tabs are driven
+  against the engine's reply shapes.

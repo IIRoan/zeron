@@ -2361,9 +2361,26 @@ impl Bridge {
                     let item = bridge.item(&plugin).ok_or("This plugin isn't on")?;
                     let records = bridge.sources(false).0.sessions;
                     let request = workbench::prepare(&item, &records, &value_json(&asked))?;
-                    let reply = if request.method == "HighlightGitDiff" {
+                    let screenshot = request.kind == workbench::Kind::WindowsVm && request.params["action"] == "screenshot";
+                    let space = request.params["spaceId"].as_str().unwrap_or_default().to_owned();
+                    let mut reply = if request.method == "HighlightGitDiff" {
                         off_thread(move || highlight::diff(&request.params)).await.ok_or("The highlighter stopped")??
-                    } else { call(&request.method, request.params).await? };
+                    } else { call(&request.method, request.params.clone()).await? };
+                    // The VM's screen: decoded here and lent as a `host:` image
+                    // (a plugin reads no file outside its folder), replaced in
+                    // place by the next one, so what shows it follows.
+                    if screenshot {
+                        let data = reply["result"]["data"].as_str().ok_or("The VM sent no picture")?.to_owned();
+                        let image = off_thread(move || {
+                            use base64::Engine as _;
+                            let bytes = base64::engine::general_purpose::STANDARD.decode(data).map_err(|e| e.to_string())?;
+                            zgx_gpu::assets::decode_image(&bytes).map_err(|e| e.to_string())
+                        }).await.ok_or("The picture's decoder stopped")??;
+                        let name = workbench::screen_name(&plugin, &request.device, &space);
+                        let size = (image.width(), image.height());
+                        bridge.host.image(&name, Some(image));
+                        reply["result"] = json!({"src": format!("host:{name}"), "width": size.0, "height": size.1});
+                    }
                     // Revoking/removing the plugin while an action runs must
                     // not lend its reply to a replacement of the same id.
                     if !bridge.item(&plugin).is_some_and(|now| now.status()=="on" && now.hash()==item.hash()) {
@@ -3742,6 +3759,8 @@ mod hotkeys_tests;
 mod markdown_tests;
 #[cfg(test)]
 mod network_tests;
+#[cfg(test)]
+mod fork_tests;
 
 #[cfg(test)]
 mod menu_tests {

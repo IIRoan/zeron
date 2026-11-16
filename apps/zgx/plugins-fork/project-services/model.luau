@@ -103,6 +103,14 @@ return function(zeron: any)
         if snapshot then for _, run in snapshot.runs do if run.serviceId == id then return run end end end
         return nil
     end
+    -- What the engine says of a service it's starting (`startups`: waiting
+    -- for what it starts after, or for another service operation), if any.
+    function M.startup(snapshot: any?, id: string): string?
+        for _, s in (snapshot and snapshot.startups) or {} do
+            if s.serviceId == id then return s.message or "Starting…" end
+        end
+        return nil
+    end
     function M.active(run: any?): boolean
         return run ~= nil and (run.status == "running" or run.status == "restarting")
     end

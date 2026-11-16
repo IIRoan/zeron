@@ -14,13 +14,13 @@ local IconButton=require("@ds/icon_button").IconButton
 local Selection=require("./selection")
 local conflict=Selection.conflict
 local function status(row: any,repository: any): (string,string)
-    if row.group=="conflicts" then return "!","$status.danger" end
+    if row.group=="conflicts" then return "!","$danger" end
     local value=if row.group=="staged" then row.file.index else row.file.worktree
     local letters={added="A",modified="M",deleted="D",renamed="R",copied="C",untracked="U",typeChanged="T"}
     local letter=letters[value] or "!"
     for _,path in (repository and repository.submodules) or {} do if path==row.file.path then letter="S" end end
-    local color=if value=="added" or value=="untracked" then "$status.success" elseif value=="deleted" then "$status.danger"
-        elseif value=="renamed" or value=="copied" then "$accent" else "$status.warning"
+    local color=if value=="added" or value=="untracked" then "$success" elseif value=="deleted" then "$danger"
+        elseif value=="renamed" or value=="copied" then "$accent" else "$warning"
     return letter,color
 end
 local function patch_lines(text: string): {any}
@@ -217,8 +217,8 @@ return function(zeron: any,Repo: any)
             },
             ui.row {class="git-branch-actions",w_full=true,provide={git_branch=branch_info},
                 zeron.slot("branch",{direction="row",gap="$space.1",items="center"})},
-            ui.show(function() return w.error:get()~="" end,ui.text {function() return w.error:get() end,color="$status.danger",wrap=true}),
-            ui.show(function() local r=w.repo();return r~=nil and not r.complete end,ui.text {"Repository status is incomplete. Refresh before changing files.",color="$status.warning",wrap=true}),
+            ui.show(function() return w.error:get()~="" end,ui.text {function() return w.error:get() end,color="$danger",wrap=true}),
+            ui.show(function() local r=w.repo();return r~=nil and not r.complete end,ui.text {"Repository status is incomplete. Refresh before changing files.",color="$warning",wrap=true}),
             TextField {value=filter,label="Filter changed files",placeholder="Filter changed files",w_full=true},
             (if p.wide then ui.row else ui.column) {w_full=true,grow=1,min_h=0,gap="$space.2",
                 ui.list {id="git-source-control",ref=list_box,focusable=true,on_key=list_key,w=if p.wide then 300 else "100%",h=if p.wide then "100%" else 180,shrink=0,offset=list_offset,

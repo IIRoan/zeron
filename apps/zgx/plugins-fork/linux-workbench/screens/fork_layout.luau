@@ -25,6 +25,16 @@ function M.Activity(): Node
             if not session then route.plugin_page("project-services","services");return end
             panel().open_plugin_tab(session,{plugin="project-services",kind="services",title="Services",data={session=session.id,project=session.project}})
         end}),
+        -- The project's environment (the Linux fork's Sandbox and Windows VM
+        -- plugins): their tabs beside the chat.
+        ui.show(function() return M.enabled("project-sandbox") end,ds.IconButton {icon="shield-check",label="Sandbox",disabled=function() return route.session:get()==nil end,tooltip="Sandbox · open a chat to see its project's sandbox",on_click=function()
+            local session=route.session:peek();if not session then return end
+            panel().open_plugin_tab(session,{plugin="project-sandbox",kind="sandbox",title="Sandbox",data={session=session.id,project=session.project}})
+        end}),
+        ui.show(function() return M.enabled("windows-vm") end,ds.IconButton {icon="monitor",label="Windows VM",disabled=function() return route.session:get()==nil end,tooltip="Windows VM · open a chat to see its project's Windows machine",on_click=function()
+            local session=route.session:peek();if not session then return end
+            panel().open_plugin_tab(session,{plugin="windows-vm",kind="windows-vm",title="Windows VM",data={session=session.id,project=session.project}})
+        end}),
         ds.IconButton {icon="terminal",label="Shell terminal",disabled=function() return route.session:get()==nil end,tooltip="Shell terminal · open a chat to use its checkout",on_click=function() M.terminal:set(not M.terminal:peek()) end},
     }
 end

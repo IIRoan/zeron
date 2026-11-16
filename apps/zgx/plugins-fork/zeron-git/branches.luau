@@ -52,7 +52,7 @@ M.View=ui.component(function(p: any): Node
                     ui.text {function() return if c.all:get() or c.query:get()~="" then "All matching branches" else "Recent branches" end,grow=1,color="$text.secondary"},
                     ds.Button {"Show all branches",size="xs",tone="ghost",on_click=function() c.all:set(true) end}},
                 ui.show(c.loading,ui.text {"Loading branches…",color="$text.secondary"}),
-                ui.show(function() return c.error:get()~="" end,ui.text {function() return c.error:get() end,wrap=true,color="$status.danger"}),
+                ui.show(function() return c.error:get()~="" end,ui.text {function() return c.error:get() end,wrap=true,color="$danger"}),
                 ui.scroll {id="git-branch-picker-list",w_full=true,h=280,
                     ui.column {w_full=true,gap="$space.1",ui.each(rows,function(b: any,index: number): Node
                         return ui.button {w_full=true,h=34,px="$space.2",gap="$space.2",items="center",label=`{b.name}{if b.remote then " (remote)" else ""}`,

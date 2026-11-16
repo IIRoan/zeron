@@ -19,7 +19,7 @@
 --     far ahead) and `git.commit` in each History row (`git_commit`). The
 --     GitHub plugin puts its pull request there; Git itself stays git.
 
-local zeron = require("./zeron")("zeron-git")
+local zeron = require("./fork_sdk")(require("./zeron")("zeron-git"), "zeron-git")
 local PanelHome = require("@ds/panel_home")
 local Repo = require("./repo")(zeron)
 local words = require("./words")(zeron)

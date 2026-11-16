@@ -1,13 +1,60 @@
 # Linux fork plugins
 
-These independent zgx plugins carry the fork's customizations. The stock
-`plugins-builtin/git`, `plugins-builtin/github`, and `ui` stay unchanged.
+These independent zgx plugins carry the fork's customizations. Upstream's
+own files stay as upstream ships them: `ui/`, `plugins-sdk/`,
+`plugins-builtin/`, `plugins-dev/` and `docs/`.
 
 | Plugin | Changes |
 | --- | --- |
 | `zeron-git` — Zeron Git (Fork) | The original fork's Git controls, grouped staging, branch/stash operations, discard recovery, and syntax/character highlighting. Includes its own diff components. |
 | `project-services` — Project Services | The existing engine's service manager, output, service settings, shared databases, and checkout setup. Includes its own draft-safe settings sheet. |
-| `linux-workbench` — Linux Workbench | Screen overrides for the original fork layout: activity rail and full-height tools left, chats/projects right, and Services in the left tools panel. |
+| `project-services` additions (1.2) | Each app service's **Start after** (`dependsOn`: databases and other app services), and startup progress from the engine's `startups` ("Waiting for …"); Stop also ends a start. |
+| `project-sandbox` — Project Sandbox | The project's devcontainer sandbox: its settings sheet (config, host and published ports, read-only files, GitHub login, commit signing; Turn on, Apply and rebuild, Turn off), and a tab with its container, what it reaches and publishes, build progress, the build log and a two-press Rebuild. |
+| `windows-vm` — Windows VM | The project's Windows VM: its settings sheet (automatic ports, ports either way, services that start it, the viewer; Connect, Start, Stop, Reconnect ports, Disconnect), and a tab with the VM's screen (a click opens the live viewer), its health, ports, and a command to run in PowerShell or on the desktop. |
+| `linux-workbench` — Linux Workbench | Screen overrides for the original fork layout: activity rail and full-height tools left, chats/projects right, and Services in the left tools panel. The rail opens Sandbox and Windows VM when they're on; each chat keeps its own files panel width and shell dock height. |
+
+The engine does the work for every one of them (the services manager,
+`crates/engine/src/sandbox.rs`, `crates/engine/src/windows_vm.rs`, the Git
+implementation); agents use the same through MCP (`service_*`, `sandbox_*`,
+`vm_*`). These plugins are the person's side of it.
+
+## The SDK and the fork's addition
+
+A plugin that uses the SDK carries `zeron.luau`, a byte-for-byte copy of
+upstream's `plugins-sdk/zeron.luau`, and `fork_sdk.luau`, a copy of
+`plugins-fork/fork_sdk.luau` (`src/plugins/fork_tests.rs` checks both):
+
+```lua
+local zeron = require("./fork_sdk")(require("./zeron")("my-plugin"), "my-plugin")
+```
+
+`fork_sdk.luau` adds `zeron.workbench(method, context, params)`, the
+project tools gateway below, and `zeron.ports.parse`/`format` and
+`zeron.words` for port and name lists written as the engine reads them.
+
+## The project tools gateway
+
+`zeron.workbench` calls one of a bounded list of engine methods through the
+host (`src/plugins/workbench.rs`): no IPC token or general engine RPC is
+lent. `context` names a known `session` or `project`; the host resolves the
+device, folder and project from its own records, overwriting whatever the
+plugin sent, and an optional captured `scope = { device, project, cwd }`
+refuses a checkout switch while a form or menu from before is open. The
+plugin's grants and content hash are checked on every call.
+
+| Group | Methods | Needs |
+| --- | --- | --- |
+| Git | `GetCheckout*`, `SetCheckoutStaged`, `CommitCheckoutStaged`, `RunCheckoutGitAction`, discard and restore, `ListGitHistory`, `SearchGitHistory`, `ListRefs`, `HighlightGitDiff` (answered by the host) | `sessions.read`, `files.read`, `commands: ["git"]` |
+| Services | `GetProjectTerminals`, `SaveProjectTerminals`, `ControlProjectTerminals`, worktree settings and setup, `DeleteWorktree` (branch kept), `ProjectServiceTerminal` (a configured service's own PTY only) | `sessions.read`, `files.read`, `commands: ["sh"]` |
+| Project sandbox | `GetProjectSandbox`, `SetProjectSandbox` | the same as Services |
+| Windows VM | `GetProjectWindowsVm`, `SetProjectWindowsVm`, `ControlProjectWindowsVm` (start, stop, view, diagnostics, screenshot, exec, launch; no raw input) | the same as Services |
+
+The sandbox and the VM are project-wide: they're addressed by the project
+alone. A VM screenshot comes back as a `host:` image the host decoded
+(`plugin/<id>/windows-vm/<device>/<project>`), replaced in place by the
+next one, since a plugin reads no file outside its folder.
+
+## Bundling and the beta
 
 The demo and Linux beta bundle these folders as separate plugins. Settings -> Customize
 -> Plugins enables or disables each one. Disabling Linux Workbench restores

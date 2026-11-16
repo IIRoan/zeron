@@ -105,7 +105,7 @@ return function(zeron: any,Model: any,Field: any,Toggle: any,ServiceEditor: any)
                         Button {"Cancel setup",size="sm",tone="secondary",on_click=function() operation("CancelWorktreeSetup") end},
                         Button {"Show setup log",size="sm",tone="secondary",on_click=function() operation("GetWorktreeSetupLog") end}})
                     table.insert(children,Button {"Use project defaults",tone="secondary",on_click=defaults})
-                    table.insert(children,Button {"Remove worktree…",tone="ghost",color="$status.danger",on_click=function() w.removing=key;w.force:set(false);w.remove:set(true) end})
+                    table.insert(children,Button {"Remove worktree…",tone="ghost",color="$danger",on_click=function() w.removing=key;w.force:set(false);w.remove:set(true) end})
                 end
             elseif section=="branch" then field("branchPrefix","Branch prefix",{description="Used for new worktree branches and their automatic title rename."})
             elseif section=="env" then
@@ -174,7 +174,7 @@ return function(zeron: any,Model: any,Field: any,Toggle: any,ServiceEditor: any)
                     local list={{value="",label="Project defaults"}};local root=w.snapshots:get()[""]
                     for _,entry in (root and root.worktrees) or {} do if entry.path~=context.root then table.insert(list,{value=entry.path,label=`{entry.branch} — {entry.path}`}) end end;return list
                 end,on_choose=function(key: string) w.section:set("overview");w.fetch(key);w.epoch:add(1) end},
-                ui.show(function() return w.error:get()~="" end,ui.text {function() return w.error:get() end,wrap=true,color="$status.danger"}),
+                ui.show(function() return w.error:get()~="" end,ui.text {function() return w.error:get() end,wrap=true,color="$danger"}),
                 ui.row {w_full=true,gap="$space.4",items="start",
                     ui.column {id="project-settings-nav",w=140,shrink=0,gap="$space.1",ui.each(sections,function(item: any): Node
                         return ui.button {role="tab",label=item[2],w_full=true,h=32,px="$space.2",items="center",justify="start",rounded="$radius.sm",

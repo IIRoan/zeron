@@ -1,0 +1,18 @@
+{
+  "id": "project-sandbox",
+  "name": "Project Sandbox",
+  "version": "1.0.0",
+  "description": "Run a project's agents, services and terminals in a container built from its devcontainer, with its build progress, log and status beside the chat.",
+  "icon": "icon.svg",
+  "entry": "init.luau",
+  "permissions": [
+    "ui.add",
+    "sessions.read",
+    "files.read",
+    "panel.tabs",
+    "commands"
+  ],
+  "commands": [
+    "sh"
+  ]
+}

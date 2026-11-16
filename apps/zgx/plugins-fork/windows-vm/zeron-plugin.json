@@ -1,0 +1,19 @@
+{
+  "id": "windows-vm",
+  "name": "Windows VM",
+  "version": "1.0.0",
+  "description": "Give a project a Windows machine: connect its ports, start and stop it, watch its screen and health, and run commands in it.",
+  "icon": "icon.svg",
+  "entry": "init.luau",
+  "permissions": [
+    "ui.add",
+    "sessions.read",
+    "files.read",
+    "panel.tabs",
+    "commands",
+    "clipboard"
+  ],
+  "commands": [
+    "sh"
+  ]
+}

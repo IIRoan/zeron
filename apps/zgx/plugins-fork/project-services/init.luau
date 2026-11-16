@@ -1,5 +1,5 @@
 --!strict
-local zeron = require("./zeron")("project-services")
+local zeron = require("./fork_sdk")(require("./zeron")("project-services"), "project-services")
 local Model = require("./model")(zeron)
 local View = require("./view")(zeron, Model)
 local PanelHome = require("@ds/panel_home")

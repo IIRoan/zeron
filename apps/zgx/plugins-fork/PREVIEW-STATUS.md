@@ -1,7 +1,8 @@
 # zgx fork preview status
 
-This branch preserves the separate Linux beta and the three fork plugins.
-It is unfinished and is not the regular GPUI Zeron release.
+This branch preserves the separate Linux beta and the fork's five plugins,
+on upstream v0.3.7 (zgx is upstream's shipping app since v0.3.0). It is
+unfinished and is not the regular GPUI Zeron release.
 
 Included work:
 
@@ -11,6 +12,8 @@ Included work:
 - Separate Linux beta identity, launcher, installer and app profile.
 - Explicit saved-account and preference transfer, including private saved
   environment snapshots needed by followed worktree environment files.
+- Project Sandbox and Windows VM as plugins of their own, and services'
+  Start after and startup progress (see PORTING.md, "Since the port began").
 
 Known gaps and validation limits:
 
@@ -21,7 +24,9 @@ Known gaps and validation limits:
   does not adequately explain that failure. Copying saved environment
   snapshots fixes the transfer omission, but stale dependency paths still
   require project configuration repair.
-- GPUI chat drag-out and the old terminal clipboard guard are not ported.
+- GPUI chat drag-out and the old terminal clipboard guard are not ported,
+  nor the sandboxed terminal's reopen after a container restart (zgx's own
+  terminal).
 - Prior native/UI checks cover selected workflows, not complete parity or
   production readiness. Bounded real Codex and Claude message exchanges
   succeeded independently of the failing project worktree setup.

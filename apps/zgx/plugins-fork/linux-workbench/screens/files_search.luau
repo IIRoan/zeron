@@ -32,7 +32,7 @@ M.View=ui.component(function(): Node
                 local r=result.data:get();return if r then "matches" else "empty"
             end,function(kind: string): Node
                 if kind=="loading" then return ui.text {"Searching…",color="$text.secondary"} end
-                if kind=="error" then return ui.text {function() return tostring(result.error:get()) end,wrap=true,color="$status.danger"} end
+                if kind=="error" then return ui.text {function() return tostring(result.error:get()) end,wrap=true,color="$danger"} end
                 if kind=="no-chat" then return ui.text {"Open a chat to search its checkout.",color="$text.secondary"} end
                 if kind=="empty" then return ui.text {"Search the current checkout. Results open at the matching line.",color="$text.secondary",wrap=true} end
                 return ui.column {w_full=true,gap="$space.2",
