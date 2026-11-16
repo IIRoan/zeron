@@ -3,6 +3,7 @@
   "name": "Linux Workbench",
   "version": "1.2.0",
   "description": "Linux workbench with tools and services on the left, project chats on the right, directory navigation, workspace search, and an optional shell terminal dock.",
+  "icon": "icon.svg",
   "entry": "init.luau",
   "permissions": [
     "ui.replace"
