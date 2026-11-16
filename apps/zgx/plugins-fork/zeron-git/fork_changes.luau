@@ -240,12 +240,14 @@ return function(zeron: any,Repo: any)
             ui.show(function() return #w.repositories:get()>1 end,Dropdown {value=w.repository,label="Repository",items=function() local items={};for _,r in w.repositories:get() do table.insert(items,{value=r.path,label=r.name .. (if r.complete then "" else " (incomplete)")}) end;return items end}),
             -- The commit, first: its message (Ctrl+Enter commits) and the
             -- button, its ways (push, sync, amend) in the menu beside it.
-            ui.column {id="git-commit-box",w_full=true,gap="$space.1",
-                TextArea {value=m.message,name="Commit message",placeholder="Message (Ctrl+Enter to commit)",w_full=true,rows=2,max_rows=6,
-                    on_submit=function() if w.commit_reason()==nil then w.commit(w.amend:peek()) end end},
-                ui.row {w_full=true,gap="$space.1",items="center",
+            -- (One line: the message growing, Commit and its menu at its right.)
+            ui.row {id="git-commit-box",w_full=true,gap="$space.1",items="start",
+                ui.div {grow=1,min_w=0,
+                    TextArea {value=m.message,name="Commit message",placeholder="Message (Ctrl+Enter to commit)",w_full=true,rows=1,max_rows=6,
+                        on_submit=function() if w.commit_reason()==nil then w.commit(w.amend:peek()) end end}},
+                ui.row {shrink=0,gap=ui.raw(2,"Commit and its menu, one control"),items="center",
                     Button {function() return if w.busy:get() then "Working…" elseif w.amend:get() then "Amend" else "Commit" end,
-                        grow=1,disabled=function() return w.commit_reason()~=nil end,tooltip=ui.text {function() return w.commit_reason() or "Commit the staged changes" end},
+                        disabled=function() return w.commit_reason()~=nil end,tooltip=ui.text {function() return w.commit_reason() or "Commit the staged changes" end},
                         on_click=function() w.commit(w.amend:peek()) end},
                     ContextMenu {width=220,hook=function(open: any) commit_menu=open end,items=function(): {any}
                         local pin=w.capture()
