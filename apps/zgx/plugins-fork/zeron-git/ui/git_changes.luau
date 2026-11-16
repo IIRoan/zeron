@@ -144,10 +144,9 @@ export type ListProps = {
 	-- end that shows under the pointer.
 	menu: ((f: File) -> { ContextMenu.Entry }?)?,
 	trail: ((f: File) -> Node?)?,
-	-- Side by side, and long lines wrapped: the person's choice
-	-- (`git.prefs`) unless said.
+	-- Side by side: the person's choice (`git.prefs`) unless said. Long
+	-- lines are never wrapped: the code scrolls sideways.
 	split: State<boolean>?,
-	wrap: State<boolean>?,
 }
 
 -- What `files` holds now.
@@ -249,7 +248,55 @@ local List = ui.component(function(props: ListProps): Node
 	local span = ui.use_state(nil :: { path: string, from: number, to: number }?)
 	local drag_tag = `{props.id or "changes-list"}:range`
 	local split = props.split or git.prefs.split
-	local wrap = props.wrap or git.prefs.wrap
+	-- Sideways: how far the code is scrolled, its widest line seen and the
+	-- room the code has (the lines say both as they're drawn).
+	local shift_x = ui.use_state(0)
+	local code_room = ui.use_state(0)
+	-- (The lines' text boxes drawn now, weakly: a row scrolled away goes.)
+	local boxes = setmetatable({}, { __mode = "k" }) :: any
+	local tracked = ui.use_state(0)
+	local shift: git.Shift = {
+		x = shift_x,
+		track = function(ref: any): any
+			boxes[ref] = true
+			ui.after(0, function()
+				tracked:set(tracked:peek() + 1)
+			end)
+			return ref
+		end,
+		room = function(w: number)
+			if math.abs(code_room:peek() - w) > 0.5 then
+				code_room:set(w)
+			end
+		end,
+	}
+	local function widest(): number
+		tracked:get()
+		local most = 0
+		for ref in boxes do
+			most = math.max(most, ref.width or 0)
+		end
+		return most
+	end
+	local function shift_limit(): number
+		return math.max(0, widest() - code_room:get())
+	end
+	-- (Another file's diff starts at its own left; the same file read
+	-- again keeps where it was.)
+	local shown_paths = ""
+	ui.effect(function()
+		local paths = {}
+		for _, f in files_of(props.files) do
+			table.insert(paths, f.path)
+		end
+		local now = table.concat(paths, "\n")
+		if now ~= shown_paths then
+			shown_paths = now
+			ui.after(0, function()
+				shift_x:set(0)
+			end)
+		end
+	end)
 	local id = props.id or "changes-list"
 	-- The room between a row's wash and the card's edge over the first
 	-- row and under the last: the list's gap, as between the washes, so
@@ -318,11 +365,6 @@ local List = ui.component(function(props: ListProps): Node
 						-- (Room over the first hunk, as the diff card keeps.)
 						table.insert(out, { key = `t:{fkey(f)}`, kind = "pad", h = ui.theme.get("space.1") :: number })
 					end
-					-- (Wrapped, a line is as tall as its text: measured, as a
-					-- block is, `heights` taking what it says; its key says so,
-					-- so the lines are drawn anew.)
-					local wrapped = wrap:get()
-					local w = if wrapped then ":w" else ""
 					-- What stands under a line (its threads), after it.
 					local function blocks_after(l: git.Line)
 						local lkey = git.line_key(l)
@@ -342,7 +384,7 @@ local List = ui.component(function(props: ListProps): Node
 							if p.hunk then
 								table.insert(out, { key = `h:{fkey(f)}:s{i}`, kind = "hunk", h = M.HUNK, path = f.path, index = i, split = true })
 							else
-								local key = `p:{fkey(f)}:{i}{w}`
+								local key = `p:{fkey(f)}:{i}`
 								table.insert(out, { key = key, kind = "pair", h = M.LINE, path = f.path, index = i })
 								if p.left and p.left ~= p.right then
 									blocks_after(p.left)
@@ -357,7 +399,7 @@ local List = ui.component(function(props: ListProps): Node
 							if l.kind == "hunk" then
 								table.insert(out, { key = `h:{fkey(f)}:{i}`, kind = "hunk", h = M.HUNK, path = f.path, index = i })
 							else
-								local key = `l:{fkey(f)}:{i}{w}`
+								local key = `l:{fkey(f)}:{i}`
 								table.insert(out, { key = key, kind = "line", h = M.LINE, path = f.path, index = i })
 								blocks_after(l)
 							end
@@ -382,8 +424,7 @@ local List = ui.component(function(props: ListProps): Node
 		end
 		return out
 	end)
-	-- Each row's height: what it measured (a wrapped line, a block), else
-	-- its own. (A measure moves these alone, not the rows.)
+	-- Each row's height: what it measured (a block), else its own. (A measure moves these alone, not the rows.)
 	local heights = ui.computed(function(): { number }
 		remeasure:get()
 		local hs: { number } = {}
@@ -508,7 +549,6 @@ local List = ui.component(function(props: ListProps): Node
 			-- is drawn: the lines are the list's own Lua, one table a file,
 			-- so the highlighter's cache keeps them.)
 			local hl = git.highlight(lines, f.path)
-			local wrapped = string.sub(key, -2) == ":w"
 			-- The line a comment goes on (a pair's: its right, else its
 			-- left), and where it stands in the file's lines.
 			local target: git.Line? = nil
@@ -582,7 +622,7 @@ local List = ui.component(function(props: ListProps): Node
 					pair = p,
 					left_runs = if hl and p.li then hl[p.li] else nil,
 					right_runs = if hl and p.ri then hl[p.ri] else nil,
-					wrap = wrapped,
+					shift = shift,
 					on_comment = if props.on_comment and p.right
 						then function()
 							(props.on_comment :: any)(f.path, git.line_key(p.right :: git.Line), p.right)
@@ -598,7 +638,7 @@ local List = ui.component(function(props: ListProps): Node
 					line = l,
 					narrow = one_column,
 					runs = if hl then hl[r.index or 0] else nil,
-					wrap = wrapped,
+					shift = shift,
 					on_comment = if props.on_comment
 						then function()
 							(props.on_comment :: any)(f.path, git.line_key(l), l)
@@ -609,20 +649,7 @@ local List = ui.component(function(props: ListProps): Node
 					row = row_extra,
 				}
 			end
-			if not wrapped then
-				return node
-			end
-			-- (Wrapped: it measures itself, and the list takes its word.)
-			return ui.div {
-				w_full = true,
-				on_resize = function(size)
-					if math.abs((measured[key] or M.LINE) - size.h) > 0.5 then
-						measured[key] = size.h
-						remeasure:set(remeasure:peek() + 1)
-					end
-				end,
-				node,
-			}
+			return node
 		elseif r.kind == "foot" then
 			local f = files_by[r.path :: string]
 			if not f then
@@ -668,6 +695,16 @@ local List = ui.component(function(props: ListProps): Node
 				props.on_frame(el)
 			end
 		end,
+		-- (A sideways wheel or trackpad swipe scrolls the code; an upright
+		-- one is the list's.)
+		on_wheel = function(e: any): boolean
+			local dx = e.dx or 0
+			if math.abs(dx) <= math.abs(e.dy or 0) or shift_limit() <= 0 then
+				return false
+			end
+			shift_x:set(math.clamp(shift_x:peek() + dx, 0, shift_limit()))
+			return true
+		end,
 		ui.list {
 			ref = props.ref,
 			w_full = true,
@@ -681,7 +718,7 @@ local List = ui.component(function(props: ListProps): Node
 				return sticky:get()
 			end,
 			-- (Read as the rows are: rows whose keys change and whose
-			-- heights don't, a diff wrapped or split, are drawn anew.)
+			-- heights don't, a diff split, are drawn anew.)
 			key = function(i: number): string
 				local r = rows:get()[i]
 				return if r then r.key .. `:paint{git.paint_version:get()}` else `none:{i}`
@@ -699,6 +736,22 @@ local List = ui.component(function(props: ListProps): Node
 			end,
 		},
 		Rail { id = if props.id then `{props.id}-rail` else "changes-rail", offset = offset, extent = total, view = seen },
+		-- The code's own slider along the foot, there while a line runs past
+		-- the room it has.
+		Rail {
+			id = if props.id then `{props.id}-sideways` else "changes-sideways",
+			horizontal = true,
+			offset = shift_x,
+			extent = function(): number
+				return math.max(widest(), code_room:get())
+			end,
+			view = function(): number
+				return code_room:get()
+			end,
+			hint = function(): boolean
+				return shift_limit() > 0
+			end,
+		},
 	}
 end)
 
@@ -770,14 +823,13 @@ function M.panel(props: Panel): Node
 			local t = totals:peek()
 			return Badge.DiffStat { added = t.add, removed = t.del }
 		end, { shrink = 0 }),
-		-- How the diffs read: side by side, long lines wrapped.
+		-- How the diffs read: side by side.
 		ui.row {
 			id = "diff-view",
 			shrink = 0,
 			gap = git.HEAD_GAP,
 			items = "center",
 			ToggleButton { on = props.split or git.prefs.split, icon = "split-columns", label = locale.s("ds.git.split"), size = "md" },
-			ToggleButton { on = props.wrap or git.prefs.wrap, icon = "wrap-text", label = locale.s("ds.git.wrap"), size = "md" },
 		},
 	}
 	local function rule(): Node

@@ -232,7 +232,6 @@ return function(zeron: any,Repo: any)
                 ui.text {function() local n=0;for _,on in selected:get() do if on then n+=1 end end;return if n>0 then `{n} selected` else "" end,text_size="$font.size.xs",color="$text.secondary"},
                 ui.div {grow=1},
                 Checkbox {value=git.prefs.split,label="Side by side"},
-                Checkbox {value=git.prefs.wrap,label="Wrap lines"},
             },
             ui.row {class="git-branch-actions",w_full=true,provide={git_branch=branch_info},
                 zeron.slot("branch",{direction="row",gap="$space.1",items="center"})},

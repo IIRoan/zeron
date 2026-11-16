@@ -545,3 +545,65 @@ return ui.div { w_full = true, h_full = true, Chat {} }
     assert!(app.wait_until(|a| shows(a, "installing dependencies (npm ci)")), "{}", app.tree());
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// Zeron Git's diff never wraps: a line longer than its room scrolls
+/// sideways (a trackpad's swipe or Shift and the wheel), the line numbers
+/// staying put, as far as the line's end and no further.
+#[test]
+fn a_long_diff_line_scrolls_sideways_to_its_end() {
+    let root = std::env::temp_dir().join(format!("zeron-fork-sideways-{}-{}", std::process::id(), rand_suffix()));
+    let ui_copy = root.join("ui");
+    std::fs::create_dir_all(&ui_copy).unwrap();
+    for name in ["git_changes.luau", "git.luau", "context_menu.luau"] {
+        std::fs::copy(dir().join("zeron-git/ui").join(name), ui_copy.join(name)).unwrap();
+    }
+    let themes = root.join("ds/themes");
+    std::fs::create_dir_all(&themes).unwrap();
+    for theme in std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("ui/ds/themes")).unwrap().flatten() {
+        std::fs::copy(theme.path(), themes.join(theme.file_name())).unwrap();
+    }
+    let entry = root.join("app.luau");
+    std::fs::write(
+        &entry,
+        r#"
+require("@ds").setup()
+local Changes = require("./ui/git_changes")
+local git = require("./ui/git")
+local lines = git.parse({ "@@ -1,1 +1,1 @@", "-short", "+begin_" .. string.rep("very_long_identifier_", 30) .. "_end" }, 100)
+local View = ui.component(function(): Node
+	return Changes.list { id = "t", bare = true, columns = 1, files = { Changes.file("a.ts", "modified", 1, 1) }, lines = function() return lines end }
+end)
+return ui.div { w = 520, h = 300, View {} }
+"#,
+    )
+    .unwrap();
+    let ui_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("ui");
+    let mut app = TestApp::new(move |runtime| super::lend_design_system(ScriptHost::new(runtime, entry.clone()), &ui_dir.join("app.luau")));
+    app.ui.scene.borrow_mut().resize(520., 300.);
+    app.frames(30);
+    assert_eq!(app.error(), None, "{}", app.tree());
+    let x_of = |app: &mut TestApp, target: &str| {
+        let node = app.target(target).unwrap_or_else(|e| panic!("{e}: {}", app.tree()));
+        app.ui.scene.borrow().bounds(node).x
+    };
+    let long = "#t >> .diff-line >> role:text ~\"begin_very\"";
+    // (The added line's sign, in the gutter before its text.)
+    let number = "#t >> .diff-line >> role:text \"+\"";
+    let (text_at, number_at) = (x_of(&mut app, long), x_of(&mut app, number));
+    let list = app.target("t").unwrap();
+    zgx_script::driver::wheel(&mut app.ui, list, 400., 0., None);
+    app.frames(10);
+    let moved = x_of(&mut app, long);
+    assert!(moved < text_at - 300., "the code didn't scroll sideways: {text_at} → {moved}");
+    assert_eq!(x_of(&mut app, number), number_at, "the line numbers moved with it");
+    // (Far past its end: it stops where the line's end is in view.)
+    for _ in 0..20 {
+        zgx_script::driver::wheel(&mut app.ui, list, 2000., 0., None);
+    }
+    app.frames(10);
+    let end = x_of(&mut app, long);
+    let node = app.target(long).unwrap();
+    let width = app.ui.scene.borrow().bounds(node).width;
+    assert!(end + width <= 521. && end + width > 300., "it scrolled past the line's end: x {end}, width {width}");
+    let _ = std::fs::remove_dir_all(root);
+}

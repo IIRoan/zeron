@@ -459,7 +459,6 @@ M.expand = expand
 -- other, and long lines wrapped or scrolled.
 M.prefs = {
 	split = ui.persist("ds.git.diff_split", false),
-	wrap = ui.persist("ds.git.diff_wrap", false),
 }
 
 -- A diff's lines coloured as their language is (ds/syntax: the editor's
@@ -601,28 +600,53 @@ M.HUNK_H, M.LINE_H = 24, 22
 
 -- One line of the diff. With `on_comment`, the + shows in its slot at the
 -- line's start under the pointer, to say something about it.
--- The text of a line: its colours (`runs`), or plain; scrolled sideways
--- whole, or wrapped (`wrap`) to the room it has.
-local function code(l: Line, runs_of: { Run }?, wrap: boolean?): Node
+-- The text of a line: its colours (`runs`), or plain, never wrapped: in a
+-- box of its own that clips it, scrolled sideways by the list's `shift`
+-- (its `x`), each line's text box held by the list (`track`, its width
+-- read as it's laid out) and its room told (`room`), so the numbers before
+-- it stay put.
+export type Shift = { x: State<number>, track: (ref: any) -> (), room: (w: number) -> () }
+local function code(l: Line, runs_of: { Run }?, shift: Shift?): Node
 	local base: { [any]: any } = {
 		literal = true,
-		shrink = if wrap then 1 else 0,
-		grow = if wrap then 1 else nil,
-		min_w = if wrap then 0 else nil,
-		wrap = wrap == true,
+		shrink = 0,
 		pr = "$space.3",
 		font = "$font.mono",
 		text_size = "$font.size.sm",
 		color = "$text.primary",
 	}
+	local text: Node
 	if not runs_of or #runs_of == 0 then
 		base[1] = expand(l.text)
-		return ui.text(base)
+		text = ui.text(base)
+	else
+		for k, r in runs_of do
+			base[k] = ui.span { r.text, color = r.color, bg = r.bg, literal = true }
+		end
+		text = ui.rich(base)
 	end
-	for k, r in runs_of do
-		base[k] = ui.span { r.text, color = r.color, bg = r.bg, literal = true }
-	end
-	return ui.rich(base)
+	return ui.row {
+		grow = 1,
+		min_w = 0,
+		items = "center",
+		overflow = "hidden",
+		on_resize = if shift
+			then function(size)
+				shift.room(size.w)
+			end
+			else nil,
+		-- (The text as wide as it runs, moved by the list's shift.)
+		ui.row {
+			shrink = 0,
+			ref = if shift then shift.track(ui.ref()) else nil,
+			x = if shift
+				then function(): number
+					return -shift.x:get()
+				end
+				else nil,
+			text,
+		},
+	}
 end
 M.code = code
 
@@ -694,7 +718,7 @@ local function add_props(base: { [string]: any }, extra: { [string]: any }?, dra
 	end
 	return p
 end
-local DiffLine = ui.component(function(props: { line: Line, narrow: boolean?, on_comment: (() -> ())?, runs: { Run }?, wrap: boolean?, mark: (() -> string?)?, slot: { [string]: any }?, row: { [string]: any }? }): Node
+local DiffLine = ui.component(function(props: { line: Line, narrow: boolean?, on_comment: (() -> ())?, runs: { Run }?, shift: Shift?, mark: (() -> string?)?, slot: { [string]: any }?, row: { [string]: any }? }): Node
 	local over = ui.use_state(false)
 	local dragging = ui.use_state(false)
 	local l = props.line
@@ -731,7 +755,7 @@ local DiffLine = ui.component(function(props: { line: Line, narrow: boolean?, on
 	-- toolbar choice there), so a long line can be read to its end. Its
 	-- label is the line as a diff writes it, sign first.
 	local kids: { Node } = numbers
-	table.insert(kids, code(l, props.runs, props.wrap))
+	table.insert(kids, code(l, props.runs, props.shift))
 	local mark = mark_of(props.mark)
 	if mark then
 		table.insert(kids, mark)
@@ -740,11 +764,8 @@ local DiffLine = ui.component(function(props: { line: Line, narrow: boolean?, on
 		class = "diff-line",
 		label = `{if l.kind == " " then " " else l.kind}{l.text}`,
 		w_full = true,
-		-- (Wrapped, as tall as its text, its numbers on its first line.)
-		h = if props.wrap then nil else M.LINE_H,
-		min_h = if props.wrap then M.LINE_H else nil,
-		items = if props.wrap then "start" else "center",
-		py = if props.wrap then ui.raw(2, "a wrapped line's text on the line's own baseline") else nil,
+		h = M.LINE_H,
+		items = "center",
 		relative = true,
 		bg = wash,
 		on_hover = if props.on_comment
@@ -787,7 +808,7 @@ end
 -- and text, on its own wash; a half with no line (a line only put in, or
 -- only taken out) a quiet blank. Comments go on the right: what's said
 -- is said of the change as it now stands.
-local function half(l: Line?, side: string, runs_of: { Run }?, wrap: boolean?, slot: Node?): Node
+local function half(l: Line?, side: string, runs_of: { Run }?, shift: Shift?, slot: Node?): Node
 	if not l then
 		return ui.row {
 			-- (Halves of one width: none of their own, the room shared.)
@@ -810,18 +831,17 @@ local function half(l: Line?, side: string, runs_of: { Run }?, wrap: boolean?, s
 		min_w = 0,
 		min_h = M.LINE_H,
 		h_full = true,
-		items = if wrap then "start" else "center",
-		py = if wrap then ui.raw(2, "a wrapped line's text on the line's own baseline") else nil,
+		items = "center",
 		overflow = "hidden",
 		bg = wash,
 		slot,
 		ui.text { if n then tostring(n) else "", w = NUM, shrink = 0, align = "right", font = "$font.mono", text_size = "$font.size.xs", color = "$text.tertiary", tabular = true },
 		ui.text { if kind == " " then "" else kind, w = SIGN, shrink = 0, align = "center", font = "$font.mono", text_size = "$font.size.sm", color = ink },
-		code(l, runs_of, wrap),
+		code(l, runs_of, shift),
 	}
 end
 
-local SplitLine = ui.component(function(props: { pair: Pair, left_runs: { Run }?, right_runs: { Run }?, wrap: boolean?, on_comment: (() -> ())?, mark: (() -> string?)?, slot: { [string]: any }?, row: { [string]: any }? }): Node
+local SplitLine = ui.component(function(props: { pair: Pair, left_runs: { Run }?, right_runs: { Run }?, shift: Shift?, on_comment: (() -> ())?, mark: (() -> string?)?, slot: { [string]: any }?, row: { [string]: any }? }): Node
 	local over = ui.use_state(false)
 	local dragging = ui.use_state(false)
 	local p = props.pair
@@ -849,8 +869,7 @@ local SplitLine = ui.component(function(props: { pair: Pair, left_runs: { Run }?
 		class = "diff-pair",
 		label = if p.left == p.right then said(r) else `{said(p.left)} │ {said(r)}`,
 		w_full = true,
-		h = if props.wrap then nil else M.LINE_H,
-		min_h = if props.wrap then M.LINE_H else nil,
+		h = M.LINE_H,
 		items = "stretch",
 		relative = true,
 		on_hover = if props.on_comment
@@ -858,9 +877,9 @@ local SplitLine = ui.component(function(props: { pair: Pair, left_runs: { Run }?
 				over:set(inside)
 			end
 			else nil,
-		half(p.left, "left", props.left_runs, props.wrap, ui.div { w = Inline.SLOT, shrink = 0 }),
+		half(p.left, "left", props.left_runs, props.shift, ui.div { w = Inline.SLOT, shrink = 0 }),
 		ui.div { w = 1, shrink = 0, bg = "$zeron.settings.rule", aria_hidden = true },
-		half(r, "right", props.right_runs, props.wrap, slot),
+		half(r, "right", props.right_runs, props.shift, slot),
 		mark_of(props.mark),
 	}
 	for k, v in props.row or {} do
