@@ -607,3 +607,55 @@ return ui.div { w = 520, h = 300, View {} }
     assert!(end + width <= 521. && end + width > 300., "it scrolled past the line's end: x {end}, width {width}");
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// Find in Files is the Explorer's Code view, as the desktop app's: the
+/// rail's search opens it in the tree's place, a query lists its matching
+/// lines under their files (what it found said over them), the files fold
+/// and unfold, and Files brings the tree back.
+#[test]
+fn find_in_files_is_the_explorer_s_code_view() {
+    let world: World = std::rc::Rc::new(std::cell::RefCell::new(json!({ "viewer": "ada" })));
+    let (mut app, _) = shell_with(vec![fork("linux-workbench")], world);
+    let asked: Calls = Calls::default();
+    {
+        let asked = asked.clone();
+        app.host.async_action("files.search_content", move |v: zgx_script::Value| {
+            let v = super::value_json(&v);
+            asked.borrow_mut().push(("search".into(), v.clone()));
+            let answer = json!({ "matches": [
+                { "path": "src/app.ts", "line": 3, "column": 7, "text": "const needle = 1;", "ranges": [{ "from": 6, "to": 12 }] },
+                { "path": "src/app.ts", "line": 9, "column": 1, "text": "needle();", "ranges": [{ "from": 0, "to": 6 }] },
+            ], "truncated": false, "indexing": false });
+            async move { Ok(super::json_value(&answer)) }
+        });
+    }
+    app.click("#shell-sidebar >> role:button \"Fix the build\"");
+    app.frames(30);
+    app.click("#fork-activity >> role:button \"Find in Files\"");
+    assert!(app.wait_until(|a| a.find("fork-code-search").is_some()), "{}", app.tree());
+    // (The panel slides in: settled before it's used.)
+    app.frames(240);
+    app.type_text("#fork-code-search >> role:textbox \"Search code\"", "needle");
+    assert!(app.wait_until(|a| shows(a, "2 matching lines in 1 file")), "{}", app.tree());
+    assert!(shows(&mut app, "const needle = 1;") || shows(&mut app, "needle"), "{}", app.tree());
+    let sent = asked.borrow().last().unwrap().1.clone();
+    assert_eq!(sent["query"], "needle");
+    assert_eq!(sent["options"]["matchCase"], false);
+    // The file folds its lines away, and back.
+    app.click("#fork-code-search >> .code-search-file");
+
+    app.frames(5);
+    assert!(app.find("#fork-code-search >> role:button \"src/app.ts:3 const needle = 1;\"").is_none(), "{}", app.tree());
+    // (Past a double click's time: another click.)
+    app.frames(60);
+    app.click("#fork-code-search >> .code-search-file");
+    app.frames(5);
+    assert!(app.find("#fork-code-search >> role:button \"src/app.ts:3 const needle = 1;\"").is_some(), "{}", app.tree());
+    // Aa asks again with the case matched.
+    app.click("#fork-code-search >> role:button \"Match case\"");
+    assert!(app.wait_until(|_| asked.borrow().last().unwrap().1["options"]["matchCase"] == true));
+    // Files: the tree again.
+    app.click("#fork-code-search >> role:button \"Search files\"");
+    assert!(app.wait_until(|a| a.find("fork-code-search").is_none()), "{}", app.tree());
+    assert_eq!(app.error(), None);
+}

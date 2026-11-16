@@ -488,7 +488,6 @@ return function(): Node
 		w_full = true,
 		h_full = true,
 		relative = true,
-		require("./files_search").View {},
         require("./project_icons").View {},
         require("./release_notes").View {},
 		-- A bare Escape nothing took (nothing focused): the chat's, which

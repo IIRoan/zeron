@@ -253,7 +253,13 @@ local made = ui.component(function(props: Props): Node
 			pointer_events = function(): PointerEvents
 				return if dock_w:get() > 0.5 then "auto" else "none"
 			end,
-			FileTree(tree_props()),
+			-- (The Linux fork's Explorer: its files, or its Code search in
+			-- their place, as the desktop app's (./files_search).)
+			ui.presence(function(): string
+				return require("./files_search").mode:get()
+			end, function(mode: string): Node
+				return if mode == "code" then require("./code_search")({ head = head_h, lead = lead_w }) else FileTree(tree_props())
+			end, { w_full = true, h_full = true }),
 			-- Its edge, from under the band (the band's hairline runs across
 			-- both heads).
 			-- (None with no file's side to part it from.)
