@@ -3,7 +3,8 @@ local ds=require("@ds")
 local route=require("@app/screens/shell/route")
 local M={open=ui.state("fork.files.search_open",false),folder=ui.state("fork.files.search_folder","")}
 function M.show(folder: string?) M.folder:set(folder or "");M.open:set(true) end
-ui.command {id="fork.search.workspace",title="Find in Files",shortcut="cmd+shift+f",run=function() M.show() end}
+-- (Once: see screens/sidebar's same-checkout command.)
+pcall(ui.command, {id="fork.search.workspace",title="Find in Files",shortcut="cmd+shift+f",run=function() M.show() end})
 M.View=ui.component(function(): Node
     local query=ui.use_state("");local include=ui.use_state("");local exclude=ui.use_state("")
     local match_case=ui.use_state(false);local whole=ui.use_state(false);local regex=ui.use_state(false);local ignored=ui.use_state(false)

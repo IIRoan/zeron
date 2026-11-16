@@ -2035,6 +2035,13 @@ return function(props: Props): Node
 				hidden = function(): boolean
 					return not away()
 				end,
+				-- (The Linux fork's: its list and page flush on the window, as
+				-- the chats are, not cards.)
+				theme = {
+					["zeron.inset.bg"] = ui.raw("#00000000", "no card: the window's own colour"),
+					["zeron.inset.edge"] = ui.raw("#00000000", "no card: no edge"),
+					["zeron.inset.radius"] = 0,
+				},
 				props.settings(),
 			}
 			else nil,

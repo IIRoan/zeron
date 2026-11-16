@@ -1060,7 +1060,10 @@ local function same_checkout(c: any)
         route.open_session(id)
     end,function(e: any) ds.toast.show {title="Couldn't create chat",body=tostring(e),tone="danger"} end)
 end
-ui.command {id="fork.chat.same_checkout",title="New chat in this checkout",run=function() same_checkout(route.session:peek()) end}
+-- (Once: this module can be evaluated again in the same window (the
+-- shell's boundary and a plain `require` of it), and a command declared
+-- twice would fail the whole chat list.)
+pcall(ui.command, {id="fork.chat.same_checkout",title="New chat in this checkout",run=function() same_checkout(route.session:peek()) end})
 
 -- A session's menu, as the gallery's (Zeron's sidebar chat menu): rename,
 -- pin, copy, move into one of your sections, archive (kept: Settings →

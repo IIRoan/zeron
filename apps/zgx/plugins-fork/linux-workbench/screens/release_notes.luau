@@ -14,7 +14,8 @@ local function current(): number
     return 1
 end
 function M.show() M.selected:set(current());M.open:set(true) end
-ui.command {id="fork.release_notes",title="What's new · release notes and changelog",run=M.show}
+-- (Once: see screens/sidebar's same-checkout command.)
+pcall(ui.command, {id="fork.release_notes",title="What's new · release notes and changelog",run=M.show})
 local function newer(a: string,b: string): boolean
     local x={};local y={}
     for n in string.gmatch(a,"%d+") do table.insert(x,tonumber(n)) end
