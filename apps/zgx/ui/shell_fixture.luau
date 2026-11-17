@@ -9,9 +9,6 @@
 ui.theme.strict("warn")
 local ds = require("@ds")
 ds.setup()
--- Addresses plain to start (hiding is the app's default): the tests read
--- them, and private_text's turn hiding on themselves.
-ds.PrivateText.hidden:set(false)
 local sessions = require("@account/sessions")
 -- (Its start as it is, a new chat: not the launch's jump to the latest
 -- session, which its tests drive themselves.)

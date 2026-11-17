@@ -23,10 +23,9 @@ local locale = require("@self/locale")
 
 local M = {}
 
--- Whether addresses are hidden: Settings → General's switch (kept across
--- launches), on until it's turned off. (Its own key: a switch saved off
--- before hiding was the default doesn't carry over.)
-M.hidden = ui.persist("private_text_hidden", true)
+-- Addresses show by default. Settings → General can hide them; a saved
+-- choice is kept across launches.
+M.hidden = ui.persist("private_text_hidden", false)
 
 -- The letters a stand-in is made of: no look-alikes (no i, l, o, 0, 1).
 local ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"
@@ -61,11 +60,12 @@ end
 local BLUR = 3
 
 -- Props that style the text (the rest of a PrivateText's are its box's).
-local TEXT = { text_size = true, line_height = true, weight = true, color = true, font = true, align = true }
+local TEXT = { text_size = true, line_height = true, weight = true, color = true, font = true, align = true, literal = true }
 
 export type Props = {
 	[number]: any, -- the text: a string, or a function that returns one
 	truncate: boolean?,
+	literal: boolean?,
 	-- False: a click doesn't show it (inside a row a press means something
 	-- else to, a menu's). It stays hidden until the setting is off.
 	reveal: boolean?,

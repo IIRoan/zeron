@@ -6,9 +6,6 @@
 ui.theme.strict("warn")
 local ds = require("@ds")
 ds.setup()
--- Addresses plain to start (hiding is the app's default): the tests read
--- them, and private_text's turn hiding on themselves.
-ds.PrivateText.hidden:set(false)
 
 local EMAILS = { "mara@halcyon.dev", "theo.lindqvist@halcyon.dev", "ines_duarte+zeron@north-wind.io" }
 
