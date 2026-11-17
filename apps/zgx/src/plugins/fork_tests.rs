@@ -204,6 +204,8 @@ fn mount(
     let root = std::env::temp_dir().join(format!("zeron-fork-view-{plugin}-{}-{}", std::process::id(), rand_suffix()));
     std::fs::create_dir_all(&root).unwrap();
     for name in files {
+        // (A file in a folder of its own, as project-services' ui/dialog.luau.)
+        std::fs::create_dir_all(root.join(name).parent().unwrap()).unwrap();
         std::fs::copy(dir().join(plugin).join(name), root.join(name)).unwrap();
     }
     let entry = root.join("app.luau");
@@ -227,6 +229,9 @@ local shown
 if "{view}" == "settings" then
 	local Settings = require("./settings")(zeron, Model)
 	shown = ui.scroll {{ w_full = true, h_full = true, Settings {{ model = Model.get(Model.context(nil, "p1")) }} }}
+elseif "{view}" == "setup" then
+	local Setup = require("./editor")(zeron, Model).Setup
+	shown = ui.scroll {{ w_full = true, h_full = true, Setup {{ model = Model.get(Model.context(nil, "p1")) }} }}
 else
 	shown = require("./view")(zeron, Model) {{ project = "p1" }}
 end
@@ -723,3 +728,62 @@ fn find_in_files_is_the_explorer_s_code_view() {
     app.frames(60);
     assert_eq!(app.error(), None);
 }
+
+/// Project Services' worktree settings: in a Muute checkout (the engine's
+/// `detectedWorkflow`), Apply preset fills in what the old app's
+/// apply_muute_preset did and Save sends it, keeping what it doesn't name;
+/// a variables line Save can't keep stops Save, as the old app's did.
+#[test]
+fn the_muute_preset_saves_what_the_desktop_did() {
+    let settings = json!({
+        "branchPrefix": "zeron/", "envFiles": [{ "path": ".env", "mode": "copy" }], "envProfile": "shared",
+        "dependencies": "install", "dependencyPaths": ["node_modules"], "installCommand": "bun install",
+        "variables": { "APP_VALUE": "a=b" }, "createCommand": "echo create", "setupCommand": "echo setup",
+        "activateCommand": "echo activate", "cleanupCommand": "echo cleanup", "removeCommand": "echo remove",
+        "commandsInProject": false, "commandTimeoutSeconds": 600, "serviceMode": "followActive",
+    });
+    let snapshot = json!({ "defaults": settings, "settings": settings, "hasOverrides": false, "detectedWorkflow": "muute",
+        "detectedEnvFiles": [], "databases": [], "appServices": [], "worktrees": [] });
+    let files = ["fork_sdk.luau", "fork_motion.luau", "model.luau", "editor.luau", "worktrees.luau", "ui/dialog.luau"];
+    let (mut app, calls) = mount("project-services", &files, "setup", move |method, _| match method {
+        // (Saving refreshes the project's services.)
+        "GetProjectTerminals" => json!({ "config": { "services": [] }, "runs": [], "startups": [] }),
+        _ => snapshot.clone(),
+    });
+    app.ui.scene.borrow_mut().resize(720., 1600.);
+    assert!(app.wait_until(|a| shows(a, "Project defaults apply")), "{}", app.tree());
+    app.click("role:tab \"Setup workflow\"");
+    assert!(app.wait_until(|a| shows(a, "Muute workflow")), "{}", app.tree());
+    // (The section fades in: a node still at no opacity takes no click.)
+    app.frames(30);
+    app.click("role:button \"Apply Muute worktree preset\"");
+    app.frames(10);
+    app.click("role:button \"Save\"");
+    assert!(app.wait_until(|_| calls.borrow().iter().any(|(m, _)| m == "SaveWorktreeSettings")), "{}", app.tree());
+    let sent = calls.borrow().iter().find(|(m, _)| m == "SaveWorktreeSettings").unwrap().1["settings"].clone();
+    for (key, value) in [
+        ("setupCommand", json!(r#"bun run worktrees codex-sync --mode setup --source "$ZERON_PROJECT_ROOT" --worktree "$ZERON_CHECKOUT_ROOT""#)),
+        ("cleanupCommand", json!(r#"bun run worktrees codex-sync --mode cleanup --source "$ZERON_PROJECT_ROOT" --worktree "$ZERON_CHECKOUT_ROOT""#)),
+        ("createCommand", json!("")), ("removeCommand", json!("")), ("activateCommand", json!("")), ("installCommand", json!("")),
+        ("dependencies", json!("skip")), ("commandsInProject", json!(true)),
+        // Kept: what the preset doesn't name.
+        ("variables", json!({ "APP_VALUE": "a=b" })), ("commandTimeoutSeconds", json!(600)), ("branchPrefix", json!("zeron/")),
+    ] {
+        assert_eq!(sent[key], value, "{key}: {sent}");
+    }
+    assert!(sent["envFiles"].as_array().is_some_and(Vec::is_empty) || sent["envFiles"].as_object().is_some_and(|o| o.is_empty()), "{sent}");
+    // A variables line without `=` stops Save; a name's spaces are trimmed.
+    app.click("role:tab \"Advanced\"");
+    app.frames(30);
+    app.fill("role:textbox \"Variables (NAME=value, one per line)\"", "APP_VALUE=a=c\nBROKEN");
+    app.click("role:button \"Save\"");
+    assert!(app.wait_until(|a| shows(a, "Use NAME=value, one environment variable per line.")), "{}", app.tree());
+    assert_eq!(calls.borrow().iter().filter(|(m, _)| m == "SaveWorktreeSettings").count(), 1);
+    app.fill("role:textbox \"Variables (NAME=value, one per line)\"", "APP_VALUE=a=c\n NEW = x");
+    app.click("role:button \"Save\"");
+    assert!(app.wait_until(|_| calls.borrow().iter().filter(|(m, _)| m == "SaveWorktreeSettings").count() == 2), "{}", app.tree());
+    let sent = calls.borrow().iter().filter(|(m, _)| m == "SaveWorktreeSettings").nth(1).unwrap().1["settings"].clone();
+    assert_eq!(sent["variables"], json!({ "APP_VALUE": "a=c", "NEW": " x" }));
+    assert_eq!(app.error(), None);
+}
+

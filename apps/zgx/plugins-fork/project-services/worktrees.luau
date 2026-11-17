@@ -4,12 +4,18 @@ local Dialog=require("@ds/dialog").Dialog
 local Checkbox=require("@ds/checkbox")
 local fm=require("./fork_motion")
 local unsaved=ui.shared("zeron.unsaved_editors",false)
+-- (Linux fork) The old app's Muute worktree preset (apply_muute_preset in
+-- crates/ui/src/shell/worktrees_ui.rs): filled in, saved only with Save.
+-- Settings it doesn't name are kept.
+local MUUTE={envFiles={},dependencies="skip",commandsInProject=true,createCommand="",removeCommand="",activateCommand="",installCommand="",
+    setupCommand='bun run worktrees codex-sync --mode setup --source "$ZERON_PROJECT_ROOT" --worktree "$ZERON_CHECKOUT_ROOT"',
+    cleanupCommand='bun run worktrees codex-sync --mode cleanup --source "$ZERON_PROJECT_ROOT" --worktree "$ZERON_CHECKOUT_ROOT"'}
 return function(zeron: any,Model: any,Field: any,Toggle: any,ServiceEditor: any)
     return function(m: any): any
         local context=Model.context(nil,m.context.project)
         local w={selected=ui.use_state(""),section=ui.use_state("overview"),snapshots=ui.use_state({} :: any),drafts=ui.use_state({} :: any),
             originals={},epoch=ui.use_state(0),error=ui.use_state(""),busy=ui.use_state(false),remove=ui.use_state(false),force=ui.use_state(false),
-            log_open=ui.use_state(false),log=ui.use_state(""),requests={}}
+            log_open=ui.use_state(false),log=ui.use_state(""),requests={},invalid=ui.use_state({} :: any)}
         local function params(key: string): any return if key=="" then {} else {checkoutPath=key} end
         local function call(method: string,p: any): any return zeron.workbench(method,context,p) end
         function w.fetch(key: string)
@@ -23,8 +29,18 @@ return function(zeron: any,Model: any,Field: any,Toggle: any,ServiceEditor: any)
                 end
             end,function(e: any) w.error:set(Model.message(e)) end)
         end
+        -- Opened from Services in a linked checkout: that checkout's page,
+        -- as the old app's open_active_worktree_settings.
+        ui.effect(function()
+            local wanted=Model.landing:get();local root=w.snapshots:get()[""]
+            if wanted=="" or not root then return end
+            Model.landing:set("")
+            for _,entry in root.worktrees or {} do if entry.path==wanted and wanted~=context.root then
+                w.selected:set(wanted);w.section:set("overview");w.fetch(wanted);w.epoch:add(1)
+            end end
+        end)
         function w.load()
-            w.snapshots:set({});w.drafts:set({});w.originals={};w.selected:set("");w.error:set("");w.fetch("")
+            w.snapshots:set({});w.drafts:set({});w.originals={};w.invalid:set({});w.selected:set("");w.error:set("");w.fetch("")
         end
         ui.every(2000,function()
             if (m.editor:peek() or w.live) and w.selected:peek()~="" and w.drafts:peek()[w.selected:peek()] then w.fetch(w.selected:peek()) end
@@ -40,10 +56,21 @@ return function(zeron: any,Model: any,Field: any,Toggle: any,ServiceEditor: any)
             if (current.settings[key]==nil and value=="") or ui.json.encode(current.settings[key])==ui.json.encode(value) then return end
             local drafts=Model.clone(w.drafts:peek());drafts[page].settings[key]=value;w.drafts:set(drafts)
         end
+        -- A page's field Save can't keep (its message), or nil: Save then
+        -- says so rather than saving without it.
+        function w.flag(key: string,message: string?)
+            if w.invalid:peek()[key]==message then return end
+            local now=table.clone(w.invalid:peek());now[key]=message;w.invalid:set(now)
+        end
         -- The page shown back as it was saved.
         function w.revert()
             local key=w.selected:peek();local drafts=table.clone(w.drafts:peek());drafts[key]=nil;w.drafts:set(drafts);w.originals[key]=nil
-            w.error:set("");w.fetch(key);w.epoch:add(1)
+            w.flag(key,nil);w.error:set("");w.fetch(key);w.epoch:add(1)
+        end
+        -- The Muute preset into this page's draft (see MUUTE).
+        function w.preset()
+            for name,value in MUUTE do w.change(name,if type(value)=="table" then Model.clone(value) else value) end
+            w.error:set("");w.epoch:add(1)
         end
         local function database(id: string,key: string,value: any)
             local drafts=Model.clone(w.drafts:peek());local page=w.selected:peek()
@@ -55,6 +82,7 @@ return function(zeron: any,Model: any,Field: any,Toggle: any,ServiceEditor: any)
         end
         function w.save()
             local key=w.selected:peek();local value=w.drafts:peek()[key];if not value or w.busy:peek() then return end
+            if w.invalid:peek()[key] then w.error:set(w.invalid:peek()[key]);return end
             local sent=Model.clone(value);local p=params(key);p.settings=sent.settings
             if key=="" then p.databases=sent.databases end
             w.busy:set(true);m.saving:set(true);w.error:set("")
@@ -105,12 +133,18 @@ return function(zeron: any,Model: any,Field: any,Toggle: any,ServiceEditor: any)
                 if key~="" then
                     local phase="Not prepared"
                     local phases={notPrepared="Not prepared",preparing="Preparing…",ready="Ready",failed="Failed",interrupted="Interrupted"}
-                    for _,entry in snapshot.worktrees or {} do if entry.path==key then phase=(phases[entry.state.phase] or entry.state.phase) .. (if entry.state.error then `: {entry.state.error}` else "") end end
+                    for _,entry in snapshot.worktrees or {} do if entry.path==key then
+                        -- (With the step it's on or stopped at, as the old app's status.)
+                        local step=if entry.state.phase~="notPrepared" and entry.state.phase~="ready" and (entry.state.step or "")~="" then ` · {entry.state.step}` else ""
+                        phase=(phases[entry.state.phase] or entry.state.phase) .. step .. (if entry.state.error then `: {entry.state.error}` else "")
+                    end end
                     table.insert(children,ui.text {phase,literal=true,wrap=true})
+                    table.insert(children,ui.text {if snapshot.hasOverrides then "Customized for this worktree." else "Using project defaults.",wrap=true,color="$text.secondary",text_size="$font.size.sm"})
                     table.insert(children,ui.row {gap="$space.2",flex_wrap=true,
                         Button {"Prepare worktree",size="sm",disabled=w.busy,on_click=function() operation("PrepareWorktree") end},
                         Button {"Cancel setup",size="sm",tone="secondary",on_click=function() operation("CancelWorktreeSetup") end},
                         Button {"Show setup log",size="sm",tone="secondary",on_click=function() operation("GetWorktreeSetupLog") end}})
+                    table.insert(children,ui.text {"Preparation stops this worktree’s services. Save settings before running setup.",wrap=true,color="$text.tertiary",text_size="$font.size.xs"})
                     table.insert(children,Button {"Use project defaults",tone="secondary",on_click=defaults})
                     table.insert(children,Button {"Remove worktree…",tone="ghost",color="$danger",on_click=function() w.removing=key;w.force:set(false);w.remove:set(true) end})
                 end
@@ -119,7 +153,8 @@ return function(zeron: any,Model: any,Field: any,Toggle: any,ServiceEditor: any)
                 field("envProfile","Environment profile")
                 table.insert(children,Button {"Add detected env files",size="sm",tone="secondary",on_click=function()
                     local list=Model.clone(s.envFiles or {});local seen={};for _,e in list do seen[e.path]=true end
-                    for _,path in snapshot.detectedEnvFiles or {} do if not seen[path] then table.insert(list,{path=path,mode="follow"}) end end;w.change("envFiles",list);w.epoch:add(1)
+                    -- (Copies, as the old app and the engine's default.)
+                    for _,path in snapshot.detectedEnvFiles or {} do if not seen[path] then table.insert(list,{path=path,mode="copy"}) end end;w.change("envFiles",list);w.epoch:add(1)
                 end})
                 for i,e in s.envFiles or {} do
                     table.insert(children,ui.column {w_full=true,gap="$space.2",
@@ -128,19 +163,43 @@ return function(zeron: any,Model: any,Field: any,Toggle: any,ServiceEditor: any)
                             changed=function(v: string) local list=Model.clone(w.drafts:peek()[key].settings.envFiles);list[i].mode=v;w.change("envFiles",list) end},
                         Button {"Remove env file",tone="ghost",size="xs",on_click=function() local list=Model.clone(w.drafts:peek()[key].settings.envFiles);table.remove(list,i);w.change("envFiles",list);w.epoch:add(1) end}})
                 end
-                table.insert(children,Button {"Add env file",size="sm",tone="secondary",on_click=function() local list=Model.clone(s.envFiles or {});table.insert(list,{path=".env",mode="follow"});w.change("envFiles",list);w.epoch:add(1) end})
+                table.insert(children,Button {"Add env file",size="sm",tone="secondary",on_click=function() local list=Model.clone(s.envFiles or {});table.insert(list,{path=".env",mode="copy"});w.change("envFiles",list);w.epoch:add(1) end})
             elseif section=="dependencies" then
                 table.insert(children,Mode {label="Dependencies",value=s.dependencies,items={{value="copy",label="Copy node_modules automatically"},{value="install",label="Install dependencies per worktree"},{value="link",label="Share dependency folders"},{value="skip",label="Let my setup command handle dependencies"}},changed=function(v: string) w.change("dependencies",v) end})
                 field("installCommand","Install command",{description=snapshot.detectedInstallCommand or "Detected from the lockfile when empty."})
                 table.insert(children,Field {label="Dependency paths (one per line)",multiline=true,value=table.concat(s.dependencyPaths or {},"\n"),changed=function(v: string) local paths={};for path in string.gmatch(v,"[^\r\n]+") do table.insert(paths,path) end;w.change("dependencyPaths",paths) end})
             elseif section=="workflow" then
+                -- (The engine finds Muute by its codex-sync tool.)
+                if snapshot.detectedWorkflow=="muute" then
+                    table.insert(children,ui.row {id="muute-worktree-preset",w_full=true,items="center",gap="$space.3",
+                        ui.column {grow=1,min_w=0,gap="$space.1",
+                            ui.text {"Muute workflow",weight="$font.weight.medium",text_size="$font.size.sm"},
+                            ui.text {"Prepare environment files, ports and databases with codex-sync.",wrap=true,color="$text.tertiary",text_size="$font.size.xs"}},
+                        Button {"Apply preset",size="sm",tone="secondary",label="Apply Muute worktree preset",disabled=w.busy,on_click=w.preset}})
+                end
                 for _,item in {{"createCommand","Create worktree command"},{"setupCommand","Setup command"},{"activateCommand","Activate command"},{"cleanupCommand","Cleanup command"},{"removeCommand","Remove worktree command"}} do field(item[1],item[2],{multiline=true,code=true}) end
                 table.insert(children,Toggle {label="Run setup commands in the main project folder",value=s.commandsInProject,changed=function(v: boolean) w.change("commandsInProject",v) end})
+                -- (The old app's "Command variables" tip.)
+                table.insert(children,ui.text {'Use double quotes around variables: "$branchname" (Git branch), "$worktreename" (folder name), "$worktreepath" (worktree path), "$projectroot" (main project path).',
+                    literal=true,wrap=true,color="$text.tertiary",text_size="$font.size.xs"})
             elseif section=="advanced" then
                 field("commandTimeoutSeconds","Command timeout (seconds)")
                 table.insert(children,Mode {label="Service groups",value=s.serviceMode,items={{value="followActive",label="One active service group"},{value="parallel",label="A group per worktree"}},changed=function(v: string) w.change("serviceMode",v) end})
                 local variables={};for k,v in s.variables or {} do table.insert(variables,`{k}={v}`) end;table.sort(variables)
-                table.insert(children,Field {label="Variables (NAME=value, one per line)",multiline=true,value=table.concat(variables,"\n"),changed=function(v: string) local vars={};for line in string.gmatch(v,"[^\r\n]+") do local k,x=string.match(line,"^([^=]+)=(.*)$");if k then vars[k]=x end end;w.change("variables",vars) end})
+                table.insert(children,Field {label="Variables (NAME=value, one per line)",multiline=true,value=table.concat(variables,"\n"),changed=function(v: string)
+                    -- (A line Save can't keep stops Save, as the old app's did.)
+                    local vars={};local bad=nil
+                    for line in string.gmatch(v,"[^\r\n]+") do if string.find(line,"%S") then
+                        local k,x=string.match(line,"^([^=]+)=(.*)$")
+                        if not k then bad="Use NAME=value, one environment variable per line."
+                        else
+                            k=string.match(k,"^%s*(.-)%s*$") :: string
+                            if vars[k]~=nil then bad="Enter each environment variable only once." end
+                            vars[k]=x
+                        end
+                    end end
+                    w.flag(key,bad);w.change("variables",vars)
+                end})
             elseif section=="databases" then
                 if key~="" then table.insert(children,ui.text {"Shared databases are configured on Project defaults.",color="$text.secondary",wrap=true})
                 else

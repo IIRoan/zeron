@@ -269,7 +269,8 @@ return function(zeron: any, Model: any)
         ui.after(0,w.load)
         local function changed(): boolean
             w.drafts:get();w.busy:get()
-            return w.dirty()
+            -- (A field Save can't keep counts: Save says what's wrong.)
+            return w.dirty() or next(w.invalid:get())~=nil
         end
         return Settings.Section {title="Worktrees and services",
             description="How Zeron prepares this project's checkouts and runs its services. Project defaults apply to every worktree without settings of its own.",

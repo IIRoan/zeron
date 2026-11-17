@@ -2,6 +2,9 @@
 return function(zeron: any)
     local M = {}
     local models: {[string]: any} = {}
+    -- Where Project settings opens (a linked checkout's path) when Services
+    -- asks from its own checkout; worktrees.luau takes it once.
+    M.landing = ui.state("services.settings_checkout", "")
     function M.clone(value: any): any
         return ui.json.decode(ui.json.encode(value))
     end
@@ -27,7 +30,7 @@ return function(zeron: any)
         local location=context.checkoutPath or context.scope.cwd
         local m: any = { context = context, snapshot = ui.state(`services.{key}.snapshot`, nil :: any),
             selected = ui.state(`services.{context.scope.device}:{context.project}:{location}.selected`, ""),
-            pending = ui.state(`services.{context.scope.device}:{context.project}:{location}.pending`, {} :: {[string]: boolean}),
+            pending = ui.state(`services.{context.scope.device}:{context.project}:{location}.pending`, {} :: {[string]: any}),
             error = ui.state(`services.{key}.error`, ""), editor = ui.state(`services.{key}.editor`, false),
             saving = ui.state(`services.{context.scope.device}:{context.project}:{location}.saving`, false), loading = false, epoch = 0, refresh_again = false }
         models[key] = m
@@ -39,7 +42,7 @@ return function(zeron: any)
         function m.busy(id: string?): boolean
             local pending = m.pending:get()
             if m.saving:get() or pending["*"] then return true end
-            if id then return pending[id] == true end
+            if id then return pending[id] ~= nil end
             return next(pending) ~= nil
         end
         local function accept(snapshot: any)
@@ -49,23 +52,37 @@ return function(zeron: any)
             for _, s in snapshot.config.services do if s.id == chosen then found = true end end
             if not found then m.selected:set(if snapshot.config.services[1] then snapshot.config.services[1].id else "") end
         end
+        -- (A poll's own error goes with the next good poll; an action's stays,
+        -- as the old app's poll_error.)
+        local polled = ""
         function m.refresh()
             if m.loading then m.refresh_again = true; return end
             m.loading = true
             local epoch = m.epoch
             m.call("GetProjectTerminals"):after(function(snapshot: any)
                 m.loading = false
+                if polled ~= "" and m.error:peek() == polled then m.error:set("") end
+                polled = ""
                 if epoch == m.epoch then accept(snapshot) end
                 if m.refresh_again or epoch ~= m.epoch then m.refresh_again = false; m.refresh() end
             end, function(err: any)
                 m.loading = false
-                if epoch == m.epoch then m.error:set(M.message(err)) end
+                if epoch == m.epoch then polled = M.message(err); m.error:set(polled) end
             end)
         end
+        -- A service's own start still under way can be stopped (the engine
+        -- cancels it), as the old app's can_stop_service.
+        function m.can_stop(id: string): boolean
+            local pending = m.pending:get()
+            return not m.saving:get() and not pending["*"] and (pending[id] == "start" or pending[id] == "restart")
+        end
+        local cancelled: {[string]: boolean} = {}
         function m.control(action: string, id: string?)
-            if m.busy(id) then return end
             local which = id or "*"
-            local pending = table.clone(m.pending:peek()); pending[which] = true; m.pending:set(pending)
+            local stopping_start = action == "stop" and id ~= nil and m.can_stop(id)
+            if m.busy(id) and not stopping_start then return end
+            if stopping_start then cancelled[which] = true end
+            local pending = table.clone(m.pending:peek()); pending[which] = action; m.pending:set(pending)
             m.epoch += 1
             local epoch = m.epoch
             m.error:set("")
@@ -78,9 +95,12 @@ return function(zeron: any)
             end
             m.call("ControlProjectTerminals", {action = action, serviceId = id or ui.null}):after(function(snapshot: any)
                 if epoch == m.epoch then accept(snapshot) end
+                if action ~= "stop" then cancelled[which] = nil end
                 settled()
             end, function(err: any)
-                m.error:set(M.message(err)); settled()
+                -- (A start that was stopped says it was cancelled: no error.)
+                if action ~= "stop" and cancelled[which] then cancelled[which] = nil else m.error:set(M.message(err)) end
+                settled()
             end)
         end
         function m.save(services: any, done: () -> ())

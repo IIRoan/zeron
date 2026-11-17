@@ -42,9 +42,11 @@ return function(zeron: any, Model: any)
             -- Running, or on its way: Stop ends a start too.
             local running=Model.active(Model.run(m.snapshot:peek(),id)) or Model.startup(m.snapshot:peek(),id)~=nil
             local busy=m.busy(id)
+            -- (Its own start still under way: Stop cancels it.)
+            local stoppable=m.can_stop(id)
             return {
                 {label="Start",icon="action-play",disabled=busy or running,on_select=function() m.control("start",id) end},
-                {label="Stop",icon="stop",disabled=busy or not running,on_select=function() m.control("stop",id) end},
+                {label="Stop",icon="stop",disabled=not stoppable and (busy or not running),on_select=function() m.control("stop",id) end},
                 {label="Restart",icon="refresh",disabled=busy,on_select=function() m.control("restart",id) end},
                 {separator=true},
                 {label="Show output",icon="terminal",on_select=function() m.selected:set(id) end},
@@ -69,7 +71,7 @@ return function(zeron: any, Model: any)
         end
         -- Running, or on its way (Stop ends a start too).
         local function going(id: string, snapshot: any?): boolean
-            return Model.active(Model.run(snapshot,id)) or Model.startup(snapshot,id)~=nil
+            return Model.active(Model.run(snapshot,id)) or Model.startup(snapshot,id)~=nil or m.can_stop(id)
         end
         local function dot(id: string): Node
             return ui.div {w=10,h=10,shrink=0,items="center",justify="center",aria_hidden=true,
@@ -146,14 +148,21 @@ return function(zeron: any, Model: any)
                     FadeText {function() local s=selected_service();return if s then s.name else "Output" end,grow=1,weight="$font.weight.medium",text_size="$font.size.sm"},
                     ui.text {function() return state_label(m.selected:get()) end,text_size="$font.size.xs",color=function() return ink(m.selected:get()) end},
                     Button {function() return if going(m.selected:get(),m.snapshot:get()) then "Stop" else "Start" end,size="xs",tone="secondary",
-                        busy=function() return m.pending:get()[m.selected:get()]==true or m.pending:get()["*"]==true end,
-                        disabled=function() return m.selected:get()=="" or m.busy(m.selected:get()) end,
+                        busy=function() local id=m.selected:get();return m.pending:get()["*"]~=nil or (m.pending:get()[id]~=nil and not m.can_stop(id)) end,
+                        disabled=function() local id=m.selected:get();return id=="" or (m.busy(id) and not m.can_stop(id)) end,
                         on_click=function() local id=m.selected:peek();m.control(if going(id,m.snapshot:peek()) then "stop" else "start",id) end},
                     IconButton {icon="refresh",label="Restart service",size="sm",disabled=function() return m.selected:get()=="" or m.busy(m.selected:get()) end,
                         on_click=function() m.control("restart",m.selected:peek()) end},
                     IconButton {icon="settings",label="Selected service settings",size="sm",disabled=function() return m.selected:get()=="" end,
                         on_click=function() local s=selected_service();if s then edit(if Model.database(s) then "databases" else "services") end end},
                 }),
+                -- What the engine says of the run (why it failed, a readiness
+                -- check's answer) above its output, as the old app's line under
+                -- the output heading. (The stopped view says it itself.)
+                fm.show(function() local run=selected_run();return terminal:get()~=nil and run~=nil and (run.message or "")~="" end,
+                    ui.text {function() local run=selected_run();return if run then run.message or "" else "" end,
+                        id="service-run-message",w_full=true,px="$space.3",py="$space.2",wrap=true,text_size="$font.size.xs",
+                        color=function() return ink(m.selected:get()) end}),
                 ui.presence(function()
                     local snapshot=m.snapshot:get()
                     if not snapshot then return "loading" end
@@ -201,7 +210,11 @@ return function(zeron: any, Model: any)
                     {separator=true},
                     {label="Edit services…",icon="settings",on_select=function() edit("services") end},
                     {label="Shared databases",icon="remote-server",on_select=function() edit("databases") end},
-                    {label="Project settings…",icon="worktree",on_select=function() zeron.open {settings=`project:{p.context.project}`} end},
+                    -- (From a linked checkout, opened on that checkout's page: worktrees.luau.)
+                    {label="Project settings…",icon="worktree",on_select=function()
+                        Model.landing:set(if p.context.scope.cwd~=p.context.root then p.context.scope.cwd else "")
+                        zeron.open {settings=`project:{p.context.project}`}
+                    end},
                     {label="Refresh",icon="refresh",on_select=function() m.refresh() end},
                 } end,
                     IconButton {icon="more-horizontal",label="Service actions",size="sm",on_click=function() actions_open:set(not actions_open:peek()) end},
