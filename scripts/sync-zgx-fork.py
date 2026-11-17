@@ -220,6 +220,12 @@ def sync_zgx(branch, report):
     spare = ROOT / "target" / f"zgx-rebase-{branch}"
     if tip and tip != fork and contains(repo, pin, tip):
         new = tip  # Rebased already: by hand, or by a run that stopped on conflicts.
+    elif tip and tip != fork and contains(repo, fork, tip):
+        report["problems"].append(
+            f"zgx: branch {branch} of {repo} has commits past Cargo.toml's {fork[:12]} that Cargo.toml doesn't "
+            f"take yet ({fork[:12]}..{tip[:12]}). Decide first: put {tip[:12]} in the [patch] (and run "
+            f"`cargo update --workspace` in apps/zgx), or move the branch back; then run this again.")
+        return False
     elif tip != fork:
         report["problems"].append(
             f"zgx: Cargo.toml takes {fork[:12]}, but branch {branch} of {repo} is at {tip[:12] or 'nothing'} "

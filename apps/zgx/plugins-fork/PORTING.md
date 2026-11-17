@@ -257,6 +257,10 @@ does the same steps without release notes.
   run `git rebase --continue`. Then run
   `python3 scripts/sync-zgx-fork.py --to <release>` again: it is safe to
   repeat, and it now takes the rebased commit.
+- **`zeron-fork` has commits `Cargo.toml` doesn't take yet.** The sync
+  won't rebase work nobody has put in the `[patch]`. Put the branch's
+  commit in the `[patch]` lines (then `cargo update --workspace` in
+  `apps/zgx`), or move the branch back, and run the sync again.
 - **`apps/zgx/Cargo.lock` conflicts.** The sync takes upstream's lock, and
   `cargo update --workspace` adds the fork's crates back.
 - **Giving up.** `git merge --abort` restores the copies, the list and

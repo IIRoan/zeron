@@ -190,6 +190,16 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(self.git(fork, "rev-parse", "zeron-fork"), tip)
         self.assertEqual(self.sync("--check").returncode, 0)
 
+    def test_zgx_fork_work_not_yet_taken_is_left_for_a_person(self):
+        fork, fork_commit, new_pin = self.zgx()
+        self.write({"more.rs": "more\n"}, fork)
+        ahead = self.commit(fork, "Fork work not in Cargo.toml yet")
+        result = self.sync()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("doesn't take yet", result.stdout)
+        self.assertEqual(self.git(fork, "rev-parse", "zeron-fork"), ahead)
+        self.assertEqual(self.patch_revs(), {fork_commit})
+
     def test_zgx_rebase_conflict_stops_and_resumes(self):
         fork, fork_commit, new_pin = self.zgx(conflict=True, checked_out=False)
         result = self.sync()
