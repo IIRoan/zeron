@@ -159,9 +159,8 @@ zgx. Engine-side work needs no port: zgx runs the same engine.
   preferences, local project icons), upstream's since taken (settings in
   the page, the session tab strip, seams, card styling). Where upstream
   had answered the fork's change itself (the panel's "+" placement, the
-  narrow files pane without a floating card) upstream's stands. After the
-  next upstream merge, repeat this per file: `git merge-file` with base
-  the upstream commit these were last merged from.
+  narrow files pane without a floating card) upstream's stands. Every
+  upstream merge now repeats this per file (see Updating from upstream).
 - Project settings moved out of sheets onto a page, as the desktop app had
   them: Linux Workbench overrides `@app/screens/settings/projects` (copied
   from upstream v0.3.7, `ui/screens/settings/projects.luau` at
@@ -192,3 +191,103 @@ zgx. Engine-side work needs no port: zgx runs the same engine.
   `turn_line` ahead of the waiting line that calls it (it was nil there,
   so any turn state said in words failed the transcript). Drop it when
   upstream fixes the same; `fork_tests` covers it.
+
+## Updating from upstream
+
+This branch carries both apps, and one command takes a stable upstream
+release into both:
+
+```sh
+scripts/update-upstream.sh            # the latest stable release
+scripts/update-upstream.sh v0.3.8     # or a given one
+```
+
+It needs a clean tree. It makes a rollback branch
+(`backup/pre-upstream-<release>-<time>`), merges the release without
+committing, snapshots the release notes, and then brings Zeron Beta along
+with `scripts/sync-zgx-fork.py --to <release>`, because a git merge leaves
+the beta's copies alone:
+
+- Every fork plugin file that copies an upstream file is three-way merged
+  with `git merge-file`: base = the upstream file at the commit it was last
+  merged from, theirs = the file in the release, ours = the copy. The
+  copies and their commits are listed in `upstream-copies.txt`: Linux
+  Workbench's screen overrides and its `ds/` copies, Zeron Git's copy of
+  the stock Git plugin and of `ds/git`, `ds/git_changes` and
+  `ds/context_menu`, and Project Services' `ds/context_menu` and
+  `ds/dialog`. Each line's commit moves to the release.
+- The plugins' SDK copies (`zeron.luau`, `fork_sdk.luau`,
+  `fork_motion.luau`) are refreshed.
+- If upstream moved its zgx pin, the zgx fork (branch `zeron-fork` of
+  `~/Documents/zgx`) is rebased onto the new pin. The old commit stays as
+  `backup/zeron-fork-<commit>`, and `Cargo.toml`'s
+  `[patch."https://github.com/zeronsh/zgx"]` and `Cargo.lock` take the new
+  commit. Upstream's own zgx lines in `Cargo.toml` are never edited, so
+  they merge cleanly. `build.rs` refuses to build a fork commit that
+  doesn't contain upstream's pin, so a stale fork can't build quietly.
+- The Workbench's offline What's new is refreshed from the new release
+  notes.
+
+Then `scripts/check-linux-fork.sh` runs the old app's checks and the
+beta's: `sync-zgx-fork.py --check` (every copy has a recorded base and is
+resolved, and the zgx fork contains upstream's pin), the notes snapshot,
+and `cargo test --locked --release --features beta --bin zeron-zgx --
+plugins::fork_tests plugins::workbench agents::` in `apps/zgx`
+(one test at a time: the Luau scripts' time budget is wall-clock time, so
+a machine busy with other builds can fail a big fixture). If they
+pass, the merge is committed. Publish with `git push origin HEAD`.
+
+To try an untagged upstream on a throwaway branch, run
+`git fetch upstream && scripts/update-upstream.sh --ref upstream/main`. It
+does the same steps without release notes.
+
+### When it stops
+
+- **Conflicts.** A copy's conflict is left the way git leaves its own.
+  `git status` lists it as both modified, the markers are labelled with the
+  copy and `upstream <commit>`, and `git checkout -m <file>` starts it over.
+  Keep the fork's change and take upstream's. Then `git add` it, run
+  `scripts/check-linux-fork.sh && git commit`.
+- **An upstream file was moved or removed.** The sync prints a PROBLEM
+  for that copy. Merge the new file into the copy by hand, then update its
+  line in `upstream-copies.txt` (the new path, and the release as its
+  commit).
+- **The zgx rebase stops.** Resolve the conflicts where the sync says
+  (`~/Documents/zgx` itself while `zeron-fork` is checked out there) and
+  run `git rebase --continue`. Then run
+  `python3 scripts/sync-zgx-fork.py --to <release>` again: it is safe to
+  repeat, and it now takes the rebased commit.
+- **`apps/zgx/Cargo.lock` conflicts.** The sync takes upstream's lock, and
+  `cargo update --workspace` adds the fork's crates back.
+- **Giving up.** `git merge --abort` restores the copies, the list and
+  `Cargo.toml` as well. A rebased zgx fork can stay: the restored
+  `Cargo.toml` still names the old commit, which `backup/zeron-fork-<commit>`
+  keeps.
+
+`python3 scripts/sync-zgx-fork.py --check` re-checks at any time. When a
+fork plugin copies another upstream file, add a line for it:
+`<copy> <upstream file> <upstream commit it was copied from>`.
+
+### Installing afterwards
+
+Commit first: the installer wants an engine whose `--build-id` names
+`HEAD`. From the repository root (the environment of the frozen builds,
+for example `target/install-beta-picker-*/build.sh`):
+
+```sh
+source scripts/linux-env.sh
+export PKG_CONFIG_PATH="$PWD/target/pr-external-release/browser-runtime/pkgconfig:$PKG_CONFIG_PATH"
+export PATH="$PWD/target/pr-external-release/native-tools:$PATH" ZERON_WPE=1 LUAU_CXXFLAGS=-DNDEBUG
+touch crates/engine/build.rs   # else --build-id keeps the previous commit
+cargo build --locked --release -p zeron --bin zeron-engine
+(cd apps/zgx && ZERON_BETA_VERSION=0.3.8-beta.1 cargo build --locked --release --features beta)
+scripts/build-sandbox-helper.sh   # target/sandbox-helper/zeron-sandbox
+python3 -c 'import hashlib, json, pathlib; print(json.dumps({str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(pathlib.Path("apps/zgx/src").rglob("*.rs"))}, indent=2))' > target/beta-native-source.json
+python3 scripts/install-zgx-beta.py --frontend apps/zgx/target/release/zeron-zgx \
+  --native-source target/beta-native-source.json --engine target/release/zeron-engine \
+  --sandbox-helper target/sandbox-helper/zeron-sandbox
+```
+
+The last command only checks. Run it again with `--apply` to install the
+release beside the earlier ones, then restart Zeron Beta
+(`zeron-beta --stop`, then open it).
