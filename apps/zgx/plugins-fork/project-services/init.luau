@@ -60,4 +60,3 @@ zeron.place { at = "hook:panel.empty", after = function(): Node
     return PanelHome.Choice { id = "services-open", icon = "terminal", label = "Services", key = "S",
         on_click = function() open(panel, session.id, session.project) end }
 end }
-
