@@ -109,7 +109,11 @@ return function(zeron: any,m: any,problem: any)
                 if not found then w.repository:set("") end
             end
             if w.again or epoch~=w.epoch then w.again=false;w.refresh() end
-        end,function(e: any) w.loading=false;if epoch==w.epoch then w.verified:set(false);w.error:set(problem(e).words) end end)
+        end,function(e: any)
+            w.loading=false
+            if epoch==w.epoch then w.verified:set(false);w.error:set(problem(e).words) end
+            if w.again or epoch~=w.epoch then w.again=false;w.refresh() end
+        end)
     end
     -- The engine's commits (parentShas, authorName, authorEmail, authoredAt
     -- in ISO 8601) in History's shape, which a commit's tab opens with.
@@ -135,6 +139,22 @@ return function(zeron: any,m: any,problem: any)
             local d=table.clone(reply);d.incoming=commits(reply.incoming);d.outgoing=commits(reply.outgoing);d.recent=commits(reply.recent)
             if pin.params.repository==w.repository:peek() then w.details:set(d) end
         end,function(e: any) w.error:set(problem(e).words) end)
+    end
+    -- Explicit refresh fetches refs before reading divergence again. Polls
+    -- remain local. Fetch can recover even after a failed index read.
+    function w.refresh_remote()
+        if w.busy:peek() or #w.queue>0 or m.acting:peek() then return end
+        local pin=w.capture()
+        w.busy:set(true);w.epoch+=1;w.error:set("")
+        local function settled()
+            w.epoch+=1;w.busy:set(false)
+            m.refresh(true);w.load_details()
+        end
+        w.call("RunCheckoutGitAction",{action={kind="fetch"}},pin):after(function()
+            settled()
+        end,function(e: any)
+            w.error:set(problem(e).words);settled()
+        end)
     end
     function w.perform(method: string,params: any?,done: ((any)->())?,pin: any?)
         if w.busy:peek() or #w.queue>0 or w.conflict_open:peek() or not w.verified:peek() or m.acting:peek() then return end

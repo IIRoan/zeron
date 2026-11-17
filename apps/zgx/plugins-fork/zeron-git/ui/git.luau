@@ -451,6 +451,7 @@ end
 -- (changes.rs DIFF_TAB_SIZE, 4 columns).
 local TAB = 4
 local function expand(text: string): string
+	if #text > 16384 then return text end -- keep pathological lines as plain text
 	if not string.find(text, "\t", 1, true) then
 		return text
 	end
@@ -503,65 +504,117 @@ local function runs(line: string, spans: { any }): { Run }
 	end
 	return out
 end
+-- Fallback lexing yields between small batches. A native result replaces
+-- its cache, so an obsolete fallback job cannot overwrite full-file syntax.
+-- The module owns the pump, rather than a virtual row: scrolling a row
+-- away must not cancel a file's unfinished highlighting forever.
+local fallback_jobs: { () -> boolean } = {}
+local fallback_wake = ui.state("git.fallback_wake", 0)
+ui.effect(function()
+	fallback_wake:get()
+	local function pump()
+		local job = fallback_jobs[1]
+		if not job then return end
+		if job() then table.remove(fallback_jobs, 1) end
+		if #fallback_jobs > 0 then ui.after(1, pump) end
+	end
+	if #fallback_jobs > 0 then ui.after(1, pump) end
+end)
 function M.highlight(lines: { Line }, path: string?): { [number]: { Run } }?
 	local known = painted[lines]
-	if known ~= nil then
-		return if known then known else nil
-	end
+	if known ~= nil then return if known then known else nil end
 	local h = if path then Syntax.highlighter(Syntax.language(path)) else nil
-	if not h then
-		painted[lines] = false
-		return nil
-	end
+	if not h then painted[lines] = false; return nil end
 	local out: { [number]: { Run } } = {}
-	local old_state: any, new_state: any = 0,0
-	for i, l in lines do
-		if l.kind == "hunk" then
-			old_state,new_state = 0,0
-		else
-			local text = expand(l.text)
-			local spans
-			if l.kind=="-" then spans,old_state=h(text,old_state)
-			elseif l.kind=="+" then spans,new_state=h(text,new_state)
-			else
-				local ignored;ignored,old_state=h(text,old_state)
-				spans,new_state=h(text,new_state)
-			end
-			out[i] = runs(text, spans)
-		end
-	end
 	painted[lines] = out
+	local source = setmetatable({ lines }, { __mode = "v" })
+	local index, old_state, new_state = 1, 0 :: any, 0 :: any
+	local function batch()
+		local list = source[1]
+		if not list or painted[list] ~= out then return true end
+		local start, bytes, count = os.clock(), 0, 0
+		while index <= #list and count < 32 and bytes < 8192 and os.clock() - start < 0.002 do
+			local i, l = index, list[index]
+			index += 1; count += 1; bytes += #l.text
+			if l.kind == "hunk" or #l.text > 8192 then
+				old_state, new_state = 0, 0
+			else
+				local text = expand(l.text)
+				local spans
+				if l.kind == "-" then spans, old_state = h(text, old_state)
+				elseif l.kind == "+" then spans, new_state = h(text, new_state)
+				else
+					local ignored; ignored, old_state = h(text, old_state)
+					spans, new_state = h(text, new_state)
+				end
+				if #spans <= 128 then out[i] = runs(text, spans) end
+			end
+		end
+		if index > #list then M.paint_version:add(1); return true end
+		return false
+	end
+	table.insert(fallback_jobs, batch)
+	fallback_wake:add(1)
 	return out
 end
 
--- Full-document native syntax spans and changed-character marks use raw
--- UTF-8 byte boundaries. Expand tabs only after segmenting, retaining the
--- running display column across segments.
-function M.paint(lines: {Line}, data: any)
-	if data.limited then return end
-	local out={}
-	for i,line in lines do
-		if line.kind=="hunk" then continue end
-		local side=if line.kind=="-" then "old" else "new"
-		local number=if side=="old" then line.old else line.new
-		local spans=(data[side] or {})[tostring(number)] or {}
-		local marks=(data[if side=="old" then "removed" else "added"] or {})[tostring(number)] or {}
-		local bounds={[1]=true,[#line.text+1]=true}
-		for _,ranges in {spans,marks} do for _,r in ranges do bounds[r[1]]=true;bounds[r[2]+1]=true end end
-		local ordered={};for n in bounds do if n>=1 and n<=#line.text+1 then table.insert(ordered,n) end end;table.sort(ordered)
-		local result={};local col=0
-		for n=1,#ordered-1 do
-			local a,b=ordered[n],ordered[n+1]-1
-			local color=TEXT;for _,s in spans do if a>=s[1] and a<=s[2] then color=s[3];break end end
-			local bg=nil;for _,s in marks do if a>=s[1] and a<=s[2] then bg=if side=="old" then "$zeron.tone.danger.edge" else "$zeron.tone.success.edge";break end end
-			local text={};for ch in string.gmatch(string.sub(line.text,a,b),utf8.charpattern) do
-				if ch=="\t" then local width=TAB-col%TAB;table.insert(text,string.rep(" ",width));col+=width else table.insert(text,ch);col+=1 end
-			end
-			table.insert(result,{text=table.concat(text),color=color,bg=bg})
-		end
-		out[i]=result
+-- Native syntax is already parsed off the UI thread. Keep it as a lazy
+-- cache: virtual rows paint only the lines actually on screen. A line's
+-- ranges are sorted/disjoint, so cursors replace the old quadratic scans.
+local function paint_line(line: Line, data: any): { Run }?
+	if line.kind == "hunk" or #line.text > 16384 then return nil end
+	local side = if line.kind == "-" then "old" else "new"
+	local number = if side == "old" then line.old else line.new
+	local spans = (data[side] or {})[tostring(number)] or {}
+	local marks = (data[if side == "old" then "removed" else "added"] or {})[tostring(number)] or {}
+	-- Highlighting is optional; pathological lines still show their text.
+	if #spans + #marks > 128 then return nil end
+	local bounds = { [1] = true, [#line.text + 1] = true }
+	for _, ranges in { spans, marks } do
+		for _, r in ranges do bounds[r[1]] = true; bounds[r[2] + 1] = true end
 	end
-	painted[lines]=out
+	local ordered = {}
+	for n in bounds do if n >= 1 and n <= #line.text + 1 then table.insert(ordered, n) end end
+	table.sort(ordered)
+	local result, col, si, mi = {}, 0, 1, 1
+	for n = 1, #ordered - 1 do
+		local a, b = ordered[n], ordered[n + 1] - 1
+		while si <= #spans and spans[si][2] < a do si += 1 end
+		while mi <= #marks and marks[mi][2] < a do mi += 1 end
+		local sp, mark = spans[si], marks[mi]
+		local color = if sp and a >= sp[1] and a <= sp[2] then sp[3] else TEXT
+		local bg = if mark and a >= mark[1] and a <= mark[2]
+			then (if side == "old" then "$zeron.tone.danger.edge" else "$zeron.tone.success.edge") else nil
+		local text = string.sub(line.text, a, b)
+		-- The normal, tab-free case needs no per-character allocations.
+		if string.find(text, "\t", 1, true) then
+			local from, parts = 1, {}
+			for at in string.gmatch(text, "()\t") do
+				local part = string.sub(text, from, at - 1)
+				col += utf8.len(part) or #part
+				local width = TAB - col % TAB
+				table.insert(parts, part); table.insert(parts, string.rep(" ", width))
+				col += width; from = at + 1
+			end
+			local part = string.sub(text, from)
+			table.insert(parts, part); col += utf8.len(part) or #part
+			text = table.concat(parts)
+		else col += utf8.len(text) or #text end
+		table.insert(result, { text = text, color = color, bg = bg })
+	end
+	return result
+end
+function M.paint(lines: { Line }, data: any)
+	if data.limited then return end
+	local source = setmetatable({ lines }, { __mode = "v" })
+	local cache = setmetatable({}, { __index = function(cache: any, i: number): any
+		local list = source[1]
+		local line = list and list[i]
+		local result = if line then paint_line(line, data) else nil
+		if result then rawset(cache, i, result) end
+		return result
+	end })
+	painted[lines] = cache
 	M.paint_version:add(1)
 end
 

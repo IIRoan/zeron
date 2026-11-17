@@ -33,7 +33,7 @@ return function(zeron: any)
             for _,c in COMMANDS do if c[1]==k then title:set(c[2]) end end
             if not pin then pin=w.capture() end
             if k=="switchBranch" or k=="pullFrom" or k=="merge" or k=="rebase" or k=="deleteBranch" then Branches.open(m,k,pin);return end
-            if k=="refresh" then w.refresh();m.refresh(true);return
+            if k=="refresh" then w.refresh_remote();return
             elseif k=="undoDiscard" then w.undo();return
             elseif k=="stageAll" or k=="unstageAll" then p.stage_all(k=="stageAll");return
             elseif k=="discardAll" or k=="discardEverything" then p.discard_all(k=="discardEverything",pin);return

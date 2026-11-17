@@ -62,14 +62,18 @@ return function(zeron: any)
 
 	-- Its last `n` lines (a long build writes thousands).
 	function M.tail(log: string?, n: number): string
-		local lines = {}
-		for line in string.gmatch(log or "", "[^\n]*\n?") do
-			if line ~= "" then
-				table.insert(lines, (string.gsub(line, "\n$", "")))
-			end
+		local text = log or ""
+		if n <= 0 then return "" end
+		if string.sub(text, -1) == "\n" then text = string.sub(text, 1, -2) end
+		-- Find only the requested tail; do not allocate every preceding line.
+		local reversed, at = string.reverse(text), 1
+		for i = 1, n do
+			local edge = string.find(reversed, "\n", at, true)
+			if not edge then return text end
+			if i == n then return string.sub(text, #text - edge + 2) end
+			at = edge + 1
 		end
-		local from = math.max(1, #lines - n + 1)
-		return table.concat(lines, "\n", from, #lines)
+		return text
 	end
 
 	function M.get(context: any): any

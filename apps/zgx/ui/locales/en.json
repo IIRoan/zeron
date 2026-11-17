@@ -502,6 +502,7 @@
       "empty_projects_word": "Empty",
       "empty_projects": "{n, plural, one {# empty project} other {# empty projects}}",
       "activity": "Activity",
+      "done": "Done",
       "working": "Working",
       "asleep": "Asleep"
     },
@@ -2292,7 +2293,7 @@
     "activity": {
       "title": "Activity",
       "terms": "activity inbox sidebar working sleep asleep snooze archive auto-archive idle",
-      "description": "One list of the chats that need you, the latest at the top. Working, asleep and archived chats fold away at its end.",
+      "description": "Completed turns appear in Done. Working chats lead Activity, newest first. Asleep and archived chats fold away at its end.",
       "view": {
         "label": "Activity sidebar",
         "description": "Show the sidebar as Activity instead of grouped by project or device. Also in the sidebar's … menu.",

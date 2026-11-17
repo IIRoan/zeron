@@ -11,6 +11,7 @@ local Icon=require("@ds/icon")
 local IconButton=require("@ds/icon_button").IconButton
 local Selection=require("./selection")
 local fm=require("./fork_motion")
+local seam=require("@ds/seam")
 local conflict=Selection.conflict
 -- Past this many rows the list is virtual (`ui.list`: rows built as they
 -- show) and its rows don't slide. ponytail: one cap; a virtual list that
@@ -57,6 +58,15 @@ return function(zeron: any,Repo: any)
         local discard=ui.use_state(false);local preview: any=nil;local discard_pin: any=nil
         local list_offset=ui.use_state(0);local diff_offset=ui.use_state(0)
         local box=ui.ref();local list_box=ui.ref()
+        -- The list's size beside the diff (its height stacked, its width
+        -- side by side), kept: the seam between them dragged sizes it,
+        -- bouncing at either end; double-clicked, back to its default.
+        local split=if p.wide then {size=ui.persist("git.fork.list_w",300),default=300,least=200,diff=240,cursor="col_resize"}
+            else {size=ui.persist("git.fork.list_h",180),default=180,least=64,diff=120,cursor="row_resize"}
+        local split_room=ui.use_state(0);local seam_over=ui.use_state(false);local seam_held=ui.use_state(false)
+        local seam_drag=seam.drag();local seam_from: any=nil
+        local function list_most(): number local room=split_room:get();return if room>0 then math.max(split.least,room-split.diff) else math.huge end
+        local function list_size(): number return math.clamp(split.size:get(),split.least,list_most())+seam_drag.nudge:get() end
         local focus_inside=false;local hover_inside=false
         ui.on_cleanup(function() selected:set({});chosen:set(nil);anchor:set(nil) end)
         local commenting=ui.use_state(false);local note=ui.use_state("");local comment: any=nil
@@ -361,7 +371,7 @@ return function(zeron: any,Repo: any)
                             },
                         }
                 end
-                local frame: {[any]: any}={id="git-source-control",ref=list_box,focusable=true,on_key=list_key,w=if p.wide then 300 else "100%",h=if p.wide then "100%" else 180,shrink=0}
+                local frame: {[any]: any}={id="git-source-control",ref=list_box,focusable=true,on_key=list_key,w=if p.wide then list_size else "100%",h=if p.wide then "100%" else list_size,shrink=0}
                 local list: Node
                 if kind=="many" then
                     frame.offset=list_offset
@@ -379,8 +389,29 @@ return function(zeron: any,Repo: any)
                     table.insert(frame,fm.each(row_list,function(row: any): string return row.id end,file_row,{w_full=true}))
                     list=ui.scroll(frame :: any)
                 end
-                return (if p.wide then ui.row else ui.column) {w_full=true,grow=1,min_h=0,gap="$space.2",
+                return (if p.wide then ui.row else ui.column) {w_full=true,grow=1,min_h=0,
+                on_resize=function(size: any) split_room:set(if p.wide then size.w else size.h) end,
                 list,
+                -- The seam: the gap between them, a hairline down its middle,
+                -- lit under the pointer and while dragged.
+                ui.div {id="git-fork-seam",w=if p.wide then 8 else "100%",h=if p.wide then "100%" else 8,shrink=0,relative=true,
+                    cursor=split.cursor,label="Resize file list",
+                    on_hover=function(inside: boolean) seam_over:set(inside) end,
+                    on_press=function(e: any)
+                        if e.clicks==2 then split.size:set(split.default);return end
+                        seam_from={at=if p.wide then e.x else e.y,size=math.clamp(split.size:peek(),split.least,list_most())};seam_held:set(true)
+                    end,
+                    on_pointer_move=function(e: any)
+                        if not seam_from then return end
+                        local want=seam_from.size+(if p.wide then e.x else e.y)-seam_from.at
+                        seam_drag.at(want,split.least,list_most());split.size:set(math.clamp(want,split.least,list_most()))
+                    end,
+                    on_release=function() seam_from=nil;seam_held:set(false);seam_drag.release() end,
+                    ui.div {absolute=true,left=if p.wide then 4 else 0,right=if p.wide then 3 else 0,top=if p.wide then 0 else 4,bottom=if p.wide then 0 else 3,
+                        bg="$border.strong",pointer_events="none"},
+                    ui.div {absolute=true,left=if p.wide then 3 else 0,right=if p.wide then 3 else 0,top=if p.wide then 0 else 3,bottom=if p.wide then 0 else 3,
+                        rounded="$radius.full",bg="$text.tertiary",pointer_events="none",
+                        opacity=seam.lit(function() return seam_over:get() or seam_held:get() end,seam_drag)}},
                 ui.column {grow=1,min_w=0,min_h=0,gap="$space.1",
                     ui.text {function() local row=chosen:get();return if row then row.file.path else "" end,color="$text.secondary",font="$font.mono",text_size="$font.size.sm"},
                     Changes.list {id="git-fork-diff",bare=true,columns=2,offset=diff_offset,

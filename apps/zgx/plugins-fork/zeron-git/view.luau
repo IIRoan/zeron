@@ -21,6 +21,7 @@ local TextField = require("@ds/text_field")
 local EmptyState = require("@ds/empty_state")
 local progress = require("@ds/progress")
 local Branches=require("./branches")
+local SyncCounts=require("./sync_counts")
 local fm=require("./fork_motion")
 local ForkHistory=require("./fork_history")
 
@@ -247,14 +248,17 @@ return function(zeron: any, Repo: any, words: any)
 				gap = "$space.1",
 				items = "center",
 				branch_switcher(m),
+				SyncCounts(m),
 				IconButton {
 					id = "git-refresh",
 					icon = "refresh",
 					label = "Refresh",
 					tone = "quiet",
+					disabled = function(): boolean
+						return m.workbench.busy:get() or m.acting:get() ~= nil
+					end,
 					on_click = function()
-						m.refresh(true)
-						m.workbench.refresh()
+						m.workbench.refresh_remote()
 					end,
 				},
 				more_menu(m),

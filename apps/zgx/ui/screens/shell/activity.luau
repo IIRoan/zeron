@@ -1,9 +1,6 @@
--- The Activity sidebar: one list of the chats that need you, the one that
--- came back last at the top. A chat under way folds into Working (running,
--- or waiting on background work that will wake it), one put to sleep into
--- Asleep until its time or until it asks for you, and archived ones sit on
--- the Archived shelf. The three shelves stand at the list's end, folded
--- until opened.
+-- The Activity sidebar: completed unseen turns in Done, then working
+-- chats first in Activity, each ordered by latest activity. Asleep and
+-- Archived remain folded at the foot.
 --
 -- What a chat is doing and its sleep are the engine's (synced, the same on
 -- every device: `sessions.now`'s chats carry `status`, `waiting`,
@@ -15,9 +12,8 @@
 -- on (its sweep).
 --
 --   activity.on                 the view (a persisted boolean)
---   activity.working_shelf      chats under way fold into Working
 --   activity.archive_after      days idle before a chat is archived (0: never)
---   activity.shelf(c, status)   "working", "asleep" or nil (the list)
+--   activity.shelf(c, status)   "done", "asleep" or nil (the list)
 --   activity.rank(c, shelf)     its place: higher, nearer the top
 --   activity.sleep(id, until)   asleep until `until` (Unix seconds)
 --   activity.wake(id)           awake now
@@ -33,7 +29,6 @@ local M = {}
 
 -- (The sidebar Zeron opens with; turned off, it lists by project, then device.)
 M.on = ui.persist("shell_sidebar_activity", true)
-M.working_shelf = ui.persist("activity_working_shelf", true)
 M.archive_after = ui.persist("activity_archive_after", 0)
 
 -- Under way: running, or waiting on work that will wake it.
@@ -52,8 +47,8 @@ function M.shelf(c: sessions.Chat, status: string?): string?
 	if c.sleep_until then
 		return "asleep"
 	end
-	if M.working_shelf:get() and status and UNDER_WAY[status] then
-		return "working"
+	if status == "done" then
+		return "done"
 	end
 	return nil
 end

@@ -684,7 +684,7 @@ local List = ui.component(function(props: ListProps): Node
 			-- heights don't, a diff wrapped or split, are drawn anew.)
 			key = function(i: number): string
 				local r = rows:get()[i]
-				return if r then r.key else `none:{i}`
+				return if r then r.key .. `:paint{git.paint_version:get()}` else `none:{i}`
 			end,
 			row = function(key: string): Node
 				return build(key)

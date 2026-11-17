@@ -65,8 +65,8 @@ end
 function M.delete(id: string): any
 	return ui.call("projects.delete", id)
 end
-function M.artwork(p: { id: string, device: string, path: string }, done: (src: string?) -> ())
-	ui.call("files.artwork", { target = { space = p.id, device = p.device, root = p.path } }):after(function(found: any)
+function M.artwork(p: { id: string, device: string, path: string, repository: string? }, done: (src: string?) -> ())
+	ui.call("files.artwork", { target = { space = p.id, device = p.device, root = p.path }, repository = p.repository }):after(function(found: any)
 		done(if type(found) == "table" then found.src else nil)
 	end, function()
 		done(nil)

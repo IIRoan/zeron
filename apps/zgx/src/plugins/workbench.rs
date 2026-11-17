@@ -367,6 +367,10 @@ mod tests {
         run_fork_script("staging");
     }
     #[test]
+    fn fork_remote_refresh_fetches_then_updates_both_commit_counts() {
+        run_fork_script("refresh");
+    }
+    #[test]
     fn fork_staging_queue_reconciles_replies_and_failed_batches() {
         run_fork_script("queue");
     }

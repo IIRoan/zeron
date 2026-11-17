@@ -932,6 +932,23 @@ ui.command {
 	end,
 }
 ui.command {
+	id = "refresh_build",
+	title = "Build activity arrives",
+	run = function()
+		find("a1").updated = os.time() + 1
+		publish()
+	end,
+}
+ui.command {
+	id = "finish_docs",
+	title = "Docs finish after the build",
+	run = function()
+		find("a2").status = "done"
+		find("a2").updated = os.time() + 2
+		publish()
+	end,
+}
+ui.command {
 	id = "finish",
 	title = "Fix the build finishes",
 	run = function()
