@@ -388,28 +388,43 @@ export type Line = { kind: string, old: number?, new: number?, text: string }
 function M.parse(text: { string } | string, max: number?): { Line }
 	local out: { Line } = {}
 	local old, new = 0, 0
+	-- A combined diff's hunks (a conflict's, `diff --cc`:
+	-- `@@@ -a,b -c,d +e,f @@@`) sign each line once per parent: `cols`
+	-- columns of signs, read against the first parent (HEAD), as a unified
+	-- diff of HEAD and the file now. A line only another parent had is
+	-- neither side's, and left out.
+	local cols = 1
 	local function each(line: string)
 		if max and #out >= max then
 			return
 		end
 		local a, c = string.match(line, "^@@ %-(%d+),?%d* %+(%d+)")
+		local ats: string? = nil
+		if not a then
+			ats, a, c = string.match(line, "^(@@@+) %-(%d+),?%d* .-%+(%d+)")
+		end
 		if a then
 			old, new = tonumber(a) :: number, tonumber(c) :: number
+			cols = if ats then #ats - 1 else 1
 			table.insert(out, { kind = "hunk", text = line })
 			return
 		end
 		local first = string.sub(line, 1, 1)
+		local text = string.sub(line, cols + 1)
+		if first == " " and cols > 1 and string.find(string.sub(line, 2, cols), "-", 1, true) then
+			return
+		end
 		if first == "\\" then
 			-- "\ No newline at end of file": not a line of either side.
 			return
 		elseif first == "+" then
-			table.insert(out, { kind = "+", new = new, text = string.sub(line, 2) })
+			table.insert(out, { kind = "+", new = new, text = text })
 			new += 1
 		elseif first == "-" then
-			table.insert(out, { kind = "-", old = old, text = string.sub(line, 2) })
+			table.insert(out, { kind = "-", old = old, text = text })
 			old += 1
 		else
-			table.insert(out, { kind = " ", old = old, new = new, text = string.sub(line, 2) })
+			table.insert(out, { kind = " ", old = old, new = new, text = text })
 			old += 1
 			new += 1
 		end

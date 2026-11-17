@@ -397,6 +397,9 @@ return function(zeron: any, Repo: any, words: any)
 	-- A face: the author's, their initial on their gradient; a picture may
 	-- lie over it (`git.commit.face`).
 	local function face(c: any, size: number): Node
+		-- (A commit known by its id alone, a parent opened by its id, has
+		-- no author: its id stands in for the face's seed.)
+		local who, email = c.author or "", c.email or ""
 		return ui.div {
 			class = "git-commit-face",
 			-- (Its size, for what lies over it.)
@@ -405,8 +408,8 @@ return function(zeron: any, Repo: any, words: any)
 			shrink = 0,
 			w = size,
 			h = size,
-			tooltip = Tooltip { if c.email and c.email ~= "" then `{c.author} <{c.email}>` else c.author },
-			people.face({ id = c.email or c.author, name = c.author }, size),
+			tooltip = Tooltip { if email ~= "" then `{who} <{email}>` else who },
+			people.face({ id = if email ~= "" then email elseif who ~= "" then who else c.sha, name = who }, size),
 			ui.div { absolute = true, left = 0, top = 0, w = size, h = size, zeron.slot("commit.face", { w = size, h = size }) },
 		}
 	end
@@ -801,11 +804,19 @@ return function(zeron: any, Repo: any, words: any)
 				items = "center",
 				flex_wrap = true,
 				face(c, 20),
-				ui.text { c.author, shrink = 0, text_size = "$font.size.sm", weight = "$font.weight.medium", color = "$text.primary" },
-				ui.text { when_whole(c.at), shrink = 0, text_size = "$font.size.sm", color = "$text.tertiary" },
+				-- (Opened by its id alone, who and when are its info's, as it comes.)
+				ui.text { function(): string
+					local i = info()
+					return c.author or (i and i.author) or ""
+				end, shrink = 0, text_size = "$font.size.sm", weight = "$font.weight.medium", color = "$text.primary" },
+				ui.text { function(): string
+					local i = info()
+					local at = c.at or (i and i.at)
+					return if at then when_whole(at) else ""
+				end, shrink = 0, text_size = "$font.size.sm", color = "$text.tertiary" },
 				ui.show(function(): boolean
 					local i = info()
-					return i ~= nil and i.committer ~= "" and i.committer ~= c.author
+					return i ~= nil and i.committer ~= "" and i.committer ~= (c.author or i.author)
 				end, ui.text {
 					function(): string
 						local i = info()

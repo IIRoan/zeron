@@ -111,9 +111,28 @@ return function(zeron: any,m: any,problem: any)
             if w.again or epoch~=w.epoch then w.again=false;w.refresh() end
         end,function(e: any) w.loading=false;if epoch==w.epoch then w.verified:set(false);w.error:set(problem(e).words) end end)
     end
+    -- The engine's commits (parentShas, authorName, authorEmail, authoredAt
+    -- in ISO 8601) in History's shape, which a commit's tab opens with.
+    local function seconds(iso: string?): number
+        local y,mo,d,h,mi,s,zone=string.match(iso or "","^(%d+)-(%d+)-(%d+)T(%d+):(%d+):(%d+)(.*)$")
+        if not y then return 0 end
+        local sign,zh,zm=string.match(zone,"^([+-])(%d%d):?(%d%d)$")
+        local offset=if sign then (tonumber(zh)*3600+tonumber(zm)*60)*(if sign=="-" then -1 else 1) else 0
+        -- (Luau's os.time reads a date as UTC.)
+        return os.time({year=tonumber(y),month=tonumber(mo),day=tonumber(d),hour=tonumber(h),min=tonumber(mi),sec=tonumber(s)})-offset
+    end
+    local function commits(list: {any}?): {any}
+        local out={}
+        for _,c in list or {} do
+            table.insert(out,{sha=c.sha,subject=c.subject or "",parents=c.parentShas or {},refs=c.refs or {},
+                author=c.authorName or "",email=c.authorEmail or "",at=seconds(c.authoredAt)})
+        end
+        return out
+    end
     function w.load_details()
         local pin=w.capture()
-        w.call("GetCheckoutGitDetails",{},pin):after(function(d: any)
+        w.call("GetCheckoutGitDetails",{},pin):after(function(reply: any)
+            local d=table.clone(reply);d.incoming=commits(reply.incoming);d.outgoing=commits(reply.outgoing);d.recent=commits(reply.recent)
             if pin.params.repository==w.repository:peek() then w.details:set(d) end
         end,function(e: any) w.error:set(problem(e).words) end)
     end

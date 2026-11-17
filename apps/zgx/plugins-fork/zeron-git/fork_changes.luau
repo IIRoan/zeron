@@ -35,6 +35,16 @@ local function patch_lines(text: string): {any}
     if lines[#lines]=="" then table.remove(lines) end
     return git.parse(lines,10000)
 end
+-- Two patches' lines alike, their hunks' headers aside: the engine writes
+-- a one-line side's count (`+1,1`) where git leaves it out (`+1`).
+local function same_lines(a: {any},b: {any}?): boolean
+    if not b or #a~=#b then return false end
+    for i,x in a do
+        local y=b[i]
+        if x.kind~=y.kind or (x.kind~="hunk" and (x.old~=y.old or x.new~=y.new or x.text~=y.text)) then return false end
+    end
+    return true
+end
 return function(zeron: any,Repo: any)
     local Commands=require("./commands")(zeron)
     return ui.component(function(p: any): Node
@@ -178,7 +188,7 @@ return function(zeron: any,Repo: any)
                 zeron.service(context.scope.device):call("selection_diff",{cwd=cwd,path=row.file.path,old=row.file.oldPath,staged=row.group=="staged"}):after(function(source: any)
                     if last~=key or not source.oldText or not source.newText then paint_status:set("stale or binary");return end
                     local parsed=patch_lines(source.text or "")
-                    if ui.json.encode(parsed)~=ui.json.encode(diff_cache) then paint_status:set("snapshot changed");return end
+                    if not same_lines(parsed,diff_cache) then paint_status:set("snapshot changed");return end
                     local old,new,pairs={},{},{}
                     for _,line in parsed do if line.old then table.insert(old,line.old) end;if line.new then table.insert(new,line.new) end end
                     for _,pair in git.pairs(parsed) do if pair.left and pair.right and pair.left.kind=="-" and pair.right.kind=="+" then table.insert(pairs,{pair.left.old,pair.right.new}) end end
@@ -189,6 +199,27 @@ return function(zeron: any,Repo: any)
                 end,function(e: any) paint_status:set(tostring(e));print(`git diff sources: {e}`) end)
             end,function(e: any) if last==key then w.error:set(tostring(e)) end end)
         end)
+        -- A conflict resolved with one side, asked first (the old app's
+        -- words): rebasing, Git's current is the upstream rebased onto and
+        -- its incoming your commit being replayed.
+        local resolving=ui.use_state(nil :: any);local resolve_open=ui.use_state(false)
+        local function resolve_words(incoming: boolean): (string,string)
+            -- (The status is the one kept fresh; the details, as last read.)
+            local s=m.status:peek();local d=w.details:peek()
+            local rebasing=(s~=nil and s.state=="rebase") or (d~=nil and d.state~=nil and d.state.operation=="rebase")
+            if rebasing then
+                return if incoming then "Accept your commit's version" else "Accept upstream version",
+                    if incoming then "version from your commit being replayed" else "upstream version being rebased onto"
+            end
+            return if incoming then "Accept incoming version" else "Accept current version",
+                if incoming then "incoming version" else "current version (HEAD)"
+        end
+        local function ask_resolve(path: string,incoming: boolean,pin: any)
+            local label,version=resolve_words(incoming)
+            resolving:set({path=path,incoming=incoming,pin=pin,title=`{label}?`,
+                body=`The contents of {path} will be replaced with the {version}. Edits made to this file while resolving the conflict will be lost.`})
+            resolve_open:set(true)
+        end
         local function menu(row: any): {any}
             if not selected:peek()[row.key] then select(row,{}) end
             local targets=Selection.paths(w.repo(),selected:peek(),row.group,false,row)
@@ -206,8 +237,8 @@ return function(zeron: any,Repo: any)
                 {separator=true},
                 {label=if row.group=="staged" then "Unstage selected" else "Stage selected",disabled=not w.can_stage(targets),on_select=function() stage_paths(targets,row.group~="staged") end},
                 {label="Discard selected…",disabled=row.group=="conflicts" or w.busy:peek(),on_select=function() ask(targets,row.group=="staged",pin) end},
-                {label="Resolve with current",disabled=row.group~="conflicts",on_select=function() w.action({kind="resolveConflict",path=row.file.path,incoming=false},pin) end},
-                {label="Resolve with incoming",disabled=row.group~="conflicts",on_select=function() w.action({kind="resolveConflict",path=row.file.path,incoming=true},pin) end},
+                {label=(resolve_words(false)),disabled=row.group~="conflicts",on_select=function() ask_resolve(row.file.path,false,pin) end},
+                {label=(resolve_words(true)),disabled=row.group~="conflicts",on_select=function() ask_resolve(row.file.path,true,pin) end},
                 {separator=true},
                 {label="Copy relative path",on_select=function() copy_paths(false) end},
                 {label="Copy path",on_select=function() copy_paths(true) end},
@@ -248,7 +279,7 @@ return function(zeron: any,Repo: any)
                     -- A successful action disables its own button and can
                     -- blur it. That is still an interaction inside this
                     -- surface, so keep the selection on the moved files.
-                    if not focus_inside and not hover_inside and zeron.window().active and not discard:peek() and not w.conflict_open:peek() then
+                    if not focus_inside and not hover_inside and zeron.window().active and not discard:peek() and not w.conflict_open:peek() and not resolve_open:peek() then
                         selected:set({});anchor:set(nil)
                     end
                 end)
@@ -353,7 +384,10 @@ return function(zeron: any,Repo: any)
                 ui.column {grow=1,min_w=0,min_h=0,gap="$space.1",
                     ui.text {function() local row=chosen:get();return if row then row.file.path else "" end,color="$text.secondary",font="$font.mono",text_size="$font.size.sm"},
                     Changes.list {id="git-fork-diff",bare=true,columns=2,offset=diff_offset,
-                        files=function() local row=chosen:get();return if row then {Changes.file(row.file.path,"modified",0,0)} else {} end,
+                        -- (Its rev, the diff's own: each diff that comes is
+                        -- drawn anew, never another file's rows kept by key.)
+                        files=function() local row=chosen:get();if not row then return {} end
+                            local f=Changes.file(row.file.path,"modified",0,0);f.rev=tostring(diff_version:get());return {f} end,
                         ranges=true,on_comment=function(path: string,key: string,line: any,range: any?)
                             local rows=range or {line};local old=true;local keys,snippet={},{}
                             for _,item in rows do if item.kind~="-" then old=false end;table.insert(keys,git.line_key(item));table.insert(snippet,item.text) end
@@ -376,11 +410,18 @@ return function(zeron: any,Repo: any)
                 },
             }
             end,fm.swap {w_full=true,grow=1,min_h=0}),
-            Dialog {open=discard,title="Discard these changes?",tone="danger",body=function() return `Discard {if preview then preview.fileCount else 0} files? A recovery copy will be kept for Undo discard.` end,
+            Dialog {open=discard,title="Discard these changes?",tone="danger",body=function() local n=if preview then preview.fileCount else 0
+                return `Discard {n} {if n==1 then "file" else "files"}? A recovery copy will be kept for Undo discard.` end,
                 confirm={label="Discard",on_click=function() if preview then w.confirm_discard(preview,discard_pin) end end}},
             Dialog {open=w.conflict_open,title="Stage files with conflict markers?",tone="danger",
-                body=function() return `Conflict markers remain in {w.conflict_count or 0} selected files. Resolve them first, or stage the current contents anyway.` end,
+                body=function() local n=w.conflict_count or 0
+                    return `Conflict markers remain in {n} selected {if n==1 then "file" else "files"}. Resolve them first, or stage the current contents anyway.` end,
                 confirm={label="Stage anyway",on_click=w.confirm_stage}},
+            Dialog {open=resolve_open,title=function() local r=resolving:get();return if r then r.title else "" end,tone="danger",
+                body=function() local r=resolving:get();return if r then r.body else "" end,
+                confirm={label="Replace file contents",on_click=function()
+                    local r=resolving:peek();if r then w.action({kind="resolveConflict",path=r.path,incoming=r.incoming},r.pin) end
+                end}},
             Dialog {open=commenting,title="Comment on selected code",size="md",confirm={label="Add to chat",on_click=function()
                 if comment and note:peek()~="" then comment.note=note:peek();zeron.compose_comment(comment) end
             end},TextArea {value=note,label="Review comment",rows=3,max_rows=8}},
