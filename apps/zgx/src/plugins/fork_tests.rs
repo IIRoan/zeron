@@ -786,4 +786,3 @@ fn the_muute_preset_saves_what_the_desktop_did() {
     assert_eq!(sent["variables"], json!({ "APP_VALUE": "a=c", "NEW": " x" }));
     assert_eq!(app.error(), None);
 }
-
