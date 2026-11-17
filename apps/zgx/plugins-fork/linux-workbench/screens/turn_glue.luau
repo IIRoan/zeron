@@ -14,6 +14,8 @@ local M = table.clone(original)
 local waiting = ui.state("linux_workbench_setup_wait", {} :: { [string]: string })
 -- When each was last asked about: polled while it's asked about.
 local asked: { [string]: number } = {}
+-- Which are being polled now.
+local polling: { [string]: boolean } = {}
 local POLL_MS = 1500
 
 local function join(names: { string }): string
@@ -69,6 +71,7 @@ local function poll(project: string, path: string)
 		-- and asked again from the start.)
 		if said == "" and (asked[project] or 0) < os.time() - 5 then
 			asked[project] = nil
+			polling[project] = nil
 			return
 		end
 		ui.after(POLL_MS, function()
@@ -84,9 +87,8 @@ end
 -- What a local project's setup is doing (nil: nothing to say), polled
 -- from now on while it's asked.
 local function setup_of(project: string): string?
-	local first = asked[project] == nil
 	asked[project] = os.time()
-	if first then
+	if not polling[project] then
 		local path: string? = nil
 		for _, p in sessions.projects:peek() do
 			if p.id == project then
@@ -95,8 +97,15 @@ local function setup_of(project: string): string?
 		end
 		if path then
 			local at = path
+			-- (Asked from the transcript's turn state, a computed: a timer
+			-- started here lasts only until its next run, which a new chat's
+			-- first send brings at once. So a poll counts as started when it
+			-- starts, and until then each run arms one again.)
 			ui.after(0, function()
-				poll(project, at)
+				if not polling[project] then
+					polling[project] = true
+					poll(project, at)
+				end
 			end)
 		end
 	end

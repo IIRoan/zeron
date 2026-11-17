@@ -1095,7 +1095,7 @@ end
 
 local function same_checkout(c: any)
     if not c or not c.cwd then return end
-    sessions.create({project=c.project,device=c.device,cwd=c.cwd,branch=c.branch,title="New chat"}):after(function(id: string)
+    sessions.create({project=c.project,device=c.device,cwd=c.cwd,branch=c.branch}):after(function(id: string)
         route.open_session(id)
     end,function(e: any) ds.toast.show {title="Couldn't create chat",body=tostring(e),tone="danger"} end)
 end
