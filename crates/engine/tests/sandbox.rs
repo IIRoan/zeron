@@ -174,7 +174,10 @@ async fn a_sandboxed_project_never_runs_on_the_host_and_its_agents_stay_inside()
     status.arg("-C").arg(&worktree).args(["status", "--short"]);
     sandbox::pin_git(&mut status, &worktree);
     assert_eq!(status.as_std().get_program(), "bwrap");
-    status.output().await.unwrap();
+    // (It runs: a git from outside /usr, Homebrew's on a machine whose /home
+    // is a link, used to fail to start there.)
+    let out = status.output().await.unwrap();
+    assert!(out.status.success(), "{out:?}");
     assert!(!planted.exists(), "host git ran a planted fsmonitor");
     assert!(sandbox::git_env(&other).unwrap().is_empty());
     // A submodule's git folder is the agents' to name: host-side git stays

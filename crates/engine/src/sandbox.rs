@@ -1126,11 +1126,19 @@ fn jail(
             Err(_) => continue,
         };
     }
-    // A git outside /usr (Homebrew) brings its prefix.
+    // A /home that is a link (Fedora Atomic's, to var/home) is one here too:
+    // Homebrew's git asks for its loader at /home/linuxbrew/.linuxbrew/lib.
+    // (Only the link: what it leads to stays out but for what's bound.)
+    if let Ok(target) = std::fs::read_link("/home") {
+        jail.arg("--symlink").arg(target).arg("/home");
+    }
+    // A git outside /usr (Homebrew) brings its prefix, at its real path (a
+    // bind can't be made through a link).
     if let Some(prefix) = git.parent().and_then(Path::parent)
         && !git.starts_with("/usr")
     {
-        jail.arg("--ro-bind").arg(prefix).arg(prefix);
+        let prefix = std::fs::canonicalize(prefix).unwrap_or_else(|_| prefix.to_path_buf());
+        jail.arg("--ro-bind").arg(&prefix).arg(&prefix);
     }
     for dir in [&sandbox.root, &sandbox.worktrees] {
         jail.arg("--bind").arg(dir).arg(dir);
