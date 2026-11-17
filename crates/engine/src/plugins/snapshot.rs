@@ -220,6 +220,31 @@ pub fn remove(path: &Path) {
 pub struct Retention {
     current: HashMap<String, String>,
     previous: HashMap<String, (String, Instant)>,
+    swept: bool,
+}
+
+/// Each id's newest snapshot in `loaded` (none through a link, none in flight).
+fn newest(loaded: &Path) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for id in std::fs::read_dir(loaded).into_iter().flatten().flatten() {
+        if !id.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let latest = std::fs::read_dir(id.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .filter(|e| !e.file_name().to_string_lossy().starts_with(".tmp-"))
+            .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok());
+        if let Some(latest) = latest {
+            out.insert(
+                id.file_name().to_string_lossy().into_owned(),
+                latest.file_name().to_string_lossy().into_owned(),
+            );
+        }
+    }
+    out
 }
 
 impl Retention {
@@ -236,6 +261,17 @@ impl Retention {
         for (id, old) in &self.current {
             if current.get(id) != Some(old) {
                 self.previous.insert(id.clone(), (old.clone(), now));
+            }
+        }
+        // (Linux fork) A fresh engine's first sweep: an id it doesn't know
+        // yet (Zeron's own, which the app names only once connected) keeps
+        // its newest snapshot as a superseded one is. An app still running
+        // from the engine before (one restarted under it) loads from it.
+        if !std::mem::replace(&mut self.swept, true) {
+            for (id, hash) in newest(&plugins_dir.join(LOADED_DIR)) {
+                if !current.contains_key(&id) {
+                    self.previous.entry(id).or_insert((hash, now));
+                }
             }
         }
         self.previous.retain(|id, (hash, since)| {
@@ -362,6 +398,52 @@ mod tests {
         assert!(snap2.exists());
         retention.sweep(plugins, HashMap::new(), t0 + Duration::from_secs(200));
         assert!(!plugins.join(".loaded/focus").exists());
+    }
+
+    /// An engine started again under a running app sweeps before the app
+    /// names Zeron's own plugins: what the app loads from stays a minute.
+    #[test]
+    fn a_fresh_engine_keeps_snapshots_it_doesnt_know_yet_a_while() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugins = dir.path();
+        let files = focus(plugins);
+        let hash = "0123456789abcdef";
+        let snap = ensure(
+            plugins,
+            "focus",
+            &plugins.join("focus"),
+            hash,
+            b"{}",
+            &files,
+        )
+        .unwrap();
+        let t0 = Instant::now();
+        // Named again once the app connects: never gone.
+        let mut named = Retention::default();
+        assert!(named.sweep(plugins, HashMap::new(), t0));
+        assert!(snap.exists(), "kept while the engine doesn't know it yet");
+        named.sweep(
+            plugins,
+            [("focus".to_string(), hash.to_string())].into(),
+            t0 + Duration::from_secs(2),
+        );
+        named.sweep(
+            plugins,
+            [("focus".to_string(), hash.to_string())].into(),
+            t0 + Duration::from_secs(120),
+        );
+        assert!(snap.exists());
+        // Never named again: gone after the minute, as a superseded one.
+        let mut unnamed = Retention::default();
+        unnamed.sweep(plugins, HashMap::new(), t0);
+        unnamed.sweep(plugins, HashMap::new(), t0 + Duration::from_secs(30));
+        assert!(snap.exists());
+        unnamed.sweep(
+            plugins,
+            HashMap::new(),
+            t0 + KEEP_PREVIOUS + Duration::from_secs(1),
+        );
+        assert!(!snap.exists());
     }
 
     fn focus(plugins: &Path) -> FileHashes {
