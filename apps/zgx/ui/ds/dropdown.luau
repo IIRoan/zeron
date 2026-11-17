@@ -216,6 +216,9 @@ local EMPTY_H = 128
 local function text(label: string | Message | () -> string, tone: string?): Node
 	return FadeText {
 		label,
+		-- (Linux fork) An item's words are data (a branch, a path): never a
+		-- template, whose `{name}` would read a state.
+		literal = type(label) == "string",
 		text_size = "$font.size.md",
 		color = tone or "$text.primary",
 		grow = 1,
@@ -512,6 +515,7 @@ return ui.component(function(props: Props): Node
 				end,
 				ui.text {
 					item.label,
+					literal = true, -- (Linux fork) data, as above
 					shrink = 0,
 					text_size = "$font.size.md",
 					color = "$text.primary",
@@ -1288,6 +1292,7 @@ return ui.component(function(props: Props): Node
 									if item.private
 										then PrivateText {
 											item.label,
+											literal = true, -- (Linux fork) data, as above
 											reveal = false,
 											truncate = true,
 											text_size = "$font.size.md",
@@ -1297,6 +1302,7 @@ return ui.component(function(props: Props): Node
 										}
 										else ui.text {
 											item.label,
+											literal = true, -- (Linux fork) data, as above
 											text_size = "$font.size.md",
 											line_height = "$font.line.md",
 											weight = "$font.weight.medium",

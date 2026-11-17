@@ -13,7 +13,7 @@
 //!                link? } }
 //!                (an agent from the ACP registry, as it says it is),
 //!                accounts = { { id, email, plan, session, week, active,
-//!                               switchable, provider? } },
+//!                               switchable, provider?, error? } },
 //!                groups?, login_for? } } }
 //! An agent that keeps a login per model provider (Pi, OpenCode, Hermes)
 //! also carries `groups`, its accounts by provider (`provider_groups`):
@@ -1789,6 +1789,14 @@ fn account_value(account: &Json, reset: Option<&Reset>) -> Value {
             Value::Bool(account["authKind"].as_str() == Some("api-key") && account["displayName"].as_str().is_some()),
         ),
     ];
+    // (Linux fork) Why no windows came, in the engine's words ("Signed out —
+    // sign in again"): the card says it after the plan, without meters, as
+    // the shipping app's settings/accounts.rs `render_usage_missing` did.
+    if windows.is_empty()
+        && let Some(error) = account["usageError"].as_str()
+    {
+        fields.push(("error", Value::from(error)));
+    }
     if account["codexResetCredits"].is_object() {
         let (count, list) = banked(&account["codexResetCredits"], spent);
         fields.push(("banked", Value::from(count as f64)));
@@ -1916,10 +1924,20 @@ fn device_accounts_value(accounts: &[Json]) -> Value {
 }
 
 /// Whether an account can be put in use: one the engine can swap to, of an
-/// agent whose logins Zeron switches (never Hermes' own pool).
+/// agent whose logins Zeron switches (never Hermes' own pool), and not one
+/// signed out.
 fn can_switch(account: &Json) -> bool {
     account["switchable"].as_bool().unwrap_or(false)
+        && !signed_out(account)
         && account["harness"].as_str().and_then(harness_id).is_some_and(zeron_proto::providers::switches_accounts)
+}
+
+/// (Linux fork) A login the engine reads as signed out (one Claude Code
+/// ended, blanked in place, or one its provider refused): nothing to switch
+/// to (the engine refuses a Claude one). It says so only in words (its
+/// agent_accounts.rs `usage_error_message`) and still lists it `switchable`.
+fn signed_out(account: &Json) -> bool {
+    account["usageError"].as_str().is_some_and(|e| e.starts_with("Signed out"))
 }
 
 /// What an account goes by.
@@ -2047,10 +2065,14 @@ mod tests {
             json!({ "id": "b", "harness": "antigravity", "active": true, "switchable": true }),
             json!({ "id": "c", "harness": "hermes", "active": true, "switchable": true, "usageError": "no" }),
             json!({ "id": "d", "harness": "acp.someone", "active": true }),
+            // (Linux fork) A login Claude Code ended: listed, never switched to.
+            json!({ "id": "e", "harness": "claude-code", "active": false, "switchable": true,
+                "usageError": "Signed out — sign in again" }),
         ]);
         let Value::Map(_) = &value else { panic!("a record") };
         let rows = value.field("claude-code").expect("claude").list().to_vec();
-        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.len(), 2);
+        assert!(!rows[1].field("can_switch").is_some_and(Value::truthy));
         assert_eq!(rows[0].field("email").map(text).as_deref(), Some("a@example.test"));
         assert!(rows[0].field("can_switch").is_some_and(Value::truthy));
         let windows = rows[0].field("windows").unwrap().list().to_vec();

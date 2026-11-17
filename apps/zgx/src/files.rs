@@ -368,6 +368,9 @@ const ARTWORK_PATHS: &[&str] = &[
     "src-tauri/icons/icon.png",
     "assets/icon.png",
     "src/assets/icon.png",
+    "assets/images/icon.png",
+    "static/favicon.png",
+    "src/lib/assets/favicon.svg",
 ];
 /// The largest artwork taken (a repository's logo, not its hero image).
 const ARTWORK_MAX: u64 = 2 * 1024 * 1024;
@@ -381,6 +384,49 @@ fn local_artwork(root: &Path) -> Option<PathBuf> {
     ARTWORK_PATHS.iter().map(|p| top.join(p)).find(|p| {
         std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() > 0 && m.len() <= ARTWORK_MAX)
     })
+}
+
+/// Rasterize a local SVG favicon for the tile renderer. Embedded/external
+/// resources are disabled, and the output is always a bounded 128px tile.
+fn tile_artwork(path: PathBuf, cache: &Path) -> Option<PathBuf> {
+    if path.extension().and_then(|e| e.to_str()) != Some("svg") { return Some(path); }
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.len() > ARTWORK_MAX as usize { return None; }
+    let name = format!("artwork-{:x}.png", Sha256::digest(&bytes));
+    let out = cache.join(name);
+    if out.is_file() { return Some(out); }
+    let options = usvg::Options {
+        image_href_resolver: usvg::ImageHrefResolver {
+            resolve_data: Box::new(|_, _, _| None),
+            resolve_string: Box::new(|_, _| None),
+        },
+        ..Default::default()
+    };
+    let tree = usvg::Tree::from_data(&bytes, &options).ok()?;
+    let size = tree.size();
+    let scale = 128.0 / size.width().max(size.height());
+    let mut pixels = resvg::tiny_skia::Pixmap::new(128, 128)?;
+    resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(scale, scale), &mut pixels.as_mut());
+    std::fs::create_dir_all(cache).ok()?;
+    let part = out.with_extension("part");
+    pixels.save_png(&part).ok()?;
+    std::fs::rename(part, &out).ok()?;
+    Some(out)
+}
+
+/// A custom picture chosen in the earlier interface. Only the local
+/// profile's managed files are used; synced icons continue to win in the UI.
+fn saved_artwork(data: &Path, repository: &str) -> Option<PathBuf> {
+    if repository.is_empty() { return None; }
+    let settings: Json = serde_json::from_slice(&std::fs::read(data.join("ui-settings.json")).ok()?).ok()?;
+    let key = format!("repo:{repository}");
+    let saved = settings["projectIconsByProfile"]["local"][&key]["path"].as_str()?;
+    let managed = data.join("project-icons").canonicalize().ok()?;
+    let path = PathBuf::from(saved).canonicalize().ok()?;
+    if !path.starts_with(managed) { return None; }
+    let metadata = std::fs::metadata(&path).ok()?;
+    (metadata.is_file() && metadata.len() > 0 && metadata.len() <= IMAGE_MAX as u64).then_some(path)
 }
 
 /// The most of an image read from another device, and its chunks (the
@@ -823,8 +869,10 @@ impl Files {
             if !root.is_absolute() {
                 return Ok(Value::Nil);
             }
-            // (A dozen stats on this Mac's disk: done here.)
-            return Ok(local_artwork(&root).map_or(Value::Nil, found));
+            let custom = engine::data_dir().and_then(|data| saved_artwork(&data, &text(arg.field("repository"))));
+            let path = custom.or_else(|| local_artwork(&root));
+            let path = path.and_then(|path| image_dir().ok().and_then(|cache| tile_artwork(path, &cache)));
+            return Ok(path.map_or(Value::Nil, found));
         }
         let params = self.params(Some(target)).await?;
         for path in ARTWORK_PATHS {
@@ -919,6 +967,12 @@ impl Files {
         params.insert("query".into(), Json::String(text(arg.field("query"))));
         params.insert("limit".into(), json!(cap("limit", 100, 500)));
         params.insert("perFileLimit".into(), json!(cap("per_file", 3, 50)));
+        if let Some(options) = arg.field("options") {
+            let value = crate::plugins::value_json(options);
+            if !value.is_object() { return Err("Search options must be an object".into()); }
+            // The engine validates its typed search options, alongside the target.
+            params.insert("options".into(), value);
+        }
         let found = self.call("SearchWorkspaceContent", params).await?;
         if self.content_searches.get() != mine {
             return Err("superseded".into());
@@ -1366,6 +1420,40 @@ mod tests {
         assert_eq!(read.take(&chunk("image/png", &[1; 10], 10, false)), Ok(false));
         assert!(read.take(&chunk("image/jpeg", &[1; 10], 20, true)).is_err());
         assert!(super::PictureRead::default().take(&chunk("image/svg+xml", b"<svg/>", 6, true)).is_err());
+    }
+
+    #[test]
+    fn local_svg_artwork_becomes_a_cached_tile() {
+        let dir = tempfile::tempdir().unwrap();
+        let svg = dir.path().join("favicon.svg");
+        std::fs::write(&svg, r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" fill="#123456"/></svg>"##).unwrap();
+        let cache = dir.path().join("cache");
+        let png = super::tile_artwork(svg.clone(), &cache).unwrap();
+        assert_eq!(image::image_dimensions(&png).unwrap(), (128, 128));
+        assert_eq!(super::tile_artwork(svg, &cache), Some(png));
+    }
+
+    #[test]
+    fn saved_project_artwork_uses_only_managed_local_pictures() {
+        let dir = tempfile::tempdir().unwrap();
+        let managed = dir.path().join("project-icons");
+        std::fs::create_dir(&managed).unwrap();
+        let picture = managed.join("chosen.png");
+        std::fs::write(&picture, b"picture").unwrap();
+        let settings = |path: &std::path::Path| {
+            std::fs::write(dir.path().join("ui-settings.json"), serde_json::json!({
+                "projectIconsByProfile": { "local": { "repo:commit:abc": { "path": path } } }
+            }).to_string()).unwrap();
+        };
+        settings(&picture);
+        assert_eq!(super::saved_artwork(dir.path(), "commit:abc"), Some(picture.canonicalize().unwrap()));
+        assert_eq!(super::saved_artwork(dir.path(), "commit:other"), None);
+        let outside = dir.path().join("outside.png");
+        std::fs::write(&outside, b"outside").unwrap();
+        settings(&outside);
+        assert_eq!(super::saved_artwork(dir.path(), "commit:abc"), None);
+        settings(&managed.join("missing.png"));
+        assert_eq!(super::saved_artwork(dir.path(), "commit:abc"), None);
     }
 
     /// A repository's artwork is found where the shipping app looks, from

@@ -28,6 +28,7 @@
 #![cfg_attr(all(windows, feature = "beta"), windows_subsystem = "windows")]
 
 mod about;
+mod browser_agents;
 #[cfg(all(windows, feature = "beta"))]
 mod windows_install;
 mod acp_registry;
@@ -153,7 +154,7 @@ use zgx_script::{ScriptHost, Shared, Value};
 
 /// Where `ui.persist` keeps its files: the Zeron app's (the beta), apart from
 /// development builds', which are staging's.
-const APP_ID: &str = if cfg!(feature = "beta") { "zeron" } else { "zeron-zgx" };
+const APP_ID: &str = if engine::manager::LINUX_BETA { "zeron-beta" } else if cfg!(feature = "beta") { "zeron" } else { "zeron-zgx" };
 
 /// Setup's window, in points: room for a step and its footer, no more.
 const ONBOARDING_SIZE: (f64, f64) = (680., 500.);
@@ -235,10 +236,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the app's updater compares releases with it: a beta's isn't the
     // workspace's.)
     zeron_update::set_app_version(about::APP_VERSION);
+    if engine::manager::LINUX_BETA {
+        let home=std::env::var_os("HOME").map(std::path::PathBuf::from).ok_or("HOME is needed for Zeron Beta")?;
+        // Also scope CLI commands before they resolve the engine. The
+        // launcher supplies these; direct launches get the same defaults.
+        unsafe {
+            if std::env::var_os("ZERON_DATA_DIR").is_none() { std::env::set_var("ZERON_DATA_DIR",engine::manager::linux_beta_data(&home)); }
+            if std::env::var_os("ZERON_IPC_PORT").is_none() { std::env::set_var("ZERON_IPC_PORT",engine::manager::LINUX_BETA_PORT.to_string()); }
+        }
+        let prod=auth::production();
+        engine::manager::Config::from_env(&prod.edge,&prod.client,prod.port).map_err(std::io::Error::other)?;
+        if argv.get(1).is_some_and(|a| a=="update") { return Err("This Zeron Beta installation is updated with its local beta installer.".into()); }
+    }
     // The Zeron app's updater follows the channel on record on every
     // platform, a stable build's too (crates/update `follows_channels`).
+    // Not the Linux fork's beta: only its local installer updates it.
     #[cfg(feature = "beta")]
-    zeron_update::set_app_follows_channels();
+    if !engine::manager::LINUX_BETA {
+        zeron_update::set_app_follows_channels();
+    }
     // On Windows this app's engine is a whole Zeron `zeron.exe`, in this
     // version's folder (scripts/package-windows.ps1), which an older updater
     // may not have brought: bring it in first (src/windows_install.rs).
@@ -251,7 +267,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     }
-    if cfg!(feature = "beta") || !dev_launch(&argv[1..]) {
+    if (cfg!(feature = "beta") && !engine::manager::LINUX_BETA) || !dev_launch(&argv[1..]) {
         match zeron_cli::run(about::APP_VERSION, zeron_cli::Engines::Helper) {
             zeron_cli::Launch::Done(result) => {
                 // (As a `main` returning it would: the error, exit status 1.)
@@ -274,10 +290,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             zeron_cli::Launch::Appshot => return Err("Appshots from the command line aren't in this app yet".into()),
         }
     }
-    let mut screen = Screen::Intro;
+    let mut screen = if engine::manager::LINUX_BETA { Screen::Main } else { Screen::Intro };
     let mut asked_for_intro = false;
     let mut inspect = false;
-    for arg in std::env::args().skip(1).filter(|_| !cfg!(feature = "beta") && open_url.is_none()) {
+    for arg in std::env::args().skip(1).filter(|_| (!cfg!(feature = "beta") || engine::manager::LINUX_BETA) && open_url.is_none()) {
         match arg.as_str() {
             "intro" => {
                 screen = Screen::Intro;
@@ -343,7 +359,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // delivered to the app as Zeron.app's are (src/links.rs).
     if cfg!(feature = "beta") {
         application = application
-            .application_id("sh.zeron.app")?
+            .application_id(if engine::manager::LINUX_BETA { "sh.zeron.beta" } else { "sh.zeron.app" })?
             .on_application_event(|event, _| {
                 if let zgx_desktop::ApplicationEvent::OpenUrls(urls) = event {
                     for url in urls {
@@ -550,10 +566,15 @@ fn open_main(cx: &mut WindowContext, inspect: bool) {
         let state = zgx_script::app_data_dir(APP_ID).map(|dir| dir.join("script-state").join("app.luau"));
         carried_settings::carry(from.as_deref(), state.as_deref());
     }
+    if engine::manager::LINUX_BETA {
+        plugins::workbench::hold_window(cx);
+    }
     let host = script_host_at(cx, plugins::prepare_live(), "app.luau");
     host.shared("window", "main");
     // Plugins and your templates (src/plugins): the main window's alone.
     plugins::install(cx, &host);
+    // (Linux fork) Agents driving its browser tabs (src/browser_agents.rs).
+    browser_agents::install(cx, &host);
     // The host's own toasts over it (a template in preview, a switch you
     // didn't make, signing keys, safe mode at launch).
     let chrome = plugins::host_bar::view(cx, host.shared("zeron.locale", "en").signal());
@@ -654,10 +675,16 @@ fn script_host(cx: &mut WindowContext, entry: &str) -> ScriptHost {
 fn script_host_at(cx: &mut WindowContext, path: PathBuf, entry: &str) -> ScriptHost {
     // Zeron's design system, lent to the window's plugins (`@ds`).
     let lent = path.clone();
+    // The full interface and its screen plugins can take over 500 ms to
+    // compile on a cold Linux launch. Give loading room without relaxing
+    // the per-handler budget or either VM's memory limit.
+    let mut limits = zgx_script::Limits::default();
+    #[cfg(target_os = "linux")]
+    { limits.load = limits.load.max(std::time::Duration::from_secs(2)); }
     // A long chat's heap, past 32 MB, collected aiming for 150% of what's in
     // use rather than Luau's double: its rows' nodes, which the collector
     // can't see the size of, go sooner (zgx #1837, the carry it replaces).
-    let host = plugins::lend_design_system(ScriptHost::new(&cx.ui.runtime, path).app_id(APP_ID).large_heap_goal(150), &lent);
+    let host = plugins::lend_design_system(ScriptHost::new(&cx.ui.runtime, path).limits(limits).app_id(APP_ID).large_heap_goal(150), &lent);
     // The network, for `ui.fetch` and remote images: the app's scripts, and
     // plugins granted "network" (zgx's own transport; a plugin without the
     // grant reaches none).
@@ -835,6 +862,10 @@ fn script_host_at(cx: &mut WindowContext, path: PathBuf, entry: &str) -> ScriptH
         appshots::install(cx, &host);
         // The panel's terminal tabs (src/terminal.rs).
         terminal::install(cx, &host);
+        // (Linux fork) A program's copy (OSC 52) counts only within 5 s of your
+        // own input in its terminal, as the shipping app's: attaching replays
+        // the engine's backlog, whose copies must not replace the clipboard.
+        zgx_desktop::terminal_copies_after_input(Some(Duration::from_secs(5)));
         // The panel's home: run actions, the branch's totals (src/session_home.rs).
         session_home::install(&host);
         engine_update::install(cx, &host);
@@ -1234,7 +1265,7 @@ fn run_menu_command(host: &ScriptHost, id: &str) {
 
 fn intro_window() -> WindowOptions {
     WindowOptions {
-        title: "Zeron".into(),
+        title: if engine::manager::LINUX_BETA { "Zeron Beta" } else { "Zeron" }.into(),
         transparent: true,
         decorations: false,
         resizable: false,
@@ -1262,7 +1293,7 @@ fn zeron_glass() -> Glass {
 /// blur, which the theme's `background` tints (the shipping app's glass).
 fn zeron_window(width: f64, height: f64) -> WindowOptions {
     WindowOptions {
-        title: "Zeron".into(),
+        title: if engine::manager::LINUX_BETA { "Zeron Beta" } else { "Zeron" }.into(),
         width,
         height,
         decorations: cfg!(target_os = "macos"),
@@ -1286,11 +1317,13 @@ fn onboarding_window() -> WindowOptions {
     }
 }
 
-/// The main window: resizable, its frame kept across launches.
+/// The main window: resizable, its frame kept across launches. (The Linux
+/// beta's shows once its plugins are in: plugins::workbench::hold_window.)
 fn main_window() -> WindowOptions {
     placed(WindowOptions {
         min_size: Some((760., 500.)),
         frame_autosave: Some("zeron-zgx-main".into()),
+        visible: !engine::manager::LINUX_BETA,
         ..zeron_window(1240., 820.)
     })
 }

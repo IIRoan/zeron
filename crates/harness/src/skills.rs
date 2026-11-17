@@ -48,6 +48,30 @@ pub(crate) async fn discover(harness: HarnessId, cwd: &Path) -> Result<Vec<Skill
         .map_err(|error| HarnessError::Protocol(error.to_string()))?
 }
 
+/// A sandboxed checkout's Claude Code skills, from their files alone: asking
+/// the CLI would start it on the host, where that checkout's project settings
+/// must never run. The sandboxed CLI loads the same skill folders and plugins
+/// (`sandbox::claude_plugin_dirs`), so each keeps its slash command.
+pub async fn sandboxed_claude(cwd: &Path) -> Result<Vec<Skill>, HarnessError> {
+    discover(HarnessId::ClaudeCode, cwd)
+        .await
+        .map(with_claude_commands)
+}
+
+fn with_claude_commands(mut skills: Vec<Skill>) -> Vec<Skill> {
+    for skill in &mut skills {
+        if !is_shared_skill(&skill.path)
+            && zeron_proto::invocation::valid_skill_command_name(&skill.name)
+        {
+            skill.command = Some(zeron_proto::invocation::SkillCommand {
+                name: skill.name.clone(),
+                harness: HarnessId::ClaudeCode,
+            });
+        }
+    }
+    skills
+}
+
 /// Shared Agent Skills do not establish a provider-native command identity.
 pub(crate) fn is_shared_skill(path: &str) -> bool {
     Path::new(path).ancestors().any(|dir| {
@@ -459,6 +483,46 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, body).unwrap();
         path
+    }
+
+    #[test]
+    fn a_sandboxed_claude_lists_plugin_skills_as_their_commands() {
+        let temp = tempfile::tempdir().unwrap();
+        let (home, repo) = (temp.path().join("home"), temp.path().join("repo"));
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let plugin = home.join(".claude/plugins/cache/ponytail/ponytail/4.10.0");
+        write(
+            &plugin,
+            "skills/ponytail/SKILL.md",
+            "---\nname: ponytail\n---\n",
+        );
+        write(
+            &home,
+            ".claude/plugins/installed_plugins.json",
+            &serde_json::json!({"plugins": {"ponytail@ponytail": [{"installPath": plugin}]}})
+                .to_string(),
+        );
+        write(
+            &repo,
+            ".agents/skills/shared/SKILL.md",
+            "---\nname: shared\n---\n",
+        );
+        let skills =
+            with_claude_commands(discover_at(HarnessId::ClaudeCode, &repo, &home).unwrap());
+        let command = |name: &str| {
+            skills
+                .iter()
+                .find(|skill| skill.name == name)
+                .unwrap()
+                .command
+                .as_ref()
+                .map(|command| command.name.clone())
+        };
+        assert_eq!(
+            command("ponytail:ponytail").as_deref(),
+            Some("ponytail:ponytail")
+        );
+        assert_eq!(command("shared"), None, "shared skills keep file delivery");
     }
 
     #[test]

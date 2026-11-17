@@ -57,6 +57,8 @@ pub mod host_bar;
 pub mod locales;
 pub mod network;
 pub mod plugin_menus;
+pub mod workbench;
+pub mod highlight;
 
 use std::{
     cell::{Cell, RefCell},
@@ -163,15 +165,16 @@ impl Item {
             return None;
         }
         let ui = &self.json["ui"];
+        let mut granted = grants::capabilities(
+            self.id(), &self.permissions(), &self.list(&ui["change"]), &self.list(&ui["replace"]),
+        );
+        // An approved shell already has native process authority. Services
+        // use zgx's terminal only to attach to their existing engine PTY.
+        if workbench::shell_allowed(self) { granted.push(Capability::Terminals); }
         Some(Plugin {
             name: self.id().into(),
             entry: snapshot.join(entry),
-            grants: grants::capabilities(
-                self.id(),
-                &self.permissions(),
-                &self.list(&ui["change"]),
-                &self.list(&ui["replace"]),
-            ),
+            grants: granted,
         })
     }
 }
@@ -359,6 +362,7 @@ fn connect(b: &Rc<Bridge>, rpc: &Rpc) {
             });
             if let Err(error) = asked.await {
                 eprintln!("zeron-zgx: Zeron's own plugins weren't loaded: {error}");
+                workbench::show_held("Zeron's own plugins didn't load");
             }
         });
     }
@@ -1314,6 +1318,11 @@ impl Bridge {
             c.follow(self);
         }
         self.apply();
+        // The Linux beta's window, hidden until Zeron's own are in (a new
+        // engine's first list comes before they're registered).
+        if self.items.borrow().iter().any(|i| i.json["builtin"] == true) {
+            workbench::show_held("plugins in");
+        }
         // One removed is unloaded now: what its VM held to the last (a
         // `ui.persist` it set as it went) goes too.
         for (id, _) in &gone {
@@ -1437,6 +1446,8 @@ impl Bridge {
     /// to finish setting up, and once the account is set up (an
     /// organization chosen) it's watched `again`, and the list follows.
     fn wait_for_setup(self: &Rc<Self>, again: crate::engine::rpc::Again) {
+        // No plugins until then: the window shows now.
+        workbench::show_held("setup isn't finished");
         if self.state.get() != "setup" {
             eprintln!("zeron-zgx: plugins: waiting for the account's setup to be finished");
             self.state.set("setup");
@@ -2346,6 +2357,51 @@ impl Bridge {
                     let asked = value_json(&asked);
                     let ran = off_thread(move || commands::run(&asked, &allowed)).await.ok_or("The program couldn't be run")??;
                     Ok(json_value(&ran))
+                }
+            }
+        });
+        host.async_action(format!("plugin.{id}.workbench"), {
+            let (me, plugin) = (me.clone(), plugin.clone());
+            move |asked| {
+                let (me, plugin) = (me.clone(), plugin.clone());
+                async move {
+                    let bridge = me.upgrade().ok_or("The window closed")?;
+                    let item = bridge.item(&plugin).ok_or("This plugin isn't on")?;
+                    // (The session list: projects and chats, as the records are
+                    // made from it; `Sources::sessions` is no longer filled.)
+                    let records = value_json(&bridge.sources(false).1);
+                    let request = workbench::prepare(&item, &records, &value_json(&asked))?;
+                    let screenshot = request.kind == workbench::Kind::WindowsVm && request.params["action"] == "screenshot";
+                    let space = request.params["spaceId"].as_str().unwrap_or_default().to_owned();
+                    let mut reply = if request.method == "HighlightGitDiff" {
+                        off_thread(move || highlight::diff(&request.params)).await.ok_or("The highlighter stopped")??
+                    } else { call(&request.method, request.params.clone()).await? };
+                    // The VM's screen: decoded here and lent as a `host:` image
+                    // (a plugin reads no file outside its folder), replaced in
+                    // place by the next one, so what shows it follows.
+                    if screenshot {
+                        let data = reply["result"]["data"].as_str().ok_or("The VM sent no picture")?.to_owned();
+                        let image = off_thread(move || {
+                            use base64::Engine as _;
+                            let bytes = base64::engine::general_purpose::STANDARD.decode(data).map_err(|e| e.to_string())?;
+                            zgx_gpu::assets::decode_image(&bytes).map_err(|e| e.to_string())
+                        }).await.ok_or("The picture's decoder stopped")??;
+                        let name = workbench::screen_name(&plugin, &request.device, &space);
+                        let size = (image.width(), image.height());
+                        bridge.host.image(&name, Some(image));
+                        reply["result"] = json!({"src": format!("host:{name}"), "width": size.0, "height": size.1});
+                    }
+                    // Revoking/removing the plugin while an action runs must
+                    // not lend its reply to a replacement of the same id.
+                    if !bridge.item(&plugin).is_some_and(|now| now.status()=="on" && now.hash()==item.hash()) {
+                        return Err("This plugin changed while the request was running".into());
+                    }
+                    if request.kind == workbench::Kind::ServiceTerminal {
+                        let terminal = workbench::terminal(&reply, request.service.as_deref().unwrap_or_default())?;
+                        let device = crate::files::route_to(Some(request.device)).await;
+                        let command = crate::terminal::command(json_value(&json!({"id":terminal})), device)?;
+                        Ok(Value::record([("id", Value::from(terminal.as_str())), ("command", command)]))
+                    } else { Ok(json_value(&reply)) }
                 }
             }
         });
@@ -3713,6 +3769,8 @@ mod hotkeys_tests;
 mod markdown_tests;
 #[cfg(test)]
 mod network_tests;
+#[cfg(test)]
+mod fork_tests;
 
 #[cfg(test)]
 mod menu_tests {

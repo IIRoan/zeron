@@ -85,7 +85,7 @@ export type Session = {
 	pr: PullRequest?,
 	-- When it was made (as `time`), for sorting by it.
 	created: (number | string)?,
-	-- The Activity view's (`activity` on): the shelf it's on ("working",
+	-- The Activity view's (`activity` on): the shelf it's on ("done",
 	-- "asleep"; nil, the list itself), and its place there (higher, nearer
 	-- the top).
 	shelf: string?,
@@ -2137,6 +2137,7 @@ local places: State<Places> = props.places or ui.use_state({ pinned = pinned_ids
 	-- until opened: kept with the folds, `folded`, as open, as the empty
 	-- projects' fold is).
 	local activity_open = opened["::activity"]
+	local done_open = opened["::done"]
 	local function shelf_open(key: string): State<boolean>
 		local k = `::shelf:{key}`
 		return {
@@ -2360,6 +2361,13 @@ local places: State<Places> = props.places or ui.use_state({ pinned = pinned_ids
 			return activity_open:peek()
 		end, function(on: boolean)
 			activity_open:set(on)
+		end)
+	end
+	local function done_fold(): Fold
+		return fold_of("done", function(): boolean
+			return done_open:peek()
+		end, function(on: boolean)
+			done_open:set(on)
 		end)
 	end
 	local function shelf_fold(key: string): Fold
@@ -2773,12 +2781,11 @@ local places: State<Places> = props.places or ui.use_state({ pinned = pinned_ids
 				room(zoned({ f }, for_drag), "pinned", "pinned")
 			end
 		end
-		-- The Activity view: one list (every session not pinned, the one back
-		-- last first), then its shelves at the list's foot, each folded until
-		-- opened: Working, Asleep, Archived. No sections, no groups.
+		-- Activity: Done above the list, working chats first within it,
+		-- and Asleep/Archived folded at the foot.
 		if act then
 			local list: { Session } = {}
-			local shelved: { [string]: { Session } } = { working = {}, asleep = {} }
+			local shelved: { [string]: { Session } } = { done = {}, asleep = {} }
 			for _, s in index:get().everything do
 				if placed[s.id] == "pinned" then
 					continue
@@ -2796,19 +2803,33 @@ local places: State<Places> = props.places or ui.use_state({ pinned = pinned_ids
 				end)
 				return all
 			end
+			if #shelved.done > 0 then
+				add({ kind = "title", key = "title:done", place = "regular", chain = {}, title = "ds.sidebar.done", n = #shelved.done, fold = done_fold, open = done_open, base = title_h })
+				if done_fold().present then
+					sessions_rows("done", ranked(shelved.done), "none", { done_fold() }, "regular")
+				end
+			end
 			local lf = activity_fold()
 			add({ kind = "title", key = "title:activity", place = "regular", chain = {}, title = "ds.sidebar.activity", n = #list, fold = activity_fold, open = activity_open, base = title_h })
 			if lf.present then
-				sessions_rows("activity", ranked(list), "none", { lf }, "regular")
+				table.sort(list, function(a: Session, b: Session): boolean
+					local function working(s: Session): boolean
+						return s.status == "working" or s.status == "connecting" or s.status == "waiting"
+					end
+					local aw, bw = working(a), working(b)
+					if aw ~= bw then return aw end
+					local x, y = a.rank or 0, b.rank or 0
+					return if x ~= y then x > y else a.id < b.id
+				end)
+				sessions_rows("activity", list, "none", { lf }, "regular")
 			end
 			local shelves = {
-				{ key = "working", title = "ds.sidebar.working", sessions = ranked(shelved.working) },
 				{ key = "asleep", title = "ds.sidebar.asleep", sessions = ranked(shelved.asleep) },
 			}
 			local stored: { Session } = if props.archived then follow(props.archived, {} :: { Session }) else {}
 			-- (The room the rest leave, so the shelves stand at the foot: its
 			-- height is the list's to work out, `heights`.)
-			if #shelved.working + #shelved.asleep + #stored > 0 then
+			if #shelved.asleep + #stored > 0 then
 				add({ kind = "spacer", key = "spacer", place = "regular", chain = {}, base = function(): number
 					return 0
 				end })

@@ -18,7 +18,6 @@ local function with_accounts(on_device: { [string]: any }): any
 	local app = mount("chat_fixture.luau")
 	app:resize(900, 700)
 	app:frames(30)
-	app:set_state("private_text_hidden", false)
 	app:set_state("agents.on_device", on_device)
 	app:frames(10)
 	return app
@@ -36,6 +35,40 @@ test("an agent with accounts has the row, the address and how much is used", fun
 	local row = app:tree("#model-picker-account")
 	expect(row).to_contain("wing@example.test")
 	expect(row).to_contain("34%")
+end)
+
+test("account emails have visible space above plan and usage in the side popover", function()
+	local app = with_accounts(here(accounts()))
+	app:click('role:button "Model"')
+	app:frames(30)
+	app:click("#model-picker-account")
+	app:frames(30)
+	local tree = app:tree('role:listbox "Account"')
+	local function box(words: string): any
+		for line in tree:gmatch("[^\n]+") do
+			if line:find(words, 1, true) then
+				local x, y, w, h = line:match("(%-?[%d%.]+),(%-?[%d%.]+) ([%d%.]+)x([%d%.]+)")
+				return { x = tonumber(x), y = tonumber(y), w = tonumber(w), h = tonumber(h) }
+			end
+		end
+		return nil
+	end
+	for i, email in { "wing@example.test", "work@example.test" } do
+		local email_line = box(`text "{email}"`)
+		local row = box(` option "{email}`)
+		local detail = box(if i == 1 then 'text "Max ·' else 'text "Pro ·')
+		expect(email_line).never.to_be_nil()
+		expect(row).never.to_be_nil()
+		expect(detail).never.to_be_nil()
+		assert(
+			email_line.w > 0 and email_line.h >= 14
+				and email_line.y >= row.y
+				and email_line.y + email_line.h <= detail.y
+				and detail.y + detail.h <= row.y + row.h,
+			tree
+		)
+	end
+	expect(app:error()).to_be(nil)
 end)
 
 test("Hide email addresses hides them in the row and the list, and a press still chooses", function()

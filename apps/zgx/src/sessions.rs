@@ -403,7 +403,12 @@ fn turn(updated: chrono::DateTime<chrono::Utc>) -> i64 {
 
 /// When a live row that shows goes stale, as `next_stale` reads it.
 fn stale_at(row: &Json) -> Option<i64> {
-    let shows = row["status"].as_str().is_some_and(|s| s != "idle") || !row["waiting"].is_null();
+    let shows = row["status"].as_str().is_some_and(|s| s != "idle")
+        || !row["waiting"].is_null()
+        // Background work and quiet children show as working too (Linux fork).
+        || row["runningBackgroundTasks"].as_u64().unwrap_or(0) > 0
+        || row["backgroundTasks"].as_array().is_some_and(|tasks| !tasks.is_empty())
+        || row["runningSubagents"].as_u64().unwrap_or(0) > 0;
     shows.then(|| row["updatedAt"].as_str().and_then(unix_seconds)).flatten().map(|updated| updated + STALE_SECS + 1)
 }
 
@@ -1345,6 +1350,7 @@ impl Sessions {
                     ("name", Value::from(project_name(p["name"].as_str(), path))),
                     ("device", Value::from(p["deviceId"].as_str().unwrap_or_default())),
                     ("path", Value::from(path)),
+                    ("identity", Value::from(p["repositoryId"].as_str().filter(|v| !v.is_empty()).unwrap_or(id))),
                     ("git", Value::Bool(p["gitDetected"].as_bool().unwrap_or(false))),
                     // Its GitHub repository (`owner/name`), the one a Cloud
                     // chat of it clones.
@@ -1791,6 +1797,9 @@ struct Live {
     waiting: Option<Vec<zeron_proto::WaitingOn>>,
     /// Its subagents streaming now, none once the row has gone quiet.
     subagents: u32,
+    /// Background work it reports, none once the row has gone quiet: the
+    /// status reads it as working (Linux fork).
+    background: bool,
     /// Its last turn's outcome and the turn it marks, as the status reads
     /// them (whether a finish is new, or was interrupted).
     outcome: Option<String>,
@@ -1810,6 +1819,7 @@ fn live_of(s: &Session, at: chrono::DateTime<chrono::Utc>) -> Live {
         indicator: zeron_proto::view::effective_indicator(Some(s), at),
         waiting: zeron_proto::view::waiting(Some(s), at).map(|w| w.on.clone()),
         subagents: zeron_proto::view::running_subagents(Some(s), at),
+        background: zeron_proto::view::has_background_tasks(Some(s), at),
         outcome: s.last_turn_outcome.as_ref().and_then(|o| serde_json::to_string(o).ok()),
         last_completed_turn: s.last_completed_turn.clone(),
     }
@@ -1867,7 +1877,9 @@ fn live_sessions(value: &Json, now: chrono::DateTime<chrono::Utc>) -> HashMap<St
 /// How much a session row says at `now`: a run showing, a wait showing,
 /// nothing (`live_sessions` keeps the one that says most).
 fn says(s: &Session, now: chrono::DateTime<chrono::Utc>) -> u8 {
-    if zeron_proto::view::effective_indicator(Some(s), now) != zeron_proto::view::Indicator::None {
+    if zeron_proto::view::effective_indicator(Some(s), now) != zeron_proto::view::Indicator::None
+        || zeron_proto::view::has_background_tasks(Some(s), now)
+    {
         2
     } else if zeron_proto::view::waiting(Some(s), now).is_some() {
         1
@@ -2389,6 +2401,26 @@ mod tests {
         assert_eq!(status_of(unseen, live.get("gone"), at), Some("done"));
         assert_eq!(status_of(seen, None, at), None);
         assert_eq!(status_of(unseen, None, at), Some("done"));
+    }
+
+    #[test]
+    fn idle_background_work_reads_working_and_expires() {
+        let now = 1_000_000;
+        let at = chrono::DateTime::from_timestamp(now, 0).unwrap();
+        let stamp = |secs: i64| chrono::DateTime::from_timestamp(secs, 0).unwrap().to_rfc3339();
+        let seen = seen_marks(&json!({ "lastMessageAt": stamp(now - 30), "lastSeenAt": stamp(now - 20) }));
+        for extra in [json!({ "runningBackgroundTasks": 1 }), json!({ "backgroundTasks": [{ "id": "server", "command": "npm run dev", "startedAt": stamp(now - 60) }] }), json!({ "runningSubagents": 1 })] {
+            let mut row = json!({ "chatId": "c", "deviceId": "d", "status": "idle", "updatedAt": stamp(now - 5) });
+            for (k, v) in extra.as_object().unwrap() {
+                row[k] = v.clone();
+            }
+            let rows = json!([row]);
+            let live = live_sessions(&rows, at);
+            assert_eq!(status_of(seen, live.get("c"), at), Some("working"), "{extra}");
+            assert_eq!(next_stale(&rows, now), Some(now - 5 + STALE_SECS + 1), "{extra}");
+            let later = chrono::DateTime::from_timestamp(now - 5 + STALE_SECS + 1, 0).unwrap();
+            assert_eq!(status_of(seen, live_sessions(&rows, later).get("c"), later), None, "{extra}");
+        }
     }
 
     #[test]

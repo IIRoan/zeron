@@ -6,10 +6,15 @@ cd "$(dirname "$0")/.."
 fail() { echo "$*" >&2; exit 1; }
 [[ "$(uname -s)" == Linux ]] || fail "This updater requires Linux."
 from_run=false
+trial=false
 if [[ "${1:-}" == --from-run && $# == 2 && "$2" =~ ^[0-9]+$ ]]; then
   from_run=true
+elif [[ "${1:-}" == --ref && $# == 2 ]]; then
+  # A trial of an untagged upstream ref you fetched (upstream/main): the same
+  # merge, sync and checks, without release notes. Not for publishing.
+  trial=true
 elif [[ $# -gt 1 || "${1:-}" == --* ]]; then
-  fail "Usage: scripts/update-upstream.sh [vX.Y.Z | --from-run RUN_ID]"
+  fail "Usage: scripts/update-upstream.sh [vX.Y.Z | --from-run RUN_ID | --ref UPSTREAM_REF]"
 fi
 git symbolic-ref --quiet HEAD >/dev/null || fail "Check out your fork branch first."
 for state in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply; do
@@ -38,6 +43,10 @@ if $from_run; then
     release="${BASH_REMATCH[1]} from Action run $2"
   fi
   backup_label="run-$2"
+elif $trial; then
+  release="$2"
+  target="$(git rev-parse --verify "$release^{commit}")" || fail "Unknown ref: $release"
+  backup_label="ref-${release//\//-}"
 else
   git remote get-url upstream >/dev/null || fail "Missing upstream remote; see docs/LINUX_FORK.md."
   release="${1:-}"
@@ -63,10 +72,16 @@ echo "Rollback point: $backup"
 # second merge commit on top would only repeat it.
 if $from_run && git merge-base --is-ancestor HEAD "$target"; then
   git merge --ff-only "$target"
+  # The Action merged the beta's plugin copies; its zgx fork is only here.
+  if [[ -d apps/zgx/plugins-fork ]] && ! python3 scripts/sync-zgx-fork.py; then
+    echo "Finish the zgx fork as printed above, then: scripts/check-linux-fork.sh && git commit. To return to your previous version: git reset --keep $backup" >&2
+    exit 1
+  fi
   if ! scripts/check-linux-fork.sh; then
     echo "Checks failed after applying the checked update. To return to your previous version: git reset --keep $backup" >&2
     exit 1
   fi
+  git diff --cached --quiet || git commit -m "Move Zeron Beta's zgx fork onto upstream's zgx"
   echo "Updated and checked $release. Publish when ready with: git push origin HEAD"
   exit 0
 fi
@@ -77,7 +92,7 @@ fi
 # Bundle notes even when the merge needs manual repair. GitHub outages use
 # local upstream history; notes never depend on the official binary updater.
 # Checked Action bundles already contain their reviewed changelog.
-if ! $from_run; then
+if ! $from_run && ! $trial; then
   if ! python3 scripts/snapshot-release-notes.py --tag "$release" --fork-head "$fork_head"; then
     echo "Resolve the merge, then prepare its release notes before running checks:" >&2
     echo "  python3 scripts/snapshot-release-notes.py --tag $release --fork-head $fork_head" >&2
@@ -87,10 +102,26 @@ if ! $from_run; then
   fi
   git add -- docs/releases/changelog.json
 fi
-if ! $merge_ok; then
+# Zeron Beta: git leaves its plugins' copies of upstream files, their SDK
+# copies and its zgx fork as they were; carry the release into them too.
+beta_ok=true
+sync=(python3 scripts/sync-zgx-fork.py --to "$target")
+if [[ -d apps/zgx/plugins-fork ]]; then
+  if $from_run; then
+    # The Action merged the copies; the zgx fork is only here.
+    sync=(python3 scripts/sync-zgx-fork.py)
+  fi
+  "${sync[@]}" || beta_ok=false
+  if ! $from_run && ! $trial; then
+    python3 apps/zgx/scripts/snapshot-fork-release-notes.py --apply
+    git add -- apps/zgx/plugins-fork/linux-workbench/screens/release_data.luau
+  fi
+fi
+if ! $merge_ok || ! $beta_ok; then
   cat >&2 <<EOF
 The merge needs attention. Your original version is saved in $backup.
-Resolve the files shown by git status, then run:
+Resolve the files shown by git status, and what Zeron Beta's sync printed
+above (it can run again: ${sync[*]}), then run:
   git add <resolved-files>
   scripts/check-linux-fork.sh && git commit
 To cancel the merge: git merge --abort

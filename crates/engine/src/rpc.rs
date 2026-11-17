@@ -3566,12 +3566,19 @@ impl RpcService for EngineRpc {
                     })
                     .await?;
                 // Discovery starts the CLI on the host, where a sandboxed
-                // checkout's project settings must never run (`crate::sandbox`).
+                // checkout's project settings must never run (`crate::sandbox`):
+                // Claude's are read from files; Codex would get host-only paths.
                 if crate::sandbox::for_path(&root)
                     .map_err(|e| RpcError::Failed(e.to_string()))?
                     .is_some()
                 {
-                    return RpcReply::value(&serde_json::json!([]));
+                    if p.harness != HarnessId::ClaudeCode {
+                        return RpcReply::value(&serde_json::json!([]));
+                    }
+                    let skills = zeron_harness::sandboxed_claude_skills(&root)
+                        .await
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    return RpcReply::value(&skills);
                 }
                 let skills = self
                     .registry

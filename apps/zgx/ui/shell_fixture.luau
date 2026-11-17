@@ -9,9 +9,6 @@
 ui.theme.strict("warn")
 local ds = require("@ds")
 ds.setup()
--- Addresses plain to start (hiding is the app's default): the tests read
--- them, and private_text's turn hiding on themselves.
-ds.PrivateText.hidden:set(false)
 local sessions = require("@account/sessions")
 -- (Its start as it is, a new chat: not the launch's jump to the latest
 -- session, which its tests drive themselves.)
@@ -928,6 +925,23 @@ ui.command {
 	run = function()
 		find("a2").status = "working"
 		find("a2").updated = os.time()
+		publish()
+	end,
+}
+ui.command {
+	id = "refresh_build",
+	title = "Build activity arrives",
+	run = function()
+		find("a1").updated = os.time() + 1
+		publish()
+	end,
+}
+ui.command {
+	id = "finish_docs",
+	title = "Docs finish after the build",
+	run = function()
+		find("a2").status = "done"
+		find("a2").updated = os.time() + 2
 		publish()
 	end,
 }

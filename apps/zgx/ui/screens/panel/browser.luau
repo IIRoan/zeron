@@ -390,6 +390,32 @@ local function page_for(id: string, profile: string): any
 	return web
 end
 
+-- (Linux fork) Agents driving the browser, screens/panel/browser_agents:
+-- its pages are these, found and made the same way.
+local Agents = require("@app/screens/panel/browser_agents")
+Agents.hooks.page = function(id: string): any
+	if webs[id] then
+		return webs[id]
+	end
+	local ok, web = pcall(api.web, `panel-browser-{id}`)
+	return if ok then web else nil
+end
+Agents.hooks.make = function(id: string): any
+	local profile = profile_name()
+	return if profile then page_for(id, profile) else nil
+end
+Agents.hooks.close = function(tab: Tab)
+	M.close(tab)
+end
+Agents.hooks.title = function(tab: Tab): string?
+	return M.title(tab)
+end
+Agents.hooks.titled = function(id: string, title: string)
+	if title ~= "" then
+		titles:set_key(id, title)
+	end
+end
+
 -- What a page that turned out to be a file says (WebKit stops a load it
 -- can't show: a download, a zip), as the shipping app's "This file can't
 -- be previewed here".
@@ -423,6 +449,12 @@ Page = ui.component(function(props: Props): Node
 	end
 	local t0 = tab()
 	local web = page_for(id, profile)
+	-- (Linux fork) Shown here, not on agents' stage.
+	ui.on_cleanup(Agents.showing(id))
+	local agents_on = ui.use_state(Agents.enabled(id))
+	ui.effect(function()
+		agents_on:set(Agents.enabled(id))
+	end)
 	-- What the field says: the page's address, or what's being typed.
 	local address = ui.use_state(if t0 and t0.url then t0.url else "")
 	-- The address the field last showed of the page's, so typing over it
@@ -1084,6 +1116,19 @@ Page = ui.component(function(props: Props): Node
 		shrink = 0,
 		gap = "$space.1",
 		items = "center",
+		-- (Linux fork) Whether this chat's agent may use the tab (the
+		-- engine's browser tools), as the desktop app's bot button.
+		ds.ToggleButton {
+			id = `panel-browser-agents-{id}`,
+			on = agents_on,
+			icon = "bot",
+			tone = "quiet",
+			label = "Allow this chat's agent to control this tab",
+			tooltip_side = "bottom",
+			on_change = function(on: boolean)
+				Agents.set_enabled(id, on)
+			end,
+		},
 		ds.ToggleButton {
 			id = `panel-browser-annotate-{id}`,
 			on = mode,

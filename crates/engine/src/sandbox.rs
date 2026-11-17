@@ -162,9 +162,23 @@ pub fn for_path(path: &Path) -> Result<Option<Sandbox>, EngineError> {
     Ok(None)
 }
 
-/// What names a project's container, image and run folder.
+/// What names a project's container, image, home volume and run folder.
 fn key_of(root: &Path) -> String {
-    let digest = Sha256::digest(root.to_string_lossy().as_bytes());
+    key_in(root, &data_dir(), &crate::repos::home_dir())
+}
+
+/// The key of `root` for an install keeping its data in `data`: the root
+/// alone for the regular one (`~/.zeron`), and the data folder too for an
+/// install with its own (Zeron Beta beside the regular app). Each recreates
+/// a container whose settings aren't its own (its data and release folders
+/// among them), so two installs sharing one would end each other's runs.
+fn key_in(root: &Path, data: &Path, home: &Path) -> String {
+    let mut name = root.to_string_lossy().into_owned();
+    if data != home.join(".zeron") {
+        name.push('\0');
+        name.push_str(&data.to_string_lossy());
+    }
+    let digest = Sha256::digest(name.as_bytes());
     digest.iter().take(6).map(|b| format!("{b:02x}")).collect()
 }
 
@@ -1112,11 +1126,19 @@ fn jail(
             Err(_) => continue,
         };
     }
-    // A git outside /usr (Homebrew) brings its prefix.
+    // A /home that is a link (Fedora Atomic's, to var/home) is one here too:
+    // Homebrew's git asks for its loader at /home/linuxbrew/.linuxbrew/lib.
+    // (Only the link: what it leads to stays out but for what's bound.)
+    if let Ok(target) = std::fs::read_link("/home") {
+        jail.arg("--symlink").arg(target).arg("/home");
+    }
+    // A git outside /usr (Homebrew) brings its prefix, at its real path (a
+    // bind can't be made through a link).
     if let Some(prefix) = git.parent().and_then(Path::parent)
         && !git.starts_with("/usr")
     {
-        jail.arg("--ro-bind").arg(prefix).arg(prefix);
+        let prefix = std::fs::canonicalize(prefix).unwrap_or_else(|_| prefix.to_path_buf());
+        jail.arg("--ro-bind").arg(&prefix).arg(&prefix);
     }
     for dir in [&sandbox.root, &sandbox.worktrees] {
         jail.arg("--bind").arg(dir).arg(dir);
@@ -1679,6 +1701,21 @@ mod tests {
             share_github: false,
             sign_commits: false,
         }
+    }
+
+    #[test]
+    fn an_install_with_its_own_data_has_its_own_containers() {
+        let home = Path::new("/home/u");
+        let root = Path::new("/home/u/Documents/muute-monorepo");
+        let regular = key_in(root, &home.join(".zeron"), home);
+        // The regular install's names are as they always were.
+        let digest = Sha256::digest(root.to_string_lossy().as_bytes());
+        let before: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
+        assert_eq!(regular, before);
+        let beta = key_in(root, Path::new("/home/u/.local/share/zeron-beta/profile/engine"), home);
+        assert_ne!(beta, regular);
+        assert_eq!(beta.len(), regular.len());
+        assert_ne!(key_in(Path::new("/home/u/other"), &home.join(".zeron"), home), regular);
     }
 
     #[test]

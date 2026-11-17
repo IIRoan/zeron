@@ -140,6 +140,51 @@ class UpdateUpstreamTests(unittest.TestCase):
         self.git(self.fork, "rev-parse", "--verify", "MERGE_HEAD")
         self.assertNotEqual(self.update().returncode, 0)
 
+    def beta(self, sync_exit=0):
+        """Zeron Beta's sync and notes snapshot as stubs that record their calls."""
+        calls = self.root / "beta-calls"
+        self.env["BETA_CALLS"] = str(calls)
+        stub = ("#!/usr/bin/env python3\nimport os, sys\n"
+                "open(os.environ['BETA_CALLS'], 'a').write(' '.join(sys.argv) + '\\n')\n")
+        (self.fork / "scripts/sync-zgx-fork.py").write_text(stub + f"sys.exit({sync_exit})\n")
+        notes = self.fork / "apps/zgx/scripts/snapshot-fork-release-notes.py"
+        notes.parent.mkdir(parents=True)
+        notes.write_text(stub + "open('apps/zgx/plugins-fork/linux-workbench/screens/release_data.luau', 'w')"
+                                ".write('notes\\n')\n")
+        (self.fork / "apps/zgx/plugins-fork/linux-workbench/screens").mkdir(parents=True)
+        (self.fork / "apps/zgx/plugins-fork/linux-workbench/screens/release_data.luau").write_text("old\n")
+        self.commit(self.fork, "beta")
+        return calls
+
+    def test_beta_is_synced_to_the_merged_release(self):
+        calls = self.beta()
+        self.release()
+        result = self.update()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        tag = self.git(self.fork, "rev-parse", "v9.9.9^{commit}")
+        self.assertIn(f"scripts/sync-zgx-fork.py --to {tag}", calls.read_text())
+        self.assertEqual(self.git(self.fork, "show", "HEAD:apps/zgx/plugins-fork/linux-workbench/screens/release_data.luau"),
+                         "notes")
+
+    def test_beta_sync_problems_leave_the_merge_uncommitted(self):
+        self.beta(sync_exit=1)
+        self.release()
+        head = self.git(self.fork, "rev-parse", "HEAD")
+        result = self.update()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("sync-zgx-fork.py --to", result.stdout)
+        self.assertEqual(self.git(self.fork, "rev-parse", "HEAD"), head)
+        self.git(self.fork, "rev-parse", "--verify", "MERGE_HEAD")
+
+    def test_trial_ref_merges_without_release_notes(self):
+        self.release()
+        self.git(self.fork, "fetch", "-q", "upstream")
+        result = self.update("--ref", "upstream/main")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual((self.fork / "upstream.txt").read_text(), "upstream update\n")
+        self.assertFalse((self.fork / "docs/releases/changelog.json").exists())
+        self.assertTrue(self.git(self.fork, "branch", "--list", "backup/pre-upstream-ref-upstream-main-*"))
+
     def checked_action_bundle(self):
         self.release()
         ci = self.root / "ci"

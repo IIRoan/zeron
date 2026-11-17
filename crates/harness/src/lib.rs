@@ -459,6 +459,7 @@ mod sandbox;
 mod scratch;
 pub mod shell_env;
 pub(crate) mod skills;
+pub use skills::sandboxed_claude as sandboxed_claude_skills;
 #[cfg(windows)]
 pub mod windows_process;
 

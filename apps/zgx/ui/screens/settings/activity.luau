@@ -1,6 +1,6 @@
 -- Settings → Activity: the Activity sidebar, and how it behaves. The view
--- itself (the sidebar's "…" turns it on too), whether working chats fold
--- into Working, what Sleep does, and how long a chat may sit idle before
+-- itself (the sidebar's "…" turns it on too), what Sleep does,
+-- and how long a chat may sit idle before
 -- it's archived. Everything after the view's own switch applies only while
 -- it's on, so it's dimmed and out of reach while it's off. All of it is
 -- this device's (screens/shell/activity).
@@ -16,7 +16,6 @@ M.TITLE = "Activity"
 
 search.index(M.ID, ui.t("settings.activity.title"), ui.t("settings.activity.terms"), {
 	{ key = "view", title = ui.t("settings.activity.view.label"), terms = ui.t("settings.activity.view.terms") },
-	{ key = "working", title = ui.t("settings.activity.working.label"), section = ui.t("settings.activity.list_section"), terms = ui.t("settings.activity.working.terms") },
 	{ key = "sleep", title = ui.t("settings.activity.sleep.label"), section = ui.t("settings.activity.list_section"), terms = ui.t("settings.activity.sleep.terms") },
 	{ key = "archive_after", title = ui.t("settings.activity.archive_after.label"), section = ui.t("settings.activity.archive_section"), terms = ui.t("settings.activity.archive_after.terms") },
 })
@@ -73,11 +72,6 @@ function M.view(): Node
 		ds.Settings.Section {
 			title = ui.t("settings.activity.list_section"),
 			ds.Settings.Group {
-				while_on("working", {
-					label = ui.t("settings.activity.working.label"),
-					description = ui.t("settings.activity.working.description"),
-					control = ds.Switch { value = activity.working_shelf, label = ui.t("settings.activity.working.label") },
-				}),
 				while_on("sleep", {
 					label = ui.t("settings.activity.sleep.label"),
 					description = ui.t("settings.activity.sleep.description"),

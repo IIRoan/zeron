@@ -82,6 +82,8 @@ pub fn install(cx: &mut WindowContext, host: &ScriptHost) {
     });
     host.async_action("terminal.close", |arg| async move {
         call_for("CloseTerminal", &arg, Map::new()).await?;
+        // (Linux fork) The shell its bridge opened in its place, closed too.
+        forget_moved(&text(arg.field("id")));
         Ok(Value::Nil)
     });
     host.async_action("terminal.write", |arg| async move { crate::plugins::preview::refuse("terminal.write")?;
@@ -118,7 +120,9 @@ fn said(error: String) -> String {
 
 /// A call about terminal `arg.id`, routed to `arg.device`.
 async fn call_for(method: &str, arg: &Value, mut params: Map<String, Json>) -> Result<Json, String> {
-    params.insert("terminalId".into(), Json::String(text(arg.field("id"))));
+    // (Linux fork) The shell running in the tab now: the one its bridge
+    // opened in place of the one the app was given, if it has.
+    params.insert("terminalId".into(), Json::String(current(text(arg.field("id")))));
     if let Some(device) = crate::files::route_to(opt_text(arg.field("device"))).await {
         params.insert("targetDeviceId".into(), Json::String(device));
     }
@@ -281,7 +285,7 @@ fn quote_windows(word: &str) -> String {
 
 /// The bridge's command line for terminal `arg.id` (on `device`, another
 /// device's, routed there).
-fn command(arg: Value, device: Option<String>) -> Result<Value, String> {
+pub(crate) fn command(arg: Value, device: Option<String>) -> Result<Value, String> {
     let (port, data) = engine::get().ipc_endpoint().ok_or("Zeron isn't available here")?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let id = text(arg.field("id"));
@@ -476,8 +480,9 @@ fn leave_claim(claim: &std::path::Path, text: &str) -> bool {
 }
 
 /// Opens the engine's terminal at `size` (what `open` says, and the size);
-/// its id, or what went wrong.
-fn open_terminal(socket: &mut Socket, open: &Map<String, Json>, size: (u16, u16)) -> Result<String, String> {
+/// its id and whether it runs in a sandbox container (Linux fork), or what
+/// went wrong.
+fn open_terminal(socket: &mut Socket, open: &Map<String, Json>, size: (u16, u16)) -> Result<(String, bool), String> {
     const OPEN_ID: u64 = 1_000_000;
     let mut params = open.clone();
     params.insert("cols".into(), json!(size.0));
@@ -498,7 +503,8 @@ fn open_terminal(socket: &mut Socket, open: &Map<String, Json>, size: (u16, u16)
                     if let Some(error) = frame["err"].as_str() {
                         return Err(said(error.to_owned()));
                     }
-                    return frame["ok"]["id"].as_str().map(str::to_owned).ok_or_else(|| "no terminal".into());
+                    let sandboxed = frame["ok"]["sandboxed"].as_bool().unwrap_or(false);
+                    return frame["ok"]["id"].as_str().map(|id| (id.to_owned(), sandboxed)).ok_or_else(|| "no terminal".into());
                 }
             }
             Ok(tungstenite::Message::Close(_)) => return Err("offline".into()),
@@ -690,12 +696,12 @@ pub fn bridge(args: &[String]) -> i32 {
     let mut size = None;
     // A new one: opened here, at the size zgx gave this pseudoterminal, so
     // the shell's first prompt is drawn for it; its id left for the app.
-    let id = match (&args.terminal, &args.open, &args.claim) {
-        (Some(id), _, _) => id.clone(),
+    let (id, sandboxed) = match (&args.terminal, &args.open, &args.claim) {
+        (Some(id), _, _) => (id.clone(), false),
         (None, Some(open), Some(claim)) => {
             let now = settled_size();
             match open_terminal(&mut socket, open, now) {
-                Ok(id) => {
+                Ok((id, sandboxed)) => {
                     device = open.get("targetDeviceId").and_then(Json::as_str).map(str::to_owned);
                     if !leave_claim(claim, &id) {
                         // (The app stopped waiting: no tab knows this one, so
@@ -708,7 +714,7 @@ pub fn bridge(args: &[String]) -> i32 {
                         return 1;
                     }
                     size = Some(now);
-                    id
+                    (id, sandboxed)
                 }
                 Err(why) => {
                     leave_claim(claim, &format!("error: {why}"));
@@ -721,12 +727,21 @@ pub fn bridge(args: &[String]) -> i32 {
         }
         _ => return 2,
     };
-    let terminal = Json::String(id);
-    let mut params = Map::new();
-    params.insert("terminalId".into(), terminal.clone());
-    // (zgx's terminal answers queries itself: the host mustn't too.)
-    params.insert("hostReplies".into(), Json::Bool(false));
-    if failed(send(&mut socket, 1, "SubscribeTerminal", params, &device)) {
+    // (Linux fork) A shell it opened itself: what it was opened with, so
+    // another opens in its place as it ends (`next_shell`).
+    let shell = match (&args.terminal, &args.open) {
+        (None, Some(open)) if cfg!(unix) => Some(Shell { open: open.clone(), first: id.clone(), sandboxed }),
+        _ => None,
+    };
+    let mut terminal = Json::String(id);
+    // (Linux fork) Its stream's call (another for each shell opened in its
+    // place), when it was attached, the last output it passed on, and when
+    // something was last typed.
+    let mut stream = 1u64;
+    let mut attached = std::time::Instant::now();
+    let mut seq = None;
+    let mut typed_at: Option<std::time::Instant> = None;
+    if failed(subscribe(&mut socket, stream, &terminal, None, &device)) {
         return 1;
     }
     let mut next_id = 2u64;
@@ -780,7 +795,10 @@ pub fn bridge(args: &[String]) -> i32 {
         #[cfg(not(unix))]
         loop {
             match rx.try_recv() {
-                Ok(bytes) => typed.push(bytes),
+                Ok(bytes) => {
+                    typed.push(bytes);
+                    typed_at = Some(std::time::Instant::now());
+                }
                 Err(mpsc::TryRecvError::Empty) => break,
                 // Its terminal closed (the tab): done.
                 Err(mpsc::TryRecvError::Disconnected) => return 0,
@@ -802,48 +820,87 @@ pub fn bridge(args: &[String]) -> i32 {
             Err(_) => return 1,
         };
         // What the shell wrote, out: all there is.
-        loop {
+        let mut ended = None;
+        'read: loop {
             match socket.read() {
                 Ok(tungstenite::Message::Text(frame)) => {
                     for line in frame.as_str().lines().filter(|l| !l.trim().is_empty()) {
                         let Ok(frame) = serde_json::from_str::<Json>(line) else {
                             continue;
                         };
-                        if frame["id"].as_u64() != Some(1) {
+                        if frame["id"].as_u64() != Some(stream) {
                             continue;
                         }
                         if let Some(error) = frame["err"].as_str() {
-                            print!("\r\nThis terminal isn't there any more ({error}).\r\n");
-                            let _ = stdout.flush();
-                            return 1;
+                            ended = Some(End::Gone(error.to_owned()));
+                            break 'read;
                         }
                         if frame.get("done").is_some() {
-                            return 0;
+                            ended = Some(End::Closed);
+                            break 'read;
                         }
                         let item = &frame["item"];
                         match item["type"].as_str() {
                             Some("data") => {
+                                seq = item["seq"].as_u64().or(seq);
                                 if let Some(bytes) = item["data"].as_str().and_then(|d| b64.decode(d).ok()) {
                                     let _ = stdout.write_all(&bytes);
                                     let _ = stdout.flush();
                                 }
                             }
                             Some("exit") => {
-                                return item["exitCode"].as_i64().unwrap_or(0) as i32;
+                                ended = Some(End::Exit(item["exitCode"].as_i64().unwrap_or(0) as i32));
+                                break 'read;
                             }
                             _ => {}
                         }
                     }
                 }
-                Ok(tungstenite::Message::Close(_)) => return 1,
+                Ok(tungstenite::Message::Close(_)) => {
+                    ended = Some(End::Lost);
+                    break;
+                }
                 Ok(_) => {}
                 Err(e) if rpc::would_block(&e) => break,
                 Err(_) => {
-                    print!("\r\nZeron's connection ended.\r\n");
-                    let _ = stdout.flush();
-                    return 1;
+                    ended = Some(End::Lost);
+                    break;
                 }
             }
+        }
+        // (Linux fork) Its shell ended, or its engine went: another shell in
+        // its place, if it opened this one itself; else it ends as it did.
+        if let Some(end) = ended {
+            let Some(shell) = &shell else { return end.leave() };
+            let idle = typed_at.map(|at| at.elapsed());
+            match next_shell(&mut socket, &args, shell, &end, attached.elapsed(), idle) {
+                Next::Done(code) => return code,
+                // (Its connection back: the same shell, from where it was, if
+                // its engine still has it; else it's Gone, and asked again.)
+                Next::Same => {}
+                Next::Shell(id, now) => {
+                    if matches!(end, End::Exit(_)) {
+                        let mut p = Map::new();
+                        p.insert("terminalId".into(), terminal.clone());
+                        let _ = send(&mut socket, next_id, "CloseTerminal", p, &device);
+                        next_id += 1;
+                    }
+                    leave_moved(&shell.first, &id);
+                    terminal = Json::String(id);
+                    attached = std::time::Instant::now();
+                    typed_at = None;
+                    seq = None;
+                    size = Some(now);
+                }
+            }
+            stream = next_id;
+            next_id += 1;
+            if failed(subscribe(&mut socket, stream, &terminal, seq, &device)) {
+                return 1;
+            }
+            #[cfg(unix)]
+            let _ = socket.get_ref().set_nonblocking(true);
+            continue;
         }
         // Asleep until one of them has something.
         #[cfg(unix)]
@@ -867,6 +924,7 @@ pub fn bridge(args: &[String]) -> i32 {
                 let n = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len()) };
                 if n > 0 {
                     typed.push(buf[..n as usize].to_vec());
+                    typed_at = Some(std::time::Instant::now());
                 } else if n == 0 || !matches!(std::io::Error::last_os_error().kind(), std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock) {
                     // Its terminal closed (the tab): done.
                     return 0;
@@ -875,6 +933,263 @@ pub fn bridge(args: &[String]) -> i32 {
         }
         #[cfg(not(unix))]
         let _ = unsent;
+    }
+}
+
+/// Asks for terminal `terminal`'s output on call `id`: what came after
+/// `after` (what it passed on before its connection went), else all the
+/// engine keeps.
+fn subscribe(socket: &mut Socket, id: u64, terminal: &Json, after: Option<u64>, device: &Option<String>) -> tungstenite::Result<()> {
+    let mut params = Map::new();
+    params.insert("terminalId".into(), terminal.clone());
+    // (zgx's terminal answers queries itself: the host mustn't too.)
+    params.insert("hostReplies".into(), Json::Bool(false));
+    if let Some(after) = after {
+        params.insert("afterSeq".into(), json!(after));
+    }
+    send(socket, id, "SubscribeTerminal", params, device)
+}
+
+// ---------------------------------------------------------------------------
+// (Linux fork) A shell the bridge opened is opened again in its tab as it
+// ends, below what it showed (the desktop app's terminal/panel.rs
+// `restart_tab`): by itself when the sandbox container it ran in stopped
+// under it (a Rebuild, the container stopped or restarted, the engine
+// restarted), else when Enter is pressed. The app keeps the id it claimed;
+// the bridge leaves the one running now beside the claims (`moved-<id>`),
+// and the app's calls about its id reach that one (`current`).
+
+/// What a shell this bridge opened was opened with.
+struct Shell {
+    open: Map<String, Json>,
+    /// The id the app claimed.
+    first: String,
+    sandboxed: bool,
+}
+
+/// How a terminal's stream ended.
+enum End {
+    /// Its shell ended, with this status.
+    Exit(i32),
+    /// The engine hasn't got it (it restarted), in its words.
+    Gone(String),
+    /// The connection to the engine ended.
+    Lost,
+    /// Its stream ended with no exit: it was closed, or its engine is
+    /// shutting down (which ends every terminal's stream first).
+    Closed,
+}
+
+impl End {
+    /// The bridge's status as it ends on it, opening nothing in its place.
+    fn leave(self) -> i32 {
+        let said = match self {
+            End::Exit(code) => return code,
+            End::Closed => return 0,
+            End::Gone(error) => format!("This terminal isn't there any more ({error})."),
+            End::Lost => "Zeron's connection ended.".to_owned(),
+        };
+        print!("\r\n{said}\r\n");
+        let _ = std::io::stdout().flush();
+        1
+    }
+}
+
+/// What comes after a shell the bridge opened ended.
+enum Next {
+    /// The bridge ends, with this status.
+    Done(i32),
+    /// Its connection is back: the same terminal again.
+    Same,
+    /// A new shell, opened at this size.
+    Shell(String, (u16, u16)),
+}
+
+/// Whether a shell opens again by itself: one the sandbox container's stop
+/// killed while no one was typing (`TerminalSession::reconnects`), or one
+/// its engine's restart ended.
+fn by_itself(sandboxed: bool, end: &End, alive: Duration, idle: Option<Duration>) -> bool {
+    match end {
+        End::Exit(code) => zeron_proto::TerminalSession::reconnects(sandboxed, *code, alive, idle),
+        // (Killed, as it were: not the person's doing.)
+        End::Gone(_) => zeron_proto::TerminalSession::reconnects(sandboxed, 128 + 9, alive, None),
+        End::Lost | End::Closed => false,
+    }
+}
+
+#[cfg(unix)]
+fn next_shell(socket: &mut Socket, args: &Args, shell: &Shell, end: &End, alive: Duration, idle: Option<Duration>) -> Next {
+    // (Closed by someone else: as before. The tab's own close ends the
+    // bridge first.)
+    if matches!(end, End::Closed) && !connection_ends(socket) {
+        return Next::Done(0);
+    }
+    let say = |text: &str| {
+        print!("\x1b[90m[{text}]\x1b[0m\r\n");
+        let _ = std::io::stdout().flush();
+    };
+    // (On a line of its own, below what the shell left; one that follows
+    // the connection's coming back is below that line already.)
+    if !matches!(end, End::Gone(_)) {
+        print!("\r\n");
+    }
+    match end {
+        End::Exit(code) => say(&format!("process exited {code}")),
+        End::Gone(_) => say("the shell ended as Zeron restarted"),
+        End::Lost | End::Closed => {
+            say("Zeron's connection ended; waiting for it");
+            loop {
+                if !pause(1000) {
+                    return Next::Done(0);
+                }
+                if let Ok(back) = dial(args.port, rpc::read_token(&args.data).as_deref()) {
+                    *socket = back;
+                    return Next::Same;
+                }
+            }
+        }
+    }
+    if by_itself(shell.sandboxed, end, alive, idle) {
+        say(if matches!(end, End::Exit(_)) { "the sandbox container stopped; opening a new shell in it" } else { "opening a new shell in the sandbox" });
+        // (The container may still be coming back.)
+        let mut why = String::new();
+        for wait in [500, 1000, 2000, 4000] {
+            if !pause(wait) {
+                return Next::Done(0);
+            }
+            match open_again(socket, args, &shell.open) {
+                Ok((id, size)) => return Next::Shell(id, size),
+                Err(error) => why = error,
+            }
+        }
+        say(&why);
+    }
+    loop {
+        say("press Enter for a new shell");
+        if !wait_for_enter() {
+            return Next::Done(0);
+        }
+        match open_again(socket, args, &shell.open) {
+            Ok((id, size)) => return Next::Shell(id, size),
+            Err(why) => say(&why),
+        }
+    }
+}
+
+/// Whether its connection ends within a moment: its engine going away, not
+/// one terminal closed.
+#[cfg(unix)]
+fn connection_ends(socket: &mut Socket) -> bool {
+    // (Short reads: the read timeout `dial` set.)
+    let _ = socket.get_ref().set_nonblocking(false);
+    let until = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < until {
+        match socket.read() {
+            Ok(tungstenite::Message::Close(_)) => return true,
+            Ok(_) => {}
+            Err(e) if rpc::would_block(&e) => {}
+            Err(_) => return true,
+        }
+    }
+    false
+}
+
+#[cfg(not(unix))]
+fn next_shell(_: &mut Socket, _: &Args, _: &Shell, end: &End, _: Duration, _: Option<Duration>) -> Next {
+    Next::Done(if let End::Exit(code) = end { *code } else { 1 })
+}
+
+/// A new shell as `open` says, at the terminal's size now: its id and that
+/// size. Its connection made again first if it went with its engine.
+#[cfg(unix)]
+fn open_again(socket: &mut Socket, args: &Args, open: &Map<String, Json>) -> Result<(String, (u16, u16)), String> {
+    let size = window_size().unwrap_or((80, 24));
+    // (`open_terminal` waits on short reads, not a socket that never blocks.)
+    let _ = socket.get_ref().set_nonblocking(false);
+    let opened = open_terminal(socket, open, size).or_else(|_| {
+        let back = dial(args.port, rpc::read_token(&args.data).as_deref())?;
+        *socket = back;
+        open_terminal(socket, open, size)
+    });
+    opened.map(|(id, _)| (id, size))
+}
+
+/// What's typed within `ms` (-1: however long it takes), for no shell:
+/// empty if nothing, None once its terminal has closed (the tab).
+#[cfg(unix)]
+fn read_typed(ms: i32) -> Option<Vec<u8>> {
+    let stdin = std::io::stdin();
+    let mut fds = [rpc::poll_fd(&stdin, libc::POLLIN)];
+    // SAFETY: one valid pollfd, for its length.
+    if unsafe { libc::poll(fds.as_mut_ptr(), 1, ms) } <= 0 {
+        return Some(Vec::new());
+    }
+    let mut buf = [0u8; 256];
+    // SAFETY: reads into a buffer of its own length from fd 0, which poll
+    // says has something (or has closed).
+    let n = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len()) };
+    if n > 0 {
+        Some(buf[..n as usize].to_vec())
+    } else if n < 0 && matches!(std::io::Error::last_os_error().kind(), std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock) {
+        Some(Vec::new())
+    } else {
+        None
+    }
+}
+
+/// Waits `ms`: false if its terminal closed meanwhile.
+#[cfg(unix)]
+fn pause(ms: u64) -> bool {
+    let until = std::time::Instant::now() + Duration::from_millis(ms);
+    loop {
+        let left = until.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return true;
+        }
+        if read_typed(left.as_millis().max(1) as i32).is_none() {
+            return false;
+        }
+    }
+}
+
+/// Waits for Enter: false if its terminal closed first.
+#[cfg(unix)]
+fn wait_for_enter() -> bool {
+    loop {
+        match read_typed(-1) {
+            None => return false,
+            Some(bytes) if bytes.iter().any(|b| matches!(b, b'\r' | b'\n')) => return true,
+            Some(_) => {}
+        }
+    }
+}
+
+/// Where a bridge leaves the shell running in place of terminal `id` (an
+/// engine's id: letters, digits and dashes).
+fn moved_path(id: &str) -> Option<PathBuf> {
+    (!id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')).then(|| claims_dir().join(format!("moved-{id}")))
+}
+
+/// The terminal running in place of `id` now: `id` itself, unless its
+/// bridge opened another.
+fn current(id: String) -> String {
+    moved_path(&id)
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|now| now.trim().to_owned())
+        .filter(|now| moved_path(now).is_some())
+        .unwrap_or(id)
+}
+
+fn leave_moved(first: &str, now: &str) {
+    if let Some(path) = moved_path(first) {
+        let _ = std::fs::create_dir_all(claims_dir());
+        let _ = std::fs::write(path, now);
+    }
+}
+
+fn forget_moved(id: &str) {
+    if let Some(path) = moved_path(id) {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -927,6 +1242,38 @@ mod tests {
         // Scrolled down its buffer: still the window's size.
         assert_eq!(super::console_window_size(0, 900, 39, 947), Some((40, 48)));
         assert_eq!(super::console_window_size(5, 5, 4, 10), None);
+    }
+
+    /// (Linux fork) A shell the sandbox container's stop killed opens again
+    /// by itself; one the person left, or one on this machine, waits for
+    /// Enter. The app's id for it reaches the shell opened in its place.
+    #[test]
+    fn a_killed_sandboxed_shell_opens_again_and_the_apps_id_follows_it() {
+        use super::{End, by_itself, current, forget_moved, leave_moved};
+        use std::time::Duration;
+        let minute = Duration::from_secs(60);
+        assert!(by_itself(true, &End::Exit(137), minute, None));
+        assert!(!by_itself(true, &End::Exit(0), minute, None));
+        assert!(!by_itself(false, &End::Exit(137), minute, None));
+        // Ctrl-C, then `exit`, a moment ago.
+        assert!(!by_itself(true, &End::Exit(130), minute, Some(Duration::from_millis(200))));
+        // Its engine restarted under it.
+        assert!(by_itself(true, &End::Gone("Terminal not found".into()), minute, Some(Duration::ZERO)));
+        assert!(!by_itself(false, &End::Gone("Terminal not found".into()), minute, None));
+        // A container that dies as a shell opens isn't tried over and over.
+        assert!(!by_itself(true, &End::Exit(137), Duration::from_secs(1), None));
+        assert!(!by_itself(true, &End::Lost, minute, None));
+        assert!(!by_itself(true, &End::Closed, minute, None));
+        let first = format!("test-{}-first", std::process::id());
+        assert_eq!(current(first.clone()), first);
+        leave_moved(&first, "now-1");
+        assert_eq!(current(first.clone()), "now-1");
+        leave_moved(&first, "now-2");
+        assert_eq!(current(first.clone()), "now-2");
+        forget_moved(&first);
+        assert_eq!(current(first.clone()), first);
+        // Nothing outside the claims' folder is read for an odd id.
+        assert_eq!(current("../etc/passwd".into()), "../etc/passwd");
     }
 
     #[test]

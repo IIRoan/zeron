@@ -1,0 +1,48 @@
+{
+  "id": "linux-workbench",
+  "name": "Linux Workbench",
+  "version": "1.3.0",
+  "description": "Linux workbench with tools and services on the left, project chats on the right, directory navigation, workspace search, and an optional shell terminal dock.",
+  "icon": "icon.svg",
+  "entry": "init.luau",
+  "permissions": [
+    "ui.replace"
+  ],
+  "settings": [
+    {
+      "id": "terminal_font_size",
+      "kind": "choice",
+      "style": "select",
+      "section": "Terminal",
+      "label": "Terminal font size",
+      "description": "The panel's terminals, open ones too. Their font is Appearance's Code font.",
+      "default": "13",
+      "options": [
+        { "value": "10", "label": "10 pt" },
+        { "value": "11", "label": "11 pt" },
+        { "value": "12", "label": "12 pt" },
+        { "value": "12.5", "label": "12.5 pt" },
+        { "value": "13", "label": "13 pt (default)" },
+        { "value": "14", "label": "14 pt" },
+        { "value": "15", "label": "15 pt" },
+        { "value": "16", "label": "16 pt" },
+        { "value": "18", "label": "18 pt" },
+        { "value": "20", "label": "20 pt" }
+      ]
+    }
+  ],
+  "ui": {
+    "replace": [
+      "@app/screens/shell",
+      "@app/screens/shell/page",
+      "@app/screens/shell/sidebar",
+      "@app/screens/panel",
+      "@app/screens/files",
+      "@app/screens/shell/project_look",
+      "@app/screens/settings/about",
+      "@app/screens/settings/projects",
+      "@app/screens/shell/title_bar",
+      "@app/screens/chat/turn_glue"
+    ]
+  }
+}

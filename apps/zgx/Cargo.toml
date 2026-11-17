@@ -25,6 +25,8 @@ path = "src/main.rs"
 # staging's built in) and Zeron.app's own engine (the bundle's `Zeron Engine`,
 # ~/.zeron, port 27654), managed as Zeron.app manages it. Without it, the app
 # stays on staging (src/auth.rs, src/engine/manager.rs).
+# On Linux the beta has its own app id, profile and engine port, and uses
+# scripts/install-zgx-beta.py for separate, manually installed releases.
 beta = []
 # The layout benchmarks that read a probed zgx (docs/zgx-layout-probe.patch;
 # `live_reflow_traced` in src/split_tests.rs says how). Off in every build.
@@ -111,6 +113,7 @@ zatex = { path = "../../crates/zatex", features = ["bundled"] }
 # Imported VS Code themes (src/themes.rs): the shipping app's theme crate,
 # its importer, library file and error words.
 zeron-theme = { path = "../../crates/theme" }
+zeron-syntax = { path = "../../crates/syntax" }
 # (A preview's process label and redacted command line, one copy with the
 # engine that advertises them; no dependencies.)
 zeron-preview-label = { path = "../../crates/preview-label" }
@@ -192,6 +195,21 @@ accesskit_consumer = { git = "https://github.com/zeronsh/zgx", rev = "d391ea7276
 accesskit_atspi_common = { git = "https://github.com/zeronsh/zgx", rev = "d391ea7276f0de5cb3d65c191bfd66c02a4c358d" }
 accesskit_unix = { git = "https://github.com/zeronsh/zgx", rev = "d391ea7276f0de5cb3d65c191bfd66c02a4c358d" }
 accesskit_windows = { git = "https://github.com/zeronsh/zgx", rev = "d391ea7276f0de5cb3d65c191bfd66c02a4c358d" }
+
+# (Linux fork) zgx from the fork's copy: branch zeron-fork of ~/Documents/zgx,
+# upstream's pin above plus web pages' snapshots and a person's input
+# (WebView::snapshot/click/insert_text/press_key) for agents driving the
+# browser (src/browser_agents.rs), and terminals holding programs' copies
+# (OSC 52) to your input (src/main.rs). Upstream's lines above stay as upstream
+# has them, so its zgx moves merge cleanly; scripts/sync-zgx-fork.py then
+# rebases the branch onto the new pin and puts its commit here, and build.rs
+# refuses a commit here that doesn't contain upstream's pin.
+[patch."https://github.com/zeronsh/zgx"]
+zgx = { git = "file:///var/home/roan/Documents/zgx", rev = "912ef32461f0bf8ff9b3c9388eb0e178f80ff860" }
+zgx-desktop = { git = "file:///var/home/roan/Documents/zgx", rev = "912ef32461f0bf8ff9b3c9388eb0e178f80ff860" }
+zgx-script = { git = "file:///var/home/roan/Documents/zgx", rev = "912ef32461f0bf8ff9b3c9388eb0e178f80ff860" }
+zgx-gpu = { git = "file:///var/home/roan/Documents/zgx", rev = "912ef32461f0bf8ff9b3c9388eb0e178f80ff860" }
+zgx-run = { git = "file:///var/home/roan/Documents/zgx", rev = "912ef32461f0bf8ff9b3c9388eb0e178f80ff860" }
 
 # zgx is slow unoptimized (its own setting): optimize dependencies, keep
 # this crate quick to build.

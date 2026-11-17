@@ -39,6 +39,11 @@ return ui.component(function(props: { [any]: any }): Node
 			style[k] = v
 		end
 	end
+	-- (Linux fork) A string is shown as written: what fades is data (a branch,
+	-- a path, a commit's subject), and a `{name}` in it isn't a template.
+	if style.literal == nil and type(style[1]) == "string" then
+		style.literal = true
+	end
 	-- (`glide`: a RollText's, as `roll` is.)
 	if not props.roll then
 		style.glide = nil

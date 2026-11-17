@@ -437,6 +437,7 @@ end
 -- (changes.rs DIFF_TAB_SIZE, 4 columns).
 local TAB = 4
 local function expand(text: string): string
+	if #text > 16384 then return text end -- keep pathological lines as plain text
 	if not string.find(text, "\t", 1, true) then
 		return text
 	end
@@ -470,6 +471,7 @@ M.prefs = {
 -- isn't known); a language Zeron doesn't colour, none at all.
 export type Run = { text: string, color: string }
 local painted: { [any]: any } = setmetatable({}, { __mode = "k" }) :: any
+M.paint_version = ui.state("git.fallback_paint_version", 0)
 local TEXT = lex.C.text
 local function runs(line: string, spans: { any }): { Run }
 	local out: { Run } = {}
@@ -489,29 +491,57 @@ local function runs(line: string, spans: { any }): { Run }
 	end
 	return out
 end
+-- Fallback lexing yields between small batches. A native result replaces
+-- its cache, so an obsolete fallback job cannot overwrite full-file syntax.
+-- The module owns the pump, rather than a virtual row: scrolling a row
+-- away must not cancel a file's unfinished highlighting forever.
+local fallback_jobs: { () -> boolean } = {}
+local fallback_wake = ui.state("git.fallback_wake", 0)
+ui.effect(function()
+	fallback_wake:get()
+	local function pump()
+		local job = fallback_jobs[1]
+		if not job then return end
+		if job() then table.remove(fallback_jobs, 1) end
+		if #fallback_jobs > 0 then ui.after(1, pump) end
+	end
+	if #fallback_jobs > 0 then ui.after(1, pump) end
+end)
 function M.highlight(lines: { Line }, path: string?): { [number]: { Run } }?
 	local known = painted[lines]
-	if known ~= nil then
-		return if known then known else nil
-	end
+	if known ~= nil then return if known then known else nil end
 	local h = if path then Syntax.highlighter(Syntax.language(path)) else nil
-	if not h then
-		painted[lines] = false
-		return nil
-	end
+	if not h then painted[lines] = false; return nil end
 	local out: { [number]: { Run } } = {}
-	local state: any = 0
-	for i, l in lines do
-		if l.kind == "hunk" then
-			state = 0
-		else
-			local text = expand(l.text)
-			local spans
-			spans, state = h(text, state)
-			out[i] = runs(text, spans)
-		end
-	end
 	painted[lines] = out
+	local source = setmetatable({ lines }, { __mode = "v" })
+	local index, old_state, new_state = 1, 0 :: any, 0 :: any
+	local function batch()
+		local list = source[1]
+		if not list or painted[list] ~= out then return true end
+		local start, bytes, count = os.clock(), 0, 0
+		while index <= #list and count < 32 and bytes < 8192 and os.clock() - start < 0.002 do
+			local i, l = index, list[index]
+			index += 1; count += 1; bytes += #l.text
+			if l.kind == "hunk" or #l.text > 8192 then
+				old_state, new_state = 0, 0
+			else
+				local text = expand(l.text)
+				local spans
+				if l.kind == "-" then spans, old_state = h(text, old_state)
+				elseif l.kind == "+" then spans, new_state = h(text, new_state)
+				else
+					local ignored; ignored, old_state = h(text, old_state)
+					spans, new_state = h(text, new_state)
+				end
+				if #spans <= 128 then out[i] = runs(text, spans) end
+			end
+		end
+		if index > #list then M.paint_version:add(1); return true end
+		return false
+	end
+	table.insert(fallback_jobs, batch)
+	fallback_wake:add(1)
 	return out
 end
 
