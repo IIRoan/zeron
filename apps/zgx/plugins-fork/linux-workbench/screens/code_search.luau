@@ -104,8 +104,19 @@ return ui.component(function(props: { head: number?, lead: number? }): Node
 			},
 		}):await()
 	end)
+	-- What the last search failed with (a regular expression that doesn't
+	-- parse, say), as the desktop app's: the results gone, the whole message
+	-- in their place. (The last answer's matches are kept as a search fails:
+	-- they were listed under the error.)
+	local function failure(): string?
+		local e = result.error:get()
+		if S.query:get() == "" or not e or tostring(e) == "superseded" then
+			return nil
+		end
+		return (string.gsub(tostring(e), "^bad params: ", ""))
+	end
 	local function matches(): { any }
-		local r = if S.query:get() ~= "" then result.data:get() else nil
+		local r = if S.query:get() ~= "" and not failure() then result.data:get() else nil
 		return (r and r.matches) or {}
 	end
 	-- Files in the order their matches came, each then its lines.
@@ -142,9 +153,8 @@ return ui.component(function(props: { head: number?, lead: number? }): Node
 		if result.loading:get() and not r then
 			return "Searching…"
 		end
-		local e = result.error:get()
-		if e and tostring(e) ~= "superseded" then
-			return tostring(e)
+		if failure() then
+			return "Search failed"
 		end
 		if not r then
 			return "Searching…"
@@ -352,6 +362,22 @@ return ui.component(function(props: { head: number?, lead: number? }): Node
 			min_h = 0,
 			ui.column {
 				w_full = true,
+				ui.show(function(): boolean
+					return failure() ~= nil
+				end, ui.text {
+					function(): string
+						return failure() or ""
+					end,
+					id = "fork-code-search-error",
+					literal = true,
+					wrap = true,
+					w_full = true,
+					px = "$space.3",
+					py = "$space.2",
+					font = "$font.mono",
+					text_size = "$font.size.xs",
+					color = "$danger",
+				}),
 				-- (Files folding and new results: the rest slide into place.)
 				fm.each(rows, function(row: any): string
 					return row.key

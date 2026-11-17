@@ -6,7 +6,6 @@ local FadeText = require("@ds/fade_text")
 local Status = require("@ds/status")
 local Dropdown = require("@ds/dropdown")
 local ContextMenu = require("./ui/context_menu")
-local Dialog = require("@ds/dialog").Dialog
 local TextField = require("@ds/text_field")
 local fm = require("./fork_motion")
 
@@ -16,13 +15,13 @@ return function(zeron: any, Model: any)
         local m = Model.get(p.context)
         local box = ui.ref()
         local editor_kind = ui.use_state("services")
-        local activate = ui.use_state(false)
         local terminal = ui.use_state(nil :: any)
         local output_error = ui.use_state("")
         local output_key = ""
         local filter=ui.use_state("")
-        local open_actions: any=nil
-        local action_button: any=nil
+        -- The actions menu, opened by its button as upstream's ⋯ menus are
+        -- (the menu's `open`): under it, its first item lit for the keys.
+        local actions_open=ui.use_state(false)
         ui.after(0,function() m.refresh() end)
         ui.every(2000,function() if (box.width or 0)>0 and (box.height or 0)>0 then m.refresh() end end)
         local function selected_service(): any?
@@ -60,9 +59,13 @@ return function(zeron: any, Model: any)
             if m.pending:get()[id] or m.pending:get()["*"] or Model.startup(m.snapshot:get(),id) or (run and (run.status=="restarting" or run.readiness=="checking")) then return "$warning" end
             return if Model.active(run) then "$success" else "$text.tertiary"
         end
+        -- The engine's words while it has any (what a start waits for, a
+        -- readiness check, a retry); "Working…" only while it has none yet.
         local function state_label(id: string): string
-            if m.pending:get()[id] or m.pending:get()["*"] then return "Working…" end
-            return Model.startup(m.snapshot:get(),id) or Model.label(Model.run(m.snapshot:get(),id))
+            local said=Model.startup(m.snapshot:get(),id);if said then return said end
+            local run=Model.run(m.snapshot:get(),id)
+            if (m.pending:get()[id] or m.pending:get()["*"]) and not (run and (run.status=="restarting" or run.readiness=="checking")) then return "Working…" end
+            return Model.label(run)
         end
         -- Running, or on its way (Stop ends a start too).
         local function going(id: string, snapshot: any?): boolean
@@ -127,11 +130,11 @@ return function(zeron: any, Model: any)
                                     hover={bg="$hover"},on_click=function() m.selected:set(service.id) end,
                                     ui.column {grow=1,min_w=0,gap="$space.1",
                                         ui.row {w_full=true,items="center",gap="$space.2",
-                                            dot(service.id),FadeText {service.name,grow=1,weight="$font.weight.medium",text_size="$font.size.sm"},
+                                            dot(service.id),FadeText {service.name,literal=true,grow=1,weight="$font.weight.medium",text_size="$font.size.sm"},
                                             if Model.database(service) then ui.text {"Shared",text_size="$font.size.xs",color="$text.tertiary"} else nil},
                                         ui.row {w_full=true,items="center",gap="$space.2",pl=ui.raw(15,"align status with the service name"),
                                             ui.text {function() return state_label(service.id) end,color=function() return ink(service.id) end,text_size="$font.size.xs"},
-                                            if wide then FadeText {service.command,grow=1,font="$font.mono",text_size="$font.size.xs",color="$text.tertiary"} else nil}}}}
+                                            if wide then FadeText {service.command,literal=true,grow=1,font="$font.mono",text_size="$font.size.xs",color="$text.tertiary"} else nil}}}}
                         end),
                         fm.show(function() return #visible:get()==0 end,ui.text {"No matching services",p="$space.3",wrap=true,color="$text.secondary",text_size="$font.size.sm"})}}}
         end
@@ -183,14 +186,14 @@ return function(zeron: any, Model: any)
         return ui.column {ref=box,id="project-services",w_full=true,h_full=true,min_h=0,
             ui.row {id="services-toolbar",w_full=true,h=42,shrink=0,px="$space.3",gap="$space.2",items="center",border_sides={0,0,1,0},border_color="$border.subtle",
                 ui.text {"Services",weight="$font.weight.semibold",text_size="$font.size.sm"},
-                ui.div {grow=1,min_w=0,ui.show(function() return (box.width or 0)>=520 end,FadeText {p.context.name,w_full=true,text_size="$font.size.xs",color="$text.secondary"})},
+                ui.div {grow=1,min_w=0,ui.show(function() return (box.width or 0)>=520 end,FadeText {p.context.name,literal=true,w_full=true,text_size="$font.size.xs",color="$text.secondary"})},
                 ui.show(function() return (box.width or 0)>=650 end,ui.text {function()
                     local snapshot=m.snapshot:get();if not snapshot or #snapshot.config.services==0 then return "" end
                     local active=0;for _,run in snapshot.runs do if Model.active(run) then active+=1 end end
                     return `{active}/{#snapshot.config.services} running`
                 end,text_size="$font.size.xs",color="$text.secondary"}),
                 Button {"Edit services",tone="ghost",size="xs",on_click=function() edit("services") end},
-                ContextMenu {hook=function(show: any) open_actions=show end,items=function() return {
+                ContextMenu {open=actions_open,label="Service actions",items=function() return {
                     {label="Start all",icon="action-play",disabled=m.busy(nil),on_select=function() m.control("start",nil) end},
                     {label="Stop app services",icon="stop",disabled=m.busy(nil),on_select=function() m.control("stop-worktree",nil) end},
                     {label="Stop all, including databases",icon="stop",disabled=m.busy(nil),on_select=function() m.control("stop",nil) end},
@@ -201,23 +204,18 @@ return function(zeron: any, Model: any)
                     {label="Project settings…",icon="worktree",on_select=function() zeron.open {settings=`project:{p.context.project}`} end},
                     {label="Refresh",icon="refresh",on_select=function() m.refresh() end},
                 } end,
-                    IconButton {icon="more-horizontal",label="Service actions",size="sm",on_mount=function(el: any) action_button=el end,on_click=function()
-                        if open_actions and action_button then open_actions(action_button.x,action_button.y+action_button.height) end
-                    end},
+                    IconButton {icon="more-horizontal",label="Service actions",size="sm",on_click=function() actions_open:set(not actions_open:peek()) end},
                 },
             },
-            fm.show(function() local s=m.snapshot:get();return s~=nil and s.checkout~=nil and s.checkout~=p.context.scope.cwd end,
-                ui.row {w_full=true,px="$space.3",py="$space.1",gap="$space.2",items="center",
-                    ui.text {"Services are running in another checkout.",grow=1,text_size="$font.size.xs",color="$warning",wrap=true},
-                    Button {"Use this checkout",size="xs",disabled=function() return m.busy(nil) end,on_click=function() activate:set(true) end}}),
+            -- (No "running in another checkout" banner: selecting a chat hands
+            -- the services to its checkout (init.luau), and the engine's
+            -- snapshot names the checkout asked about, never another.)
             fm.show(function() return m.error:get()~="" end,ui.text {function() return m.error:get() end,px="$space.3",py="$space.2",wrap=true,color="$danger",text_size="$font.size.sm"}),
             ui.presence(function() return if (box.width or 0)>=580 then "wide" else "narrow" end,function(kind: string): Node
                 return (if kind=="wide" then ui.row else ui.column) {w_full=true,grow=1,min_h=0,
                     ui.show(function() local s=m.snapshot:get();return s~=nil and #s.config.services>0 end,service_list(kind=="wide")),output()}
             end,{w_full=true,grow=1,min_h=0}),
             Editor {model=m,kind=function() return editor_kind:get() end},
-            Dialog {open=activate,title="Move services to this checkout?",body="App services in the previous checkout will stop. Shared databases stay in the main project folder.",
-                confirm={label="Use this checkout",on_click=function() m.control("activate",nil) end}},
         }
     end)
     return ui.component(function(p: any): Node

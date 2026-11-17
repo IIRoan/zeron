@@ -17,7 +17,7 @@ return function(zeron: any, Model: any)
         return ui.column {gap="$space.1", w_full=true,
             if p.multiline then TextArea {value=value,label=p.label,rows=3,max_rows=8}
             else TextField {value=value,label=p.label,placeholder=p.placeholder or "",w_full=true,font=if p.code then "$font.mono" else "$font.sans"},
-            if p.description then ui.text {p.description,wrap=true,color="$text.tertiary",text_size="$font.size.xs"} else nil,
+            if p.description then ui.text {p.description,literal=true,wrap=true,color="$text.tertiary",text_size="$font.size.xs"} else nil,
         }
     end)
     local Toggle = ui.component(function(p: any): Node
@@ -177,7 +177,8 @@ return function(zeron: any, Model: any)
                     else "Only these services and their requirements start first. Databases must pass their ready check.",
                     wrap=true,color="$text.tertiary",text_size="$font.size.xs"}}
             for _,c in candidates do
-                table.insert(rows,Toggle {label=`Wait for {c.name}`,value=table.find(chosen,c.id)~=nil,
+                -- (A function: its name as written, never read as a template.)
+                table.insert(rows,Toggle {label=function() return `Wait for {c.name}` end,value=table.find(chosen,c.id)~=nil,
                     changed=function(v: boolean) set_depends(s.id,c.id,v) end})
             end
             return ui.column(rows)

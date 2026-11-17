@@ -3464,6 +3464,11 @@ local places: State<Places> = props.places or ui.use_state({ pinned = pinned_ids
 			provide = if g.project then { project = g.project } else nil,
 			name = name,
 			hovered = hovered,
+			-- (A project's: room for its settings beside it (a small icon
+			-- button, 22), below, and the list's gap, as the foot's for
+			-- settings. Its full width, the new chat under the pointer stood
+			-- under the gear.)
+			less = if g.project then 22 + ((ui.theme.get("zeron.list.gap") :: number?) or 2) else nil,
 			lead = g.tile(hidden, sessions),
 			leads = g.shows_tile,
 			indent = if tree_of
@@ -3496,7 +3501,7 @@ local places: State<Places> = props.places or ui.use_state({ pinned = pinned_ids
 		if project then
 			-- Its settings (Settings → Projects, its page: environment,
 			-- worktrees, services), and what plugins put beside it.
-			header = ui.row {w_full=true,items="center",provide={project=project},
+			header = ui.row {w_full=true,items="center",gap="$zeron.list.gap",provide={project=project},
 				ui.div {grow=1,min_w=0,header},
 				IconButton {icon="settings",label="Project settings",size="sm",tone="quiet",shrink=0,on_click=function()
 					require("@app/screens/settings/projects").open(if type(project)=="table" then project.id else project)

@@ -55,8 +55,6 @@ local WINDOW_EDGE = 0
 -- The window's gap before the sidebar's card, part of the sidebar's move
 -- (screens/shell/sidebar `before`).
 local SIDEBAR_GAP = 0
--- The panel's Expand on the top bar (the bar's controls' size).
-local EXPAND = 24
 -- What the title line's right end keeps for the bar's controls there. (The
 -- line itself is the bar's: `ds.TitleBar.middle`.)
 local TITLE_RIGHT = 64
@@ -647,14 +645,14 @@ return function(props: Props): Node
 	-- The width it would take, its tree docked: as last split (opening, a
 	-- neighbour opening or closing) or dragged. Kept across launches.
 	local files_w = Prefs.persist("shell_files_width", FILES_W)
-	-- Each chat keeps its own (and its shell dock's height): screens/chat_sizes.
-	require("./chat_sizes").follow(files_w)
-	-- Whether a width was chosen (its edge dragged, or keyed) since it was
-	-- last opened or closed: until its toggle, it holds that width (another
-	-- chat's panel, a relaunch), the fit narrowing it only as it must. Its
-	-- toggle forgets it, as Zeron's does: it opens at its share again, and
-	-- keeps to its share as the window is resized.
+	-- Whether a width was chosen (its edge dragged, or keyed): it holds that
+	-- width (opened again, another chat's panel, a relaunch), the fit
+	-- narrowing it only as it must, as the Linux fork's desktop app kept its
+	-- panel's width. Until one is, or after its edge's double-click puts it
+	-- back, it opens at its share and keeps to it as the window is resized.
 	local chosen = Prefs.persist("shell_panel_width_chosen", false)
+	-- Each chat keeps its own (and its shell dock's height): screens/chat_sizes.
+	require("./chat_sizes").follow(files_w, chosen)
 	local from_x, from_w, resizing = 0, 0, false
 	-- Its edge being dragged: whether its tree was docked at the press (kept
 	-- until release: a drag across the line docks or floats it then, not as
@@ -837,32 +835,20 @@ return function(props: Props): Node
 			right_w:set(r)
 		end
 	end
-	-- (Whose panel shows: the session's, a plugin page's; none on a new
-	-- chat. Another one is the route moving, not the person opening or
-	-- closing this one, and the panel lands at once, as it is there.)
-	local function owner(peek: boolean): string
-		local c: any = if peek then route.chat:peek() else route.chat:get()
-		if c.name == "plugin" then
-			return `page:{c.plugin or ""}/{c.page or ""}`
-		end
-		return if c.name == "session" then `chat:{c.session or ""}` else c.name or ""
-	end
-	-- It opens at its share, unless a width was chosen since its toggle
-	-- (its edge dragged, then another chat's panel shown, or the fit hiding
-	-- it for room and bringing it back). Its toggle, opening or closing it,
-	-- forgets that width. (The sidebar folding or coming back splits them
-	-- again too, above, as Zeron's does: Gaël's call over Wing's earlier
-	-- rule, where the chat took all the sidebar gave and the panel held.)
-	local split = { on = shown:peek(), open = props.files:peek(), owner = owner(true) }
+	-- It opens at its share, unless a width was chosen (its edge dragged:
+	-- then opened again, another chat's panel shown, a relaunch, or the fit
+	-- hiding it for room and bringing it back, it's at that width). Its
+	-- toggle keeps that width, as the Linux fork's desktop app did: opening
+	-- it forgot the width, so a relaunch (every panel closed) opened it at
+	-- its share and that was kept as the chat's own (screens/chat_sizes).
+	-- (The sidebar folding or coming back splits them again, above, as
+	-- Zeron's does: Gaël's call over Wing's earlier rule, where the chat
+	-- took all the sidebar gave and the panel held.)
+	local was_on = shown:peek()
 	ui.effect(function()
 		local on = shown:get()
-		local open, who = props.files:get(), owner(false)
-		local changed = on ~= split.on
-		local toggled = open ~= split.open and who == split.owner
-		split = { on = on, open = open, owner = who }
-		if toggled and chosen:peek() then
-			chosen:set(false)
-		end
+		local changed = on ~= was_on
+		was_on = on
 		local vw = fit.viewport:peek()
 		if changed and on and not shell_view.expanded:peek() and vw > 0 then
 			local side = sidebar_settled()
@@ -2061,62 +2047,27 @@ return function(props: Props): Node
 				return 44 + (if shown:get() then open_w:get() + gap_before:get() else 0) + 8
 			end,
 			-- (Clear of the title bar's box where it stands over the page (the
-			-- chat list folded: screens/title_bar), and of Expand while the
-			-- panel's open.)
+			-- chat list folded: screens/title_bar). The fork has no Expand.)
 			right = function(): number
 				local fork_layout = require("./fork_layout")
-				local toggle = fork_layout.bar_w() - fork_layout.list_w() + 8
-				local right = if shown:get() then toggle + EXPAND + 8 else toggle
+				local right = fork_layout.bar_w() - fork_layout.list_w() + 8
 				-- (And of what there is to update.)
 				local button = updates.width()
 				return if button > 0 then right + button + 8 else right
 			end,
 		},
-		-- What there is to update, beside the panel toggle (and Expand, with the
-		-- panel open): nothing with nothing to say.
+		-- What there is to update, beside the panel toggle: nothing with
+		-- nothing to say.
 		ui.show(updates.shown, ui.div {
 			absolute = true,
 			right = function(): number
-				local toggle = 24 + 8 + ds.TitleBar.actions_right()
-				return ui.raw(if shown:get() then toggle + EXPAND + 8 else toggle, "off the panel toggle")
+				return ui.raw(24 + 8 + ds.TitleBar.actions_right(), "off the panel toggle")
 			end,
 			top = function(): number
 				return ds.TitleBar.middle() - 14
 			end,
 			pointer_events = "auto",
 			updates.Button {},
-		}),
-		-- Expand: the panel over the session's chat, and back, on the top bar beside
-		-- the panel toggle, as far off it as Back is off the sidebar's toggle.
-		ui.show(function(): boolean
-			return shown:get()
-		end, ui.div {
-			absolute = true,
-			right = function(): number
-				return ui.raw(24 + 8 + ds.TitleBar.actions_right(), "off the panel toggle")
-			end,
-			top = function(): number
-				return ds.TitleBar.middle() - EXPAND / 2
-			end,
-			pointer_events = "auto",
-			-- (Its name, glyph and tooltip swap as it flips: two buttons.)
-			ui.presence(function(): string
-				return if expanded() then "collapse" else "expand"
-			end, function(which: string): Node
-				return ds.IconButton {
-					id = "panel-expand",
-					label = if which == "collapse" then ui.t("panel.strip.collapse") else ui.t("panel.strip.expand"),
-					tooltip_side = "bottom",
-					w = EXPAND,
-					h = EXPAND,
-					-- (One of the title bar's: its glyph held under the pointer.)
-					tone = "bar",
-					on_click = function()
-						shell_view.toggle_expanded()
-					end,
-					ds.Icon { name = if which == "collapse" then "collapse-arrows" else "expand-arrows", size = 14, glyph_stroke = true },
-				}
-			end),
 		}),
 	}
 end

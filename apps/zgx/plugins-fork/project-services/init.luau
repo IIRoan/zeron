@@ -7,10 +7,17 @@ local Setup = require("./editor")(zeron,Model).Setup
 
 -- Foreground chat selection owns the checkout handoff. Polling and opening
 -- settings never activates an environment; shells can stay selected below.
+-- (A chat's page is the route "session": zeron.route's names.) Only a
+-- change of checkout claims one: another chat in the same checkout, the
+-- window refocused or a return from another page claims nothing again, as
+-- the old app's last activation (crates/ui/src/plugins/services/panel.rs).
 local desired: any=nil;local last="";local handing_off=false
 local function handoff()
-    if handing_off or not desired or last==desired.key then return end
-    local context=desired;last=context.key;handing_off=true
+    if handing_off or not desired then return end
+    local context=desired
+    local scope=`{context.scope.device}:{context.project}:{context.scope.cwd}`
+    if last==scope then return end
+    last=scope;handing_off=true
     local m=Model.get(context)
     local pending=table.clone(m.pending:peek());pending["*"]=true;m.pending:set(pending);m.epoch+=1
     local function settled(error: any?)
@@ -24,8 +31,7 @@ end
 ui.effect(function()
     local route=zeron.read("route");local window=zeron.window()
     local session=zeron.read("session")
-    desired=if route and route.name=="chat" and window.shown and window.active and session then Model.context(session,nil) else nil
-    if not desired then last="" end
+    desired=if route and route.name=="session" and window.shown and window.active and session then Model.context(session,nil) else nil
     handoff()
 end)
 

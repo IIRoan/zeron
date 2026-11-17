@@ -101,12 +101,12 @@ return function(zeron: any,Model: any,Field: any,Toggle: any,ServiceEditor: any)
                 table.insert(children,Field(p))
             end
             if section=="overview" then
-                table.insert(children,ui.text {if key=="" then "Project defaults apply to every checkout without an override." else key,wrap=true,color="$text.secondary"})
+                table.insert(children,ui.text {if key=="" then "Project defaults apply to every checkout without an override." else key,literal=true,wrap=true,color="$text.secondary"})
                 if key~="" then
                     local phase="Not prepared"
                     local phases={notPrepared="Not prepared",preparing="Preparing…",ready="Ready",failed="Failed",interrupted="Interrupted"}
                     for _,entry in snapshot.worktrees or {} do if entry.path==key then phase=(phases[entry.state.phase] or entry.state.phase) .. (if entry.state.error then `: {entry.state.error}` else "") end end
-                    table.insert(children,ui.text {phase,wrap=true})
+                    table.insert(children,ui.text {phase,literal=true,wrap=true})
                     table.insert(children,ui.row {gap="$space.2",flex_wrap=true,
                         Button {"Prepare worktree",size="sm",disabled=w.busy,on_click=function() operation("PrepareWorktree") end},
                         Button {"Cancel setup",size="sm",tone="secondary",on_click=function() operation("CancelWorktreeSetup") end},
@@ -163,7 +163,7 @@ return function(zeron: any,Model: any,Field: any,Toggle: any,ServiceEditor: any)
                 selected.key ..= ":worktree-service-editor"
                 local services=Model.get(selected)
                 table.insert(children,ui.text {"App services are saved separately from environment settings.",wrap=true,color="$text.secondary"})
-                for _,service in snapshot.appServices or {} do table.insert(children,ui.text {`{service.name}: {service.command}`,wrap=true,font="$font.mono",text_size="$font.size.sm"}) end
+                for _,service in snapshot.appServices or {} do table.insert(children,ui.text {`{service.name}: {service.command}`,literal=true,wrap=true,font="$font.mono",text_size="$font.size.sm"}) end
                 table.insert(children,Button {if key=="" then "Edit app services…" else "Customize for this worktree…",tone="secondary",on_click=function() services.snapshot:set(nil);services.editor:set(true) end})
                 if key~="" then table.insert(children,Button {"Use project services",tone="ghost",disabled=w.busy,on_click=function()
                     w.busy:set(true)

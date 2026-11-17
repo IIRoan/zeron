@@ -78,6 +78,9 @@ export type Account = {
 	-- for a face (`provider`, the agent's id for it).
 	key: boolean?,
 	provider: string?,
+	-- (Linux fork) Why it has no windows, in the engine's words ("Signed out
+	-- — sign in again"): said after its plan, no meters.
+	error: string?,
 }
 
 -- One model provider's accounts of an agent that keeps a login per
@@ -447,7 +450,16 @@ local function account(c: CardProps, row: State<Account>, group: { read_only: bo
 				then locale.s("ds.provider_card.limit_reached_plan", { plan = a.plan, words = words })
 				else locale.s("ds.provider_card.limit_reached", { words = words })
 		end
+		-- (Linux fork) Its windows didn't come: why, after the plan.
+		if a.error and a.key ~= true then
+			return if a.plan ~= "" then `{a.plan} · {a.error}` else a.error
+		end
 		return a.plan
+	end
+	-- (Linux fork) Meters only for what has windows to show.
+	local function metered(): boolean
+		local a = row:get()
+		return a.key ~= true and a.error == nil
 	end
 	-- Both windows' resets, over the meters (the shipping app's tooltip).
 	local function resets(): string?
@@ -491,9 +503,7 @@ local function account(c: CardProps, row: State<Account>, group: { read_only: bo
 			gap = "$space.3",
 			items = "center",
 			-- (An API key has no plan, so no windows: no meters for it.)
-			ui.show(function(): boolean
-				return row:get().key ~= true
-			end, ui.column {
+			ui.show(metered, ui.column {
 				gap = "$zeron.space.hair",
 				-- (Labels alone where no reset is known, as the shipping app.)
 				tooltip = Tooltip {

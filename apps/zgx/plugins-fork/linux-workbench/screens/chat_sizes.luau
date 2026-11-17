@@ -33,8 +33,12 @@ function M.pruned(all: { [string]: any }): { [string]: any }
 end
 
 -- Follow the session showing: put its sizes back as it shows, and keep
--- them as they're changed. `files_w` is the page's files panel width.
-function M.follow(files_w: any)
+-- them as they're changed. `files_w` is the page's files panel width,
+-- `chosen` whether it was dragged: only a dragged width is a chat's own,
+-- as the desktop app kept only a resize (`remember_panel_size`). The share
+-- the panel opens at, kept, came back as the chat's width over what it was
+-- dragged to; put back, a width is chosen again.
+function M.follow(files_w: any, chosen: any)
 	local current: string? = nil
 	ui.effect(function()
 		local session = route.session:get()
@@ -47,6 +51,7 @@ function M.follow(files_w: any)
 		if saved then
 			if saved.files then
 				files_w:set(saved.files)
+				chosen:set(true)
 			end
 			if saved.terminal then
 				fork_layout.height:set(saved.terminal)
@@ -57,11 +62,14 @@ function M.follow(files_w: any)
 	local files = ui.debounced(files_w, 300)
 	local height = ui.debounced(fork_layout.height, 300)
 	ui.effect(function()
-		local f, h = files:get(), height:get()
+		local w, h = files:get(), height:get()
 		local id = current
 		if not id then
 			return
 		end
+		-- (Its share, not chosen: none of its own. Its edge double-clicked
+		-- back to it, what it was dragged to is forgotten.)
+		local f: number? = if chosen:peek() then w else nil
 		local all = sizes:peek()
 		local mine = all[id]
 		if mine and mine.files == f and mine.terminal == h then

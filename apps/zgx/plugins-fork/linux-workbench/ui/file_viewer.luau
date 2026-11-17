@@ -1557,6 +1557,24 @@ local function component(props: Props): Node
 
 	-- The code, in the editor.
 	local function code(language: string?, path: string): Node
+		-- A line asked for, this editor's only once its file is the one
+		-- showing: the editor it replaces stays while it fades (`mode =
+		-- "wait"`), and took the line itself, the new file opening at its top.
+		local reveal: any = nil
+		if props.reveal_line then
+			local asked = props.reveal_line
+			reveal = ui.use_state(nil :: any)
+			ui.effect(function()
+				local at = asked:get()
+				local d = doc()
+				if at ~= nil and d and d.path == path then
+					ui.batch(function()
+						asked:set(nil)
+						reveal:set(at)
+					end)
+				end
+			end)
+		end
 		return CodeEditor {
 			value = text,
 			saved = base,
@@ -1588,7 +1606,7 @@ local function component(props: Props): Node
 				else nil,
 			label = base_name(path),
 			text_size = if props.code_size then props.code_size() else nil,
-			reveal = props.reveal_line,
+			reveal = reveal,
 			escape_hint = props.escape_hint,
 			w_full = true,
 			h_full = true,

@@ -192,7 +192,7 @@ return function(zeron: any, Model: any)
 					grow = 1,
 					gap = 0,
 					ui.text { "Sandbox", weight = "$font.weight.semibold" },
-					ui.text { m.context.name, color = "$text.tertiary", text_size = "$font.size.xs" },
+					ui.text { m.context.name, literal = true, color = "$text.tertiary", text_size = "$font.size.xs" },
 				},
 				ui.presence(function()
 					local word, tone = pill()
@@ -235,7 +235,7 @@ return function(zeron: any, Model: any)
 			}),
 			fm.show(function()
 				return m.error:get() ~= ""
-			end, ui.text { m.error, wrap = true, color = "$danger", text_size = "$font.size.sm" }),
+			end, ui.text { m.error, literal = true, wrap = true, color = "$danger", text_size = "$font.size.sm" }),
 			ui.column {
 				w_full = true,
 				grow = 1,

@@ -578,7 +578,7 @@ return function(zeron: any, Model: any)
 				}),
 				fm.show(function()
 					return m.error:get() ~= ""
-				end, ui.text { m.error, wrap = true, color = "$danger", text_size = "$font.size.sm" }),
+				end, ui.text { m.error, literal = true, wrap = true, color = "$danger", text_size = "$font.size.sm" }),
 				fm.show(function()
 					return m.state() == "running"
 				end, run()),

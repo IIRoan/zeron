@@ -46,8 +46,10 @@ local compact_shown = ui.shared("chat.compact", false)
 ui.effect(function()
 	compact_shown:set(M.compact_transcript:get())
 end)
--- (The shipping app's `open_web_links_in_zeron`, on by default.)
-M.open_links = ui.persist("settings_open_links", "zeron")
+-- (The shipping app's `open_web_links_in_zeron`, on by default. Linux fork:
+-- the default browser by default, as the fork's chat links always opened;
+-- a choice made here is kept.)
+M.open_links = ui.persist("settings_open_links", "external")
 -- (The design system's own, so every PrivateText follows it.)
 M.hide_emails = PrivateText.hidden
 
