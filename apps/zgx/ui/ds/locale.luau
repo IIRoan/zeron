@@ -21,6 +21,10 @@
 --
 -- Dates and times read the same way in every screen through these.
 
+local control = require("@self/control")
+type Argument = string | number | boolean | Readable<unknown> | (() -> unknown)
+export type Arguments = { read [string]: Argument }
+
 local M = {}
 
 -- (Loaded already, by this host's app or an earlier load, a message is
@@ -53,7 +57,7 @@ end
 local english: { [string]: string }? = nil
 local function value(v: any): any
 	if type(v) == "function" then
-		return v()
+		return control.value(v)
 	elseif type(v) == "table" or type(v) == "userdata" then
 		local ok, got = pcall(function()
 			return v:get()
@@ -62,8 +66,8 @@ local function value(v: any): any
 	end
 	return v
 end
-local function format(msg: string, args: { [string]: any }, count: number?): string
-	local out = {}
+local function format(msg: string, args: Arguments, count: number?): string
+	local out: { string } = {}
 	local i, n = 1, #msg
 	local function word(): string
 		local w = string.match(msg, "^%s*([%w_.=-]+)%s*", i)
@@ -156,7 +160,7 @@ local function format(msg: string, args: { [string]: any }, count: number?): str
 	end
 	return table.concat(out)
 end
-local function english_of(key: string, args: { [string]: any }?): string
+local function english_of(key: string, args: Arguments?): string
 	if not english then
 		local ok, words = pcall(require, "@self/locale_en")
 		english = if ok then words else {}
@@ -171,24 +175,24 @@ end
 -- An ICU message formatted with `args` by English's plural rules (a
 -- plugin's own words, plugins-sdk/zeron.luau `zeron.s`): `{name}`, plural
 -- (`one`, `other`, `=N`), select, number.
-function M.format(msg: string, args: { [string]: any }?): string
+function M.format(msg: string, args: Arguments?): string
 	return format(msg, args or {}, nil)
 end
 
 -- A message to show: it follows the locale. (English text, in a VM without
 -- the catalog yet.)
-function M.t(key: string, args: { [string]: any }?): Message | string
+function M.t(key: string, args: Arguments?): Message | string
 	if catalog() then
-		return ui.t(key, args)
+		return ui.t(key, if args then table.clone(args) :: { [string]: Argument } else nil)
 	end
 	return english_of(key, args)
 end
 
 -- A message's text now (tracked: a function or computed reading it
 -- follows the locale). For what wants a string: a tooltip, a sort.
-function M.s(key: string, args: { [string]: any }?): string
+function M.s(key: string, args: Arguments?): string
 	if catalog() then
-		return ui.t(key, args):get()
+		return ui.t(key, if args then table.clone(args) :: { [string]: Argument } else nil):get()
 	end
 	return english_of(key, args)
 end

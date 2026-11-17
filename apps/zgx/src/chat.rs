@@ -5530,9 +5530,13 @@ fn tool_row(part: &Json, live: bool) -> Option<Value> {
     if let Some(target) = &target {
         fields.push(("target", Value::from(target.as_str())));
     }
-    // The whole call, for the row opened, when it says more than the line.
-    if let Some(call) = call_text(part).filter(|c| Some(c) != target.as_ref()) {
+    if let Some(call) = call_text(part) {
         fields.push(("call", Value::from(call.as_str())));
+    }
+    if matches!(kind, "read" | "write" | "edit")
+        && let Some(path) = part["call"]["path"].as_str()
+    {
+        fields.push(("path", Value::from(path)));
     }
     if part["isError"].as_bool() == Some(true) {
         fields.push(("failed", Value::Bool(true)));
@@ -5567,10 +5571,7 @@ fn tool_row(part: &Json, live: bool) -> Option<Value> {
 const CALL_MAX_LINES: usize = 200;
 const CALL_LINE_MAX_CHARS: usize = 2_000;
 
-/// A tool's whole call, as the shipping app's `call_block` writes it: the
-/// whole command, pattern (and where), url (and what was asked of it), the
-/// plan's items one a line, an MCP or other tool's input as JSON. None for
-/// thinking, and where the call is only a path (the line names it).
+/// The expanded invocation: command, file path, search, plan, or tool input.
 fn call_text(part: &Json) -> Option<String> {
     if part["kind"].as_str() != Some("tool") {
         return None;
@@ -5588,6 +5589,11 @@ fn call_text(part: &Json) -> Option<String> {
     };
     let text = match call["kind"].as_str().unwrap_or_default() {
         "exec" => s("command")?.to_owned(),
+        "readFile" | "editFile" | "applyPatch" => s("path")?.to_owned(),
+        "writeFile" => match s("content") {
+            Some(content) => format!("{}\n{content}", s("path")?),
+            None => s("path")?.to_owned(),
+        },
         "search" => match s("path") {
             Some(path) => format!("{} in {path}", s("pattern")?),
             None => s("pattern")?.to_owned(),
@@ -7400,10 +7406,17 @@ mod tests {
         assert!(!line.contains('\n'));
         assert!(line.starts_with("echo '--- a'; git grep -n x echo '--- b'"));
         assert_eq!(str_of(&ran, "call").as_deref(), Some(script));
-        // A command of one short line: nothing more to open to.
         let short = tool(&part(json!({ "kind": "exec", "command": "cargo test" }))).expect("a tool");
         assert_eq!(str_of(&short, "target").as_deref(), Some("cargo test"));
-        assert_eq!(str_of(&short, "call"), None);
+        assert_eq!(str_of(&short, "call").as_deref(), Some("cargo test"));
+        let command = format!("cargo test --package {}", "long-package-name-".repeat(20));
+        let long = tool(&part(json!({ "kind": "exec", "command": command }))).unwrap();
+        assert_eq!(str_of(&long, "call").as_deref(), Some(command.as_str()));
+        let read = tool(&part(json!({ "kind": "readFile", "path": "src/deep/app.rs" }))).unwrap();
+        assert_eq!(str_of(&read, "path").as_deref(), Some("src/deep/app.rs"));
+        assert_eq!(str_of(&read, "target").as_deref(), Some("app.rs"));
+        let write = tool(&part(json!({ "kind": "writeFile", "path": "src/new.rs", "content": "fn main() {}" }))).unwrap();
+        assert_eq!(str_of(&write, "call").as_deref(), Some("src/new.rs\nfn main() {}"));
         // A pattern with a newline and where it looked; an MCP call's input.
         let search = tool(&part(json!({ "kind": "search", "pattern": "fn a\\(\n", "path": "src" }))).expect("a tool");
         assert_eq!(str_of(&search, "target").as_deref(), Some("fn a\\("));
@@ -7414,7 +7427,7 @@ mod tests {
         // An edit names its file; its strings never reach its line.
         let edit = tool(&part(json!({ "kind": "editFile", "path": "src/a.rs", "old_string": "x\ny", "new_string": "z" }))).expect("a tool");
         assert_eq!(str_of(&edit, "target").as_deref(), Some("a.rs"));
-        assert_eq!(str_of(&edit, "call"), None);
+        assert_eq!(str_of(&edit, "call").as_deref(), Some("src/a.rs"));
         // A call past its cap says how much more there was.
         let long = (0..250).map(|i| format!("echo {i}")).collect::<Vec<_>>().join("\n");
         let big = tool(&part(json!({ "kind": "exec", "command": long }))).expect("a tool");

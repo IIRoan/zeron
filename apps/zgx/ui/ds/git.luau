@@ -138,7 +138,7 @@ function M.header(pr: Header, narrow: boolean?): Node
 	-- The first line: the title, its state and number right after it, and
 	-- the actions at the far end. (As a list with no hole: a header with no
 	-- actions has none.)
-	local first: { any } = { w_full = true, gap = "$space.3", items = "center" }
+	local first: ContainerProps = { w_full = true, gap = "$space.3", items = "center" }
 	table.insert(first, Text { pr.title, style = "heading", wrap = true, heading = 1, shrink = 1, min_w = 0 })
 	table.insert(first, Badge.PullRequest { state = pr.state :: any, number = pr.number, size = "md" })
 	table.insert(first, ui.div { grow = 1 })
@@ -148,7 +148,7 @@ function M.header(pr: Header, narrow: boolean?): Node
 	local lines: { Node } = { ui.row(first) }
 	-- Under it, who and when · where · how much: on one line at the
 	-- window's width, who on a line of its own at a side pane's.
-	local rest = if narrow then { dotted({ who }), dotted({ where, if stat then { stat } else {} }) } else { dotted({ who, where, if stat then { stat } else {} }) }
+	local rest: { { Node } } = if narrow then { dotted({ who }), dotted({ where, if stat then { stat } else {} }) } else { dotted({ who, where, if stat then { stat } else {} }) }
 	for _, line in rest do
 		if #line > 0 then
 			table.insert(lines, ui.row { gap = "$space.2", items = "center", flex_wrap = true, table.unpack(line) })
@@ -643,7 +643,8 @@ local function add_props(base: { [string]: any }, extra: { [string]: any }?, dra
 	for k, v in extra do
 		p[k] = v
 	end
-	local drag, ended = extra.on_drag, extra.on_drag_end
+	local drag = extra.on_drag :: (() -> unknown)?
+	local ended = extra.on_drag_end :: ((unknown, boolean) -> ())?
 	if drag then
 		p.on_drag = function(): any
 			dragging:set(true)
@@ -1265,7 +1266,7 @@ local function event(e: Event, last: boolean, o: ActivityOpts): Node
 			note(table.unpack(rows)),
 		}
 	elseif e.kind == "comment" then
-		local who = e.who or { id = "someone", name = locale.s("ds.git.someone") }
+		local who: people.Who = e.who or { id = "someone", name = locale.s("ds.git.someone") }
 		lead = people.face(who, LEAD)
 		local parts: { Node } = {
 			if e.where
@@ -1290,7 +1291,7 @@ local function event(e: Event, last: boolean, o: ActivityOpts): Node
 			nil
 		)
 	elseif e.kind == "review" then
-		local who = e.who or { id = "someone", name = locale.s("ds.git.someone") }
+		local who: people.Who = e.who or { id = "someone", name = locale.s("ds.git.someone") }
 		lead = people.face(who, LEAD)
 		local verb = e.verb
 			or (if e.verdict == "approved"
@@ -1320,7 +1321,7 @@ local function event(e: Event, last: boolean, o: ActivityOpts): Node
 end
 
 function M.activity(events: { Event }, opts: ActivityOpts?): Node
-	local o = opts or {}
+	local o: ActivityOpts = opts or {}
 	local rows: { Node } = {}
 	for i, e in events do
 		table.insert(rows, event(e, i == #events, o))

@@ -166,7 +166,7 @@ local SAME: { [string]: string } = { magnifer = "search" }
 -- Each glyph's SVG travels as code (ds/icon_svgs, made from
 -- assets/icons/ui by tools/icon_svgs.py): a plugin lent the design system
 -- loads no file outside its own folder, and draws these all the same.
-local SVGS: { [string]: string } = require("@ds/icon_svgs")
+local SVGS = require("@ds/icon_svgs") :: { read [string]: string }
 local function file(name: string): string
 	local key = SAME[name] or name
 	local code = SVGS[key]

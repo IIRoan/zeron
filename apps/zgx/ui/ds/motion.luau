@@ -14,6 +14,7 @@
 --   anime.animate(width, motion.column(from, to))     { value, duration, ease }
 --   ui.tween(x, motion.sidebar)                        the sidebar's own move
 
+local control = require("@self/control")
 local prefers = require("@self/prefers")
 
 local M = {}
@@ -50,7 +51,7 @@ local function landed(target: any, opts: { from: any?, to: any? }): any
 	-- (A state or a computed, tracked; a function's answer.)
 	local function now(): any
 		if type(target) == "function" then
-			return target()
+			return control.value(target)
 		elseif type(target) == "userdata" or type(target) == "table" then
 			local ok, getter = pcall(function()
 				return (target :: any).get
@@ -266,7 +267,12 @@ M.TAB_LIFT_TWEEN = { duration = 120, ease = "out(3)" } :: TweenOptions
 -- tab on this one too, so the two never drift apart.
 M.TAB_SLIDE_SPRING = { stiffness = 600, damping = 49 } :: SpringOptions
 function M.tab_slide(): { [string]: any }?
-	return M.layout { spring = anime.createSpring(M.TAB_SLIDE_SPRING) }
+	return M.layout {
+		spring = anime.createSpring {
+			stiffness = M.TAB_SLIDE_SPRING.stiffness,
+			damping = M.TAB_SLIDE_SPRING.damping,
+		},
+	}
 end
 -- A tab carried near an end of its strip scrolls the strip under it, this
 -- far from the edge, at this many points a second, till the end.

@@ -28,6 +28,7 @@ local Markdown = require("@self/markdown")
 local locale = require("@self/locale")
 local ReplyPicture = require("@self/reply_picture")
 local FoldButton = require("@self/fold_button")
+local FileIcon = require("@self/file_icons")
 
 -- (`cloud`, `git`: a Cloud machine's own setup steps, the machine and its
 -- checkout.)
@@ -41,6 +42,7 @@ export type Tool = {
 	-- A subagent's spawn: the doc it runs in, how it stands, its title.
 	subagent: { ref: string, title: string?, status: string? }?,
 	target: string?,
+	path: string?,
 	-- The whole call, when the line says less (a command of many lines, a
 	-- tool's input): the row opens to it.
 	call: string?,
@@ -88,6 +90,8 @@ export type Props = {
 	-- A subagent's spawn row (its tool's `subagent`): what opens it (its
 	-- lane). Without it, the row opens its call as any does.
 	open_subagent: ((sub: any) -> ())?,
+	open_link: ((target: string) -> ())?,
+	link_chip: ((target: string) -> { file: boolean?, skill: string? }?)?,
 	-- Where a tool's pictures are read from (ds/transcript's
 	-- `shown_pictures`: files on the chat's host). Without it, none show.
 	pictures: ReplyPicture.Pictures?,
@@ -206,6 +210,7 @@ end
 -- as tall as it is.
 local function call_block(now: () -> Tool): Node
 	return ui.div {
+		class = "tool-call",
 		ml = ui.raw(GUTTER, "under the line's words, past the tree's gutter"),
 		mb = "$space.1",
 		px = "$space.3",
@@ -347,10 +352,6 @@ local GROUPS_CHOSEN = ui.state("activity_groups_chosen", {} :: { [string]: boole
 -- (ds/user_message): the words are laid out whole behind the clip, so
 -- nothing rewraps as it opens.
 --
--- Being written or settled, the fold is the same: its first lines, fading
--- out at the foot, "Show all N lines" under them. (Zeron's streaming thought
--- keeps its tail, the fade at the top; the user wanted one fold, faded at
--- the foot, Nov 2 2026.)
 local THOUGHT_LINES = 4
 local THOUGHT_FADE = 1.5
 -- The button, and the room it takes under the words (folded, under their
@@ -424,7 +425,7 @@ local function thought_row(
 	below: () -> boolean,
 	writing: Writing?,
 	group: string?,
-	resized: ((size: { w: number, h: number }) -> ())?
+	resized: ((size: Size, element: Element) -> ())?
 ): Node
 	local id = now().id
 	local line = ui.theme.get("zeron.prose.small.line") :: number
@@ -475,14 +476,14 @@ local function thought_row(
 	-- Written and folded: the words shifted up so their latest line sits
 	-- at the window's foot.
 	local function rise(): number
-		return 0
+		return if live() and folded() then -math.max(0, (body.height or 0) - folded_h) else 0
 	end
 	local function fade(): { number }
 		if not folded() then
 			return { 0, 0 }
 		end
 		local px = line * THOUGHT_FADE
-		return { 0, px }
+		return if live() then { px, 0 } else { 0, px }
 	end
 	local function label(): string
 		return if is_open() then locale.s("ds.activity.show_fewer_lines") else locale.s("ds.activity.show_all_lines", { n = tostring(lines()) })
@@ -594,13 +595,26 @@ local function row(
 	open_subagent: ((sub: any) -> ())?,
 	writing: Writing?,
 	group: string?,
-	resized: ((size: { w: number, h: number }) -> ())?,
+	resized: ((size: Size, element: Element) -> ())?,
 	settled: boolean?,
-	pictures: ReplyPicture.Pictures?
+	pictures: ReplyPicture.Pictures?,
+	open_link: ((target: string) -> ())?,
+	link_chip: ((target: string) -> { file: boolean?, skill: string? }?)?
 ): Node
 	local t = now()
 	if t.kind == "thought" then
 		return thought_row(now, below, writing, group, resized)
+	end
+	local file_target: string? = nil
+	if t.path and open_link and link_chip then
+		local encoded = string.gsub(t.path, "[^%w%-%._~/]", function(c: string): string
+			return string.format("%%%02X", string.byte(c))
+		end)
+		local target = if string.sub(t.path, 1, 1) == "/" then `file://{encoded}` else `zeron-file:{encoded}`
+		local chip = link_chip(target)
+		if chip and chip.file then
+			file_target = target
+		end
 	end
 	local function tint(): string
 		return if now().failed then "$danger" else "$text.secondary"
@@ -666,7 +680,6 @@ local function row(
 			w = BRANCH_END + 1,
 			pointer_events = "none",
 			draw = function(c, _, h)
-				local mid = ROW / 2
 				c:fill(branch_of(h, below()), "$zeron.tree")
 			end,
 		},
@@ -738,7 +751,25 @@ local function row(
 				},
 				-- (Its line as the tool goes on: a command's input may still
 				-- be arriving as it starts.)
-				if t.target
+				if file_target and open_link
+					then ui.rich {
+						class = "tool-file-badge",
+						min_w = 0,
+						shrink = 1,
+						text_size = "$font.size.sm",
+						ui.span {
+							t.target or t.path or "",
+							literal = true,
+							bg = "$zeron.chip.bg",
+							padding = { 4, 1 },
+							radius = ui.raw(5, "file badge corner"),
+							icon = { src = `assets/icons/files/{if string.find(ui.theme.kind(), "dark", 1, true) then "dark" else "light"}/{FileIcon.of(t.target or "")}.svg`, size = 14, gap = 2 },
+							on_click = function()
+								open_link(file_target :: string)
+							end,
+						},
+					}
+				elseif t.target
 					then target_line(now)
 					else ui.show(
 					function(): boolean
@@ -935,7 +966,7 @@ return ui.component(function(props: Props): Node
 			return index:get()
 		end
 		-- Its height, as laid out, for the rows after it.
-		local function resized(size: { w: number, h: number })
+		local function resized(size: Size, _element: Element)
 			local k = `{own_key}:{id}`
 			if MEASURED[k] ~= size.h then
 				kept_set(MEASURED, k, size.h)
@@ -953,7 +984,7 @@ return ui.component(function(props: Props): Node
 				return place() < last_branch:get()
 			end, function(): boolean
 				return live() and place() == count:get()
-			end, props.open_subagent, props.thought, props.key, resized, place() < count:peek(), props.pictures)
+			end, props.open_subagent, props.thought, props.key, resized, place() < count:peek(), props.pictures, props.open_link, props.link_chip)
 		end
 		-- (A call arriving joins as a row joining a `ui.each` does; the rest
 		-- are made as they come into view, as they were.)

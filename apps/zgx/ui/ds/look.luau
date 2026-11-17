@@ -182,7 +182,7 @@ function M.accented_ink(own: any): () -> any
 		if M.accented:get() then
 			return "$zeron.accented.ink"
 		end
-		return if type(own) == "function" then own() else own
+		return if type(own) == "function" then (own :: () -> unknown)() else own
 	end
 end
 

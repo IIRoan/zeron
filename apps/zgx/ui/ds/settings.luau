@@ -497,7 +497,7 @@ function M.Row(props: RowProps): Node
 				items = "start",
 				ui.text {
 					function(): string
-						return control.value(props.detail) or ""
+						return control.text(props.detail) or ""
 					end,
 					grow = 1,
 					min_w = 0,
@@ -1034,7 +1034,7 @@ function M.Catalog(props: CatalogProps): Node
 		end
 		return card()
 	end
-	local column: { any } = {
+	local column: ContainerProps = {
 		w_full = true,
 		gap = "$space.4",
 		ui.row {
@@ -1078,7 +1078,7 @@ function M.Catalog(props: CatalogProps): Node
 			color = "$text.tertiary",
 		})
 	end
-	local page: { any } = {
+	local page: PageProps = {
 		title = props.title,
 		description = props.description,
 		trail = props.trail,

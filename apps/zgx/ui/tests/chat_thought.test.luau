@@ -100,10 +100,7 @@ test("opened stays opened: the chat left and come back to", function()
 	expect(app:error()).to_be(nil)
 end)
 
--- Being written or settled, a thought past four lines folds the same way:
--- its first lines, fading out at the foot, the button under them. (It used
--- to show a written thought's latest lines, faded at the top.)
-test("a thought being written folds to its first lines, as a settled one does", function()
+test("a live thought follows its latest lines and a settled thought returns to its start", function()
 	local app = mount("chat_fixture.luau")
 	app:resize(900, 700)
 	app:command("go_s2")
@@ -114,14 +111,21 @@ test("a thought being written folds to its first lines, as a settled one does", 
 	expect(app:has('~"Weighing the parser first."')).to_be(true)
 	expect(show_all(app)).to_be(nil)
 	local _, was_top = box(app, 'text "Weighing the parser first."')
-	-- Past the fold while still written: a window four lines tall, the
-	-- first line where it was, the button in its room under it.
 	app:command("thought_grows")
 	settle(app)
 	expect(show_all(app) ~= nil).to_be(true)
-	expect(clip_height(app, "Weighing the parser first.")).to_be(FOLD)
 	local _, first_y = box(app, 'text "Weighing the parser first."')
-	expect(first_y).to_be(was_top)
+	expect(first_y < was_top).to_be(true)
+	local _, tail_y, _, tail_h = box(app, "It sends each block whole")
+	local _, button_y = box(app, 'button "Show all')
+	expect(tail_y + tail_h <= button_y).to_be(true)
+	expect(tail_y + tail_h > button_y - ROOM - LINE).to_be(true)
+	app:click('role:button ~"Show all"')
+	settle(app)
+	local _, expanded_y = box(app, 'text "Weighing the parser first."')
+	expect(expanded_y).to_be(was_top)
+	app:click('role:button "Show fewer lines"')
+	settle(app)
 	-- Settled: its group folds shut (as the turn ends), and opened again,
 	-- the same fold.
 	app:command("thought_settles")

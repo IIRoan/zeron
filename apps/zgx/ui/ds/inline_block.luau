@@ -156,7 +156,7 @@ function M.Composer(props: ComposerProps): Node
 		comment.ReplyComposer {
 			value = props.value,
 			open = true,
-			name = locale.t("ds.inline_block.comment"),
+			name = locale.s("ds.inline_block.comment"),
 			placeholder = props.placeholder or locale.t("ds.inline_block.placeholder"),
 			submit = props.submit,
 			on_submit = props.on_submit,
@@ -165,22 +165,23 @@ function M.Composer(props: ComposerProps): Node
 	}
 end
 
-export type ThreadProps = Merge<Props, comment.ThreadProps>
+export type ThreadProps = Props & comment.ThreadProps
 
 -- A thread on a line: the comments, with their replies, in the band.
 function M.Thread(props: ThreadProps): Node
+	local thread: comment.ThreadProps = {
+		comments = props.comments,
+		location = props.location,
+		resolved = props.resolved,
+		draft = props.draft,
+		me = props.me,
+		on_reply = props.on_reply,
+		on_resolve = props.on_resolve,
+	}
 	return M.InlineBlock {
 		inset = props.inset,
 		joined = props.joined,
-		comment.Thread {
-			comments = props.comments,
-			location = props.location,
-			resolved = props.resolved,
-			draft = props.draft,
-			me = props.me,
-			on_reply = props.on_reply,
-			on_resolve = props.on_resolve,
-		},
+		comment.Thread(thread),
 	}
 end
 

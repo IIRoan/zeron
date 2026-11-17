@@ -268,6 +268,6 @@ M.WEIGHTS = {
 	medium = "$font.weight.medium",
 	semibold = "$font.weight.semibold",
 	bold = "$font.weight.bold",
-}
+} :: { read [string]: string }
 
 return M

@@ -33,7 +33,7 @@ return function(props: Props): Node
 	local space = ui.theme.get("space.3")
 	local pad = if type(space) == "number" then space else 12
 	local function cell(c: number, content: Node): Node
-		local col = columns[c] or {}
+		local col: Column = columns[c] or {}
 		return ui.row {
 			min_w = 0,
 			grow = if col.w then 0 else 1,
@@ -58,7 +58,7 @@ return function(props: Props): Node
 	if labelled then
 		local head: { Node } = {}
 		for c = 1, count do
-			local col = columns[c] or {}
+			local col: Column = columns[c] or {}
 			table.insert(
 				head,
 				cell(

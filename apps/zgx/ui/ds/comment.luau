@@ -12,9 +12,11 @@
 -- Inline in a diff, a thread sits on the quiet card; on a pull request's
 -- page, plain on the page.
 
+local control = require("@self/control")
 local Button = require("@self/button")
 local material = require("@self/material")
-local IconButton = require("@self/icon_button").IconButton
+local icon_button = require("@self/icon_button")
+local IconButton = icon_button.IconButton
 local Icon = require("@self/icon")
 local TextArea = require("@self/text_area")
 local people = require("@self/people")
@@ -49,7 +51,7 @@ export type Action = {
 	label: string | Message,
 	on_click: (() -> ())?,
 	danger: boolean?,
-	role: string?,
+	role: AriaRole?,
 	id: string?,
 }
 
@@ -64,7 +66,7 @@ function M.Actions(list: { Action | Node }, focused: ((inside: boolean) -> ())?,
 	for _, a in list do
 		if type(a) == "table" and rawget(a :: any, "icon") ~= nil then
 			local act = a :: Action
-			table.insert(buttons, IconButton {
+			local props: icon_button.Props = {
 				id = act.id,
 				icon = act.icon,
 				label = act.label :: any,
@@ -79,7 +81,8 @@ function M.Actions(list: { Action | Node }, focused: ((inside: boolean) -> ())?,
 				on_blur = if focused then function()
 					focused(false)
 				end else nil,
-			})
+			}
+			table.insert(buttons, IconButton(props))
 		else
 			table.insert(buttons, a :: Node)
 		end
@@ -176,12 +179,12 @@ end)
 -- with Cancel and the way on, ⌘↵ sending, Escape folding it again.
 export type ComposerProps = {
 	value: State<string>,
-	placeholder: string?,
+	placeholder: Label?,
 	-- What assistive technology calls the field ("Reply").
-	name: string?,
+	name: Label?,
 	-- Whose face goes before it.
 	me: people.Who?,
-	submit: string?,
+	submit: Label?,
 	on_submit: ((text: string) -> ())?,
 	on_cancel: (() -> ())?,
 	-- Open from the start (an inline comment just begun).
@@ -226,8 +229,8 @@ M.ReplyComposer = ui.component(function(props: ComposerProps): Node
 				gap = "$space.2",
 				TextArea {
 					value = value,
-					placeholder = props.placeholder or locale.t("ds.comment.reply_placeholder"),
-					name = props.name or locale.t("ds.comment.reply"),
+					placeholder = if props.placeholder then (function(): string return control.text(props.placeholder) or "" end) else locale.t("ds.comment.reply_placeholder"),
+					name = if props.name then (function(): string return control.text(props.name) or "" end) else locale.t("ds.comment.reply"),
 					rows = 3,
 					max_rows = 12,
 					w_full = true,
@@ -250,7 +253,7 @@ M.ReplyComposer = ui.component(function(props: ComposerProps): Node
 					Button { locale.t("common.cancel"), tone = "ghost", size = "sm", on_click = cancel },
 					if props.secondary then Button { props.secondary.label, tone = "secondary", size = "sm", on_click = props.secondary.on_click } else nil,
 					Button {
-						props.submit or locale.t("ds.comment.comment"),
+						function(): string return control.text(props.submit) or locale.s("ds.comment.comment") end,
 						size = "sm",
 						disabled = function()
 							return string.match(value:get(), "%S") == nil

@@ -37,12 +37,18 @@
 -- it stays sharp as it zooms in.
 
 local Icon = require("@self/icon")
-local IconButton = require("@self/icon_button").IconButton
+local icon_button = require("@self/icon_button")
+local IconButton = icon_button.IconButton
 local glass = require("@self/glass")
 local control = require("@self/control")
 local Motion = require("@self/motion")
 local locale = require("@self/locale")
 local toast = require("@self/toast")
+
+local animate_numbers: ({ [string]: number }, TableParams) -> Animation = anime.animate
+-- The runtime accepts bindings for image rendering, like its other string props.
+type LiveImageProps = Merge<ImageProps, { image_rendering: ("auto" | "pixelated" | (() -> ("auto" | "pixelated")))? }>
+local live_image = ui.image :: (LiveImageProps) -> Node
 
 local M = {}
 
@@ -266,13 +272,17 @@ local StageView = ui.component(function(st: Stage): Node
 		end
 		-- (Read once while it's open, not on every frame of a motion: this
 		-- stage is built again each time it opens.)
-		local hd = headers[it.src]
+		local hd: { w: number, h: number } | false | nil = headers[it.src]
 		if hd == nil then
 			local ok, w, h = pcall(ui.image_size, it.src)
-			hd = if ok and type(w) == "number" and type(h) == "number" and w > 0 and h > 0 then { w = w, h = h } else false
+			if ok and type(w) == "number" and type(h) == "number" and w > 0 and h > 0 then
+				hd = { w = w, h = h }
+			else
+				hd = false :: false
+			end
 			headers[it.src] = hd
 		end
-		if hd then
+		if type(hd) == "table" then
 			return hd
 		end
 		if it.w and it.h and it.w > 0 and it.h > 0 then
@@ -333,6 +343,7 @@ local StageView = ui.component(function(st: Stage): Node
 
 	-- Laying the picture out at the scale it shows, once a gesture rests
 	-- (a drag or a pan never changes it).
+	local rested_at, zoomed_at = 0, 0
 	local settle_gen = 0
 	local function settle_later()
 		settle_gen += 1
@@ -381,7 +392,6 @@ local StageView = ui.component(function(st: Stage): Node
 	local stage_ref = ui.ref()
 	-- (false when nothing is held: a state made with nil reads false.)
 	local standin = ui.use_state(false :: any) :: State<{ src: string, item: string, s0: number, cx0: number, cy0: number, ix: number, iy: number, iw: number, ih: number, w: number, h: number } | false>
-	local rested_at, zoomed_at = 0, 0
 	local function hold()
 		local it = item()
 		if not it or st.morphing:peek() then
@@ -443,7 +453,7 @@ local StageView = ui.component(function(st: Stage): Node
 		clamp_view()
 		if animate and not Motion.reduced_now() then
 			local to = { s = view.s, cx = view.cx, cy = view.cy }
-			local probe = { s = from.s, cx = from.cx, cy = from.cy }
+			local probe: { [string]: number } = { s = from.s, cx = from.cx, cy = from.cy }
 			view.s, view.cx, view.cy = from.s, from.cx, from.cy
 			local params: TableParams = {
 				s = to.s,
@@ -461,7 +471,7 @@ local StageView = ui.component(function(st: Stage): Node
 					settle_later()
 				end,
 			}
-			motion = anime.animate(probe, params)
+			motion = animate_numbers(probe, params)
 			heading = to.s
 		else
 			redraw()
@@ -480,8 +490,8 @@ local StageView = ui.component(function(st: Stage): Node
 			return
 		end
 		view.s, view.cx, view.cy = from.s, from.cx, from.cy
-		local probe = { s = from.s, cx = from.cx, cy = from.cy }
-		motion = anime.animate(probe, {
+		local probe: { [string]: number } = { s = from.s, cx = from.cx, cy = from.cy }
+		motion = animate_numbers(probe, {
 			s = to.s,
 			cx = to.cx,
 			cy = to.cy,
@@ -742,7 +752,7 @@ local StageView = ui.component(function(st: Stage): Node
 		end
 		stop_motion()
 		local tau = 325
-		local probe = { cx = view.cx, cy = view.cy }
+		local probe: { [string]: number } = { cx = view.cx, cy = view.cy }
 		local from = { cx = view.cx, cy = view.cy }
 		view.cx += vx * tau
 		view.cy += vy * tau
@@ -752,7 +762,7 @@ local StageView = ui.component(function(st: Stage): Node
 		if math.abs(to.cx - from.cx) < 0.5 and math.abs(to.cy - from.cy) < 0.5 then
 			return
 		end
-		motion = anime.animate(probe, {
+		motion = animate_numbers(probe, {
 			cx = to.cx,
 			cy = to.cy,
 			duration = 650,
@@ -789,26 +799,27 @@ local StageView = ui.component(function(st: Stage): Node
 	end
 
 	local function on_key(e: KeyEvent): boolean?
+		local key, cmd, editing = e.key, e.cmd, e.editing
 		local it = item()
-		if e.key == "ArrowLeft" and not e.cmd then
+		if key == "ArrowLeft" and not cmd then
 			go(-1)
-		elseif e.key == "ArrowRight" and not e.cmd then
+		elseif key == "ArrowRight" and not cmd then
 			go(1)
-		elseif e.cmd and (e.key == "=" or e.key == "+") then
+		elseif cmd and (key == "=" or key == "+") then
 			step(1)
-		elseif e.cmd and e.key == "-" then
+		elseif cmd and key == "-" then
 			step(-1)
-		elseif e.cmd and e.key == "0" then
+		elseif cmd and key == "0" then
 			fit_animated()
-		elseif e.cmd and e.key == "1" then
+		elseif cmd and key == "1" then
 			zoom_to(1, nil, nil, true)
-		elseif e.cmd and e.key == "c" and it then
+		elseif cmd and key == "c" and it then
 			copy_image(it)
-		elseif e.key == "Escape" then
+		elseif key == "Escape" then
 			-- (Here, not the modal's: it would let focus go at once, while the
 			-- thumbnail it goes back to is still lifted out.)
 			st.close()
-		elseif e.key == " " and not e.editing then
+		elseif key == " " and not editing then
 			-- (Space: Quick Look's way out.)
 			st.close()
 		else
@@ -844,7 +855,7 @@ local StageView = ui.component(function(st: Stage): Node
 	-- (`key`: the name's message; a tooltip is a string, read as it's built.)
 	local function button(icon: Icon.Name, key: string, keys: string?, on_click: () -> (), disabled: (() -> boolean)?): Node
 		local label = locale.s(key)
-		return IconButton {
+		local props: icon_button.Props = {
 			icon = icon,
 			label = locale.t(key),
 			tooltip = if keys then `{label}  {ui.shortcut_text(keys)}` else label,
@@ -860,6 +871,7 @@ local StageView = ui.component(function(st: Stage): Node
 				poke()
 			end,
 		}
+		return IconButton(props)
 	end
 	table.insert(island_props, ui.text {
 		function(): string
@@ -1253,7 +1265,7 @@ local StageView = ui.component(function(st: Stage): Node
 					},
 				}
 			),
-			ui.image {
+			live_image {
 				src = function(): string
 					local it = item()
 					return if it then it.src else ""
@@ -1415,7 +1427,7 @@ local HostBody = ui.component(function(): Node
 		end
 		moving = {}
 	end
-	local function animate(target: any, params: TableParams)
+	local function animate(target: State<number>, params: TableParams)
 		table.insert(moving, anime.animate(target, params))
 	end
 	-- The thumbnail of `index`, if it shows: its rect in the window, and

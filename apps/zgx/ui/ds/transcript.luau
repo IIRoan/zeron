@@ -634,6 +634,7 @@ type View = {
 	-- `sent_pictures`: they're files on the chat's host, as sent ones are).
 	shown_pictures: ReplyPicture.Pictures?,
 	open: ((target: string) -> ())?,
+	link_chip: ((target: string) -> { file: boolean?, skill: string? }?)?,
 	link_menu: ((target: string) -> { Markdown.LinkEntry }?)?,
 	open_subagent: ((sub: any) -> ())?,
 	-- A message text's find (its key: `<id>:u`, `<id>:<block>`, `<id>:r`).
@@ -664,6 +665,8 @@ local function blocks_of(list: () -> { Block }, m: Message, now: () -> Message, 
 			return Activity {
 				key = `{m.id}:{b.id}`,
 				open_subagent = if view then view.open_subagent else nil,
+				open_link = if view then view.open else nil,
+				link_chip = if view then view.link_chip else nil,
 				pictures = if view then view.shown_pictures else nil,
 				-- (A long group builds only what's near the view, as a long
 				-- reply does.)
@@ -827,6 +830,8 @@ local function reply(
 			Activity {
 				key = m.id,
 				open_subagent = if view then view.open_subagent else nil,
+				open_link = if view then view.open else nil,
+				link_chip = if view then view.link_chip else nil,
 				pictures = if view then view.shown_pictures else nil,
 				thought = thought_of(m, now, draft),
 				tools = function()
@@ -1491,8 +1496,8 @@ local function Transcript(props: Props): Node
 				table.insert(shown, { id = id, el = row })
 			end
 		end
-		table.sort(shown, function(a, b)
-			return a.el.y < b.el.y
+		table.sort(shown, function(a: { id: string, el: Element }, b: { id: string, el: Element }): boolean
+			return (a.el.y or 0) < (b.el.y or 0)
 		end)
 		-- The first block starting in view (what is read, whole lines of it
 		-- in sight), in whichever row: a row of no blocks (a prompt) is
@@ -1742,7 +1747,7 @@ local function Transcript(props: Props): Node
 					local at = spot:peek()
 					take(act, if at then { text = at.text, who = at.who, from = at.from } else nil)
 				end,
-				text,
+				function(): string return control.text(text) or "" end,
 			}
 		end
 		-- Where it stands: the last place it was given, so it fades out there.
@@ -2104,7 +2109,7 @@ local function Transcript(props: Props): Node
 			-- A row Tab (or ⇧Tab) focuses scrolls clear of both bands: the
 			-- title bar's fade at the top, the composer at the foot (followed
 			-- as it grows).
-			scroll_padding = function(): { top: number, bottom: number }
+			scroll_padding = function(): ScrollPadding
 				return { top = 24 + 8, bottom = math.max(24, foot()) + 8 }
 			end,
 			-- Always (a list's runs past its edges aren't measured, so a
@@ -2164,7 +2169,7 @@ local function Transcript(props: Props): Node
 			end, function()
 				-- The menus' glass (solid when opaque), a closer shadow: a pill
 				-- over the reply, firming to the solid fill as it is touched.
-				local pill = glass.style({
+				local pill_props: ContainerProps = {
 					label = locale.t("ds.transcript.jump_to_latest"),
 					h = 30,
 					px = "$space.3",
@@ -2177,11 +2182,12 @@ local function Transcript(props: Props): Node
 					weight = "$font.weight.medium",
 					hover = { bg = "$zeron.menu.solid" },
 					active = { bg = "$zeron.menu.solid" },
-				}, "menu")
+				}
+				local pill = glass.style(pill_props, "menu")
 				pill.shadow = "$shadow.md"
 				local pill_ref = ui.ref()
 				pill.ref = pill_ref
-				pill.on_resize = function(size: { w: number, h: number })
+				pill.on_resize = function(size: Size, _element: Element)
 					jump_w = size.w
 					if props.on_jump_width and away:peek() then
 						props.on_jump_width(size.w)

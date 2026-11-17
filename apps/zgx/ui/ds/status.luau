@@ -8,7 +8,6 @@
 
 local motion = require("@self/motion")
 local Icon = require("@self/icon")
-local prefers = require("@self/prefers")
 local locale = require("@self/locale")
 
 local M = {}
@@ -224,7 +223,7 @@ end
 local function glyph(kind: Kind, size: number): Node?
 	local k = KINDS[kind]
 	if kind == "working" or kind == "connecting" or kind == "waiting" then
-		return ring(`$zeron.status.{hue(kind)}`, size)
+		return ring(`$zeron.status.{hue(kind :: Kind)}`, size)
 	end
 	return if k.glyph then Icon { name = k.glyph, size = size } else nil
 end
@@ -268,7 +267,6 @@ end
 -- A state's glyph and its name, in its hue; working, the time it has taken
 -- (from `since`, in `os.time()` seconds) after it.
 M.Status = ui.component(function(props: { kind: Kind, label: string?, since: number? }): Node
-	local k = KINDS[props.kind]
 	local now = ui.use_state(os.time())
 	if props.since and props.kind == "working" then
 		ui.every(1000, function()
@@ -330,7 +328,6 @@ end
 -- A state's dot and its long name beside it, small, in its hue (a list
 -- row with room for it).
 function M.StatusTag(props: { kind: Kind }): Node
-	local k = KINDS[props.kind]
 	return ui.row {
 		gap = "$space.1",
 		items = "center",

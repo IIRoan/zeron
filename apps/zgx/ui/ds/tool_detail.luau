@@ -42,10 +42,11 @@
 
 local locale = require("@self/locale")
 local FoldButton = require("@self/fold_button")
+local Git = require("@self/git")
 
 local M = {}
 
-export type Line = { kind: string, old: number?, new: number?, text: string }
+export type Line = Git.Line
 export type Diff = { kind: "diff", path: string?, lines: { Line }, added: number?, removed: number?, more: number? }
 export type Output = { kind: "output", lines: { string }, more: number? }
 export type Stat = { path: string, added: number, removed: number }
@@ -224,7 +225,7 @@ local function cut(line: string): string
 	if #line <= LINE_CHARS then
 		return line
 	end
-	local ok, at = pcall(utf8.offset, line, LINE_CHARS + 1)
+	local ok, at = pcall(utf8.offset, line, LINE_CHARS + 1, 1)
 	if ok and at then
 		return string.sub(line, 1, at - 1) .. "…"
 	end
@@ -528,7 +529,7 @@ local function more_line(n: number?): Node?
 end
 
 -- A diff's line, the gallery's look.
-local function diff_line(l: Line): Node
+local function diff_line(l: Line, painted: { Git.Run }?): Node
 	if l.kind == "hunk" then
 		return ui.text {
 			l.text,
@@ -562,23 +563,11 @@ local function diff_line(l: Line): Node
 		num(l.old),
 		num(l.new),
 		ui.text { l.kind, w = SIGN, shrink = 0, align = "center", font = "$font.mono", text_size = "$font.size.sm", color = ink },
-		ui.text {
-			(string.gsub(l.text, "\t", "    ")),
-			literal = true,
-			shrink = 0,
-			pr = "$space.3",
-			font = "$font.mono",
-			text_size = "$font.size.xs",
-			color = "$text.primary",
-		},
+		Git.code(l, painted),
 	}
 end
 
 local function diff_view(d: Diff): Node
-	local rows: { Node } = {}
-	for _, l in d.lines do
-		table.insert(rows, diff_line(l))
-	end
 	return ui.column {
 		w_full = true,
 		rounded = "$radius.md",
@@ -587,7 +576,24 @@ local function diff_view(d: Diff): Node
 		py = "$space.1",
 		class = "tool-diff",
 		label = if d.path then locale.t("ds.tool_detail.diff_of", { path = d.path }) else locale.t("ds.tool_detail.diff_of_file"),
-		ui.column { w_full = true, table.unpack(rows) },
+		ui.scroll_x {
+			w_full = true,
+			class = "tool-diff-scroll",
+			fade_x = { 16, 32 },
+			fade_overflow = true,
+			ui.presence(function(): string
+				-- Deferred Git highlighters announce completed colours here.
+				local version = (Git :: any).paint_version
+				return tostring(if version then version:get() else 0)
+			end, function(): Node
+				local painted = Git.highlight(d.lines, d.path)
+				local rows: { Node } = {}
+				for i, l in d.lines do
+					table.insert(rows, diff_line(l, if painted then painted[i] else nil))
+				end
+				return ui.column { min_w = "100%", table.unpack(rows) }
+			end),
+		},
 		more_line(d.more),
 	}
 end

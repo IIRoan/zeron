@@ -20,8 +20,8 @@
 -- whose box shows nothing of its own width (one that fills what holds it):
 -- the roll the same, without laying the row out again every frame.
 
+local control = require("@self/control")
 local motion = require("@self/motion")
-local prefers = require("@self/prefers")
 
 -- Scritto's roll: 550 ms, a glyph travelling .35 em from a .6 scale, tilted
 -- 2 degrees and blurred .1 em while it moves, the starts spread over 30% of
@@ -70,12 +70,7 @@ return ui.component(function(props: { [any]: any }): Node
 	-- (A message, `ui.t`, reads as a state does: its text, followed.)
 	local source: string | State<string> | Message | (() -> string) = props[1]
 	local function read(): string
-		if type(source) == "function" then
-			return source()
-		elseif type(source) == "string" then
-			return source
-		end
-		return source:get()
+		return control.text(source) or ""
 	end
 	-- The text's style (all but the box's), and its size in points.
 	local style: { [any]: any } = {}
@@ -123,7 +118,7 @@ return ui.component(function(props: { [any]: any }): Node
 		local from = last
 		last = now
 		count += 1
-		if motion.reduced_now() or from == "" or (props.rolls ~= nil and not props.rolls()) then
+		if motion.reduced_now() or from == "" or (props.rolls ~= nil and control.value(props.rolls) ~= true) then
 			roll:set(nil)
 			return
 		end

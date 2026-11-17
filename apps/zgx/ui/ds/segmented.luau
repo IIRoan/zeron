@@ -136,9 +136,9 @@ return function(props: Props): Node
 		w = if props.fill
 			then nil
 			elseif fixed then fixed * #props.options + PAD * 2
-			else function(): number?
+			else function(): number | string
 				if not measured() then
-					return nil
+					return "auto"
 				end
 				local sum = PAD * 2
 				for i in refs do

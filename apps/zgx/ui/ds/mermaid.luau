@@ -67,7 +67,7 @@ local function is_dark(ink: string): boolean
 	if not r then
 		return true
 	end
-	local l = 0.2126 * tonumber(r, 16) + 0.7152 * tonumber(g :: string, 16) + 0.0722 * tonumber(b :: string, 16)
+	local l = 0.2126 * (tonumber(r, 16) or 0) + 0.7152 * (tonumber(g :: string, 16) or 0) + 0.0722 * (tonumber(b :: string, 16) or 0)
 	return l > 128
 end
 
@@ -235,9 +235,10 @@ M.Diagram = ui.component(function(props: Props): Node
 		end
 	end
 	-- The diagram as the thumbnail the lightbox grows from and goes back to.
-	local function thumb(p: { [any]: any }): { [any]: any }
+	local function thumb(p: ContainerProps): ContainerProps
 		for k, v in Lightbox.source(group, 1, 0) do
-			p[k] = v
+			local props = p :: { [string]: unknown }
+			props[k] = v
 		end
 		return p
 	end

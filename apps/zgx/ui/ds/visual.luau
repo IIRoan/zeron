@@ -37,7 +37,6 @@ local Switch = require("@self/switch")
 local Slider = require("@self/slider")
 local Segmented = require("@self/segmented")
 local Select = require("@self/select")
-local Icon = require("@self/icon")
 local Stat = require("@self/stat")
 local DataTable = require("@self/data_table")
 local Chart = require("@self/chart")
@@ -163,31 +162,47 @@ local build: (n: any, ctx: Ctx, parent: string) -> Node
 
 -- ---- text -------------------------------------------------------------------
 
-local ALIGN_TEXT = { start = "start", center = "center", ["end"] = "right" }
+local ALIGN_TEXT: { [string]: TextAlign } = { start = "start", center = "center", ["end"] = "right" }
+
+type TextStyle = {
+	literal: boolean?,
+	wrap: Props_wrap,
+	truncate: Props_truncate,
+	lines: Props_lines,
+	min_w: Props_min_w,
+	text_size: Props_text_size,
+	line_height: Props_line_height,
+	weight: Props_weight,
+	font: Props_font,
+	italic: Props_italic,
+	align: Props_align,
+	color: Props_color,
+}
 
 local function text(n: any, ctx: Ctx): Node
 	local get = ctx.at(n.p)
 	local size, line = ink.size(n.size)
-	local props: { [any]: any } = {
+	local style: TextStyle = {
 		literal = true,
 		wrap = not n.truncate,
-		truncate = n.truncate,
+		truncate = n.truncate :: boolean?,
 		lines = if n.truncate then 1 else nil,
 		min_w = 0,
 		text_size = size,
 		line_height = line,
 		weight = ink.WEIGHTS[n.weight] or "$font.weight.regular",
 		font = if n.mono then "$font.mono" else nil,
-		italic = n.italic,
+		italic = n.italic :: boolean?,
 		align = ALIGN_TEXT[n.align] or "start",
 		color = function(): any
 			local now = get()
 			return ink.paint(now and now.color)
 		end,
 	}
-	local spans = n.spans or {}
+	local spans: { { t: string, weight: string?, color: unknown, mono: boolean?, italic: boolean? } } = n.spans or {}
 	local plain = #spans == 1 and not spans[1].weight and not spans[1].color and not spans[1].mono and not spans[1].italic
 	if plain or #spans == 0 then
+		local props = table.clone(style) :: TextProps
 		props[1] = function(): string
 			local now = get()
 			local s = now and now.spans and now.spans[1]
@@ -195,6 +210,7 @@ local function text(n: any, ctx: Ctx): Node
 		end
 		return ui.text(props)
 	end
+	local props = table.clone(style) :: RichProps
 	for i, s in spans do
 		props[i] = ui.span {
 			function(): string
@@ -202,7 +218,12 @@ local function text(n: any, ctx: Ctx): Node
 				local live = now and now.spans and now.spans[i]
 				return if live then live.t else ""
 			end,
-			weight = if s.weight then ink.WEIGHTS[s.weight] else nil,
+			weight = if s.weight
+				then function(): number
+					local token = ink.WEIGHTS[s.weight :: string] or ink.WEIGHTS.regular
+					return (ui.theme.get(string.sub(token, 2)) :: number?) or 400
+				end
+				else nil,
 			font = if s.mono then "$font.mono" else nil,
 			italic = s.italic,
 			color = if s.color
@@ -245,7 +266,7 @@ local Tabs = ui.component(function(props: { n: any, ctx: Ctx }): Node
 		return ctx.peek(n.p)
 	end
 	local value = synced(get, peek, ctx, n.value)
-	local options = {}
+	local options: { Select.Option } = {}
 	local long = #n.options > 4
 	for _, o in n.options do
 		table.insert(options, { value = o, label = o })
@@ -256,7 +277,11 @@ local Tabs = ui.component(function(props: { n: any, ctx: Ctx }): Node
 	if long then
 		return Select { value = value, options = options, size = "sm", name = ctx.title() }
 	end
-	return Segmented { value = value, options = options, label = ctx.title() }
+	local segments: { Segmented.Option } = {}
+	for _, option in options do
+		table.insert(segments, { value = option.value, label = option.label })
+	end
+	return Segmented { value = value, options = segments, label = ctx.title() }
 end)
 
 local Toggle = ui.component(function(props: { n: any, ctx: Ctx }): Node
@@ -558,13 +583,13 @@ local Surface = ui.component(function(props: { n: any, ctx: Ctx }): Node
 	local get = ctx.at(n.p)
 	local box = ui.ref()
 	local src = ui.use_state("")
-	local labels = ui.use_state({} :: { any })
-	local hints: { any } = {}
+	local labels = ui.use_state({} :: { { t: string, x: number, y: number, size: string?, c: string? } })
+	local hints: { { x: number, y: number, r: number?, t: string } } = {}
 	local hint = ui.use_state("")
 	local failed = ui.use_state("")
-	local yaw = ui.use_state(n.yaw or 0)
-	local pitch = ui.use_state(n.pitch or 0)
-	local mouse = ui.use_state(nil :: any)
+	local yaw = ui.use_state((n.yaw or 0) :: number)
+	local pitch = ui.use_state((n.pitch or 0) :: number)
+	local mouse = ui.use_state(nil :: { x: number, y: number, down: boolean, sx: number?, sy: number? }?)
 	local drag: any = nil
 	local function spinning(): boolean
 		local now = get()
@@ -637,12 +662,16 @@ local Surface = ui.component(function(props: { n: any, ctx: Ctx }): Node
 	-- pointer (a shader's) while it's still. At most one frame a tick.
 	ui.effect(function()
 		ctx.gen()
-		local _ = box.width, ui.theme.current:get(), visible:get()
+		local _width = box.width
+		ui.theme.current:get()
+		visible:get()
 		local now = get()
 		if now and (now.animate or spinning()) then
 			t:get()
 		else
-			local _ = yaw:get(), pitch:get(), mouse:get()
+			yaw:get()
+			pitch:get()
+			mouse:get()
 		end
 		request()
 	end)
@@ -773,7 +802,8 @@ local JUSTIFY = { start = "start", center = "center", ["end"] = "end", between =
 
 -- How a child sits in a row: the width it was given, the spare width it
 -- takes (asked, or a node with no width of its own), or its own.
-local function place(props: { [any]: any }, n: any, parent: string)
+local function place<P>(given: P, n: any, parent: string): P
+	local props = given :: P & ContainerProps
 	if n.w then
 		props.w = raw(n.w, "a visual's width for this, as its script asks")
 		props.shrink = 0
@@ -785,16 +815,22 @@ local function place(props: { [any]: any }, n: any, parent: string)
 		props.shrink = 1
 		props.min_w = 0
 	end
-	return props
+	return given
 end
+
+local box: (ContainerProps, any, string) -> ContainerProps = place
+local button_props: (Button.Props, any, string) -> Button.Props = place
+local link_props: (TextProps, any, string) -> TextProps = place
 
 local function stack(n: any, ctx: Ctx, parent: string): Node
 	local row = n.k == "row"
 	local kids: { Node } = {}
 	for _, child in n.children or {} do
-		table.insert(kids, build(child, ctx, n.k))
+		local render: (any, Ctx, string) -> Node = build
+		local node = render(child, ctx, n.k)
+		table.insert(kids, node)
 	end
-	local props: { [any]: any } = {
+	local props: ContainerProps = {
 		class = if row then "visual-row" else "visual-column",
 		w_full = parent ~= "row",
 		min_w = 0,
@@ -834,7 +870,10 @@ local function stack(n: any, ctx: Ctx, parent: string): Node
 		end
 	end
 	place(props, n, parent)
-	return if row then ui.row(props) else ui.column(props)
+	if row then
+		return ui.row(props)
+	end
+	return ui.column(props)
 end
 
 build = function(n: any, ctx: Ctx, parent: string): Node
@@ -846,11 +885,11 @@ build = function(n: any, ctx: Ctx, parent: string): Node
 		for _, child in n.children or {} do
 			table.insert(kids, ui.column { min_w = 0, build(child, ctx, "grid") })
 		end
-		return ui.grid(place({ class = "visual-grid", w_full = true, cols = n.columns, gap = raw(n.gap, "a visual's gap, as its script asks"), kids }, n, parent))
+		return ui.grid(box({ class = "visual-grid", w_full = true, cols = n.columns, gap = raw(n.gap, "a visual's gap, as its script asks"), kids }, n, parent))
 	elseif k == "text" then
 		local node = text(n, ctx)
 		if parent == "row" and (n.w or n.grow) then
-			return ui.column(place({ min_w = 0, node }, n, parent))
+			return ui.column(box({ min_w = 0, node }, n, parent))
 		end
 		return node
 	elseif k == "rule" then
@@ -869,7 +908,7 @@ build = function(n: any, ctx: Ctx, parent: string): Node
 				return now and now[name]
 			end
 		end
-		return ui.column(place({
+		return ui.column(box({
 			min_w = 0,
 			Stat {
 				value = field("value"),
@@ -886,7 +925,7 @@ build = function(n: any, ctx: Ctx, parent: string): Node
 		for _, row in n.rows or {} do
 			count = math.max(count, #row)
 		end
-		return ui.column(place({
+		return ui.column(box({
 			w_full = parent ~= "row",
 			min_w = 0,
 			DataTable {
@@ -906,18 +945,18 @@ build = function(n: any, ctx: Ctx, parent: string): Node
 		}, n, parent))
 	elseif k == "chart" then
 		local get = ctx.at(n.p)
-		return ui.column(place({
+		return ui.column(box({
 			w_full = parent ~= "row",
 			min_w = 0,
 			Chart { data = get, height = n.h, label = ctx.title() },
 		}, n, parent))
 	elseif k == "canvas" then
-		return ui.column(place({ w_full = parent ~= "row", min_w = 0, Canvas { n = n, ctx = ctx } }, n, parent))
+		return ui.column(box({ w_full = parent ~= "row", min_w = 0, Canvas { n = n, ctx = ctx } }, n, parent))
 	elseif k == "scene" or k == "shader" then
-		return ui.column(place({ w_full = parent ~= "row", min_w = 0, Surface { n = n, ctx = ctx } }, n, parent))
+		return ui.column(box({ w_full = parent ~= "row", min_w = 0, Surface { n = n, ctx = ctx } }, n, parent))
 	elseif k == "button" then
 		local get = ctx.at(n.p)
-		return Button(place({
+		return Button(button_props({
 			tone = if n.primary then "primary" else "secondary",
 			size = "sm",
 			on_click = function()
@@ -933,14 +972,14 @@ build = function(n: any, ctx: Ctx, parent: string): Node
 			},
 		}, n, parent))
 	elseif k == "tabs" then
-		return ui.row(place({ min_w = 0, Tabs { n = n, ctx = ctx } }, n, parent))
+		return ui.row(box({ min_w = 0, Tabs { n = n, ctx = ctx } }, n, parent))
 	elseif k == "toggle" then
-		return ui.row(place({ min_w = 0, Toggle { n = n, ctx = ctx } }, n, parent))
+		return ui.row(box({ min_w = 0, Toggle { n = n, ctx = ctx } }, n, parent))
 	elseif k == "slider" then
-		return ui.column(place({ w_full = parent ~= "row", min_w = 0, VisualSlider { n = n, ctx = ctx } }, n, parent))
+		return ui.column(box({ w_full = parent ~= "row", min_w = 0, VisualSlider { n = n, ctx = ctx } }, n, parent))
 	elseif k == "link" then
 		local get = ctx.at(n.p)
-		return ui.text(place({
+		return ui.text(link_props({
 			function(): string
 				local now = get()
 				return if now then now.label else ""

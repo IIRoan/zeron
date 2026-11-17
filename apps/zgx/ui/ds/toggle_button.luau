@@ -12,6 +12,7 @@
 -- `tooltip_side` are `IconButton`'s.
 
 local Icon = require("@self/icon")
+local control = require("@self/control")
 local icon_button = require("@self/icon_button")
 
 local recipe = ui.variants {
@@ -69,7 +70,7 @@ return function(props: Props): Node
 	local p = table.clone(props) :: any
 	local on = props.on
 	local size: icon_button.Size = props.size or "md"
-	p.variants = recipe { size = size, tone = props.tone, on = on :: any }
+	p.variants = recipe { size = size, tone = if props.tone == "quiet" then "quiet" else "normal", on = on :: any }
 	p.on, p.size, p.tone, p.icon, p.text, p.tooltip_side, p.on_change = nil, nil, nil, nil, nil, nil, nil
 	if props.tooltip == false then
 		p.tooltip = nil
@@ -77,7 +78,7 @@ return function(props: Props): Node
 		-- (A tooltip is a string, read as it is built: a message's text in
 		-- the locale then.)
 		local label: any = props.label
-		p.tooltip = if type(label) == "string" then label elseif typeof(label) == "MessageUd" then label:get() else nil
+		p.tooltip = if type(label) == "string" then label elseif control.is_message(label) then label:get() else nil
 	end
 	if p.tooltip then
 		p.tooltip_placement = icon_button.placement(props.tooltip_side)

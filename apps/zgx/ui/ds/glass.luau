@@ -27,7 +27,8 @@ local M = {}
 
 -- Adds the glass to `props` (changed in place, and returned). (A modal
 -- opening closes every popup open outside it: zgx's own, since #1419.)
-function M.style(props: { [any]: any }, kind: Kind?): { [any]: any }
+function M.style<P>(given: P, kind: Kind?): P
+	local props = given :: P & ContainerProps
 	if kind == "island" then
 		props.rounded = props.rounded or "$zeron.island.radius"
 		props.bg = function()
@@ -39,7 +40,7 @@ function M.style(props: { [any]: any }, kind: Kind?): { [any]: any }
 		props.shadow = "$zeron.island.shadow"
 		props.border = 1
 		props.border_color = "$border.subtle"
-		return props
+		return given
 	end
 	props.rounded = props.rounded or "$radius.lg"
 	-- (Where popups can't blur what's under them, Windows', solid too.)
@@ -52,7 +53,7 @@ function M.style(props: { [any]: any }, kind: Kind?): { [any]: any }
 	props.border = 1
 	props.border_color = "$border"
 	props.shadow = "$zeron.menu.shadow"
-	return props
+	return given
 end
 
 export type Props = Merge<ContainerProps, { kind: Kind?, [number]: Child }>

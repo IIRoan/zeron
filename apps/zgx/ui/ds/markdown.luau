@@ -141,7 +141,7 @@ export type Find = {
 local VEIL_MIN, VEIL_MAX, VEIL_EMA_SEED, VEIL_GAP_MAX = 120, 400, 160, 1000
 type VeilChunk = { from: number, to: number, started: number, ms: number, boost: number }
 type VeilElem = { text: string, chunks: { VeilChunk }, ema: number, last: number? }
-type Veil = { elems: { [string]: VeilElem }, block: number, n: number, seeding: boolean, tick: State<number>?, ticking: any }
+type Veil = { elems: { [string]: VeilElem }, block: number, n: number, seeding: boolean, tick: State<number>?, ticking: any, clocks: number? }
 local VEILS: { [string]: Veil } = {}
 local veil_count = 0
 local function veil_of(key: string, seeding: boolean): Veil
@@ -236,7 +236,7 @@ local accented_ink = look.accented_ink
 
 -- `color` (a token, or as written) at a chunk's fade now: as it is once it's done.
 local function veil_color(v: Veil, color: any, c: VeilChunk): any
-	local shown = if type(color) == "function" then color() else color
+	local shown = if type(color) == "function" then control.value(color) else color
 	local plain = if type(shown) == "string" and string.sub(shown, 1, 1) == "$" then ui.theme.get(string.sub(shown, 2)) else shown
 	local r, g, b, a = string.match(tostring(plain), "^#(%x%x)(%x%x)(%x%x)(%x?%x?)$")
 	if not r then
@@ -248,7 +248,7 @@ local function veil_color(v: Veil, color: any, c: VeilChunk): any
 		if p >= 1 then
 			-- (A colour that is itself a function, a link's or inline
 			-- code's accented ink, is read: a binding gives a colour.)
-			return if type(color) == "function" then color() else color
+			return if type(color) == "function" then control.value(color) else color
 		end
 		if v.tick then
 			v.tick:get()
@@ -422,7 +422,7 @@ end
 -- (transcript.rs `user_bubble_text`, composer/chip.rs `paint_chip`): its
 -- name in the body's ink on the composer chip's wash, corner 5, its file's
 -- icon (or a chat's) before it. Its click is the document's `open`.
-local function mention_chip(span: { [any]: any }, target: string, name: string)
+local function mention_chip(span: SpanProps, target: string, name: string)
 	local chat = string.match(target, "^zeron%-chat:") ~= nil
 	local dir = string.sub(target, -1) == "/"
 	-- (Its icon by its file's own name: a reply's link may say it in other
@@ -508,7 +508,7 @@ end
 
 -- An attached item's chip, named in the words: its kind's icon (a file's
 -- by its name; a chat's, a picture's, a quote's glyph), its name.
-local function attachment_chip(span: { [any]: any }, name: string, item: { kind: string, icon: string? })
+local function attachment_chip(span: SpanProps, name: string, item: { kind: string, icon: string? })
 	local set = if string.find(ui.theme.kind(), "dark", 1, true) then "dark" else "light"
 	span.underline = false
 	span.underline_offset = nil
@@ -524,7 +524,7 @@ local function attachment_chip(span: { [any]: any }, name: string, item: { kind:
 		else chip_icon { src = `assets/icons/files/{set}/{FileIcon.of(name, false)}.svg` }
 end
 
-local function invocation_chip(span: { [any]: any }, name: string)
+local function invocation_chip(span: SpanProps, name: string)
 	local glyph = if string.sub(name, 1, 1) == "/" then "command" else "magic-stick"
 	-- (A skill by its name alone, `frontend-design`, its icon saying it's
 	-- one; a command keeps its `/`.)
@@ -651,7 +651,7 @@ local function runs_now(list: { MarkdownRun }, style: { [string]: any }?, ctx: C
 		end
 		fading = veil_chunks(veil, table.concat(flat))
 	end
-	local function emit(span: { [any]: any }, text: string)
+	local function emit(span: SpanProps, text: string)
 		local from, to = pos + 1, pos + #text
 		pos = to
 		-- A chip (its icon before its name) is one piece, one wash: never cut
@@ -670,7 +670,7 @@ local function runs_now(list: { MarkdownRun }, style: { [string]: any }?, ctx: C
 			veil_pieces(fading, from, to, function(s: number, e: number, c: VeilChunk?)
 				local piece = table.clone(span)
 				piece[1] = string.sub(text, s - from + 1, e - from + 1)
-				if c then
+				if c and veil then
 					piece.color = veil_color(veil, span.color or props.color, c)
 				end
 				table.insert(props, ui.span(piece))
@@ -714,7 +714,7 @@ local function runs_now(list: { MarkdownRun }, style: { [string]: any }?, ctx: C
 			r.x = if run.x ~= "" then run.x else (string.match(run.img, "([^/]+)$") or run.img)
 			r.a = run.a or run.img
 		end
-		local span: { [any]: any } = { r.x, literal = true }
+		local span: SpanProps = { r.x, literal = true }
 		if r.b then
 			-- (A number: a span's `weight` takes no token.)
 			span.weight = ui.raw(600, "semibold; a span's weight takes no token")
@@ -796,7 +796,7 @@ local function runs_now(list: { MarkdownRun }, style: { [string]: any }?, ctx: C
 					end
 					return Links.other(target, if open
 						then function()
-							open(target)
+							if open then open(target) end
 						end
 						else nil)
 				end)
@@ -885,7 +885,7 @@ local TableBlock = ui.component(function(props: { b: any, ctx: Ctx? }): Node
 	local b, ctx = props.b, props.ctx
 	local count = #b.head
 	local tracks: { string } = {}
-	local aligns: { string } = {}
+	local aligns: { Align } = {}
 	local any_long = false
 	local long: { boolean } = {}
 	for c, head in b.head do
@@ -899,7 +899,7 @@ local TableBlock = ui.component(function(props: { b: any, ctx: Ctx? }): Node
 				numbers = numbers and is_number(text)
 			end
 		end
-		local said = if b.align then b.align[c] else nil
+		local said = if b.align then b.align[c] :: Align? else nil
 		aligns[c] = if said and said ~= "" then said elseif numbers and filled > 0 then "end" else "start"
 		if longest <= TABLE_SHORT or (numbers and filled > 0) then
 			tracks[c] = "max-content"
@@ -1083,7 +1083,7 @@ local function code_text(text: string, lang: string, wrap: boolean?, find: CodeF
 		end
 		local from = pos + 1
 		veil_pieces(fading, from, pos + #t, function(s: number, e: number, c: VeilChunk?)
-			cut(string.sub(t, s - from + 1, e - from + 1), if c then veil_color(veil.veil, color or props.color, c) else color)
+			cut(string.sub(t, s - from + 1, e - from + 1), if c and veil then veil_color(veil.veil, color or props.color, c) else color)
 		end)
 	end
 	if Syntax.highlighter(lang) == nil then
@@ -1763,13 +1763,16 @@ end
 return function(props: Props): Node
 	local text = props.text
 	local opts: MarkdownOptions = { key = props.key, breaks = props.breaks }
+	local function empty_context(): Ctx
+		return { tasks = {} }
+	end
 	local ctx: Ctx? = if props.image or props.open or props.link_menu or props.link_chip or props.attached or props.task or props.pictures or props.small
 		then { image = props.image, image_size = props.image_size, open = props.open, link_menu = props.link_menu, link_chip = props.link_chip, attached = props.attached, task = props.task, tasks = {}, pictures = props.pictures, group = props.group, small = props.small }
 		else nil
 	-- A text that grows: what a ```mermaid fence reads to know whether
 	-- it's still being written (ds/mermaid).
 	if type(text) == "function" then
-		ctx = ctx or { tasks = {} }
+		ctx = ctx or empty_context()
 		;(ctx :: Ctx).source = text
 	end
 	-- Fading in as it streams (`veil`, with `key`), unless motion is reduced. `veil_seed`:
@@ -1782,8 +1785,8 @@ return function(props: Props): Node
 				v.seeding = false
 			end)
 		end
-		ctx = ctx or ({ tasks = {} } :: any)
-		;(ctx :: any).veil = v
+		ctx = ctx or empty_context()
+		;(ctx :: Ctx).veil = v
 	end
 	-- Its words' ink, where the caller sets it (a thought's secondary).
 	local ink = props.ink

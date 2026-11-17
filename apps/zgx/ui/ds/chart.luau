@@ -351,9 +351,9 @@ return ui.component(function(props: Props): Node
 				min_h = function(): number
 					return n("zeron.visual.text.sm.line", 20)
 				end,
-				h = function(): number?
+				h = function(): number | string
 					local h = resting:get()
-					return if hovered:get() > 0 and h > 0 then h else nil
+					return if hovered:get() > 0 and h > 0 then h else "auto"
 				end,
 				on_resize = function(size: { w: number, h: number })
 					if hovered:peek() == 0 then

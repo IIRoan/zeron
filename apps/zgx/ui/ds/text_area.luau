@@ -18,7 +18,7 @@ export type Props = {
 	value: State<string>,
 	-- (Each takes a message, `ui.t`.)
 	label: Label?,
-	placeholder: (string | Message)?,
+	placeholder: Label?,
 	hint: Label?,
 	error: Props_error,
 	count: field.Count?,
@@ -28,7 +28,7 @@ export type Props = {
 	max_rows: number?,
 	size: control.Size?,
 	disabled: boolean?,
-	name: (string | Message)?,
+	name: Label?,
 	autofocus: boolean?,
 	-- ⌘Enter (a form's submit from a multi-line field).
 	on_submit: ((text: string) -> ())?,
@@ -135,7 +135,7 @@ return ui.component(function(props: Props): Node
 		font = font,
 		line_height = line,
 		on_mount = if props.autofocus
-			then function(el)
+			then function(el: Element): ()
 				el:focus()
 			end
 			else nil,

@@ -7,6 +7,8 @@
 --
 --   Stat { value = "1,284", label = "Requests", delta = "+12%", tone = "$success" }
 
+local control = require("@self/control")
+
 export type Live<T> = T | () -> T
 export type Props = {
 	value: Live<string>,
@@ -18,12 +20,7 @@ export type Props = {
 	line: string?,
 }
 
-local function read<T>(v: Live<T>?): T?
-	if type(v) == "function" then
-		return (v :: any)()
-	end
-	return v :: any
-end
+local read = control.value
 
 return function(props: Props): Node
 	local function delta(): string
@@ -44,7 +41,7 @@ return function(props: Props): Node
 			min_w = 0,
 			ui.text {
 				function(): string
-					return read(props.value) or ""
+					return control.text(props.value) or ""
 				end,
 				literal = true,
 				tabular = true,

@@ -44,7 +44,8 @@
 --     group = "reply:42", set = … }
 
 local Icon = require("@self/icon")
-local IconButton = require("@self/icon_button").IconButton
+local icon_button = require("@self/icon_button")
+local IconButton = icon_button.IconButton
 local Lightbox = require("@self/lightbox")
 local ContextMenu = require("@self/context_menu")
 local control = require("@self/control")
@@ -183,9 +184,11 @@ function M.fit(nw: number, nh: number, maxw: number, maxh: number): Fit
 	local fw, fh = nw, nh
 	local crop: "none" | "top" | "middle" = "none"
 	if a < m.TALL then
-		fw, fh, crop = nw, nw / m.TALL, "top"
+		fw, fh = nw, nw / m.TALL
+		crop = "top" :: "top"
 	elseif a > m.WIDE then
-		fw, fh, crop = nh * m.WIDE, nh, "middle"
+		fw, fh = nh * m.WIDE, nh
+		crop = "middle" :: "middle"
 	end
 	local k = math.min(1, maxw / fw, maxh / fh)
 	fw, fh = fw * k, fh * k
@@ -250,7 +253,7 @@ function M.layout(list: { { src: string, w: number?, h: number? } }, inner: numb
 				if it.w <= w and it.h <= h then
 					crop, pw, ph = "small", it.w, it.h
 				elseif it.w / it.h < 0.6 then
-					crop = "top"
+					crop = "top" :: "top"
 				end
 			end
 			places[it.src] = { x = x, y = y, w = w, h = h, crop = crop, pw = pw, ph = ph }
@@ -293,7 +296,7 @@ end
 -- What a picture is now: as its reader says, or as one that can't be
 -- shown (not one to draw, or its kept copy gone).
 local function now_of(pictures: Pictures, src: string): Picture
-	local p = pictures.resolve(src) or { state = "failed", error = locale.s("ds.reply_picture.not_a_picture") }
+	local p: Picture = pictures.resolve(src) or { state = "failed", error = locale.s("ds.reply_picture.not_a_picture") }
 	local broken = if p.state == "ready" and p.src then BROKEN:get()[p.src] else nil
 	if broken then
 		return { state = "failed", error = if broken ~= "" then broken else locale.s("ds.reply_picture.gone"), path = p.path, here = p.here }
@@ -343,23 +346,19 @@ local function open_among(pictures: Pictures, set: () -> { Entry }, src: string,
 end
 
 -- One of the controls at the top right: a small glass square.
-local function control_button(icon: Icon.Name, label: any, radius: number, on_click: () -> (), focus: (boolean) -> ()): Node
-	return ui.div(glass.style({
+local function control_button(icon: Icon.Name, label: Label, radius: number, on_click: () -> (), focus: (boolean) -> ()): Node
+	local button: icon_button.Props = {
+		icon = icon, label = label, size = "lg",
+		rounded = ui.raw(radius, "fills its glass square"),
+		on_click = on_click,
+		on_focus = function() focus(true) end,
+		on_blur = function() focus(false) end,
+	}
+	local frame: ContainerProps = {
 		rounded = ui.raw(radius, "concentric: the frame's corner less the controls' inset"),
-		IconButton {
-			icon = icon,
-			label = label,
-			size = "lg",
-			rounded = ui.raw(radius, "fills its glass square"),
-			on_click = on_click,
-			on_focus = function()
-				focus(true)
-			end,
-			on_blur = function()
-				focus(false)
-			end,
-		},
-	}, "island"))
+		IconButton(button),
+	}
+	return ui.div(glass.style(frame, "island"))
 end
 
 -- A picture's frame, with what's in it while it comes, once it's here, and
@@ -543,7 +542,7 @@ local Frame = ui.component(function(props: FrameProps): Node
 			opacity = Motion.tween(ui.computed(function(): number
 				return if controls_up() then 1 else 0
 			end), { duration = 140, ease = Motion.EASE }),
-			pointer_events = function(): string
+			pointer_events = function(): "auto" | "none"
 				return if controls_up() then "auto" else "none"
 			end,
 			ui.show(function(): boolean
@@ -713,7 +712,7 @@ local Missing = ui.component(function(props: { pictures: Pictures, entry: Entry,
 		reason = M.plain(now_of(props.pictures, e.src).error),
 		on_click = if open
 			then function()
-				open(e.src)
+				if open then open(e.src) end
 			end
 			else nil,
 		context_menu = if open or asked
@@ -721,7 +720,7 @@ local Missing = ui.component(function(props: { pictures: Pictures, entry: Entry,
 				local own = if asked then asked(e.src) else nil
 				return own or Links.other(e.src, if open
 					then function()
-						open(e.src)
+						if open then open(e.src) end
 					end
 					else nil)
 			end)

@@ -32,11 +32,13 @@ export type State = {
 	platform: boolean,
 	looks_up: boolean,
 }
-export type Options = { takes_paste: boolean?, more: ((state: State) -> { any })? }
+export type Options = { takes_paste: boolean?, more: ((state: State) -> { MenuAt.Entry })? }
 
 -- (A plugin lent the design system has no host for it: its editors keep
 -- zgx's own menu.)
-local has_said, said = pcall(ui.shared, "editor_menu", nil :: any)
+local has_said, said = pcall(function()
+	return ui.shared("editor_menu", nil :: State?)
+end)
 
 local function run(action: string): () -> ()
 	return function()
@@ -49,39 +51,42 @@ end
 -- up); Cut with a selection to copy in an editor that edits; Copy with a
 -- selection (a password field's copies nothing); Paste in one that edits,
 -- with text on the clipboard (or any paste, when it takes pictures).
-function M.entries(state: State, options: Options?): { any }
-	local o = options or {}
-	local list: { any } = {}
+function M.entries(state: State, options: Options?): { MenuAt.Entry }
+	local o: Options = options or {}
+	local list: { MenuAt.Entry } = {}
+	local function append(entry: MenuAt.Entry)
+		table.insert(list, entry)
+	end
 	if state.looks_up and state.copyable then
-		table.insert(list, {
+		append({
 			label = SelectionMenu.look_up_label(state.selected),
 			icon = "search",
 			on_select = run("look_up"),
 		})
-		table.insert(list, { separator = true })
+		append({ separator = true })
 	end
-	table.insert(list, {
+	append({
 		label = locale.s("ds.editor_menu.cut"),
 		icon = "scissors",
 		shortcut = "cmd+x",
 		disabled = not (state.copyable and state.editable and state.platform),
 		on_select = run("cut"),
 	})
-	table.insert(list, {
+	append({
 		label = locale.s("common.copy"),
 		icon = "copy",
 		shortcut = "cmd+c",
 		disabled = not (state.copyable and state.platform),
 		on_select = run("copy"),
 	})
-	table.insert(list, {
+	append({
 		label = locale.s("ds.editor_menu.paste"),
 		icon = "clipboard",
 		shortcut = "cmd+v",
 		disabled = not state.editable or (not state.clipboard and o.takes_paste ~= true),
 		on_select = run("paste"),
 	})
-	table.insert(list, {
+	append({
 		label = locale.s("ds.selection_menu.select_all"),
 		icon = "wrap-text",
 		shortcut = "cmd+a",
@@ -89,7 +94,7 @@ function M.entries(state: State, options: Options?): { any }
 	})
 	local added = if o.more then o.more(state) else {}
 	if #added > 0 then
-		table.insert(list, { separator = true })
+		append({ separator = true })
 		for _, entry in added do
 			table.insert(list, entry)
 		end

@@ -20,7 +20,11 @@ local M = {}
 -- (A plugin lent the design system has its own copy of this module, and
 -- reads neither: the app keeps the selection to itself. There its menu
 -- never opens, and a secondary click goes on to what's around it.)
-local has_selection, selection = pcall(ui.shared, "selection", nil :: any)
+type SelectionBox = { x: number, y: number, w: number, h: number }
+type Selection = { text: string, top: SelectionBox?, bottom: SelectionBox? }
+local has_selection, selection = pcall(function()
+	return ui.shared("selection", nil :: Selection?)
+end)
 -- Whether the platform looks words up.
 local has_looks_up, looks_up = pcall(ui.shared, "looks_up", false)
 

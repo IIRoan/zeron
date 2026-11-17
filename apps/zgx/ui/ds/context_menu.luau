@@ -405,7 +405,7 @@ local function build_panel(props: PanelProps): Node
 		for k = 1, n do
 			local i = (start + k - 1) % n + 1
 			local s = stops[i]
-			local name = string.lower(s.entry.label or "")
+			local name = string.lower(control.text(s.entry.label) or "")
 			if s.enabled and string.sub(name, 1, #want) == want then
 				focus(i)
 				return
@@ -514,7 +514,7 @@ local function build_panel(props: PanelProps): Node
 		end
 		if e.heading then
 			flush()
-			title = e.heading
+			title = control.text(e.heading)
 			continue
 		end
 		local reason = if type(e.disabled) == "string" then e.disabled else nil
@@ -532,7 +532,7 @@ local function build_panel(props: PanelProps): Node
 		end
 		-- What it says: its name, or, armed, what it asks.
 		local said = function(): string
-			return if armed:get() == i then e.confirm or "" else e.label or ""
+			return if armed:get() == i then control.text(e.confirm) or "" else control.text(e.label) or ""
 		end
 		local glyph = if e.icon then Menu.glyph(e.icon, glyph_ink) else nil
 		local name: Node = if e.confirm then RollText { said, text_size = "$font.size.md", color = ink, grow = 1, min_w = 0 } else FadeText {

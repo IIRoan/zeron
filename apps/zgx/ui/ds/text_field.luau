@@ -46,7 +46,7 @@ export type Props = {
 	-- A field that drives a list under it, for assistive technology: its
 	-- role ("combobox"), whether the list shows, and the option lit in it
 	-- (an id), followed as they change.
-	role: string?,
+	role: AriaRole?,
 	expanded: (() -> boolean)?,
 	active_descendant: (() -> string?)?,
 	-- While true, the field opens into what hangs under it (a browser's
@@ -133,7 +133,7 @@ return ui.component(function(props: Props): Node
 			value = value,
 			-- (Named by its placeholder, as a plain or changing string, or a
 			-- message.)
-			label = props.label or props.name or (if type(props.placeholder) == "string" or type(props.placeholder) == "function" or control.is_message(props.placeholder) then props.placeholder else nil) or "",
+			label = props.label or props.name or props.placeholder or "",
 			-- (A masked input masks its placeholder too: a password's is
 			-- drawn over it instead, below.)
 			placeholder = if secure then nil else props.placeholder,
@@ -146,7 +146,7 @@ return ui.component(function(props: Props): Node
 			expanded = props.expanded,
 			active_descendant = props.active_descendant,
 			on_mount = if props.autofocus
-				then function(el)
+				then function(el: Element): ()
 					el:focus()
 				end
 				else nil,
@@ -184,13 +184,7 @@ return ui.component(function(props: Props): Node
 				aria_hidden = true,
 				ui.text {
 					function(): string
-						local ph: any = props.placeholder
-						if type(ph) == "function" then
-							return ph()
-						elseif type(ph) == "table" and ph.get then
-							return ph:get()
-						end
-						return control.text(ph) or ""
+						return control.text(props.placeholder) or ""
 					end,
 					text_size = control.TEXT[size],
 					color = "$zeron.field.placeholder",

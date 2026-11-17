@@ -19,7 +19,9 @@ export type Props = {
 }
 
 -- (The app's only: asking from a plugin raises, and a plugin draws the glyph.)
-local icons_ok, icons = pcall(ui.shared, "agent_icons", {} :: { [string]: string })
+local icons_ok, icons = pcall(function()
+	return ui.shared("agent_icons", {} :: { [string]: string })
+end)
 
 local function icon_of(harness: string): string
 	if not icons_ok then
@@ -30,10 +32,15 @@ local function icon_of(harness: string): string
 end
 
 -- One look, drawn.
-local function draw(look: Look.Look, size: number, bare: boolean): Node
-	if look.kind == "initial" then
-		-- (One of your own, named by its harness alone: the glyph.)
-		look = { kind = "fallback", src = Look.FALLBACK, tint = if bare then "currentColor" else Look.INK, bg = if bare then nil else Look.TILE }
+local function draw(given: Look.Look, size: number, bare: boolean): Node
+	local look: Look.Look = given
+	if given.kind == "initial" then
+		local fallback: Look.Look = {
+			kind = "fallback", src = Look.FALLBACK,
+			tint = if bare then "currentColor" else Look.INK,
+			bg = if bare then nil else Look.TILE,
+		}
+		look = fallback
 	end
 	local glyph = size * (if bare then 1 else 0.6)
 	local svg = ui.svg {

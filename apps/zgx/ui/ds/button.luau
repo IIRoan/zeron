@@ -100,6 +100,7 @@ local INK: { [string]: string } = {
 }
 local SPIN: { [string]: number } = { sm = 12, md = 14, lg = 16 }
 
+local control = require("@self/control")
 local status = require("@self/status")
 
 return function(props: Props): Node
@@ -141,12 +142,16 @@ return function(props: Props): Node
 		pointer_events = "none",
 		ui.show(busy, status.Spinner { size = SPIN[props.size or "md"], ink = INK[props.tone or "primary"] }),
 	}
+	local disabled = props.disabled
 	local click = props.on_click
-	if click then
-		p.on_click = function(...)
-			if not busy() then
-				click(...)
-			end
+	if type(disabled) == "table" and type(click) == "function" then
+		local callback = click :: ClickHandler
+		p.on_click = function(event: ClickEvent)
+			if not busy() then callback(event) end
+		end
+	else
+		p.disabled = function(): boolean
+			return busy() or control.value(disabled) == true
 		end
 	end
 	return ui.button(p)

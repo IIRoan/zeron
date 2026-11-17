@@ -98,7 +98,7 @@ local function thumb(a: Attachment, source: () -> (string, boolean), group: stri
 	local broken = ui.use_state("")
 	local function picture(): ReplyPicture.Picture
 		local src, own = source()
-		local p = if pictures and not own then pictures.resolve(src) or { state = "failed" } else { state = "ready", src = src }
+		local p: ReplyPicture.Picture = if pictures and not own then pictures.resolve(src) or { state = "failed" } else { state = "ready", src = src }
 		if p.state == "ready" and broken:get() == p.src then
 			return { state = "failed" }
 		end
@@ -255,7 +255,7 @@ return ui.component(function(props: Props): Node
 	-- The pictures it carries, a set in the lightbox (named by its id).
 	-- (Where each shows from as it opens: a picture read from another
 	-- device is its file here.)
-	local pictures = props.pictures
+	local pictures: ReplyPicture.Pictures? = props.pictures
 	-- Where its `n`th picture shows from now, and whether that's this
 	-- Mac's own file (`now`'s): as drawn, without it.
 	local function source(n: number, a: Attachment): (string, boolean)
@@ -282,7 +282,11 @@ return ui.component(function(props: Props): Node
 			if a.kind == "image" and a.src and a.src ~= "" then
 				n += 1
 				local at, own = source(n, a)
-				local p = if pictures and not own then pictures.resolve(at) else nil
+				local p: ReplyPicture.Picture? = nil
+				local reader = pictures
+				if reader and not own then
+					p = reader.resolve(at)
+				end
 				local src = if p and p.state == "ready" and p.src then p.src else at
 				-- (A file here by its whole path: a Mac's `/…` or Windows' `C:\…`.)
 				local whole = string.sub(src, 1, 1) == "/" or string.match(src, "^%a:[\\/]") ~= nil
