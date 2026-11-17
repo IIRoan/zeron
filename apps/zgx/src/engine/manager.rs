@@ -216,15 +216,20 @@ impl Config {
         if (edge, client, callback_port) != (production.edge.as_str(), production.client.as_str(), production.port) {
             return Err(format!("{edge} isn't production's edge and sign-in"));
         }
-        let port = if LINUX_BETA {
+        // (Linux fork) `ZERON_BETA_PROFILE=regular`: the beta as a window on
+        // regular Zeron's profile and engine (`~/.zeron`, its port unless
+        // said), which the person's zeron-host service keeps running: never
+        // an engine of the beta's own, so no side-by-side profile either.
+        let regular = LINUX_BETA && var("ZERON_BETA_PROFILE").as_deref() == Some("regular");
+        let port = if LINUX_BETA && !regular {
             var("ZERON_IPC_PORT").map(|s| s.parse::<u16>().map_err(|_| "Invalid Zeron Beta IPC port".to_string())).transpose()?.unwrap_or(LINUX_BETA_PORT)
         } else { zeron_cli::ipc_port_from(var("ZERON_IPC_PORT").as_deref()) };
         let data_dir = zeron_cli::paths::resolve_data_dir(|key| match key {
             "HOME" => Some(home.as_os_str().to_owned()),
-            "ZERON_DATA_DIR" if LINUX_BETA => Some(var(key).map(PathBuf::from).unwrap_or_else(|| linux_beta_data(home)).into_os_string()),
+            "ZERON_DATA_DIR" if LINUX_BETA && !regular => Some(var(key).map(PathBuf::from).unwrap_or_else(|| linux_beta_data(home)).into_os_string()),
             key => var(key).map(Into::into),
         });
-        if LINUX_BETA { beta_profile(port,&data_dir,home)?; }
+        if LINUX_BETA && !regular { beta_profile(port,&data_dir,home)?; }
         if port == STAGING_PORT {
             return Err(format!("port {STAGING_PORT} is the staging engine's"));
         }
@@ -236,7 +241,7 @@ impl Config {
             data_dir,
             bin: exe.and_then(zeron_launch::engine_executable),
             home: if LINUX_BETA { var("ZERON_ZGX_ENGINE_HOME").map(|p| expand(&p,home)) } else { None },
-            spawn: true,
+            spawn: !regular,
             edge: edge.into(),
             client: client.into(),
             callback_port,
@@ -530,6 +535,16 @@ mod tests {
         assert!(config_of(&[("ZERON_IPC_PORT", "27871")], home, Some(&exe), &prod.edge).is_err());
         assert!(config_of(&[("ZERON_DATA_DIR", "/Users/someone/.zeron-staging")], home, Some(&exe), &prod.edge).is_err());
         assert!(config_of(&[], home, Some(&exe), "https://staging.zeron.sh").is_err());
+        // (Linux fork) The Linux beta keeps to its own profile unless told
+        // it's a window on regular Zeron's, whose engine it never starts.
+        if LINUX_BETA {
+            assert!(config_of(&[("ZERON_DATA_DIR", "/Users/someone/.zeron")], home, Some(&exe), &prod.edge).is_err());
+            let regular = config_of(&[("ZERON_BETA_PROFILE", "regular")], home, Some(&exe), &prod.edge).unwrap();
+            assert_eq!((regular.port, regular.data_dir.clone()), (27654, home.join(".zeron")));
+            assert_eq!(regular.startable(), None);
+            let moved = config_of(&[("ZERON_BETA_PROFILE", "regular"), ("ZERON_DATA_DIR", "/tmp/copy"), ("ZERON_IPC_PORT", "27701")], home, Some(&exe), &prod.edge).unwrap();
+            assert_eq!((moved.port, moved.data_dir), (27701, PathBuf::from("/tmp/copy")));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
