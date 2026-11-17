@@ -118,11 +118,11 @@ zgx. Engine-side work needs no port: zgx runs the same engine.
 | `c8cdb7c9`, `771c2207`, `325ca85e`, `2e3bd6cd`, `e5c58ac6`, `0312d143`, `66d1ed78`, `05181c07` | Sandbox runtime: devcontainer build, logins handed in, jailed host git, ports published as servers open them, protected git folders, MCP relay, stop ordering | Shared engine, harness and `crates/sandbox` |
 | `055ef365` | Sandbox setup from Zeron MCP | Shared engine and MCP (`sandbox_*`) |
 | `4742d22f`, `36c40f74` | Sandbox settings in Project settings | `project-sandbox` settings sheet |
-| `e1a3838a`, `04f7db30` | Sandbox build progress and log; the Environment panel's sandbox card and two-press Rebuild | `project-sandbox` tab |
+| `e1a3838a`, `04f7db30` | Sandbox build progress and log; the Environment panel's sandbox card, its Open terminal and two-press Rebuild | `project-sandbox` tab; Open terminal asks the panel for a `shell-terminal` tab, which `linux-workbench/screens/panel.luau` turns into the chat's terminal dock (⌘J's) |
 | `e1a3838a`, `04f7db30` | Windows VM for projects: settings, ports, start with services, viewer | `windows-vm` settings sheet; shared engine (`windows_vm.rs`, port keeping) |
 | `e1a3838a`, `04f7db30` | The Environment panel's VM card: screen, state, health, ports, Run in Windows | `windows-vm` tab (screenshots as `host:` images) |
 | `e1a3838a`, `04f7db30` | Services' Start after and startup progress | `project-services` 1.2 |
-| `e1a3838a`, `04f7db30` | Sandboxed terminal reopens after a container restart | zgx's own terminal (host): not ported |
+| `e1a3838a`, `04f7db30` | Sandboxed terminal reopens after a container restart (and Enter reopens an ended shell) | The terminal bridge (`src/terminal.rs`, Linux fork): a shell it opened is opened again in place, by itself after a container stop, Rebuild or engine restart (`TerminalSession::reconnects`), else on Enter; the app's calls about the tab's id reach the new shell (`moved-<id>` beside the claims) |
 | `953a39ab` | `winvm view` borrows the desktop session's display | `scripts/winvm` (shared) |
 | `9451bc3e`, `718ca29b`, `6058d115` | Agents control and edit services, databases and worktree settings | Shared engine and MCP (`service_*`, `worktree_settings_*`) |
 | `12cf01b7` | Archiving a chat soft-closes its worktree; deleting it removes it | Shared engine |

@@ -862,6 +862,10 @@ fn script_host_at(cx: &mut WindowContext, path: PathBuf, entry: &str) -> ScriptH
         appshots::install(cx, &host);
         // The panel's terminal tabs (src/terminal.rs).
         terminal::install(cx, &host);
+        // (Linux fork) A program's copy (OSC 52) counts only within 5 s of your
+        // own input in its terminal, as the shipping app's: attaching replays
+        // the engine's backlog, whose copies must not replace the clipboard.
+        zgx_desktop::terminal_copies_after_input(Some(Duration::from_secs(5)));
         // The panel's home: run actions, the branch's totals (src/session_home.rs).
         session_home::install(&host);
         engine_update::install(cx, &host);

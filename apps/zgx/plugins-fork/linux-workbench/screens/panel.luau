@@ -66,6 +66,9 @@ local ContextMenu = require("@ds/context_menu")
 local IconButton = require("@ds/icon_button").IconButton
 
 local state = require("@app/screens/panel/state")
+-- (The terminal dock, as the module loads: a later require of it can fail
+-- once the engine has snapshotted the plugin again.)
+local fork_layout = require("./fork_layout")
 -- Tab groups. A panel's tabs can be split into groups laid out side
 -- by side and above one another (the tree of screens/shell/split), each
 -- with a strip of its own and the tab it shows; the focused one lifted,
@@ -112,6 +115,44 @@ do
 	else
 		print(`zeron-zgx: the panel's terminals didn't load: {found}`)
 	end
+end
+
+-- Terminals in this plugin's "Terminal font size" (Settings → Plugins →
+-- Linux Workbench; the shipping app's Appearance → Terminal font): each
+-- starts in it (its session's `font_size`, which zgx's reset goes back to),
+-- and those open follow a change. Their font is the theme's code font.
+do
+	local api = (require :: any)("@app/screens/panel/terminal_api")
+	local settings = ui.shared("plugin.linux-workbench.settings", {} :: any)
+	local function size(values: any): number
+		return tonumber((values or {}).terminal_font_size) or 13
+	end
+	-- (zgx's own, kept across a reload of this module.)
+	local term = api.fork_term or api.term
+	api.fork_term = term
+	-- The sessions started here, let go as nothing else holds them.
+	local started = setmetatable({}, { __mode = "v" }) :: { [string]: any }
+	api.term = function(key: string, options: any?): any
+		if options and options.font_size == nil then
+			options = table.clone(options)
+			options.font_size = size(settings:peek())
+		end
+		local t = term(key, options)
+		if options then
+			started[key] = t
+		end
+		return t
+	end
+	ui.effect(function()
+		local points = size(settings:get())
+		for _, t in started do
+			-- (Set outright: down to zgx's least, 6, then up by the rest.)
+			pcall(function()
+				t:binding("decrease_font_size:100")
+				t:binding(`increase_font_size:{points - 6}`)
+			end)
+		end
+	end)
 end
 
 -- A lane's tab (a side chat, a subagent: screens/chat/lane_tab), loaded
@@ -567,6 +608,23 @@ end
 -- with "panel.tabs"): the one already showing that plugin's kind and title,
 -- else a new tab. The panel opens for the session showing.
 function M.open_plugin_tab(session: any, tab: { [string]: any })
+	-- Project Sandbox's Open terminal (the desktop app's open_shell_panel):
+	-- the chat's shell terminal in the dock, as ⌘J opens it, on the terminal
+	-- in front or a new one.
+	if tab.plugin == "project-sandbox" and tab.kind == "shell-terminal" then
+		local id = if type(session) == "table" then session.id else session
+		if type(id) == "string" then
+			local k = `dock:{id}`
+			local s = state.of(k)
+			if s.active then
+				state.activate(k, s.active)
+			else
+				state.open(k, "terminal")
+			end
+			fork_layout.terminal:set(true)
+		end
+		return
+	end
 	-- (On its own page, the page's panel: a plugin's own pages only.)
 	local page = tab.page
 	if type(page) == "table" and page.plugin ~= tab.plugin then

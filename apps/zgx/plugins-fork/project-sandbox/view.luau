@@ -157,6 +157,19 @@ return function(zeron: any, Model: any)
 				ui.row {
 					gap = "$space.2",
 					pt = "$space.1",
+					-- The chat's shell, in the container at its checkout (the
+					-- desktop app's open_shell_panel): Linux Workbench opens
+					-- its terminal dock on it.
+					ui.show(function()
+						return p.panel ~= nil
+					end, Button {
+						"Open terminal",
+						tone = "secondary",
+						size = "sm",
+						on_click = function()
+							p.panel.open_tab { kind = "shell-terminal", title = "Terminal", icon = "terminal" }
+						end,
+					}),
 					Button {
 						function()
 							return if confirm_until:get() > 0 then "Rebuild now" else "Rebuild"
@@ -305,7 +318,7 @@ return function(zeron: any, Model: any)
 					ui.text { "Open a chat in a project to see its sandbox.", color = "$text.tertiary", text_size = "$font.size.sm" },
 				}
 			end
-			return Pane { context = c }
+			return Pane { context = c, panel = p.panel }
 		end, fm.swap { w_full = true, h_full = true })
 	end)
 end

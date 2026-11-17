@@ -25,7 +25,22 @@ zeron.place {
 }
 
 zeron.tab("sandbox", function(tab: any): Node
-	return View { session = tab.data and tab.data.session, project = tab.data and tab.data.project }
+	return View {
+		session = tab.data and tab.data.session,
+		project = tab.data and tab.data.project,
+		-- (Its chat's panel, read as the tab builds: Open terminal asks it.)
+		panel = zeron.context("panel"),
+	}
+end)
+
+-- Open terminal's ask where Linux Workbench isn't there to take it (the
+-- stock panel opens it as a tab of ours): where the chat's terminal is.
+zeron.tab("shell-terminal", function(): Node
+	return ui.column {
+		w_full = true,
+		p = "$space.4",
+		ui.text { "Ctrl+J opens this chat's terminal.", color = "$text.tertiary", text_size = "$font.size.sm" },
+	}
 end)
 
 -- The panel's home: open the chat's project's sandbox beside it.
