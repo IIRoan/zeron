@@ -28,6 +28,7 @@
 #![cfg_attr(all(windows, feature = "beta"), windows_subsystem = "windows")]
 
 mod about;
+mod browser_agents;
 #[cfg(all(windows, feature = "beta"))]
 mod windows_install;
 mod acp_registry;
@@ -565,10 +566,15 @@ fn open_main(cx: &mut WindowContext, inspect: bool) {
         let state = zgx_script::app_data_dir(APP_ID).map(|dir| dir.join("script-state").join("app.luau"));
         carried_settings::carry(from.as_deref(), state.as_deref());
     }
+    if engine::manager::LINUX_BETA {
+        plugins::workbench::hold_window(cx);
+    }
     let host = script_host_at(cx, plugins::prepare_live(), "app.luau");
     host.shared("window", "main");
     // Plugins and your templates (src/plugins): the main window's alone.
     plugins::install(cx, &host);
+    // (Linux fork) Agents driving its browser tabs (src/browser_agents.rs).
+    browser_agents::install(cx, &host);
     // The host's own toasts over it (a template in preview, a switch you
     // didn't make, signing keys, safe mode at launch).
     let chrome = plugins::host_bar::view(cx, host.shared("zeron.locale", "en").signal());
@@ -1307,11 +1313,13 @@ fn onboarding_window() -> WindowOptions {
     }
 }
 
-/// The main window: resizable, its frame kept across launches.
+/// The main window: resizable, its frame kept across launches. (The Linux
+/// beta's shows once its plugins are in: plugins::workbench::hold_window.)
 fn main_window() -> WindowOptions {
     placed(WindowOptions {
         min_size: Some((760., 500.)),
         frame_autosave: Some("zeron-zgx-main".into()),
+        visible: !engine::manager::LINUX_BETA,
         ..zeron_window(1240., 820.)
     })
 }

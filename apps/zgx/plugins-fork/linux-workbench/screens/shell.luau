@@ -488,6 +488,9 @@ return function(): Node
 		w_full = true,
 		h_full = true,
 		relative = true,
+        -- Agents' browser tabs no view shows, out of sight (their pages
+        -- live only while a box shows them).
+        require("@app/screens/panel/browser_agents").Stage {},
         require("./project_icons").View {},
         require("./release_notes").View {},
 		-- A bare Escape nothing took (nothing focused): the chat's, which

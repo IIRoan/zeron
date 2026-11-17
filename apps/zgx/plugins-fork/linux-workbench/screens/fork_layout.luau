@@ -43,7 +43,13 @@ function M.Activity(): Node
         ds.IconButton {icon="folder",label="Explorer",disabled=function() return route.session:get()==nil end,tooltip="Explorer · open a chat to use its checkout",on_click=function() panel().show_files() end},
         ds.IconButton {icon="magnifer",label="Find in Files",disabled=function() return route.session:get()==nil end,tooltip="Find in Files · open a chat to search its checkout",on_click=function() require("./files_search").show() end},
         ui.show(function() return M.enabled("zeron-git") end,ds.IconButton {icon="git-branch",label="Source control",disabled=function() return route.session:get()==nil end,tooltip="Source control · open a chat to use its checkout",on_click=function() git("changes") end}),
-        ui.show(function() return M.enabled("project-services") end,ds.IconButton {icon="remote-server",label="Project services",on_click=function()
+        -- A browser tab beside the chat, in one click (the panel's home offers
+        -- it too). The globe is the browser's alone: Services wear their grid.
+        ds.IconButton {icon="global",label="Browser",disabled=function() return route.session:get()==nil end,tooltip="Browser · open a chat to browse beside it",on_click=function()
+            local session=route.session:peek();if not session then return end
+            panel().open_url(session,nil)
+        end},
+        ui.show(function() return M.enabled("project-services") end,ds.IconButton {icon="widget",label="Project services",on_click=function()
             local session=route.session:peek()
             if not session then route.plugin_page("project-services","services");return end
             panel().open_plugin_tab(session,{plugin="project-services",kind="services",title="Services",data={session=session.id,project=session.project}})

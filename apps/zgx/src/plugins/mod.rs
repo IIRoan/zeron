@@ -362,6 +362,7 @@ fn connect(b: &Rc<Bridge>, rpc: &Rpc) {
             });
             if let Err(error) = asked.await {
                 eprintln!("zeron-zgx: Zeron's own plugins weren't loaded: {error}");
+                workbench::show_held("Zeron's own plugins didn't load");
             }
         });
     }
@@ -1317,6 +1318,11 @@ impl Bridge {
             c.follow(self);
         }
         self.apply();
+        // The Linux beta's window, hidden until Zeron's own are in (a new
+        // engine's first list comes before they're registered).
+        if self.items.borrow().iter().any(|i| i.json["builtin"] == true) {
+            workbench::show_held("plugins in");
+        }
         // One removed is unloaded now: what its VM held to the last (a
         // `ui.persist` it set as it went) goes too.
         for (id, _) in &gone {
@@ -1440,6 +1446,8 @@ impl Bridge {
     /// to finish setting up, and once the account is set up (an
     /// organization chosen) it's watched `again`, and the list follows.
     fn wait_for_setup(self: &Rc<Self>, again: crate::engine::rpc::Again) {
+        // No plugins until then: the window shows now.
+        workbench::show_held("setup isn't finished");
         if self.state.get() != "setup" {
             eprintln!("zeron-zgx: plugins: waiting for the account's setup to be finished");
             self.state.set("setup");

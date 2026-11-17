@@ -192,6 +192,37 @@ pub fn terminal(snapshot: &Json, service: &str) -> Result<String, String> {
         .ok_or_else(|| "Start this service to show its output".into())
 }
 
+/// How long the Linux beta's main window may wait hidden for its plugins:
+/// an engine that's slow or gone still gets a window.
+const HOLD_AT_MOST: std::time::Duration = std::time::Duration::from_secs(4);
+
+thread_local! {
+    /// The Linux beta's main windows, hidden until Zeron's own plugins are
+    /// in, and since when.
+    static HELD: std::cell::RefCell<Vec<(zgx_desktop::WindowHandle, std::time::Instant)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The Linux beta's main window (made hidden, `main_window`) shows once
+/// Zeron's own plugins are in (`show_held`): the Workbench stands in for
+/// Zeron's shell (`ui.replace`), which would otherwise draw first, glass and
+/// all, and be swapped out a moment later. On Wayland a hidden window draws
+/// nothing until it shows.
+pub(crate) fn hold_window(cx: &mut zgx_desktop::WindowContext) {
+    HELD.with(|held| held.borrow_mut().push((cx.window.clone(), std::time::Instant::now())));
+    cx.tasks.spawn(async {
+        zgx::timer::sleep(HOLD_AT_MOST).await;
+        show_held("not waiting longer");
+    });
+}
+
+/// Every window `hold_window` hid, shown (`why`: for the log).
+pub(crate) fn show_held(why: &str) {
+    for (window, since) in HELD.with(|held| std::mem::take(&mut *held.borrow_mut())) {
+        eprintln!("zeron-zgx: window: shown after {} ms, {why}", since.elapsed().as_millis());
+        window.set_visible(true);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

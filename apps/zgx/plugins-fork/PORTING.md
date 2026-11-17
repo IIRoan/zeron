@@ -83,6 +83,7 @@ terminals have their own optional dock; Services never occupies that dock.
 | `faa9a4eb` | WPE helper packaging guard | GPUI Linux package workflow; zgx uses its own WebKitGTK view |
 | `d673397e` | Background commands in sidebar running status | Native sessions bridge with focused regression |
 | `b7218f40` | Browser MCP/CI compatibility | Shared engine/browser protocol and existing CI changes |
+| `cf066992` (its `crates/ui` part) | Agents driving the in-app browser (`browser_*` tools; each tab's bot toggle) | `src/browser_agents.rs` (the engine's browser host, as `shell/browser_control.rs`), `ui/screens/panel/browser_agents.luau` (the pages' side and an out-of-sight stage for tabs no view shows), hooks and the toggle in `ui/screens/panel/browser.luau`, the stage mounted from `linux-workbench/screens/shell.luau`; the desktop app's page script as `src/browser_automation.js`. Screenshots and a person's click, typing and keys need zgx's fork (`~/Documents/zgx`, branch `zeron-fork`: `WebView::snapshot/click/insert_text/press_key`, Luau `web:snapshot/click/type/key`), which `apps/zgx/Cargo.toml` takes. Checked end to end against WebKitGTK (37 checks, the engine's MCP). |
 
 ## Native framework differences and validation boundaries
 

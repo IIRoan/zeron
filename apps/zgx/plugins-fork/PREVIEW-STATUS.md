@@ -17,8 +17,9 @@ Included work:
 
 Known gaps and validation limits:
 
-- The Linux beta web view is reported broken; this branch does not claim a
-  working bundled web runtime.
+- The Linux beta's web view is the system's WebKitGTK 4.1 (`webkit2gtk4.1`
+  on Fedora, which the Astral image carries from `feat/webkitgtk-for-zeron`);
+  without it every page is a placeholder. Nothing is bundled.
 - Project setup can reject a send before the agent starts when configured
   environment/dependency sources are missing. The preview's delivery UI
   does not adequately explain that failure. Copying saved environment
