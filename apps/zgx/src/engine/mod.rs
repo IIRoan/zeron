@@ -137,9 +137,17 @@ impl Drop for Supervising {
 impl Engine {
     fn new() -> Self {
         let account = crate::auth::endpoint();
-        let config = Config::from_env(&account.edge, &account.client, account.port);
+        let config = if crate::direct_instance::ENABLED {
+            Err("This window connects to its paired Linux engine".into())
+        } else {
+            Config::from_env(&account.edge, &account.client, account.port)
+        };
         match &config {
             Ok(config) => eprintln!("zeron-zgx: engine: {}", config.describe()),
+            Err(_) if crate::direct_instance::ENABLED => eprintln!(
+                "zeron-zgx: engine: paired Linux gateway at {}",
+                crate::direct_instance::address()
+            ),
             Err(why) => eprintln!("zeron-zgx: engine: refused ({why}); nothing that needs it works"),
         }
         Self {
@@ -190,6 +198,9 @@ impl Engine {
     /// The engine's data dir, as this app's config has it (nothing when the
     /// config refused one).
     pub fn data_dir(&self) -> Option<std::path::PathBuf> {
+        if crate::direct_instance::ENABLED {
+            return zgx_script::app_data_dir(crate::APP_ID);
+        }
         self.config.as_ref().ok().map(|c| c.data_dir.clone())
     }
 
@@ -220,12 +231,16 @@ impl Engine {
     /// Whether no connection is to be said as "can't reach the engine". (With
     /// a connection, it's not asked.)
     pub fn unreachable(&self) -> bool {
-        says_unreachable(self.config.is_err(), self.answered.get(), self.can_start(), self.down_since.get().elapsed())
+        says_unreachable(!self.has_endpoint(), self.answered.get(), self.can_start(), self.down_since.get().elapsed())
     }
 
     /// Whether this app can start an engine, should none answer.
     pub fn can_start(&self) -> bool {
         self.config.as_ref().is_ok_and(|config| config.startable().is_some())
+    }
+
+    fn has_endpoint(&self) -> bool {
+        self.config.is_ok() || crate::direct_instance::ENABLED
     }
 
     /// The connection, waiting up to `wait` for one.
@@ -235,7 +250,7 @@ impl Engine {
             if let Some(rpc) = self.rpc.borrow().clone().filter(|rpc| !rpc.is_closed()) {
                 return Some(rpc);
             }
-            if self.config.is_err() || Instant::now() >= until {
+            if !self.has_endpoint() || Instant::now() >= until {
                 return None;
             }
             zgx::timer::sleep(Duration::from_millis(100)).await;
@@ -251,7 +266,7 @@ impl Engine {
                 return Some(rpc);
             }
             let waiting = keeps_waiting(self.answered.get(), self.can_start());
-            if self.config.is_err() || (!waiting && Instant::now() >= until) {
+            if !self.has_endpoint() || (!waiting && Instant::now() >= until) {
                 return None;
             }
             zgx::timer::sleep(Duration::from_millis(100)).await;
@@ -284,6 +299,9 @@ impl Engine {
     }
 
     fn follow_session(&self) {
+        if crate::direct_instance::ENABLED {
+            return;
+        }
         let scope = self.scope.borrow().clone();
         if self.restarting.get() || !manager::needs_restart(scope.as_deref(), self.signed_in.get()) {
             return;
@@ -306,9 +324,10 @@ impl Engine {
 
     async fn supervise(self: Rc<Self>) {
         let _supervising = Supervising(self.clone());
-        let Ok(config) = &self.config else {
+        if !self.has_endpoint() {
             return;
-        };
+        }
+        let local = self.config.as_ref().ok();
         let mut spawner = Spawner::new();
         let mut delay = Duration::from_millis(250);
         let mut said = None::<String>;
@@ -316,13 +335,17 @@ impl Engine {
         // The token the engine last refused, if it refused the last dial.
         let mut refused = None::<Option<String>>;
         loop {
-            let token = rpc::read_token(&config.data_dir);
+            let token = local.and_then(|config| rpc::read_token(&config.data_dir));
             // Refused again with the same token: nothing will change by
             // dialling as often (a data dir with a copy of an engine's token,
             // which that engine replaced as it started again).
             let stale = refused.as_ref() == Some(&token);
             let mut refused_now = false;
-            match rpc::connect(config.port, token.clone()).await {
+            let connection = match local {
+                Some(config) => rpc::connect(config.port, token.clone()).await,
+                None => crate::direct_instance::connect().await,
+            };
+            match connection {
                 Ok(rpc) => {
                     delay = Duration::from_millis(250);
                     said = None;
@@ -355,21 +378,23 @@ impl Engine {
                     refused = None;
                     // (Started one, or an engine is about to let go of the
                     // data dir: it's a moment away, not worth backing off.)
-                    if spawner.start_if_due(config) || spawner.held() {
+                    if local.is_some_and(|config| spawner.start_if_due(config) || spawner.held()) {
                         delay = Duration::from_millis(500);
                     }
                 }
                 // A new engine is writing its token: try again shortly. The
                 // same token refused twice: said once, and tried less often.
                 Err(DialError::Unauthorized) => {
-                    if stale && said.as_deref() != Some(STALE_TOKEN) {
+                    if let Some(config) = local
+                        && stale && said.as_deref() != Some(STALE_TOKEN)
+                    {
                         eprintln!(
                             "zeron-zgx: engine: {STALE_TOKEN} ({}): trying it again less often",
                             config.data_dir.join("ipc-token").display()
                         );
                         said = Some(STALE_TOKEN.to_string());
                     }
-                    refused = Some(token);
+                    refused = local.map(|_| token);
                     refused_now = true;
                 }
                 Err(DialError::Other(error)) => {
@@ -393,7 +418,7 @@ impl Engine {
             let waited = Instant::now();
             loop {
                 zgx::timer::sleep(delay.min(TOKEN_LOOK)).await;
-                let changed = refused.as_ref().is_some_and(|was| *was != rpc::read_token(&config.data_dir));
+                let changed = local.zip(refused.as_ref()).is_some_and(|(config, was)| *was != rpc::read_token(&config.data_dir));
                 if changed || waited.elapsed() >= delay {
                     break;
                 }

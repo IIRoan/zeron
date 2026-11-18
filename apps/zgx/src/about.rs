@@ -327,7 +327,7 @@ pub fn install(cx: &mut WindowContext, host: &ScriptHost) {
     *about.windows.borrow_mut() = Some(cx.windows.clone());
     // (The app's updater first: the window's first `about` says whether the
     // app updates itself.)
-    if about.shared.borrow().is_empty() {
+    if about.shared.borrow().is_empty() && !crate::direct_instance::ENABLED {
         start(&about);
     }
     about.shared.borrow_mut().push(host.shared("about", about.value()));
@@ -336,6 +336,9 @@ pub fn install(cx: &mut WindowContext, host: &ScriptHost) {
     host.async_action("about.check", move |_| {
         let a = a.clone();
         async move {
+            if crate::direct_instance::ENABLED {
+                return Err("unmanaged".to_owned());
+            }
             let desktop = a.desktop.borrow().clone();
             if let Some(desktop) = desktop {
                 let checker = desktop.checker.clone();
@@ -363,7 +366,7 @@ pub fn install(cx: &mut WindowContext, host: &ScriptHost) {
     host.async_action("about.apply", move |_| {
         let a = a.clone();
         async move {
-            if crate::engine::manager::LINUX_BETA { return Err("unmanaged".to_string()); }
+            if crate::engine::manager::LINUX_BETA || crate::direct_instance::ENABLED { return Err("unmanaged".to_string()); }
             let desktop = a.desktop.borrow().clone();
             if let Some(desktop) = desktop {
                 if let Some(why) = desktop.status.borrow().as_ref().and_then(|s| s.held.clone()) {

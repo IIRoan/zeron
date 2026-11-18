@@ -95,10 +95,20 @@ impl Frames {
     }
 }
 
-type Socket = tungstenite::WebSocket<TcpStream>;
+use tungstenite::stream::MaybeTlsStream;
+
+pub(crate) type Socket = tungstenite::WebSocket<MaybeTlsStream<TcpStream>>;
+
+pub(crate) fn tcp(socket: &Socket) -> &TcpStream {
+    match socket.get_ref() {
+        MaybeTlsStream::Plain(stream) => stream,
+        MaybeTlsStream::Rustls(stream) => &stream.sock,
+        _ => unreachable!("Zeron only dials plain IPC and rustls"),
+    }
+}
 
 /// The handshake, blocking (on the network thread).
-fn dial(port: u16, token: Option<&str>) -> Result<Socket, DialError> {
+pub(crate) fn dial(port: u16, token: Option<&str>) -> Result<Socket, DialError> {
     use tungstenite::client::IntoClientRequest;
     let address = SocketAddr::from(([127, 0, 0, 1], port));
     let stream = TcpStream::connect_timeout(&address, DIAL_TIMEOUT).map_err(|error| {
@@ -125,7 +135,7 @@ fn dial(port: u16, token: Option<&str>) -> Result<Socket, DialError> {
     let config = tungstenite::protocol::WebSocketConfig::default()
         .max_message_size(Some(LIMIT))
         .max_frame_size(Some(LIMIT));
-    match tungstenite::client::client_with_config(request, stream, Some(config)) {
+    match tungstenite::client::client_with_config(request, MaybeTlsStream::Plain(stream), Some(config)) {
         Ok((socket, _)) => Ok(socket),
         Err(tungstenite::HandshakeError::Failure(tungstenite::Error::Http(response)))
             if response.status().as_u16() == 401 =>
@@ -211,9 +221,9 @@ fn serve(mut socket: Socket, rx: mpsc::Receiver<String>, frames: Frames, #[cfg(u
     // Without a pipe to wait on (not unix), short reads let the thread
     // interleave outgoing requests.
     #[cfg(unix)]
-    let _ = socket.get_ref().set_nonblocking(true);
+    let _ = tcp(&socket).set_nonblocking(true);
     #[cfg(not(unix))]
-    let _ = socket.get_ref().set_read_timeout(Some(Duration::from_millis(15)));
+    let _ = tcp(&socket).set_read_timeout(Some(Duration::from_millis(15)));
     let fail = |error: tungstenite::Error| frames.push(None, Some(error.to_string()));
     // Frames were read since this thread last gave back what the main thread
     // has freed of them.
@@ -268,7 +278,7 @@ fn serve(mut socket: Socket, rx: mpsc::Receiver<String>, frames: Frames, #[cfg(u
         #[cfg(unix)]
         {
             let out = if unsent { libc::POLLOUT } else { 0 };
-            let mut fds = [poll_fd(socket.get_ref(), libc::POLLIN | out), poll_fd(&heard, libc::POLLIN)];
+            let mut fds = [poll_fd(tcp(&socket), libc::POLLIN | out), poll_fd(&heard, libc::POLLIN)];
             // SAFETY: `fds` is a valid slice of pollfds for its whole length.
             let woken = unsafe {
                 libc::poll(
@@ -294,6 +304,12 @@ fn serve(mut socket: Socket, rx: mpsc::Receiver<String>, frames: Frames, #[cfg(u
 
 /// Connects on a background thread, resolving once the socket is open.
 pub fn connect(port: u16, token: Option<String>) -> impl Future<Output = Result<Rpc, DialError>> {
+    connect_with(move || dial(port, token.as_deref()))
+}
+
+pub(crate) fn connect_with(
+    dial: impl FnOnce() -> Result<Socket, DialError> + Send + 'static,
+) -> impl Future<Output = Result<Rpc, DialError>> {
     let frames = Frames(Arc::default());
     let (tx, rx) = mpsc::channel::<String>();
     let opened = Arc::new(Mutex::new((None::<Result<(), DialError>>, None::<Waker>)));
@@ -322,7 +338,7 @@ pub fn connect(port: u16, token: Option<String>) -> impl Future<Output = Result<
     let ready = true;
     let spawned = ready.then(|| {
         std::thread::Builder::new().name("zeron-ipc".into()).spawn(move || {
-            let socket = match dial(port, token.as_deref()) {
+            let socket = match dial() {
                 Ok(socket) => socket,
                 Err(error) => {
                     open(Err(error));

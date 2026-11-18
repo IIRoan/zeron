@@ -38,7 +38,6 @@
 
 use std::{
     io::Write,
-    net::{SocketAddr, TcpStream},
     path::PathBuf,
     time::Duration,
 };
@@ -50,7 +49,7 @@ use serde_json::{Map, Value as Json, json};
 use zgx_desktop::WindowContext;
 use zgx_script::{ScriptHost, Value};
 
-use crate::engine::{self, rpc};
+use crate::engine::{self, rpc::{self, Socket}};
 
 /// The bridge commands the host itself made (`terminal.start`,
 /// `terminal.command`): a terminal Zeron started shows while a template is a
@@ -160,17 +159,14 @@ fn claims_dir() -> PathBuf {
 async fn start(arg: Value) -> Result<Value, String> {
     let target = arg.field("target").ok_or("no target")?;
     let params = open_params(target).await?;
-    let (port, data) = engine::get().ipc_endpoint().ok_or("Zeron isn't available here")?;
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let dir = claims_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let claim = dir.join(format!("{}-{}", std::process::id(), operation_nonce()));
     // (In base64: no quote inside it for a shell to read as its own, `runnable`.)
     let open = base64::engine::general_purpose::STANDARD.encode(Json::Object(params).to_string());
     let line = runnable(format!(
-        "{} terminal-bridge --port {port} --data {} --open {} --claim {}",
-        quote(&exe.to_string_lossy()),
-        quote(&data.to_string_lossy()),
+        "{} --open {} --claim {}",
+        bridge_command()?,
         quote(&open),
         quote(&claim.to_string_lossy()),
     ));
@@ -286,16 +282,13 @@ fn quote_windows(word: &str) -> String {
 /// The bridge's command line for terminal `arg.id` (on `device`, another
 /// device's, routed there).
 pub(crate) fn command(arg: Value, device: Option<String>) -> Result<Value, String> {
-    let (port, data) = engine::get().ipc_endpoint().ok_or("Zeron isn't available here")?;
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let id = text(arg.field("id"));
     if id.is_empty() {
         return Err("no terminal".into());
     }
     let mut line = format!(
-        "{} terminal-bridge --port {port} --data {} --terminal {}",
-        quote(&exe.to_string_lossy()),
-        quote(&data.to_string_lossy()),
+        "{} --terminal {}",
+        bridge_command()?,
         quote(&id),
     );
     if let Some(device) = device {
@@ -304,6 +297,17 @@ pub(crate) fn command(arg: Value, device: Option<String>) -> Result<Value, Strin
     let line = runnable(line);
     note_issued(&line);
     Ok(Value::from(line.as_str()))
+}
+
+fn bridge_command() -> Result<String, String> {
+    let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+    let prefix = format!("{} terminal-bridge", quote(&exe.to_string_lossy()));
+    if crate::direct_instance::ENABLED {
+        Ok(prefix)
+    } else {
+        let (port, data) = engine::get().ipc_endpoint().ok_or("Zeron isn't available here")?;
+        Ok(format!("{prefix} --port {port} --data {}", quote(&data.to_string_lossy())))
+    }
 }
 
 /// The line zgx's terminal runs for the bridge's `line`. The Windows beta is
@@ -341,14 +345,18 @@ fn attach_console() {
 // The bridge: its own process, run by zgx's terminal.
 
 struct Args {
-    port: u16,
-    data: PathBuf,
+    endpoint: Endpoint,
     /// The engine terminal to attach to; or, for a new one, what to open
     /// (OpenTerminal's parameters, but its size) and where to leave its id.
     terminal: Option<String>,
     open: Option<Map<String, Json>>,
     claim: Option<PathBuf>,
     device: Option<String>,
+}
+
+enum Endpoint {
+    Local { port: u16, data: PathBuf },
+    Direct,
 }
 
 fn parse(args: &[String]) -> Result<Args, String> {
@@ -381,9 +389,13 @@ fn parse(args: &[String]) -> Result<Args, String> {
     if terminal.is_none() && (open.is_none() || claim.is_none()) {
         return Err("--terminal, or --open with --claim, is needed".into());
     }
+    let endpoint = if crate::direct_instance::ENABLED {
+        Endpoint::Direct
+    } else {
+        Endpoint::Local { port: port.ok_or("--port is needed")?, data: data.ok_or("--data is needed")? }
+    };
     Ok(Args {
-        port: port.ok_or("--port is needed")?,
-        data: data.ok_or("--data is needed")?,
+        endpoint,
         terminal,
         open,
         claim,
@@ -391,22 +403,18 @@ fn parse(args: &[String]) -> Result<Args, String> {
     })
 }
 
-type Socket = tungstenite::WebSocket<TcpStream>;
-
-fn dial(port: u16, token: Option<&str>) -> Result<Socket, String> {
-    use tungstenite::client::IntoClientRequest;
-    let address = SocketAddr::from(([127, 0, 0, 1], port));
-    let stream = TcpStream::connect_timeout(&address, Duration::from_secs(5)).map_err(|e| e.to_string())?;
-    let _ = stream.set_nodelay(true);
-    let mut request = format!("ws://127.0.0.1:{port}").into_client_request().map_err(|e| e.to_string())?;
-    if let Some(token) = token {
-        let value = tungstenite::http::HeaderValue::from_str(&format!("Bearer {token}")).map_err(|e| e.to_string())?;
-        request.headers_mut().insert(tungstenite::http::header::AUTHORIZATION, value);
-    }
-    let (socket, _) = tungstenite::client::client(request, stream).map_err(|e| e.to_string())?;
+fn dial(endpoint: &Endpoint) -> Result<Socket, String> {
+    let socket = match endpoint {
+        Endpoint::Local { port, data } => rpc::dial(*port, rpc::read_token(data).as_deref()),
+        Endpoint::Direct => crate::direct_instance::dial_paired(),
+    }.map_err(|error| match error {
+        rpc::DialError::Refused => "The Zeron engine is offline.".to_owned(),
+        rpc::DialError::Unauthorized => "The Zeron engine rejected this connection.".to_owned(),
+        rpc::DialError::Other(error) => error,
+    })?;
     // (Opening a terminal waits on its answer with short reads; passing
     // bytes, the socket doesn't block at all: see `bridge`.)
-    let _ = socket.get_ref().set_read_timeout(Some(Duration::from_millis(15)));
+    let _ = rpc::tcp(&socket).set_read_timeout(Some(Duration::from_millis(15)));
     Ok(socket)
 }
 
@@ -680,8 +688,7 @@ pub fn bridge(args: &[String]) -> i32 {
             return 2;
         }
     };
-    let token = rpc::read_token(&args.data);
-    let mut socket = match dial(args.port, token.as_deref()) {
+    let mut socket = match dial(&args.endpoint) {
         Ok(socket) => socket,
         Err(why) => {
             print!("\r\nZeron can't be reached right now ({why}).\r\n");
@@ -750,7 +757,7 @@ pub fn bridge(args: &[String]) -> i32 {
     #[cfg(unix)]
     let Some(resized) = resizes() else { return 1 };
     #[cfg(unix)]
-    let _ = socket.get_ref().set_nonblocking(true);
+    let _ = rpc::tcp(&socket).set_nonblocking(true);
     #[cfg(not(unix))]
     let rx = {
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
@@ -899,7 +906,7 @@ pub fn bridge(args: &[String]) -> i32 {
                 return 1;
             }
             #[cfg(unix)]
-            let _ = socket.get_ref().set_nonblocking(true);
+            let _ = rpc::tcp(&socket).set_nonblocking(true);
             continue;
         }
         // Asleep until one of them has something.
@@ -908,7 +915,7 @@ pub fn bridge(args: &[String]) -> i32 {
             let out = if unsent { libc::POLLOUT } else { 0 };
             let stdin = std::io::stdin();
             let mut fds = [
-                rpc::poll_fd(socket.get_ref(), libc::POLLIN | out),
+                rpc::poll_fd(rpc::tcp(&socket), libc::POLLIN | out),
                 rpc::poll_fd(&stdin, libc::POLLIN),
                 rpc::poll_fd(&resized, libc::POLLIN),
             ];
@@ -1042,7 +1049,7 @@ fn next_shell(socket: &mut Socket, args: &Args, shell: &Shell, end: &End, alive:
                 if !pause(1000) {
                     return Next::Done(0);
                 }
-                if let Ok(back) = dial(args.port, rpc::read_token(&args.data).as_deref()) {
+                if let Ok(back) = dial(&args.endpoint) {
                     *socket = back;
                     return Next::Same;
                 }
@@ -1081,7 +1088,7 @@ fn next_shell(socket: &mut Socket, args: &Args, shell: &Shell, end: &End, alive:
 #[cfg(unix)]
 fn connection_ends(socket: &mut Socket) -> bool {
     // (Short reads: the read timeout `dial` set.)
-    let _ = socket.get_ref().set_nonblocking(false);
+    let _ = rpc::tcp(&socket).set_nonblocking(false);
     let until = std::time::Instant::now() + Duration::from_secs(2);
     while std::time::Instant::now() < until {
         match socket.read() {
@@ -1105,9 +1112,9 @@ fn next_shell(_: &mut Socket, _: &Args, _: &Shell, end: &End, _: Duration, _: Op
 fn open_again(socket: &mut Socket, args: &Args, open: &Map<String, Json>) -> Result<(String, (u16, u16)), String> {
     let size = window_size().unwrap_or((80, 24));
     // (`open_terminal` waits on short reads, not a socket that never blocks.)
-    let _ = socket.get_ref().set_nonblocking(false);
+    let _ = rpc::tcp(socket).set_nonblocking(false);
     let opened = open_terminal(socket, open, size).or_else(|_| {
-        let back = dial(args.port, rpc::read_token(&args.data).as_deref())?;
+        let back = dial(&args.endpoint)?;
         *socket = back;
         open_terminal(socket, open, size)
     });
@@ -1298,7 +1305,7 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         let parsed = parse(&args).unwrap();
-        assert_eq!(parsed.port, 27897);
+        assert!(matches!(parsed.endpoint, Endpoint::Local { port: 27897, .. }));
         assert_eq!(parsed.terminal.as_deref(), Some("t1"));
         assert_eq!(parsed.device.as_deref(), Some("dev"));
         assert!(parse(&["--port".to_string()]).is_err());

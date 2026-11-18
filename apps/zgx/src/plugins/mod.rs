@@ -350,6 +350,12 @@ pub fn expose_own(host: &ScriptHost, id: &str) {
 /// (`auth::set_up`), on the same connection, so plugins load as setup
 /// finishes, with no relaunch. Settings → Plugins says so meanwhile.
 fn connect(b: &Rc<Bridge>, rpc: &Rpc) {
+    if crate::direct_instance::ENABLED {
+        // The engine's plugin paths live on Linux. The viewer must neither
+        // load those paths nor register its own Windows paths on the host.
+        b.heard(&json!({ "plugins": [] }));
+        return;
+    }
     // Zeron's own plugins, shipped beside the app's scripts: the engine
     // scans them with yours (each connection: an engine started again
     // forgets).

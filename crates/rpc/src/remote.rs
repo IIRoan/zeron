@@ -165,11 +165,45 @@ struct Gateway {
     instance: String,
     device: String,
     credential: Credential,
+    desktop: bool,
 }
 #[derive(Clone)]
 enum Credential {
     Pair(String),
     Device(String),
+}
+
+fn desktop_stream(method: &str) -> bool {
+    matches!(
+        method,
+        "AuthStatus" | "WatchChats" | "WatchDevices" | "WatchSessions" | "WatchSpaces"
+            | "WatchSidebarPreferences" | "WatchDocMessages" | "WatchQueue"
+            | "WatchHeldSends" | "WatchWaitingMessages" | "WatchConnectivity"
+            | "WatchTransfers" | "WatchThemes" | "WatchWorkspaceFiles"
+            | "WatchWorkspaceGitStatus" | "WatchCheckoutDiffs" | "SubscribeTerminal"
+    )
+}
+
+fn desktop_request(method: &str, params: &Value) -> bool {
+    if method == "Mutate" {
+        return matches!(
+            params["op"].as_str(),
+            Some("createChat" | "setChatArchived" | "deleteChat" | "renameChat"
+                | "markChatSeen" | "setChatConfig" | "changeSidebarPin" | "renameSpace")
+        ) && params["cloud"].as_bool() != Some(true);
+    }
+    desktop_stream(method)
+        || matches!(
+            method,
+            "EngineInfo" | "LocalDevice" | "GetChat" | "QueueCommand"
+                | "QueueMessage" | "RetryDelivery" | "RemoveHeldSend" | "StopWaiting"
+                | "StopBackgroundTask" | "ForkSideChat" | "ListAgentAccounts"
+                | "ListCommands" | "ListSkills" | "FetchToolBlob" | "ReadToolOutput"
+                | "GetWorkspaceGitStatus" | "SearchWorkspaceFiles" | "SearchWorkspaceContent"
+                | "ReadWorkspaceImage" | "WriteWorkspaceFile" | "CreateWorkspaceEntry"
+                | "MoveWorkspaceEntry" | "DeleteWorkspaceEntry" | "OpenTerminal"
+                | "TerminalStatus" | "WriteTerminal" | "ResizeTerminal" | "CloseTerminal"
+        )
 }
 
 fn permitted(method: &str) -> bool {
@@ -224,11 +258,12 @@ impl RpcService for Gateway {
             _ => {}
         }
         if method == "DirectHello" {
-            return RpcReply::value(
-                &json!({"protocol": 1, "instanceId": self.instance, "deviceId": self.device}),
-            );
+            return RpcReply::value(&json!({
+                "protocol": 1, "instanceId": self.instance, "deviceId": self.device,
+                "desktop": self.desktop
+            }));
         }
-        if !permitted(method)
+        if !(permitted(method) || self.desktop && desktop_request(method, &params))
             || params
                 .get("targetDeviceId")
                 .is_some_and(|id| id.as_str() != Some(&self.device))
@@ -237,7 +272,7 @@ impl RpcService for Gateway {
                 "Method is not available through this direct connection",
             ));
         }
-        if matches!(
+        if (self.desktop && desktop_stream(method)) || matches!(
             method,
             methods::DIRECT_SESSION | methods::WATCH_CHECKOUT_CHANGE_REQUEST
         ) {
@@ -264,10 +299,17 @@ async fn connect_gateway_ipc(url: &str, data_dir: Option<&Path>) -> Result<RpcCl
 }
 
 pub async fn serve(listener: TcpListener, ipc: String, store: RemoteStore) -> anyhow::Result<()> {
-    let data_dir = std::env::var_os("ZERON_DATA_DIR")
+    serve_with_data_dir(listener, ipc, store, default_data_dir()).await
+}
+
+fn default_data_dir() -> Option<PathBuf> {
+    std::env::var_os("ZERON_DATA_DIR")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".zeron")));
-    serve_with_data_dir(listener, ipc, store, data_dir).await
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".zeron")))
+}
+
+pub async fn serve_desktop(listener: TcpListener, ipc: String, store: RemoteStore) -> anyhow::Result<()> {
+    serve_gateway(listener, ipc, store, default_data_dir(), true).await
 }
 
 /// Serve using an explicit engine directory for IPC token discovery.
@@ -277,8 +319,22 @@ pub async fn serve_with_data_dir(
     store: RemoteStore,
     data_dir: Option<PathBuf>,
 ) -> anyhow::Result<()> {
+    serve_gateway(listener, ipc, store, data_dir, false).await
+}
+
+async fn serve_gateway(
+    listener: TcpListener,
+    ipc: String,
+    store: RemoteStore,
+    data_dir: Option<PathBuf>,
+    desktop: bool,
+) -> anyhow::Result<()> {
     let engine = connect_gateway_ipc(&ipc, data_dir.as_deref()).await?;
     let info = engine.call(methods::ENGINE_INFO, json!({})).await?;
+    anyhow::ensure!(
+        !desktop || info["workspaceScope"].as_str() == Some("local"),
+        "The desktop gateway requires a local-only Zeron engine"
+    );
     let scope = json!({"deviceId": info["deviceId"], "workspaceScope": info["workspaceScope"]});
     let instance = store.identity(scope)?;
     engine
@@ -333,9 +389,10 @@ pub async fn serve_with_data_dir(
             let Ok(Ok(socket)) = tokio::time::timeout(Duration::from_secs(5), tokio_tungstenite::accept_hdr_async_with_config(socket, check, Some(config))).await else { return };
             let Some(credential) = credential else { return };
             let Ok(engine) = connect_gateway_ipc(&ipc, data_dir.as_deref()).await else { return };
-            if engine.call(methods::ENGINE_INFO, json!({})).await.ok().as_ref() != Some(&info) { return; }
+            let Ok(current) = engine.call(methods::ENGINE_INFO, json!({})).await else { return };
+            if current["deviceId"] != info["deviceId"] || current["workspaceScope"] != info["workspaceScope"] { return; }
             let engine = Arc::new(engine);
-            let service = Arc::new(Gateway { engine, store: store.clone(), instance, device, credential: credential.clone() });
+            let service = Arc::new(Gateway { engine, store: store.clone(), instance, device, credential: credential.clone(), desktop });
             let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<String>(64);
             let (in_tx, in_rx) = tokio::sync::mpsc::channel::<String>(64);
             let task = tokio::spawn(crate::serve_connection(service, out_tx, in_rx));
@@ -408,6 +465,23 @@ mod tests {
                 .identity(json!({"deviceId": "b", "workspaceScope": "local"}))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn desktop_workspace_access_keeps_engine_and_account_controls_private() {
+        assert!(desktop_stream("AuthStatus"));
+        assert!(desktop_stream("WatchDocMessages"));
+        assert!(desktop_stream("SubscribeTerminal"));
+        assert!(!permitted("SubscribeTerminal"));
+        assert!(desktop_request("OpenTerminal", &json!({})));
+        assert!(!permitted("OpenTerminal"));
+        assert!(desktop_request("Mutate", &json!({"op": "createChat"})));
+        assert!(!desktop_request("Mutate", &json!({"op": "createChat", "cloud": true})));
+        assert!(!desktop_request("Mutate", &json!({"op": "removeDevice"})));
+        for method in ["StopEngine", "AccessToken", "SignIn", "SignOut", "ApplyUpdate"] {
+            assert!(!desktop_request(method, &json!({})), "{method}");
+            assert!(!permitted(method), "{method}");
+        }
     }
 
     struct FakeEngine;

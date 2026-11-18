@@ -3,6 +3,9 @@ use clap::{Parser, Subcommand};
 struct Args {
     #[arg(long, env = "ZERON_REMOTE_DATA_DIR")]
     data_dir: Option<std::path::PathBuf>,
+    /// Use the separate account-free ZGX desktop gateway and device store.
+    #[arg(long)]
+    desktop: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -29,7 +32,11 @@ async fn main() -> anyhow::Result<()> {
         std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
             .join(".local/share/zeron-remote")
     });
-    let store = zeron_rpc::remote::RemoteStore::open(root)?;
+    let store = zeron_rpc::remote::RemoteStore::open(if args.desktop {
+        root.join("desktop")
+    } else {
+        root
+    })?;
     match args.command {
         Command::Serve { listen, ipc_port } => {
             anyhow::ensure!(
@@ -40,7 +47,12 @@ async fn main() -> anyhow::Result<()> {
             eprintln!(
                 "Direct instance gateway on {listen}. Use an HTTPS proxy and generate a key with zeron-remote pair."
             );
-            zeron_rpc::remote::serve(listener, format!("ws://127.0.0.1:{ipc_port}"), store).await?;
+            let ipc = format!("ws://127.0.0.1:{ipc_port}");
+            if args.desktop {
+                zeron_rpc::remote::serve_desktop(listener, ipc, store).await?;
+            } else {
+                zeron_rpc::remote::serve(listener, ipc, store).await?;
+            }
         }
         Command::Pair => println!("{}", store.pairing_key()?),
         Command::Devices => {

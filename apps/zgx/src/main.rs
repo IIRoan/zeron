@@ -42,6 +42,7 @@ mod dev;
 mod dictation;
 mod completion;
 mod desktop_blur;
+mod direct_instance;
 mod engine;
 mod engine_update;
 mod editor_menu;
@@ -154,7 +155,7 @@ use zgx_script::{ScriptHost, Shared, Value};
 
 /// Where `ui.persist` keeps its files: the Zeron app's (the beta), apart from
 /// development builds', which are staging's.
-const APP_ID: &str = if engine::manager::LINUX_BETA { "zeron-beta" } else if cfg!(feature = "beta") { "zeron" } else { "zeron-zgx" };
+const APP_ID: &str = if direct_instance::ENABLED { "zeron-zgx-direct" } else if engine::manager::LINUX_BETA { "zeron-beta" } else if cfg!(feature = "beta") { "zeron" } else { "zeron-zgx" };
 
 /// Setup's window, in points: room for a step and its footer, no more.
 const ONBOARDING_SIZE: (f64, f64) = (680., 500.);
@@ -211,6 +212,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var_os("ZGX_CHECK").is_none() {
         // SAFETY: first thing in main, before any thread is started.
         unsafe { std::env::set_var("ZGX_CHECK", "0") };
+    }
+    if direct_instance::ENABLED {
+        match argv.get(1).map(String::as_str) {
+            None => return run_direct(false),
+            Some("--pair") => return run_direct(true),
+            Some("--version" | "-V") => {
+                println!("zeron {}", about::APP_VERSION);
+                return Ok(());
+            }
+            Some(_) => return Err("This portable Zeron build accepts --pair and --version.".into()),
+        }
     }
     // The browser tab's pages on Linux (zgx-desktop's `webkitgtk`) are drawn
     // in GTK 3 offscreen windows, which can't make a GL context. Where
@@ -393,6 +405,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // so the next launch is on it (src/about.rs).
     about::install_on_quit();
     // Reload Zeron: the windows closed, a fresh launch in this one's place.
+    relaunch::after_quit();
+    Ok(())
+}
+
+fn run_direct(force_pair: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let paired = !force_pair && direct_instance::paired();
+    let mut application = Application::new().application_id("sh.zeron.direct")?;
+    for font in fonts() {
+        application = application.font(font?);
+    }
+    if paired {
+        compile_ahead(&Screen::Main);
+        application.window(main_window()).run(|cx| open_main(cx, false))?;
+    } else {
+        application.window(onboarding_window()).run(|cx| {
+            let host = script_host(cx, "direct.luau");
+            host.shared("direct.address", direct_instance::address().as_str());
+            let (windows, window) = (cx.windows.clone(), cx.window.clone());
+            host.async_action("direct.pair", move |value| {
+                let (windows, window) = (windows.clone(), window.clone());
+                let key = match value { Value::Str(text) => text.to_string(), _ => String::new() };
+                async move {
+                    direct_instance::pair(key).await?;
+                    windows.open(main_window(), |cx| open_main(cx, false));
+                    window.close();
+                    Ok(Value::Nil)
+                }
+            });
+            serve(cx, host, "direct.luau", false);
+        })?;
+    }
     relaunch::after_quit();
     Ok(())
 }
@@ -838,7 +881,7 @@ fn script_host_at(cx: &mut WindowContext, path: PathBuf, entry: &str) -> ScriptH
     haptics::install(&host);
     // The engine's account (src/auth.rs), this Mac's agents (src/agents.rs)
     // and GitHub for Cloud (src/github.rs): every window but the intro's.
-    if entry != "intro.luau" {
+    if entry != "intro.luau" && entry != "direct.luau" {
         auth::install(cx, &host);
         agents::install(&host);
         acp_registry::install(cx, &host);
