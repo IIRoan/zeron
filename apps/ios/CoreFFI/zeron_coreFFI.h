@@ -1703,6 +1703,11 @@ uint64_t uniffi_zeron_mobile_fn_func_max_attachment_bytes(RustCallStatus *_Nonnu
 RustBuffer uniffi_zeron_mobile_fn_func_model_label(RustBuffer harness, RustBuffer model, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_FUNC_PAIR_INSTANCE
+#define UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_FUNC_PAIR_INSTANCE
+uint64_t uniffi_zeron_mobile_fn_func_pair_instance(RustBuffer endpoint, RustBuffer key, RustBuffer name
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_FUNC_PARSE_AUTH_CALLBACK
 #define UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_FN_FUNC_PARSE_AUTH_CALLBACK
 RustBuffer uniffi_zeron_mobile_fn_func_parse_auth_callback(RustBuffer url, RustCallStatus *_Nonnull out_status
@@ -2116,6 +2121,12 @@ uint16_t uniffi_zeron_mobile_checksum_func_max_attachment_bytes(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_CHECKSUM_FUNC_MODEL_LABEL
 #define UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_CHECKSUM_FUNC_MODEL_LABEL
 uint16_t uniffi_zeron_mobile_checksum_func_model_label(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_CHECKSUM_FUNC_PAIR_INSTANCE
+#define UNIFFI_FFIDEF_UNIFFI_ZERON_MOBILE_CHECKSUM_FUNC_PAIR_INSTANCE
+uint16_t uniffi_zeron_mobile_checksum_func_pair_instance(void
     
 );
 #endif
