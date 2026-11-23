@@ -1,5 +1,5 @@
 local ds={Button=require("@ds/button"),Dialog=require("@ds/dialog").Dialog,TextField=require("@ds/text_field"),
-    Icon=require("@ds/icon"),FadeText=require("@ds/fade_text")}
+    Icon=require("@ds/icon"),FadeText=require("@ds/fade_text"),HoverCard=require("@ds/hover_card")}
 local choices=require("./branch_choices")
 local fm=require("./fork_motion")
 local titles={switchBranch="Checkout to…",pullFrom="Pull from…",merge="Merge branch…",rebase="Rebase onto…",deleteBranch="Delete branch…"}
@@ -20,9 +20,15 @@ function M.open(m: any,kind: string,pin: any?)
         if mine~=p.serial then return end;p.branches:set(result.branches or result);p.loading:set(false)
     end,function(e: any) if mine==p.serial then p.loading:set(false);p.error:set(tostring(e)) end end)
 end
+-- (Literal: a branch named `{x}` would otherwise be read as a template and
+-- withdraw the plugin.)
 function M.Button(m: any): Node
-    return ds.Button {function() local s=m.status:get();return (s and (s.branch or (s.oid and string.sub(s.oid,1,7)))) or "Branch" end,
-        id="git-branch",label="Branch",size="xs",tone="ghost",disabled=function() return m.workbench.busy:get() end,
+    local function name(): string local s=m.status:get();return (s and (s.branch or (s.oid and string.sub(s.oid,1,7)))) or "Branch" end
+    return ds.Button {ds.FadeText {name,literal=true,min_w=0,shrink=1},
+        id="git-branch",label="Branch",size="xs",tone="ghost",min_w=0,shrink=1,tooltip_delay=350,
+        tooltip=ds.HoverCard.Tip {px="$space.2",py="$space.1",max_w=320,
+            ui.text {name,literal=true,text_size="$font.size.xs",color="$text.primary",wrap=true}},
+        disabled=function() return m.workbench.busy:get() end,
         on_click=function() M.open(m,"switchBranch") end}
 end
 M.View=ui.component(function(p: any): Node
