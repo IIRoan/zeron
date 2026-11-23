@@ -48,7 +48,8 @@ return function(zeron: any, Repo: any, words: any)
 
 	-- What Changes is of: the work tree, the branch, the last turn (a chip
 	-- of the panel's scale, the composer's footer's).
-	local function scope_chip(m: any): Node
+	-- (`measured`, Linux fork: its laid-out width, its group's minimum.)
+	local function scope_chip(m: any, measured: State<number>): Node
 		local value = ui.use_state(m.scope:peek() :: string?)
 		ui.effect(function()
 			local s = m.scope:get()
@@ -63,6 +64,11 @@ return function(zeron: any, Repo: any, words: any)
 		return ui.row {
 			id = "git-scope",
 			shrink = 0,
+			on_resize = function(size)
+				if measured:peek() ~= size.w then
+					measured:set(size.w)
+				end
+			end,
 			Dropdown {
 				value = value,
 				items = items,
@@ -200,6 +206,7 @@ return function(zeron: any, Repo: any, words: any)
 		-- reflows live as an edge is dragged.)
 		local width = ui.use_state("")
 		local scope_wrapped = ui.use_state(false)
+		local scope_w = ui.use_state(0)
 
 		-- (A band as the panel's others are: the browser's bar, the file's
 		-- head; 40 points, its controls the panel's 24, its first under the
@@ -224,8 +231,11 @@ return function(zeron: any, Repo: any, words: any)
 			if view == "changes"
 				then ui.row {
 					id = "git-scope-group",
-					grow = 1,
-					min_w = 0,
+					-- (Linux fork) Never narrower than the scope chip, as
+					-- measured: its words fade, so its own minimum is its glyph.
+					min_w = function(): number
+						return scope_w:get()
+					end,
 					flex_wrap = true,
 					gap = "$space.1",
 					items = "center",
@@ -236,18 +246,27 @@ return function(zeron: any, Repo: any, words: any)
 							scope_wrapped:set(now)
 						end
 					end,
-					scope_chip(m),
+					scope_chip(m, scope_w),
 					base_chip(m, scope_wrapped),
 				}
-				else ui.div { grow = 1 },
-			-- At its end, as the browser's page controls are: the branch,
-			-- the rest.
+				else ui.div {},
+			-- (Linux fork) The branch takes only the room left over: a long
+			-- name fades instead of pushing the scope and controls.
+			ui.row {
+				id = "git-branch-room",
+				grow = 1,
+				basis = 0,
+				min_w = 64,
+				justify = "end",
+				items = "center",
+				branch_switcher(m),
+			},
+			-- At its end, as the browser's page controls are.
 			ui.row {
 				id = "git-head-controls",
 				shrink = 0,
 				gap = "$space.1",
 				items = "center",
-				branch_switcher(m),
 				SyncCounts(m),
 				IconButton {
 					id = "git-refresh",
