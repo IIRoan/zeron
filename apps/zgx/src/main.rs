@@ -65,6 +65,7 @@ mod relaunch;
 mod session_home;
 mod sessions;
 mod settings;
+mod startup;
 #[cfg(target_os = "macos")]
 mod system_sound;
 mod terminal;
@@ -424,6 +425,7 @@ fn compile_ahead(screen: &Screen) {
         }
         Screen::Onboarding => ahead(&ui, "app.luau"),
         Screen::Main => {
+            if engine::manager::LINUX_BETA { startup::precompile(&ui); }
             let live = plugins::templates_root()
                 .map(|root| root.join(plugins::live::LIVE))
                 .filter(|live| live.join("app.luau").is_file());
@@ -566,13 +568,11 @@ fn open_main(cx: &mut WindowContext, inspect: bool) {
         let state = zgx_script::app_data_dir(APP_ID).map(|dir| dir.join("script-state").join("app.luau"));
         carried_settings::carry(from.as_deref(), state.as_deref());
     }
-    if engine::manager::LINUX_BETA {
-        plugins::workbench::hold_window(cx);
-    }
     let host = script_host_at(cx, plugins::prepare_live(), "app.luau");
     host.shared("window", "main");
+    let startup = engine::manager::LINUX_BETA.then(|| startup::Startup::new(cx, &host));
     // Plugins and your templates (src/plugins): the main window's alone.
-    plugins::install(cx, &host);
+    plugins::install(cx, &host, startup.clone());
     // (Linux fork) Agents driving its browser tabs (src/browser_agents.rs).
     browser_agents::install(cx, &host);
     // The host's own toasts over it (a template in preview, a switch you
@@ -580,7 +580,7 @@ fn open_main(cx: &mut WindowContext, inspect: bool) {
     let chrome = plugins::host_bar::view(cx, host.shared("zeron.locale", "en").signal());
     // Where the app's toasts stand, over the host's (host_bar.rs `follow`).
     let floor = host.shared("toast_floor", 16.);
-    let view = serve_with(cx, host, "app.luau", inspect, Some(chrome), menu_bar::Role::Bar);
+    let view = serve_with_startup(cx, host, "app.luau", inspect, Some(chrome), menu_bar::Role::Bar, startup);
     plugins::host_bar::follow(floor);
     // What zgx reports of the window's elements, for plugins' places.
     plugins::set_view(view);
@@ -1024,10 +1024,22 @@ fn serve_with(
     chrome: Option<zgx::compose::View>,
     role: menu_bar::Role,
 ) -> zgx::compose::ViewHandle {
-    let _ = host.reload();
+    serve_with_startup(cx, host, entry, inspect, chrome, role, None)
+}
+
+fn serve_with_startup(
+    cx: &mut WindowContext,
+    host: ScriptHost,
+    entry: &str,
+    inspect: bool,
+    chrome: Option<zgx::compose::View>,
+    role: menu_bar::Role,
+    startup: Option<Rc<startup::Startup>>,
+) -> zgx::compose::ViewHandle {
+    if startup.is_none() { let _ = host.reload(); }
     // (The scripts' garbage is collected as the window goes idle, by zgx
     // itself: `zgx::idle`. The app once looked for quiet twice a second.)
-    cx.tasks.spawn(host.watch(Duration::from_millis(250)));
+    if startup.is_none() { cx.tasks.spawn(host.watch(Duration::from_millis(250))); }
     if inspect {
         zgx_script::inspect::prepare();
     }
@@ -1051,14 +1063,16 @@ fn serve_with(
     previews::install(&host);
     let looks_up = host.shared("looks_up", false);
     let view = host.view();
+    let runtime = cx.ui.runtime.clone();
     let handle = cx.render(component(move |cx| {
         let found = cx.try_service::<PlatformService>().map(|p| (*p).clone());
         looks_up.set(Value::from(found.as_ref().is_some_and(|p| p.0.looks_up())));
         *platform.borrow_mut() = found;
-        match chrome {
+        let content = match chrome {
             Some(chrome) => plugins::host_bar::compose(chrome, view),
             None => view,
-        }
+        };
+        match startup { Some(startup) => startup.view(content, &runtime), None => content }
     }));
     let devtools = if inspect {
         let session = zgx_script::inspect::Session::new(
@@ -1318,12 +1332,11 @@ fn onboarding_window() -> WindowOptions {
 }
 
 /// The main window: resizable, its frame kept across launches. (The Linux
-/// beta's shows once its plugins are in: plugins::workbench::hold_window.)
+/// beta shows a native loading view until its layout plugins are ready.)
 fn main_window() -> WindowOptions {
     placed(WindowOptions {
         min_size: Some((760., 500.)),
         frame_autosave: Some("zeron-zgx-main".into()),
-        visible: !engine::manager::LINUX_BETA,
         ..zeron_window(1240., 820.)
     })
 }

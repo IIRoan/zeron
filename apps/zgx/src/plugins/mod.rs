@@ -207,6 +207,7 @@ struct Gh {
 
 pub struct Bridge {
     host: ScriptHost,
+    startup: Option<Rc<crate::startup::Startup>>,
     /// Where each plugin's requests may go, as its manifest names them.
     network: network::Network,
     windows: WindowFactory,
@@ -355,6 +356,7 @@ fn connect(b: &Rc<Bridge>, rpc: &Rpc) {
     // forgets).
     let builtin = builtin_dir();
     if builtin.is_dir() {
+        let startup = b.startup.clone();
         b.tasks.spawn(async move {
             let asked = crate::auth::after_setup(|| {
                 let builtin = builtin.clone();
@@ -362,7 +364,7 @@ fn connect(b: &Rc<Bridge>, rpc: &Rpc) {
             });
             if let Err(error) = asked.await {
                 eprintln!("zeron-zgx: Zeron's own plugins weren't loaded: {error}");
-                workbench::show_held("Zeron's own plugins didn't load");
+                if let Some(startup) = startup { startup.finish("Zeron's own plugins didn't load"); }
             }
         });
     }
@@ -543,7 +545,7 @@ pub(crate) fn draft_of(session: &str, here: &Value, shown: &Value, cargo: &Value
 }
 
 /// Plugins for the main window `cx` shows `host` in.
-pub fn install(cx: &mut WindowContext, host: &ScriptHost) {
+pub fn install(cx: &mut WindowContext, host: &ScriptHost, startup: Option<Rc<crate::startup::Startup>>) {
     expose_surface(host);
     let plugin_network = network::Network::default();
     host.fetch_policy(plugin_network.clone());
@@ -551,6 +553,7 @@ pub fn install(cx: &mut WindowContext, host: &ScriptHost) {
     host.guard(preview::guard);
     let bridge = Rc::new(Bridge {
         host: host.clone(),
+        startup,
         network: plugin_network,
         windows: cx.windows.clone(),
         page: host.shared("plugins", page_value("loading", None, &[], &[])),
@@ -1318,10 +1321,10 @@ impl Bridge {
             c.follow(self);
         }
         self.apply();
-        // The Linux beta's window, hidden until Zeron's own are in (a new
-        // engine's first list comes before they're registered).
+        // The Linux beta's shell stays behind its loading view until the
+        // bundled layout is known (a new engine lists plugins before these).
         if self.items.borrow().iter().any(|i| i.json["builtin"] == true) {
-            workbench::show_held("plugins in");
+            if let Some(startup) = &self.startup { startup.finish("plugins in"); }
         }
         // One removed is unloaded now: what its VM held to the last (a
         // `ui.persist` it set as it went) goes too.
@@ -1427,6 +1430,9 @@ impl Bridge {
         let (sources, list) = self.sources(false);
         self.publish_records(&sources, &list);
         if *self.loaded.borrow() == want {
+            if self.startup.as_ref().is_some_and(|s| s.pending() && !s.attempted()) {
+                self.reload();
+            }
             return;
         }
         *self.loaded.borrow_mut() = want.clone();
@@ -1435,6 +1441,12 @@ impl Bridge {
     }
 
     fn reload(&self) {
+        if let Some(startup) = &self.startup {
+            // A new engine can publish an empty or user-only list before
+            // SetBuiltinPlugins finishes. Keep waiting for the layout.
+            if startup.pending() && !self.items.borrow().iter().any(|i| i.json["builtin"] == true) { return; }
+            startup.loading();
+        }
         if let Err(error) = self.host.reload() {
             eprintln!("zeron-zgx: the window didn't reload with its plugins: {error}");
             self.blame(&error);
@@ -1447,7 +1459,7 @@ impl Bridge {
     /// organization chosen) it's watched `again`, and the list follows.
     fn wait_for_setup(self: &Rc<Self>, again: crate::engine::rpc::Again) {
         // No plugins until then: the window shows now.
-        workbench::show_held("setup isn't finished");
+        if let Some(startup) = &self.startup { startup.finish("setup isn't finished"); }
         if self.state.get() != "setup" {
             eprintln!("zeron-zgx: plugins: waiting for the account's setup to be finished");
             self.state.set("setup");
