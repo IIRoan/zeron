@@ -664,21 +664,28 @@ return function(): Node
 					ui.div {
 						ref = card,
 						absolute = true,
-						left = at.x + at.w + 10,
+						-- (Linux fork) Left of the row when the right has no room:
+						-- the chat list is at the window's right.
+						left = function(): number
+							local w = card.width or 300
+							local right = at.x + at.w + 10
+							return if right + w <= (root.width or 0) - 8 then right else math.max(8, at.x - w - 10)
+						end,
 						-- (Beside the row's top, kept inside the window.)
 						top = function(): number
 							local h = card.height or 0
 							return math.max(8, math.min(at.y, (root.height or 0) - h - 8))
 						end,
-						ds.SessionCard {
-							session = id,
+						-- (Linux fork) The usage card, for ds.SessionCard.
+						require("./chat_usage") {
+							id = id,
 							title = function(): string
 								local c = chat()
 								return if c then c.title else ""
 							end,
-							time = function(): number?
+							project = function(): string?
 								local c = chat()
-								return if c then c.updated else nil
+								return if c then c.project else nil
 							end,
 							device = function(): string?
 								return (device())
@@ -686,22 +693,6 @@ return function(): Node
 							here = function(): boolean
 								local _, here = device()
 								return here
-							end,
-							project = function(): string?
-								local c = chat()
-								if not c or not c.project then
-									return nil
-								end
-								for _, p in sessions.projects:get() do
-									if p.id == c.project then
-										return p.name
-									end
-								end
-								return nil
-							end,
-							branch = function(): string?
-								local c = chat()
-								return if c then c.branch else nil
 							end,
 						},
 					},

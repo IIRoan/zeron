@@ -28,6 +28,7 @@
 #![cfg_attr(all(windows, feature = "beta"), windows_subsystem = "windows")]
 
 mod about;
+mod chat_usage;
 mod browser_agents;
 #[cfg(all(windows, feature = "beta"))]
 mod windows_install;
@@ -1061,6 +1062,8 @@ fn serve_with_startup(
     favicons::install(&host);
     // The project's dev servers, for the browser tab's start page.
     previews::install(&host);
+    // (Linux fork) What a chat's processes use, for the chat list's usage card.
+    chat_usage::install(&host);
     let looks_up = host.shared("looks_up", false);
     let view = host.view();
     let runtime = cx.ui.runtime.clone();

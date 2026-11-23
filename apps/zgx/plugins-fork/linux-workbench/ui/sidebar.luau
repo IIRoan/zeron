@@ -1141,12 +1141,13 @@ local places: State<Places> = props.places or ui.use_state({ pinned = pinned_ids
 		return SessionRow.on_tree(body, now_tree, lead_at, list_gap())
 	end
 	-- A session's card (Zeron's hover card, shell/session_hover_card.rs):
-	-- the pointer resting on a row 550 ms, the caller shows its card beside
+	-- the pointer resting on a row a second (Linux fork; Zeron's waits
+	-- 550 ms), the caller shows its card beside
 	-- it (`on_card`, told the row's box; nil, none); within 400 ms of one
 	-- going, the next shows at once. A press, a scroll or a rename puts it
 	-- away (and the next waits its full rest); on the rail, in a flyout,
 	-- none.
-	local DWELL, WARM = 550, 400
+	local DWELL, WARM = 1000, 400
 	local card_shown: string? = nil
 	local card_waiting: string? = nil
 	local card_cancel: (() -> ())? = nil
