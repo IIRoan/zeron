@@ -50,7 +50,7 @@ class BuildPreviewTests(unittest.TestCase):
         result, calls = self.run_script(watch_exit=1, steps=0)
         self.assertEqual(result.returncode, 0, result.stderr)
         pools = [c.split('runner=')[1] for c in calls if c.startswith('gh workflow run')]
-        self.assertEqual(pools, ['macos-26', 'macos-15'])
+        self.assertEqual(pools, ['macos-26', 'macos-15-intel'])
         self.assertIn('builds%2Fabc-123%2Fmanifest.plist', result.stdout)
         self.assertEqual(calls[-1], 'git push --quiet origin --delete ios-preview')
 

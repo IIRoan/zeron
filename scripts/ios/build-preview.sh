@@ -21,11 +21,13 @@ git push --force --quiet origin "$SHA:refs/heads/$BRANCH"
 trap 'git push --quiet origin --delete "$BRANCH" 2>/dev/null || true' EXIT
 
 # GitHub cancels a job after 15 minutes if no runner takes it, leaving it with
-# no steps. Keep trying both Apple Silicon pools, for up to about 3 hours.
-POOLS=(macos-26 macos-15)
+# no steps. Apple Silicon runners run short when GitHub is busy (a whole
+# afternoon on 2026-11-25), so the Intel pool takes every other turn. Up to
+# about 3 hours of trying.
+POOLS=(macos-26 macos-15-intel macos-15)
 ok=1
 for attempt in $(seq 0 11); do
-  POOL=${POOLS[attempt % 2]}
+  POOL=${POOLS[attempt % 3]}
   START=$(date -u -d '-2 min' +%FT%TZ)
   OUT=$(gh workflow run ios-direct.yml -R "$REPO" --ref "$BRANCH" -f distribution=preview -f runner="$POOL" 2>&1)
   RUN=$(grep -o 'actions/runs/[0-9]*' <<<"$OUT" | grep -o '[0-9]*$' || true)
@@ -37,6 +39,8 @@ for attempt in $(seq 0 11); do
   done
   [ -n "$RUN" ] || { echo "error: workflow run not found: $OUT" >&2; exit 1; }
   echo "Run: https://github.com/$REPO/actions/runs/$RUN on $POOL"
+  # A run just made can answer 404 for a little while.
+  for _ in $(seq 30); do gh run view "$RUN" -R "$REPO" --json status >/dev/null 2>&1 && break; sleep 5; done
 
   ok=0
   gh run watch "$RUN" -R "$REPO" --exit-status --interval 60 || ok=$?

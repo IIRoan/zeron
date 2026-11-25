@@ -11,9 +11,9 @@ on:
         options: [preview, unsigned]
         default: preview
       runner:
-        description: Apple Silicon runner image (macos-15 is an alternate pool)
+        description: Runner image (macos-15 and the Intel macos-15-intel are alternate pools)
         type: choice
-        options: [macos-26, macos-15]
+        options: [macos-26, macos-15, macos-15-intel]
         default: macos-26
 permissions:
   contents: read
@@ -24,7 +24,8 @@ jobs:
   build:
     if: github.repository == 'IIRoan/zeron'
     runs-on: ${{ inputs.runner || 'macos-26' }}
-    timeout-minutes: 180
+    # An Intel runner with a cold Rust cache needs about twice Apple Silicon's time.
+    timeout-minutes: 330
     env:
       CARGO_INCREMENTAL: 0
       CARGO_PROFILE_DEV_DEBUG: 0
@@ -48,6 +49,8 @@ jobs:
           test -n "$xcode"
           sudo xcode-select -s "$xcode/Contents/Developer"
           xcodebuild -version
+          # The simulator runs the host's architecture: arm64, or x86_64 on an Intel runner.
+          echo "SIM_ARCH=$(uname -m)" >> "$GITHUB_ENV"
           python3 scripts/ios/configure-ci.py
       - name: Boot simulator and wait for readiness
         timeout-minutes: 6
@@ -72,14 +75,14 @@ jobs:
       - name: Rust toolchain
         run: |
           rustup update stable --no-self-update
-          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
-          key: direct-ios
+          key: direct-ios${{ runner.arch != 'ARM64' && '-x64' || '' }}
           cache-on-failure: true
       - name: Direct transport and real engine regressions
         # A cold Rust cache needs ~30 minutes for these test builds.
-        timeout-minutes: 45
+        timeout-minutes: ${{ runner.arch == 'ARM64' && 45 || 90 }}
         run: |
           cargo test --locked -p zeron-rpc
           cargo test --locked -p zeron-engine --test direct_mobile
@@ -87,9 +90,9 @@ jobs:
           cargo test --locked -p zeron-doc direct_tests
       - name: Build Rust simulator core and Swift bindings
         # ~26 minutes from a cold cache.
-        timeout-minutes: 45
+        timeout-minutes: ${{ runner.arch == 'ARM64' && 45 || 90 }}
         env:
-          ARCHS: arm64
+          ARCHS: ${{ env.SIM_ARCH }}
         run: |
           set -o pipefail
           bash scripts/ios/build-core.sh iphonesimulator 2>&1 | tee "$RUNNER_TEMP/ios-core-build.log"
@@ -102,9 +105,9 @@ jobs:
           set -o pipefail
           # Ad-hoc signing gives the simulator its Keychain access group without an Apple certificate.
           xcodebuild -project Zeron.xcodeproj -scheme Zeron-CI \
-            -destination "platform=iOS Simulator,id=$IOS_SIMULATOR_ID,arch=arm64" \
+            -destination "platform=iOS Simulator,id=$IOS_SIMULATOR_ID,arch=$SIM_ARCH" \
             -derivedDataPath "$RUNNER_TEMP/ios-derived" \
-            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
+            ARCHS=$SIM_ARCH ONLY_ACTIVE_ARCH=YES \
             CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM=ZERONLOCAL \
             ZERON_BUNDLE_ID="$IOS_BUNDLE_ID" build-for-testing 2>&1 | tee "$RUNNER_TEMP/ios-build.log"
           git diff --exit-code -- Zeron/Core/Generated/zeron_core.swift
@@ -125,12 +128,12 @@ jobs:
         run: |
           set -o pipefail
           xcodebuild -project Zeron.xcodeproj -scheme Zeron-CI \
-            -destination "platform=iOS Simulator,id=$IOS_SIMULATOR_ID,arch=arm64" \
+            -destination "platform=iOS Simulator,id=$IOS_SIMULATOR_ID,arch=$SIM_ARCH" \
             -derivedDataPath "$RUNNER_TEMP/ios-derived" \
             -resultBundlePath "$RUNNER_TEMP/ios-tests.xcresult" \
             -parallel-testing-enabled NO \
             -only-testing:ZeronTests -only-testing:ZeronUITests/DirectInstanceTests \
-            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
+            ARCHS=$SIM_ARCH ONLY_ACTIVE_ARCH=YES \
             CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM=ZERONLOCAL \
             ZERON_BUNDLE_ID="$IOS_BUNDLE_ID" test-without-building 2>&1 | tee "$RUNNER_TEMP/ios-tests.log"
       - name: Stop simulator fixture
@@ -146,7 +149,7 @@ jobs:
           fi
       - name: Archive for iPhone
         # Builds the device core (thin LTO, one codegen unit) from scratch when the cache is cold.
-        timeout-minutes: 60
+        timeout-minutes: ${{ runner.arch == 'ARM64' && 60 || 120 }}
         working-directory: apps/ios
         env:
           DISTRIBUTION: ${{ inputs.distribution || 'unsigned' }}
