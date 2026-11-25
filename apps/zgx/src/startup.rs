@@ -75,7 +75,7 @@ fn splash(dark: bool) -> View {
     } else {
         (Color(250, 250, 250, 255), Color(27, 27, 29, 255), Color(110, 110, 114, 255))
     };
-    let mark = SvgData::new(&include_bytes!("../../../crates/ui/assets/icons/solace-logo.svg")[..])
+    let mark = SvgData::new(&include_bytes!("../../../assets/icons/solace-logo.svg")[..])
         .expect("Solace's logo").tinted(ink);
     column().id("startup-splash").w_full().h_full().bg(bg)
         .items_center().justify_center().gap(16.)

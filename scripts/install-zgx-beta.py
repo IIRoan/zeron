@@ -105,7 +105,7 @@ def main():
             for name in ['LICENSE', 'THIRD_PARTY_NOTICES.md']:
                 shutil.copy2(ROOT / name, temporary / name)
             (temporary / 'licenses/fonts').mkdir(parents=True)
-            for licence in [*(ROOT / 'crates/ui/assets/fonts/licenses').iterdir(), *(ROOT / 'apps/zgx/fonts').glob('*-OFL.txt')]:
+            for licence in [*(ROOT / 'assets/fonts/licenses').iterdir(), *(ROOT / 'apps/zgx/fonts').glob('*-OFL.txt')]:
                 shutil.copy2(licence, temporary / 'licenses/fonts' / licence.name)
             shutil.copy2(ROOT / 'dist/zeron.png', temporary / 'zeron-beta.png')
             patch = subprocess.check_output(['git', 'diff', '--binary', 'HEAD'], cwd=ROOT)

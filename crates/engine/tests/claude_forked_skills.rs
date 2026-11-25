@@ -69,6 +69,8 @@ async fn check_forked_skill(parked: bool, failed: bool) {
         attachments: vec![],
         worktree: None,
         resume: None,
+        code_mode: false,
+        zeron_mcp_only: false,
     };
     core.sessions
         .dispatch(CHAT, HarnessId::ClaudeCode, request, None)

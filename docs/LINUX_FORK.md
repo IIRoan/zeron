@@ -3,8 +3,14 @@
 `origin` points to the [Linux fork](https://github.com/IIRoan/zeron), and
 `upstream` points to [zeronsh/zeron](https://github.com/zeronsh/zeron).
 Keep upstream history intact: merge releases into `main`, then push to your fork.
-The original platform code stays available to make future merges easier; use
-the Linux launcher for this custom desktop.
+The original platform code stays available to make future merges easier.
+
+Since v0.3.20 the desktop app is Zeron Beta (`apps/zgx`), as upstream's is:
+upstream retired the old GPUI app (`crates/ui`, #1499), and the fork with it.
+`zeron` (`apps/zeron`) is the command line with the engine linked in: the
+installed one runs `zeron headless` (the engine Zeron Beta and the phone
+gateway attach to) and `zeron mcp`. The fork's own screens are Zeron Beta's
+plugins in `apps/zgx/plugins-fork` (see its `PORTING.md`).
 
 ## Update to a new release
 
@@ -37,17 +43,15 @@ scripts/check-linux-fork.sh && git commit
 branch also retains the version from before the update. Avoid force pushes and
 wholesale "ours" conflict resolutions: they can silently drop upstream fixes.
 
-After the checks pass, publish and run the new version:
+After the checks pass, install both builds from the commit (the engine and
+command line, and Zeron Beta: `apps/zgx/plugins-fork/PORTING.md`, "Installing
+afterwards"), then publish:
 
 ```bash
 git push origin main
-scripts/dev-linux.sh
 ```
 
-Close the previous **Zeron Dev** window first, answering any unsaved-file dialog.
-The launcher builds locally, uses independent data in `target/linux-dev-data`
-and IPC port `27700`, and disables the official binary updater. Updates to the
-installed official app do not update this custom build.
+Updates to the installed official app do not update these custom builds.
 
 ## Manually update on GitHub
 
@@ -63,8 +67,8 @@ The Action never pushes or merges directly to `main` on GitHub. If already up to
 date, it exits without creating an artifact. Conflicts and failed checks produce
 diagnostic artifacts for manual repair.
 
-Review the local result, push with `git push origin main`, and restart with
-`scripts/dev-linux.sh`. The Action needs no additional secret or write deploy
+Review the local result, install it as above and push with
+`git push origin main`. The Action needs no additional secret or write deploy
 key; its API token remains read-only. This also handles releases that change
 workflow files, which GitHub's built-in Action token cannot push. Existing
 upstream CI files are preserved with job guards that restrict them to
@@ -74,9 +78,10 @@ automatic macOS/Windows builds, edge deployments, official releases, and
 scheduled SDK updates in your fork.
 
 **Linux fork tests** runs on relevant pushes to `main` and pull requests, and
-can also be started manually. It runs the native Linux core and UI suites
+can also be started manually. It runs the native Linux core suites
 directly, including the fork's worktree, service and terminal integration tests
-and the syntax highlighting and theme tests, and builds the desktop. It uses
+and the syntax highlighting and theme tests, and builds the command line with
+the engine. It uses
 read-only repository permissions and has no publishing step. New commits
 cancel older runs for the same branch.
 Documentation-only changes skip the builds.
@@ -100,7 +105,7 @@ If `upstream` already exists, use `git remote set-url upstream` instead of addin
 it. Authenticate pushes with the GitHub account that owns the fork. The local
 updater only fetches upstream; it does not need permission to push there.
 
-Keep custom UI and Git behavior in the existing `shell/workbench`,
-`source_control`, `checkout_changes`, `checkout_discard`, and `checkout_git`
-modules where possible. Small integration points are easier to reconcile with
+Keep custom UI in Zeron Beta's fork plugins (`apps/zgx/plugins-fork`) and Git
+behavior in the engine's `checkout_changes`, `checkout_discard`, and
+`checkout_git` modules where possible. Small integration points are easier to reconcile with
 upstream releases than replacing entire shared files.

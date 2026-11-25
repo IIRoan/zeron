@@ -4,6 +4,28 @@
   "fork_repository": "IIRoan/zeron",
   "releases": [
     {
+      "version": "0.3.20",
+      "upstream_commit": "e5694031448f3e0cee7a3c24c0bfad1d7f570be6",
+      "upstream_url": "https://github.com/zeronsh/zeron/releases/tag/v0.3.20",
+      "published_at": "2026-11-24T22:35:53Z",
+      "notes_source": "github_release",
+      "upstream_notes": "## What's Changed\n* Sidebar: an archived session's row is its own, and follows it back by @wingleeio in https://github.com/zeronsh/zeron/pull/1591\n* A message waiting as the engine starts is answered with Zeron's tools by @wingleeio in https://github.com/zeronsh/zeron/pull/1593\n* Zeron 0.3.20 by @wingleeio in https://github.com/zeronsh/zeron/pull/1594\n\n\n**Full Changelog**: https://github.com/zeronsh/zeron/compare/v0.3.19...v0.3.20",
+      "fork_changes": [
+        "Zeron Beta: Zeron Git is no longer withdrawn after hours of agents at work"
+      ],
+      "fork_through_commit": "e033bc585fa022bd844ae423dc74b46a52a16db0"
+    },
+    {
+      "version": "0.3.19",
+      "upstream_commit": "82a58c5f6b100dabd6363118c9f7e5272cec3d78",
+      "upstream_url": "https://github.com/zeronsh/zeron/releases/tag/v0.3.19",
+      "published_at": "2026-11-24T20:13:11Z",
+      "notes_source": "github_release",
+      "upstream_notes": "## What's Changed\n* MCP servers: connected once, for every agent, device and Cloud by @wingleeio in https://github.com/zeronsh/zeron/pull/1589\n* Sidebar: ⇧-click picks out sessions, acted on together by @wingleeio in https://github.com/zeronsh/zeron/pull/1590\n* Zeron 0.3.19 by @wingleeio in https://github.com/zeronsh/zeron/pull/1592\n\n\n**Full Changelog**: https://github.com/zeronsh/zeron/compare/v0.3.18...v0.3.19",
+      "fork_changes": [],
+      "fork_through_commit": "e033bc585fa022bd844ae423dc74b46a52a16db0"
+    },
+    {
       "version": "0.3.7",
       "upstream_commit": "55a5c392199ca0f7907c485b57b6a4252cc42e98",
       "upstream_url": "https://github.com/zeronsh/zeron/releases/tag/v0.3.7",
@@ -246,33 +268,6 @@
         "Keep shared databases and app services in one saved list"
       ],
       "fork_through_commit": "5805868044d65dc07d501bb35eec4055cfa5ec1d"
-    },
-    {
-      "version": "0.2.110",
-      "upstream_commit": "ec28627ce2e28304d01751d3462302ce7fd3d57a",
-      "upstream_url": "https://github.com/zeronsh/zeron/releases/tag/v0.2.110",
-      "published_at": "2026-10-10T19:33:13Z",
-      "notes_source": "github_release",
-      "upstream_notes": "## What's Changed\n* Panels: content columns share the width, continuous transitions by @gaelcado in https://github.com/zeronsh/zeron/pull/677\n* Engine: fall back to the fetch URL when a remote's push URL is disabled by @katulevskiy in https://github.com/zeronsh/zeron/pull/863\n\n\n**Full Changelog**: https://github.com/zeronsh/zeron/compare/v0.2.109...v0.2.110",
-      "fork_changes": [],
-      "fork_through_commit": "5805868044d65dc07d501bb35eec4055cfa5ec1d"
-    },
-    {
-      "version": "0.2.107",
-      "upstream_commit": "565b49c527fb738704f217b897f9ba3aee575285",
-      "upstream_url": "https://github.com/zeronsh/zeron/releases/tag/v0.2.107",
-      "published_at": "2026-10-08T17:29:28Z",
-      "notes_source": "github_release",
-      "upstream_notes": "## What's Changed\n* Cut startup memory from ~700 MB to ~200 MB on large local profiles by @neo773 in https://github.com/zeronsh/zeron/pull/818\n* Windows browser, image previews in tool calls, selectable tool output by @Master0fFate in https://github.com/zeronsh/zeron/pull/813\n* Engine: keep turn snapshots out of the checkout's object database by @katulevskiy in https://github.com/zeronsh/zeron/pull/820\n* Harden Claude/Codex adapters: no early \"done\", Stop kills, sends never do by @wingleeio in https://github.com/zeronsh/zeron/pull/748\n\n## New Contributors\n* @Master0fFate made their first contribution in https://github.com/zeronsh/zeron/pull/813\n\n**Full Changelog**: https://github.com/zeronsh/zeron/compare/v0.2.106...v0.2.107",
-      "fork_changes": [
-        "Managed terminals and project services use your interactive shell PATH, including Go and Cloudflared.",
-        "Review this update and the previous upstream release in the new update summary, with all notes reachable when scrolling.",
-        "Start a fresh chat with another agent in the same checkout, keeping its files, env and services.",
-        "More reliable Git actions, mixed file selection, conflict confirmations, and bounded discard recovery.",
-        "Safer worktree creation and removal, env-file handoff, and service shutdown and restart handling.",
-        "Project settings protect unsaved edits; inactive Git panels poll less often and diff colors follow your theme."
-      ],
-      "fork_through_commit": "85016cff1a9eb690a49c96c2c10ab39f590082ee"
     }
   ]
 }

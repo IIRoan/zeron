@@ -211,6 +211,7 @@ impl zeron_harness::Harness for ControlledHarness {
                     prefill: None,
                     multiline: false,
                     multi_select: false,
+                    note: None,
                 }])
                 .await
                 .unwrap();

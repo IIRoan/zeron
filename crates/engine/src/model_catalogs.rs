@@ -170,9 +170,9 @@ async fn list_inner(
             result
         }
     });
-    // Picker opens request a forced refresh and retain their visible rows
-    // while waiting. Returning disk here would pin the old list in the UI
-    // even after the detached probe has persisted a newer catalog.
+    // A kept catalog answers at once while the refresh runs on, unless the
+    // caller asked for this one (`force`: a sign-in just changed what the
+    // agent lists, and the kept one is the last account's).
     let result = if disk.is_some() && !force {
         tokio::time::timeout(Duration::from_millis(100), &mut refresh)
             .await
@@ -334,6 +334,7 @@ mod tests {
         probe.delay.store(true, SeqCst);
         let gate = Arc::new(tokio::sync::RwLock::new(()));
         let lease = Arc::new(gate.clone().read_owned().await);
+        // (Unforced: the kept catalog answers while the probe runs on.)
         list_with_lease(dir.path(), probe, false, Some(lease))
             .await
             .unwrap();
@@ -454,9 +455,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(250)).await;
         assert_eq!(read(&path, &context), Some(models()));
     }
-
+    /// Asked for this one (a sign-in just changed what the agent lists), a
+    /// slow probe is waited for: the kept catalog is the last account's.
     #[tokio::test]
-    async fn forced_refresh_waits_for_new_models_instead_of_returning_disk() {
+    async fn a_forced_list_waits_for_the_probe_over_the_kept_one() {
         let dir = tempfile::tempdir().unwrap();
         let probe = Probe::new();
         let context = probe.model_context().unwrap().unwrap();
