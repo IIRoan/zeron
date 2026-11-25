@@ -682,6 +682,14 @@ fn script_host_at(cx: &mut WindowContext, path: PathBuf, entry: &str) -> ScriptH
     let mut limits = zgx_script::Limits::default();
     #[cfg(target_os = "linux")]
     { limits.load = limits.load.max(std::time::Duration::from_secs(2)); }
+    // (Linux fork) The beta's plugins are its own built-ins (Git, services,
+    // the sandbox): a merge's thousands of files or a lockfile's diff went
+    // past 32 MB, and past 50 ms with the collector's work in a reply's call,
+    // and the Git plugin was withdrawn.
+    if engine::manager::LINUX_BETA {
+        limits.plugin_memory = limits.plugin_memory.max(128 << 20);
+        limits.call = limits.call.max(std::time::Duration::from_millis(150));
+    }
     // A long chat's heap, past 32 MB, collected aiming for 150% of what's in
     // use rather than Luau's double: its rows' nodes, which the collector
     // can't see the size of, go sooner (zgx #1837, the carry it replaces).

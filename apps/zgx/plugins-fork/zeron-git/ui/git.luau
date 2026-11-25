@@ -520,6 +520,7 @@ ui.effect(function()
 	end
 	if #fallback_jobs > 0 then ui.after(1, pump) end
 end)
+local FALLBACK_LINES = 2000
 function M.highlight(lines: { Line }, path: string?): { [number]: { Run } }?
 	local known = painted[lines]
 	if known ~= nil then return if known then known else nil end
@@ -529,11 +530,15 @@ function M.highlight(lines: { Line }, path: string?): { [number]: { Run } }?
 	painted[lines] = out
 	local source = setmetatable({ lines }, { __mode = "v" })
 	local index, old_state, new_state = 1, 0 :: any, 0 :: any
+	-- (Its first FALLBACK_LINES lines alone, the rest plain: a conflicted
+	-- lockfile's or translation file's 10,000 lines, coloured whole, ran
+	-- the Git plugin out of memory.)
 	local function batch()
 		local list = source[1]
 		if not list or painted[list] ~= out then return true end
+		local most = math.min(#list, FALLBACK_LINES)
 		local start, bytes, count = os.clock(), 0, 0
-		while index <= #list and count < 32 and bytes < 8192 and os.clock() - start < 0.002 do
+		while index <= most and count < 32 and bytes < 8192 and os.clock() - start < 0.002 do
 			local i, l = index, list[index]
 			index += 1; count += 1; bytes += #l.text
 			if l.kind == "hunk" or #l.text > 8192 then
@@ -550,7 +555,7 @@ function M.highlight(lines: { Line }, path: string?): { [number]: { Run } }?
 				if #spans <= 128 then out[i] = runs(text, spans) end
 			end
 		end
-		if index > #list then M.paint_version:add(1); return true end
+		if index > most then M.paint_version:add(1); return true end
 		return false
 	end
 	table.insert(fallback_jobs, batch)

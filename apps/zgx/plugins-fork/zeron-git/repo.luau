@@ -112,6 +112,25 @@ return function(zeron: any)
 	end
 
 	local models: { [string]: any } = {}
+	-- The chats shown last, latest first. Past KEEP, one no view shows lets
+	-- go of its checkout's files, changes and details until it is shown
+	-- again: kept for every chat a day opens, they filled the plugin's
+	-- 32 MB and a merge's diff then ran it out of memory.
+	local KEEP = 4
+	local recent: { string } = {}
+	local function shown_now(id: string)
+		local at = table.find(recent, id)
+		if at then
+			table.remove(recent, at)
+		end
+		table.insert(recent, 1, id)
+		while #recent > KEEP do
+			local old = models[table.remove(recent) :: string]
+			if old and next(old.showing) == nil then
+				old.release()
+			end
+		end
+	end
 
 	-- The model of session `id`'s checkout.
 	function M.get(id: string): any
@@ -329,6 +348,18 @@ return function(zeron: any)
 			end
 		end
 
+		-- (`shown_now`: no longer one of the chats shown last.) Not while
+		-- an ask is on its way, whose answer would fill it again.
+		function m.release()
+			if m.busy or m.loading_changes or not m.workbench.release() then
+				return
+			end
+			m.changes:set(nil)
+			m.seen = ""
+			m.stale = true
+			m.released = true
+		end
+
 		-- What its device says of it (once per model; its listener lasts
 		-- with the window, as the model does).
 		local function listen()
@@ -365,6 +396,11 @@ return function(zeron: any)
 					return
 				end
 				m.showing[key] = true
+				shown_now(id)
+				if m.released then
+					m.released = false
+					m.workbench.load_details()
+				end
 				ui.on_cleanup(function()
 					m.showing[key] = nil
 				end)

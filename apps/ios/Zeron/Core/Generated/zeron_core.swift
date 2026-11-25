@@ -16040,7 +16040,7 @@ public struct FfiConverterTypeCredentials: FfiConverterRustBuffer {
         
         case 1: return .direct(endpoint: try FfiConverterString.read(from: &buf), instanceId: try FfiConverterString.read(from: &buf), token: try FfiConverterString.read(from: &buf)
         )
-
+        
         case 2: return .workOs(userId: try FfiConverterString.read(from: &buf), orgId: try FfiConverterString.read(from: &buf), tokens: try FfiConverterTypeAuthTokens.read(from: &buf)
         )
         
@@ -16063,8 +16063,8 @@ public struct FfiConverterTypeCredentials: FfiConverterRustBuffer {
             FfiConverterString.write(endpoint, into: &buf)
             FfiConverterString.write(instanceId, into: &buf)
             FfiConverterString.write(token, into: &buf)
-
-
+            
+        
         case let .workOs(userId,orgId,tokens):
             writeInt(&buf, Int32(2))
             FfiConverterString.write(userId, into: &buf)

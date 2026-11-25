@@ -22,6 +22,14 @@ return function(zeron: any,m: any,problem: any)
         for _,r in w.repositories:get() do if r.path==w.repository:get() then return r end end
         return nil
     end
+    -- What the checkout's files take, in state and here, let go while other
+    -- chats are shown (never mid-staging or mid-read); read again when this
+    -- one is.
+    function w.release(): boolean
+        if #w.queue>0 or w.loading or w.busy:peek() then return false end
+        w.baseline={};w.signature=nil;w.repositories:set({});w.details:set(nil)
+        return true
+    end
     function w.capture(): any
         local r=w.repo();local s=if r then r.git else nil
         local old=m.status:peek()
@@ -68,7 +76,9 @@ return function(zeron: any,m: any,problem: any)
     function w.publish(move: any?)
         local repositories=Staging.project(w.baseline,w.queue)
         w.repositories:set(repositories)
-        local repository=w.repo()
+        -- (From the plain tables, not read back through the state: a merge's
+        -- thousands of files cost a refresh its time budget that way.)
+        local repository=nil;for _,r in repositories do if r.path==w.repository:peek() then repository=r end end
         local selected,chosen,anchor=Selection.reconcile(repository,w.selected:peek(),w.chosen:peek(),w.anchor:peek(),move)
         w.selected:set(selected);w.chosen:set(chosen);w.anchor:set(anchor)
         local pending={}
@@ -97,6 +107,7 @@ return function(zeron: any,m: any,problem: any)
         w.loading=true
         local context=w.context();local repository=w.repository:peek();local epoch=w.epoch
         zeron.workbench("GetCheckoutChanges",context,{}):after(function(result: any)
+          local function read()
             w.loading=false
             if epoch==w.epoch then
                 w.verified:set(true)
@@ -109,6 +120,11 @@ return function(zeron: any,m: any,problem: any)
                 if not found then w.repository:set("") end
             end
             if w.again or epoch~=w.epoch then w.again=false;w.refresh() end
+          end
+          -- A merge's thousands of files, made Lua as the reply comes, take
+          -- most of its time budget: those are read in a call of their own.
+          local n=0;for _,r in result.repositories or {} do n+=#(r.files or {}) end
+          if n>500 then ui.after(0,read) else read() end
         end,function(e: any)
             w.loading=false
             if epoch==w.epoch then w.verified:set(false);w.error:set(problem(e).words) end
