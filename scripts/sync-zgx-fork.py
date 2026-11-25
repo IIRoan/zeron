@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Carry an upstream merge into Zeron Beta's fork plugins and its zgx fork.
+"""Carry an upstream merge into the app's fork plugins and its zgx fork.
 
 scripts/update-upstream.sh runs this after merging a release:
 
@@ -354,7 +354,7 @@ def main():
         print("Resolve each CONFLICT (keep the fork's change and upstream's), then `git add` it.")
     if report["conflicts"] or report["problems"]:
         raise SystemExit(1)
-    print("Zeron Beta copies are in step." if args.check else "Zeron Beta is in step with the merge.")
+    print("The fork plugins' copies are in step." if args.check else "The fork plugins are in step with the merge.")
 
 
 if __name__ == "__main__":

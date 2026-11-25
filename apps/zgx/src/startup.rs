@@ -79,10 +79,10 @@ fn splash(dark: bool) -> View {
         .expect("Solace's logo").tinted(ink);
     column().id("startup-splash").w_full().h_full().bg(bg)
         .items_center().justify_center().gap(16.)
-        .role(Role::Status).live(Live::Polite).accessible_label("Opening Zeron Beta")
+        .role(Role::Status).live(Live::Polite).accessible_label("Opening Zeron")
         .child(svg("Solace", Arc::new(mark)).size(48., 48.))
         .child(column().items_center().gap(6.)
-            .child(text("Zeron Beta").font_family(FontFamily::from("Geist"))
+            .child(text("Zeron").font_family(FontFamily::from("Geist"))
                 .text_size(20.).line_height(28.).font_weight(500).text_color(ink))
             .child(text("Opening your workspace…").font_family(FontFamily::from("Geist"))
                 .text_size(13.).line_height(20.).text_color(muted)))
@@ -147,7 +147,7 @@ return ui.text {id="workspace", "Ready workspace"}
         let (_dir, mut app, startup, watchers) = mount();
         assert!(app.find("#startup-splash").is_some());
         assert!(app.find("#workspace").is_none());
-        assert!(app.tree().contains("Opening Zeron Beta"));
+        assert!(app.tree().contains("Opening Zeron"));
         startup.loading();
         app.host.reload().unwrap();
         startup.finish("plugins in");

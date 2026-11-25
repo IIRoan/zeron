@@ -81,7 +81,7 @@ if $from_run && git merge-base --is-ancestor HEAD "$target"; then
     echo "Checks failed after applying the checked update. To return to your previous version: git reset --keep $backup" >&2
     exit 1
   fi
-  git diff --cached --quiet || git commit -m "Move Zeron Beta's zgx fork onto upstream's zgx"
+  git diff --cached --quiet || git commit -m "Move the app's zgx fork onto upstream's zgx"
   echo "Updated and checked $release. Publish when ready with: git push origin HEAD"
   exit 0
 fi
@@ -102,7 +102,7 @@ if ! $from_run && ! $trial; then
   fi
   git add -- docs/releases/changelog.json
 fi
-# Zeron Beta: git leaves its plugins' copies of upstream files, their SDK
+# The app (apps/zgx): git leaves its plugins' copies of upstream files, their SDK
 # copies and its zgx fork as they were; carry the release into them too.
 beta_ok=true
 sync=(python3 scripts/sync-zgx-fork.py --to "$target")
@@ -120,7 +120,7 @@ fi
 if ! $merge_ok || ! $beta_ok; then
   cat >&2 <<EOF
 The merge needs attention. Your original version is saved in $backup.
-Resolve the files shown by git status, and what Zeron Beta's sync printed
+Resolve the files shown by git status, and what the app's sync printed
 above (it can run again: ${sync[*]}), then run:
   git add <resolved-files>
   scripts/check-linux-fork.sh && git commit

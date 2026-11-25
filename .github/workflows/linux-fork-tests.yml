@@ -81,6 +81,6 @@ jobs:
           rust-cache: desktop
           save-rust-cache: 'true'
       # The old GPUI app is retired (upstream #1499): `zeron` is the command
-      # line with the engine linked in, and Zeron Beta (apps/zgx) the app.
+      # line with the engine linked in, and apps/zgx the app.
       - name: Build the Linux command line and engine
         run: cargo build --locked -p zeron

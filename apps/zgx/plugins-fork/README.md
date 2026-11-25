@@ -71,7 +71,7 @@ alone. A VM screenshot comes back as a `host:` image the host decoded
 (`plugin/<id>/windows-vm/<device>/<project>`), replaced in place by the
 next one, since a plugin reads no file outside its folder.
 
-## Bundling and the beta
+## Bundling and installing
 
 The demo and Linux beta bundle these folders as separate plugins. Settings -> Customize
 -> Plugins enables or disables each one. Disabling Linux Workbench restores
@@ -121,35 +121,30 @@ framework differences. Workspace search, recent/fuzzy branch checkout,
 confirmed missing-branch creation, persistent per-repository commit drafts,
 local project icons and offline release notes are included.
 
-The Linux beta is installed separately as **Zeron Beta** (`zeron-beta`),
-with application id `sh.zeron.beta`, engine port 27946, and its own profile
-under `~/.local/share/zeron-beta/profile`. It uses the installed agent CLIs
-and their normal login locations; it does not copy regular Zeron's chats,
-settings or credentials, and contains no scripted demo provider.
+On Linux this app is **Zeron** itself (`zeron`, application id
+`sh.zeron.app`): a window on the engine `zeron-host.service` runs on the
+regular profile (`~/.zeron`, port 27654), which it never starts or manages.
+It was installed separately as Zeron Beta, with a profile of its own, until
+upstream retired the GPUI app in v0.3.20.
 
-Build `apps/zgx` with `--features beta` and `ZERON_BETA_VERSION` set, and
-the engine from the same commit (`cargo build --release -p zeron --bin
-zeron-engine`). `scripts/install-zgx-beta.py --frontend <binary>
---native-source <manifest> --engine <zeron-engine>` checks the package. Add
-`--apply` to install it. The native-source manifest maps every
-`apps/zgx/src/*.rs` path (recursively, relative to the repository root) to its
-SHA-256 at build time. The engine's `--build-id` must name this checkout's
-commit. A release is flat, as the Linux tarball is: the app with `ui/` and
-`plugins-builtin/` beside it, where zgx looks for them. The installer preserves both regular Zeron and the demo and only
-seeds stock Git/GitHub switches off for a new beta profile. Future installs
-preserve the beta's plugin switches. About & updates identifies this local
-beta and explains its separate manual updates. `zeron-beta --status` lists
-only its processes; `zeron-beta --stop` stops only this beta.
-
-An existing user's saved agent accounts and compatible preferences can be
-transferred explicitly with `python3 scripts/migrate-zgx-beta-profile.py`.
-It checks only unless `--apply` is supplied and requires the beta to be
-stopped. It backs up overwritten beta files privately, merges account
-identities while retaining newer credentials, translates UI preferences,
-and copies service/worktree configuration without importing running
-processes. Project registrations must be recreated through the beta's RPC
-with the same project ids and its own device id. Regular Zeron's profile,
-the beta's identity and its plugin switches remain separate.
+Build `apps/zgx` with `--features beta` (upstream's name for the Zeron app's
+build: production's edge and sign-in), and from the same commit the engine
+(`cargo build --release -p zeron --bin zeron-engine`), the phone gateway
+(`-p zeron-rpc --bin zeron-remote`) and the sandbox helper.
+`scripts/install-linux-fork.py --app <binary> --native-source <manifest>
+--engine <zeron-engine> --remote <zeron-remote> --sandbox-helper <helper>`
+checks the package; `--apply` installs it into
+`~/.local/share/zeron-linux-fork/releases/`, switches `current`, and makes
+`~/.local/bin/zeron` the fork's launcher (`scripts/launch-zeron.py`). The
+native-source manifest maps every `apps/zgx/src/*.rs` path (recursively,
+relative to the repository root) to its SHA-256 at build time. The engine's
+`--build-id` must name this checkout's commit. A release is flat, as the
+Linux tarball is: the app as `zeron`, with `ui/`, `plugins-builtin/` and
+`zeron-engine` beside it; the app runs its engine commands (`zeron headless`,
+`zeron mcp`) in `zeron-engine`. The installer seeds stock Git/GitHub switches
+off only for a profile without decisions. About & updates says updates come
+from the fork's installer. `zeron --status` lists this install's windows;
+`zeron --stop` stops them.
 
 After updating `docs/releases/changelog.json`, refresh the offline plugin
 snapshot with `python3 apps/zgx/scripts/snapshot-fork-release-notes.py --apply`.

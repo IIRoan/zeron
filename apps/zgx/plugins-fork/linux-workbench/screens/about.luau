@@ -169,7 +169,7 @@ export type Update = { title: string, line: string, action: string?, accent: boo
 
 function M.describe(a: About, doing: string): Update
 	if a.manual_updates then
-		return {title = "Local beta build", line = "Install a new Zeron Beta build to update this app. Regular Zeron is installed separately."}
+		return {title = "Linux fork build", line = "Install a new build with the fork's installer to update Zeron."}
 	end
 	local current = a.engine_version
 	local checked = ago(a.checked_at)
@@ -330,7 +330,7 @@ function M.view(): Node
 		ds.Settings.Section {
 			title = ui.t("settings.about.updates_section"),
 			-- (Whether the app updates itself is fixed for the process.)
-			description = if M.now:peek().manual_updates then "Updates are installed separately for Zeron Beta." elseif M.now:peek().self_updating
+			description = if M.now:peek().manual_updates then "Updates are installed with the Linux fork's installer." elseif M.now:peek().self_updating
 				then ui.t("settings.about.updates_self_description")
 				else ui.t("settings.about.updates_description"),
 			ds.Settings.Group {

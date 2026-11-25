@@ -27,7 +27,7 @@ cargo test --locked -p zeron-engine --test local_first --test project_terminals 
   --test terminal_shell_path --test worktree_environments --test worktree_on_run -- --test-threads=1
 cargo test --locked -p zeron-syntax -p zeron-theme -- --test-threads=1
 cargo build --locked -p zeron
-# Zeron Beta (apps/zgx with the fork's plugins): every upstream copy has a
+# The app (apps/zgx with the fork's plugins): every upstream copy has a
 # recorded base and is resolved, the What's new snapshot is current, and the
 # fork plugins, their host gateway and the providers page pass their tests.
 # Its zgx fork is a local repository, so a machine without it (CI) skips
@@ -40,6 +40,6 @@ if [[ -d apps/zgx/plugins-fork ]]; then
     (cd apps/zgx && cargo test --locked --release --features beta --bin zeron-zgx -- \
       plugins::fork_tests plugins::workbench agents:: --test-threads=1)
   else
-    echo "Skipped Zeron Beta's tests: its zgx fork ($zgx_fork) isn't on this machine."
+    echo "Skipped the app's tests: its zgx fork ($zgx_fork) isn't on this machine."
   fi
 fi

@@ -5,12 +5,14 @@
 Keep upstream history intact: merge releases into `main`, then push to your fork.
 The original platform code stays available to make future merges easier.
 
-Since v0.3.20 the desktop app is Zeron Beta (`apps/zgx`), as upstream's is:
-upstream retired the old GPUI app (`crates/ui`, #1499), and the fork with it.
-`zeron` (`apps/zeron`) is the command line with the engine linked in: the
-installed one runs `zeron headless` (the engine Zeron Beta and the phone
-gateway attach to) and `zeron mcp`. The fork's own screens are Zeron Beta's
-plugins in `apps/zgx/plugins-fork` (see its `PORTING.md`).
+Since v0.3.20 Zeron's desktop app is `apps/zgx`, as upstream's is: upstream
+retired the old GPUI app (`crates/ui`, #1499), and the fork with it. The app
+that was installed separately as Zeron Beta is now Zeron itself: `zeron`, a
+window on the engine `zeron-host.service` runs on the regular profile
+(`~/.zeron`). Its engine commands (`zeron headless` for that service, `zeron
+mcp`) run in `zeron-engine` beside it, as in upstream's Linux package. The
+fork's own screens are the app's plugins in `apps/zgx/plugins-fork` (see its
+`PORTING.md`).
 
 ## Update to a new release
 
@@ -43,15 +45,15 @@ scripts/check-linux-fork.sh && git commit
 branch also retains the version from before the update. Avoid force pushes and
 wholesale "ours" conflict resolutions: they can silently drop upstream fixes.
 
-After the checks pass, install both builds from the commit (the engine and
-command line, and Zeron Beta: `apps/zgx/plugins-fork/PORTING.md`, "Installing
-afterwards"), then publish:
+After the checks pass, install the build from the commit
+(`scripts/install-linux-fork.py`: `apps/zgx/plugins-fork/PORTING.md`,
+"Installing afterwards"), then publish:
 
 ```bash
 git push origin main
 ```
 
-Updates to the installed official app do not update these custom builds.
+Updates to the installed official app do not update this custom build.
 
 ## Manually update on GitHub
 
@@ -105,7 +107,7 @@ If `upstream` already exists, use `git remote set-url upstream` instead of addin
 it. Authenticate pushes with the GitHub account that owns the fork. The local
 updater only fetches upstream; it does not need permission to push there.
 
-Keep custom UI in Zeron Beta's fork plugins (`apps/zgx/plugins-fork`) and Git
+Keep custom UI in the app's fork plugins (`apps/zgx/plugins-fork`) and Git
 behavior in the engine's `checkout_changes`, `checkout_discard`, and
 `checkout_git` modules where possible. Small integration points are easier to reconcile with
 upstream releases than replacing entire shared files.

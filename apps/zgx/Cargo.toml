@@ -25,8 +25,8 @@ path = "src/main.rs"
 # staging's built in) and Zeron.app's own engine (the bundle's `Zeron Engine`,
 # ~/.zeron, port 27654), managed as Zeron.app manages it. Without it, the app
 # stays on staging (src/auth.rs, src/engine/manager.rs).
-# On Linux the beta has its own app id, profile and engine port, and uses
-# scripts/install-zgx-beta.py for separate, manually installed releases.
+# On Linux (the fork) it's Zeron itself, a window on the engine
+# zeron-host.service runs, installed with scripts/install-linux-fork.py.
 beta = []
 # The layout benchmarks that read a probed zgx (docs/zgx-layout-probe.patch;
 # `live_reflow_traced` in src/split_tests.rs says how). Off in every build.
