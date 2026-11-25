@@ -199,17 +199,20 @@ accesskit_windows = { git = "https://github.com/zeronsh/zgx", rev = "d391ea7276f
 # (Linux fork) zgx from the fork's copy: branch zeron-fork of ~/Documents/zgx,
 # upstream's pin above plus web pages' snapshots and a person's input
 # (WebView::snapshot/click/insert_text/press_key) for agents driving the
-# browser (src/browser_agents.rs), and terminals holding programs' copies
-# (OSC 52) to your input (src/main.rs). Upstream's lines above stay as upstream
+# browser (src/browser_agents.rs), terminals holding programs' copies
+# (OSC 52) to your input (src/main.rs), and scripts' collection and the
+# conversion cache's sweeps kept off a call's time budget, the sweep collecting
+# in a window that never goes idle (Zeron Git was withdrawn after a few hours
+# of agents at work). Upstream's lines above stay as upstream
 # has them, so its zgx moves merge cleanly; scripts/sync-zgx-fork.py then
 # rebases the branch onto the new pin and puts its commit here, and build.rs
 # refuses a commit here that doesn't contain upstream's pin.
 [patch."https://github.com/zeronsh/zgx"]
-zgx = { git = "file:///var/home/roan/Documents/zgx", rev = "912ef32461f0bf8ff9b3c9388eb0e178f80ff860" }
-zgx-desktop = { git = "file:///var/home/roan/Documents/zgx", rev = "912ef32461f0bf8ff9b3c9388eb0e178f80ff860" }
-zgx-script = { git = "file:///var/home/roan/Documents/zgx", rev = "912ef32461f0bf8ff9b3c9388eb0e178f80ff860" }
-zgx-gpu = { git = "file:///var/home/roan/Documents/zgx", rev = "912ef32461f0bf8ff9b3c9388eb0e178f80ff860" }
-zgx-run = { git = "file:///var/home/roan/Documents/zgx", rev = "912ef32461f0bf8ff9b3c9388eb0e178f80ff860" }
+zgx = { git = "file:///var/home/roan/Documents/zgx", rev = "63589db0511d1200968d2136522509d8cfaa3cfb" }
+zgx-desktop = { git = "file:///var/home/roan/Documents/zgx", rev = "63589db0511d1200968d2136522509d8cfaa3cfb" }
+zgx-script = { git = "file:///var/home/roan/Documents/zgx", rev = "63589db0511d1200968d2136522509d8cfaa3cfb" }
+zgx-gpu = { git = "file:///var/home/roan/Documents/zgx", rev = "63589db0511d1200968d2136522509d8cfaa3cfb" }
+zgx-run = { git = "file:///var/home/roan/Documents/zgx", rev = "63589db0511d1200968d2136522509d8cfaa3cfb" }
 
 # zgx is slow unoptimized (its own setting): optimize dependencies, keep
 # this crate quick to build.
