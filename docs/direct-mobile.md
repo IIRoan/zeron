@@ -55,9 +55,11 @@ sign it out, change agent accounts or route requests to another device.
 
 The **Direct instance iOS** workflow builds on Apple Silicon (`macos-26`), using
 ARM64 simulator and iPhone binaries. Manual runs can select `macos-15`, or the
-Intel `macos-15-intel` (an x86_64 simulator; the iPhone build stays ARM64), as
-alternate runner pools when GitHub cannot allocate a macOS 26 runner;
-`scripts/ios/build-preview.sh` rotates through all three.
+Intel `macos-15-intel`, as alternate runner pools when GitHub cannot allocate a
+macOS 26 runner; `scripts/ios/build-preview.sh` rotates through all three. An
+Intel runner builds the ARM64 iPhone app and the Rust tests only: booting the
+iOS 26 simulator there took the runner down (2026-11-25), so simulator tests run
+on Apple Silicon.
 Rust core compilation and the Swift simulator build run as separate, time-limited
 steps so a stalled build fails with logs instead of consuming the entire job.
 CI selects the newest installed iOS 26 iPhone simulator and waits for it to boot.
