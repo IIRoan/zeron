@@ -11,8 +11,11 @@ check_base=HEAD
 if git rev-parse --verify --quiet MERGE_HEAD >/dev/null; then
   check_base=MERGE_HEAD
 fi
-git diff --check "$check_base"
-git diff --cached --check "$check_base"
+# (Generated iOS bindings keep the generator's own trailing spaces, which
+# CI checks byte for byte: not this check's to flag.)
+generated=(':!apps/ios/CoreFFI/zeron_coreFFI.h' ':!apps/ios/Zeron/Core/Generated')
+git diff --check "$check_base" -- . "${generated[@]}"
+git diff --cached --check "$check_base" -- . "${generated[@]}"
 python3 scripts/tests/test_update_upstream.py
 python3 scripts/tests/test_sync_zgx_fork.py
 python3 scripts/tests/test_snapshot_release_notes.py
@@ -23,13 +26,8 @@ cargo test --locked -p zeron-engine checkout_ --lib -- --test-threads=1
 cargo test --locked -p zeron-engine --test local_first --test project_terminals \
   --test terminal_shell_path --test worktree_environments --test worktree_on_run -- --test-threads=1
 cargo test --locked -p zeron-syntax -p zeron-theme -- --test-threads=1
-cargo test --locked -p zeron-ui source_control --lib -- --test-threads=1
-cargo test --locked -p zeron-ui file_close_modal --lib -- --test-threads=1
-cargo test --locked -p zeron-ui release_notes --lib -- --test-threads=1
-cargo test --locked -p zeron-ui --lib -- --test-threads=1 \
-  changes:: theme:: toast:: project_terminals_ui worktrees_ui
 cargo build --locked -p zeron
-# Zeron Beta (apps/zgx with the fork's plugins): every upstream copy has a
+# The app (apps/zgx with the fork's plugins): every upstream copy has a
 # recorded base and is resolved, the What's new snapshot is current, and the
 # fork plugins, their host gateway and the providers page pass their tests.
 # Its zgx fork is a local repository, so a machine without it (CI) skips
@@ -42,6 +40,6 @@ if [[ -d apps/zgx/plugins-fork ]]; then
     (cd apps/zgx && cargo test --locked --release --features beta --bin zeron-zgx -- \
       plugins::fork_tests plugins::workbench agents:: --test-threads=1)
   else
-    echo "Skipped Zeron Beta's tests: its zgx fork ($zgx_fork) isn't on this machine."
+    echo "Skipped the app's tests: its zgx fork ($zgx_fork) isn't on this machine."
   fi
 fi

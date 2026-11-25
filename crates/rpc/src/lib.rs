@@ -37,7 +37,7 @@ pub use device_room::{
     NudgeHandler, PeerLiveness, PeerLivenessProbe, StaticToken, TokenError, TokenSource,
     decode_device_frame, device_room_ws_url, encode_device_frame, is_liveness_probe,
 };
-pub use server::{serve_connection, serve_ws_listener, serve_ws_listener_scoped};
+pub use server::{agent_service, serve_connection, serve_ws_listener, serve_ws_listener_scoped};
 
 /// RPC method names — single source of truth for both ends.
 /// Full surface: docs/research/feature-inventory.md §2.
@@ -98,11 +98,25 @@ pub mod methods {
     /// (`{switchable, off}`; set with `{harness, enabled}`).
     pub const GET_NATIVE_SUBAGENTS: &str = "GetNativeSubagents";
     pub const SET_NATIVE_SUBAGENTS: &str = "SetNativeSubagents";
+    /// Which providers on this device have Code Mode enabled
+    /// (`{supported, enabled}`; set with `{harness, enabled}`).
+    pub const GET_CODE_MODE: &str = "GetCodeMode";
+    pub const SET_CODE_MODE: &str = "SetCodeMode";
+    /// Settings → Providers: which agents run with only Zeron's MCP servers
+    /// (their own hidden), and the choice per agent.
+    pub const GET_ZERON_MCP_ONLY: &str = "GetZeronMcpOnly";
+    pub const SET_ZERON_MCP_ONLY: &str = "SetZeronMcpOnly";
     pub const SET_HARNESS_ENABLED: &str = "SetHarnessEnabled";
     pub const LIST_MODELS: &str = "ListModels";
     pub const LIST_SKILLS: &str = "ListSkills";
     pub const LIST_COMMANDS: &str = "ListCommands";
     pub const QUEUE_COMMAND: &str = "QueueCommand";
+    /// `WarmStart {chatId, request, typed}` → `{outcome}`: start (or renew) a
+    /// new chat's agent before its first message, for the id the chat will
+    /// be created with (engine `warm_start`).
+    pub const WARM_START: &str = "WarmStart";
+    /// `WarmStop {chatId}`: stop that warm start.
+    pub const WARM_STOP: &str = "WarmStop";
     pub const TAKE_PROJECT_ACTION_SETUP: &str = "TakeProjectActionSetup";
     /// Peer-to-peer delivery fallback: the SENDER's engine forwards a queued
     /// command entry (client-minted id and all) straight over the device-room
@@ -203,6 +217,15 @@ pub mod methods {
     /// Headed IPC owners do not implement this method: closing another app's
     /// engine behind its windows would leave that process unusable.
     pub const STOP_ENGINE: &str = "StopEngine";
+    /// "Keep Zeron running after you quit": `{ keepRunningAfterQuit }`
+    /// (the background engine's; this device's app only).
+    pub const GET_BACKGROUND_SETTINGS: &str = "GetBackgroundSettings";
+    pub const SET_BACKGROUND_SETTINGS: &str = "SetBackgroundSettings";
+    /// A quitting app asks what's still working: `{ keepRunning, working }`.
+    pub const QUIT_CHECK: &str = "QuitCheck";
+    /// The app quits with the setting off: the engine stops once nothing is
+    /// pending; `{ stopWork: true }` stops the chats still working first.
+    pub const APP_QUITTING: &str = "AppQuitting";
     /// Headless IPC only: stop starting work ahead of a Cloud sleep (the
     /// edge runs `zeron quiesce` before stopping the machine). Replies
     /// `{"quiesced":true}` or `{"quiesced":false,"busy":"<why>"}`.
@@ -349,6 +372,24 @@ pub mod methods {
     pub const CLOSE_TERMINAL: &str = "CloseTerminal";
     /// Whether closing a terminal would end a program running in it.
     pub const TERMINAL_STATUS: &str = "TerminalStatus";
+    /// `{command, cwd?, chatId?, timeoutMs?, background?}` → `RunOutcome`:
+    /// one shell command run to its end on the target device (no PTY, no
+    /// session), its output capped and its process group killed at the
+    /// timeout; with `background`, → `CommandStatus` of one left running.
+    /// Relay-forwardable, as are the three below (Zeron MCP's `run_command`,
+    /// `command_output`, `stop_command`, `list_commands`).
+    pub const RUN_COMMAND: &str = "RunCommand";
+    /// `{id}` → `CommandStatus`: a background command's output since it was
+    /// last read, and whether it still runs.
+    pub const READ_COMMAND_OUTPUT: &str = "ReadCommandOutput";
+    /// `{id}` → `CommandStatus`: stop a background command and all it started.
+    pub const STOP_COMMAND: &str = "StopCommand";
+    /// `{chatId?}` → `[CommandStatus]`: the background commands a chat started.
+    pub const LIST_BACKGROUND_COMMANDS: &str = "ListBackgroundCommands";
+    /// `{chatId}` → stream of `[CommandStatus]`: [`LIST_BACKGROUND_COMMANDS`]
+    /// now and each time one starts or ends. The chat's host follows its
+    /// agent's commands on other devices with it (its background band).
+    pub const WATCH_BACKGROUND_COMMANDS: &str = "WatchBackgroundCommands";
     /// Checkout-diff stream for the target device's chats (DataRpc,
     /// relay-forwardable — diffs are produced where the checkout lives).
     pub const WATCH_CHECKOUT_DIFFS: &str = "WatchCheckoutDiffs";
@@ -459,6 +500,13 @@ pub mod methods {
     pub const CLOUD_SESSIONS: &str = "CloudSessions";
     /// `{machine}` → `CloudStatus`. The size new sessions start on.
     pub const CLOUD_SET_MACHINE: &str = "CloudSetMachine";
+    /// `{reach: "devices" | "isolated"}` → `CloudStatus`. The reach new
+    /// sessions start with. The person's alone ([`local_only`]).
+    pub const CLOUD_SET_REACH: &str = "CloudSetReach";
+    /// `{chatId, reach}` → `CloudSession`. Whether that session reaches the
+    /// person's other devices; isolating closes it out of what it reached.
+    /// The person's alone ([`local_only`]).
+    pub const CLOUD_SESSION_SET_REACH: &str = "CloudSessionSetReach";
     /// `{chatId, machine?, wake?}` → `CloudSession`. Wake one session's sandbox
     /// (on `machine`, when given; `wake: false` only records the size for its
     /// next wake); sending to a sleeping session wakes it on its own (the host
@@ -744,6 +792,23 @@ pub mod methods {
     /// shown as the engine's own are, under the same Settings, at most a few
     /// a minute for each `source`; clicking it opens `session`.
     pub const POST_NOTIFICATION: &str = "PostNotification";
+
+    // ── Managed MCP servers ──────────────────────────────────────────────────
+    pub const WATCH_MCP_SERVERS: &str = "WatchMcpServers";
+    pub const LIST_MCP_SERVERS: &str = "ListMcpServers";
+    pub const UPSERT_MCP_SERVER: &str = "UpsertMcpServer";
+    pub const SET_MCP_SERVER_ENABLED: &str = "SetMcpServerEnabled";
+    pub const DELETE_MCP_SERVER: &str = "DeleteMcpServer";
+    pub const START_MCP_AUTH: &str = "StartMcpAuth";
+    /// An agent asks for a change to the MCP servers; it waits for the
+    /// person (`ResolveMcpRequest`, this device's app alone).
+    pub const REQUEST_MCP_CHANGE: &str = "RequestMcpChange";
+    pub const GET_MCP_REQUEST: &str = "GetMcpRequest";
+    pub const RESOLVE_MCP_REQUEST: &str = "ResolveMcpRequest";
+    pub const POLL_MCP_AUTH: &str = "PollMcpAuth";
+    pub const CANCEL_MCP_AUTH: &str = "CancelMcpAuth";
+    pub const DISCONNECT_MCP_AUTH: &str = "DisconnectMcpAuth";
+    pub const REFRESH_MCP_SERVERS: &str = "RefreshMcpServers";
 }
 
 /// Methods answered only over this device's own local IPC, never to a peer
@@ -754,6 +819,11 @@ pub fn local_only(method: &str) -> bool {
         method,
         methods::ACCESS_TOKEN
             | methods::STEP_UP
+            // This device's background engine: whether it outlives its app.
+            | methods::GET_BACKGROUND_SETTINGS
+            | methods::SET_BACKGROUND_SETTINGS
+            | methods::QUIT_CHECK
+            | methods::APP_QUITTING
             // An API key typed into this device's app: stored here alone.
             | methods::ADD_AGENT_API_KEY
             | methods::DELETE_ACCOUNT
@@ -799,6 +869,23 @@ pub fn local_only(method: &str) -> bool {
             | methods::SET_BUILTIN_PLUGINS
             | methods::POST_NOTIFICATION
             | methods::EXPORT_PLUGIN
+            // What a Cloud chat reaches: this device's app sets it, never
+            // another device (a Cloud machine among them) and never an agent.
+            | methods::CLOUD_SET_REACH
+            | methods::CLOUD_SESSION_SET_REACH
+            // Managed MCP server mutations and OAuth flows carry secrets or
+            // drive loopback auth callbacks: never cross the peer relay.
+            | methods::UPSERT_MCP_SERVER
+            | methods::SET_MCP_SERVER_ENABLED
+            | methods::DELETE_MCP_SERVER
+            | methods::START_MCP_AUTH
+            | methods::POLL_MCP_AUTH
+            | methods::CANCEL_MCP_AUTH
+            | methods::DISCONNECT_MCP_AUTH
+            // What an agent asks for is this device's to answer, here.
+            | methods::REQUEST_MCP_CHANGE
+            | methods::GET_MCP_REQUEST
+            | methods::RESOLVE_MCP_REQUEST
     )
 }
 
@@ -844,6 +931,9 @@ pub fn app_forward_only(method: &str, params: &serde_json::Value) -> bool {
 /// credentials (`AccessToken`, sign-in, `StepUp`, `DeleteAccount`),
 /// terminals, files, vault and agent logins, and a command's whole output
 /// (`ReadToolOutput`: an agent reads a chat as its doc keeps it).
+/// Running a command (`RunCommand`, on any of the person's devices) is
+/// here, and the engine allows it only to an agent whose chat runs with
+/// full access (its agent gate).
 pub fn agent_allowed(method: &str) -> bool {
     matches!(
         method,
@@ -890,6 +980,12 @@ pub fn agent_allowed(method: &str) -> bool {
             | methods::CHAT_WINDOWS_VM
             // Saying what the calling chat's agent waits on.
             | methods::AWAIT_BACKGROUND
+            // Commands on any of the person's devices (Zeron MCP's
+            // run_command & co.): full access only (the engine's agent gate).
+            | methods::RUN_COMMAND
+            | methods::READ_COMMAND_OUTPUT
+            | methods::STOP_COMMAND
+            | methods::LIST_BACKGROUND_COMMANDS
             // Plugins: authoring, installing (lands waiting for the person),
             // checking for updates, exporting (to Zeron's plugin-exports
             // folder only: the engine refuses an agent's `to`), and their
@@ -915,6 +1011,12 @@ pub fn agent_allowed(method: &str) -> bool {
             | methods::DELETE_TEMPLATE
             | methods::EXPORT_TEMPLATE
             | methods::IMPORT_TEMPLATE
+            // MCP servers: reading them (no secret is in the list), and
+            // asking for a change, which waits for the person (only this
+            // device's app answers it: `ResolveMcpRequest` isn't here).
+            | methods::LIST_MCP_SERVERS
+            | methods::REQUEST_MCP_CHANGE
+            | methods::GET_MCP_REQUEST
             // Themes: data only (no consent: a theme can't run anything),
             // read, made, changed, deleted (yours only) and worn. Not the
             // window's watch.
@@ -1115,6 +1217,47 @@ mod tests {
                 other => Err(RpcError::UnknownMethod(other.into())),
             }
         }
+    }
+
+    #[test]
+    fn what_a_cloud_chat_reaches_is_set_by_this_devices_app_alone() {
+        for method in [methods::CLOUD_SET_REACH, methods::CLOUD_SESSION_SET_REACH] {
+            assert!(local_only(method), "{method}");
+            assert!(peer_refused(method, &serde_json::Value::Null), "{method}");
+            assert!(!agent_allowed(method), "{method}");
+        }
+    }
+
+    #[test]
+    fn managed_mcp_server_mutations_and_auth_are_local_only_and_never_agent_allowed() {
+        for method in [
+            methods::UPSERT_MCP_SERVER,
+            methods::SET_MCP_SERVER_ENABLED,
+            methods::DELETE_MCP_SERVER,
+            methods::START_MCP_AUTH,
+            methods::POLL_MCP_AUTH,
+            methods::CANCEL_MCP_AUTH,
+            methods::DISCONNECT_MCP_AUTH,
+        ] {
+            assert!(local_only(method), "{method}");
+            assert!(peer_refused(method, &serde_json::Value::Null), "{method}");
+            assert!(!agent_allowed(method), "{method}");
+        }
+        for method in [methods::WATCH_MCP_SERVERS, methods::REFRESH_MCP_SERVERS] {
+            assert!(!local_only(method), "{method}");
+            assert!(!agent_allowed(method), "{method}");
+        }
+        // An agent reads the (secret-free) list, and asks; the person answers,
+        // in this device's app alone.
+        assert!(!local_only(methods::LIST_MCP_SERVERS));
+        assert!(agent_allowed(methods::LIST_MCP_SERVERS));
+        for method in [methods::REQUEST_MCP_CHANGE, methods::GET_MCP_REQUEST] {
+            assert!(local_only(method), "{method}");
+            assert!(agent_allowed(method), "{method}");
+        }
+        assert!(local_only(methods::RESOLVE_MCP_REQUEST));
+        assert!(peer_refused(methods::RESOLVE_MCP_REQUEST, &serde_json::Value::Null));
+        assert!(!agent_allowed(methods::RESOLVE_MCP_REQUEST));
     }
 
     #[test]
@@ -1546,6 +1689,13 @@ mod tests {
         // Exporting a plugin reaches the engine as the agent's, which keeps
         // it to Zeron's plugin-exports folder (R29).
         let asked = agent.call(methods::EXPORT_PLUGIN, serde_json::json!({})).await.unwrap();
+        assert!(asked.as_str().unwrap().starts_with("Agent"), "{asked}");
+        // A command reaches the engine as the agent's, which runs it only
+        // for a chat with full access.
+        let asked = agent
+            .call(methods::RUN_COMMAND, serde_json::json!({}))
+            .await
+            .unwrap();
         assert!(asked.as_str().unwrap().starts_with("Agent"), "{asked}");
         // The theme tools' methods, exactly: data only.
         for method in [methods::LIST_THEMES, methods::GET_THEME, methods::CREATE_THEME, methods::UPDATE_THEME, methods::DELETE_THEME, methods::USE_THEME] {

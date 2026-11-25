@@ -64,6 +64,8 @@ async fn check_persistence(
         auto_approve: true,
         access: Default::default(),
         plan: false,
+        code_mode: false,
+        zeron_mcp_only: false,
         attachments: vec![],
         worktree: None,
         resume: None,
@@ -266,6 +268,8 @@ async fn check_quiet_children(scenario: &str) {
         attachments: vec![],
         worktree: None,
         resume: None,
+        code_mode: false,
+        zeron_mcp_only: false,
     };
     for (turn, prompt, expected) in [
         (1, None, 3),

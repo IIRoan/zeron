@@ -20,6 +20,7 @@
 -- the diff keeps one column of line numbers.
 
 local Badge = require("@ds/badge")
+local material = require("@ds/material")
 local Icon = require("@ds/icon")
 local Text = require("@ds/text")
 local Tabs = require("@ds/tabs")
@@ -243,7 +244,7 @@ function M.card(head: Node?, rows: { Node }, faded: ((i: number) -> boolean)?): 
 	return ui.column {
 		w_full = true,
 		rounded = M.RADIUS,
-		bg = "$zeron.settings.card",
+		bg = material.pick("$zeron.settings.tint", "$zeron.settings.card"),
 		border = M.EDGE,
 		border_color = "$zeron.settings.edge",
 		overflow = "hidden",
@@ -274,7 +275,7 @@ function M.frame(props: FrameProps): Node
 		px = if props.padded then "$space.4" else nil,
 		py = if props.padded then "$space.3" else nil,
 		rounded = M.RADIUS,
-		bg = "$zeron.settings.card",
+		bg = material.pick("$zeron.settings.tint", "$zeron.settings.card"),
 		border = M.EDGE,
 		border_color = "$zeron.settings.edge",
 		overflow = "hidden",
@@ -1257,7 +1258,7 @@ function M.checks_block(o: ChecksBlock): Node
 	return ui.column {
 		w_full = true,
 		rounded = M.RADIUS,
-		bg = "$zeron.settings.card",
+		bg = material.pick("$zeron.settings.tint", "$zeron.settings.card"),
 		border = M.EDGE,
 		border_color = "$zeron.settings.edge",
 		overflow = "hidden",
@@ -1332,7 +1333,7 @@ local function note(...: Node): Node
 		py = "$space.2",
 		gap = "$space.1",
 		rounded = "$radius.lg",
-		bg = "$zeron.settings.card",
+		bg = material.pick("$zeron.settings.note", "$zeron.settings.card"),
 		border = 1,
 		border_color = "$zeron.settings.edge",
 		...,

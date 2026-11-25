@@ -17,6 +17,7 @@
 -- it lays itself out.
 
 local ds = require("@ds")
+local Draft = require("@ds/draft_text")
 local Dictation = require("@app/screens/chat/dictation")
 local motion = require("@ds/motion")
 local Placement = require("@app/screens/chat/composer_place")
@@ -28,11 +29,13 @@ local route = require("@app/screens/shell/route")
 local art = require("@app/screens/shell/art")
 local shared = require("@app/screens/chat/shared")
 local sessions = require("@account/sessions")
+local cloud = require("@account/cloud")
 local LinkNotice = require("@app/screens/chat/link_notice")
 local CloudTray = require("@app/screens/chat/cloud_tray")
 local Held = require("@app/screens/chat/held")
 local CloudMachine = require("@app/screens/chat/cloud_machine")
 local Where = require("@app/screens/chat/where")
+local Warm = require("@app/screens/chat/warm")
 local DropOverlay = require("@ds/drop_overlay")
 local Asks = require("@app/screens/chat/asks")
 local Invocations = require("@app/screens/chat/invocations")
@@ -40,6 +43,7 @@ local ZeronCommands = require("@app/screens/chat/zeron_commands")
 -- (Loaded with the chat page: captures land on its composer.)
 local Appshots = require("@app/screens/chat/appshots")
 local Carried = require("@app/screens/chat/carried")
+local ComposerAtoms = require("@ds/composer_atoms")
 local Completions = require("@app/screens/chat/completions")
 
 -- Zeron's dock spring (ω ≈ 27).
@@ -189,6 +193,9 @@ local function Composer(): Node
 	local checkout = ui.state("chat_checkout", "worktree" :: string?)
 	local branch = ui.state("chat_branch", nil :: string?)
 	local project = ui.state("chat_project", nil :: string?)
+	-- On Cloud, what a new chat's machine reaches (nil: the account's
+	-- default, Settings → Cloud). Each new chat starts from the default.
+	local reach = ui.state("chat_reach", nil :: string?)
 	local locals: { [string]: State<any> } =
 		{ model = model, effort = effort, fast = fast, options = options, access = access, plan = plan }
 
@@ -229,7 +236,28 @@ local function Composer(): Node
 				end
 			elseif s then
 				-- (Its own pick, unsent, over what the session runs with.)
-				local pick = shared.picks:peek()[id] or {}
+				local all_picks = shared.picks:peek()
+				local raw_pick = all_picks[id]
+				if raw_pick then
+					local any_kept = false
+					for k in DRAFTED do
+						local pv = raw_pick[k]
+						if pv ~= nil then
+							local own = (s :: any)[k]
+							if not equal(own, pv) and not (pv == false and own == nil) then
+								any_kept = true
+								break
+							end
+						end
+					end
+					if not any_kept then
+						local next = table.clone(all_picks)
+						next[id] = nil
+						shared.picks:set(next)
+						raw_pick = nil
+					end
+				end
+				local pick = raw_pick or {}
 				for _, k in FIELDS do
 					local v = (s :: any)[k]
 					if DRAFTED[k] and pick[k] ~= nil then
@@ -482,6 +510,58 @@ local function Composer(): Node
 		branch = branch,
 		active = new_chat,
 	}
+	-- A new chat's agent, started as the person opens it or types (see
+	-- screens/chat/warm), with the send's own choices.
+	local warm = Warm.bind {
+		session = function(): string?
+			return session_id:get()
+		end,
+		text = shared.text,
+		owner = shared.owner,
+		request = function(): any?
+			-- (Only a new chat's.)
+			if not new_chat() then
+				return nil
+			end
+			local req = {
+				model = model:get(),
+				effort = effort:get(),
+				fast = fast:get(),
+				options = options:get(),
+				access = access:get(),
+				plan = plan:get(),
+			}
+			-- (Heard when the place changes too.)
+			device:get()
+			project:get()
+			checkout:get()
+			branch:get()
+			if where.blocked:peek() then
+				return nil
+			end
+			local p = where.plan()
+			if p.cloud or p.worktree then
+				return nil
+			end
+			-- (Only for a chat that will run here: one on another device
+			-- would outlive this app's quit.)
+			local here = (sessions.now:peek() :: any).here
+			if p.device ~= nil and p.device ~= here then
+				return nil
+			end
+			for _, m in store.catalog:get().models do
+				if m.value == req.model then
+					(req :: any).harness = m.harness
+				end
+			end
+			if (req :: any).harness == nil then
+				return nil
+			end
+			(req :: any).cwd = p.cwd;
+			(req :: any).device = p.device
+			return req
+		end,
+	}
 	-- (A new chat's project, for what follows the route: its panel.)
 	ui.effect(function()
 		if new_chat() then
@@ -716,10 +796,10 @@ local function Composer(): Node
 		end
 		return LinkNotice.of {
 			connection = sessions.connection:get(),
-			cloud = machine.cloud_link(string.find(shared.text:get(), "%S") ~= nil or #shared.cargo:get() > 0 or #queue:get() > 0),
+			cloud = machine.cloud_link(Draft.has_text(shared.text) or #shared.cargo:get() > 0 or #queue:get() > 0),
 			host_unreachable = host_unreachable,
 			host = host,
-			intent = string.find(shared.text:get(), "%S") ~= nil or #shared.cargo:get() > 0 or #queue:get() > 0,
+			intent = Draft.has_text(shared.text) or #shared.cargo:get() > 0 or #queue:get() > 0,
 		}
 	end)
 
@@ -801,12 +881,13 @@ local function Composer(): Node
 
 	-- A queued message being edited in the composer: which, and the draft
 	-- it set aside (put back when the edit ends).
-	local editing = ui.state("chat_editing", nil :: { item: string, aside: string, aside_cargo: { any }? }?)
+	local editing = ui.state("chat_editing", nil :: { item: string, aside: string, aside_cargo: { any }?, aside_atoms: { any }? }?)
 	local edits = Asks.queue_edits {
 		id = function(): string?
 			return session_id:peek()
 		end,
 		text = shared.text,
+		atoms = shared.atoms,
 		editing = editing,
 		focus = function()
 			shared.focus:add(1)
@@ -843,24 +924,38 @@ local function Composer(): Node
 	-- the focus; back from Settings): the composer takes the keys. Once
 	-- what brought it here is done (a palette closing
 	-- puts focus back where it was first), so this comes last; a field
-	-- that takes the keys after (a rename) has them. (Kept: a reload, or
-	-- the window opening, isn't an arrival.)
+	-- that takes the keys after (a rename) has them. The window opening on
+	-- a chat is an arrival too: what's typed from the launch on goes into
+	-- the composer, with no click first (Zeron's composer has the keys as it
+	-- opens; ademark's A1 types from the launch and timed out on every run
+	-- while they were nowhere). (Kept: a reload isn't one.)
 	local arrived = ui.state("chat_composer_arrived", "?")
 	ui.effect(function()
 		local now = route.current:get()
 		local pane = route.chat:get().session
 		local chat = now.name == "session" or now.name == "home"
-		local at = `{now.name}|{now.session or ""}|{now.project or ""}|{pane or ""}`
-		local was = arrived:peek()
-		if was == at then
+		-- (A session's project is the chat's own, known once the engine
+		-- lists it: its coming isn't a move, and it took the keys from
+		-- whatever had them by then, a dialog opened at launch.)
+		local project = if now.name == "home" then now.project or "" else ""
+		local at = `{now.name}|{now.session or ""}|{project}|{pane or ""}`
+		if arrived:peek() == at then
 			return
 		end
-		arrived:set(at)
 		-- (A tab strip's arrows keep the keys on the tab they chose.)
-		if route.take_keys_kept() or was == "?" or not chat then
+		if route.take_keys_kept() or not chat then
+			arrived:set(at)
 			return
 		end
+		-- Marked arrived as the keys are given, not before: the window's
+		-- scripts loaded again meanwhile (the engine's plugins coming in as
+		-- the window opens) drop this turn's callback, and the scripts made
+		-- again give them instead.
 		ui.after(0, function()
+			if arrived:peek() == at then
+				return
+			end
+			arrived:set(at)
 			shared.focus:add(1)
 		end)
 	end)
@@ -875,11 +970,14 @@ local function Composer(): Node
 		-- token goes; anything carried stays).
 		local zeron = completions.command_of(shared.text:peek())
 		if zeron then
-			shared.text:set("")
+			ui.batch(function()
+				shared.text:set("")
+				shared.atoms:set({})
+			end)
 			ZeronCommands.run(zeron, session_id:peek())
 			return
 		end
-		local typed, carried = shared.take()
+		local typed, carried, raw_draft, raw_atoms = shared.take()
 		local pack = Carried.pack(carried, typed, text)
 		local attachments = pack.attachments
 		-- (Each command or skill picked: its canonical reference.)
@@ -895,11 +993,12 @@ local function Composer(): Node
 			-- arrives as the same row.
 			-- (While a turn runs it's queued instead: it shows in the queue.)
 			-- The chat's unsent pick goes with it (the run takes that agent,
-			-- model and effort, and the session with them); queued, it waits
-			-- for the turn it will run in.
+			-- model and effort, and the session with them); while a turn runs
+			-- the queued message carries the pick so it runs on the chosen
+			-- agent/model when promoted or drained.
 			local pick = shared.picks:peek()[id]
 			local req: { [string]: any } = { session = id, text = text_out, attachments = attachments, appshots = Appshots.of_cargo(carried) }
-			if pick and not running:peek() then
+			if pick then
 				for k, v in pick do
 					req[k] = v
 				end
@@ -909,13 +1008,20 @@ local function Composer(): Node
 							req.harness = m.harness
 						end
 					end
+					if not req.harness then
+						req.harness = string.match(pick.model, "^([^/]+)/")
+					end
 				end
 			end
 			local function deliver(message_id: string?)
+				local queued = message_id == nil
 				req.message_id = message_id
 				store.send(req :: any):after(function()
 					-- Sent with it: the session has it now; no pick left.
-					if req.model or req.effort or req.fast ~= nil or req.options then
+					-- While a turn is running, keep the pick visible in the
+					-- composer until the session adopts it so the picker
+					-- doesn't snap back to the old provider mid-turn.
+					if not queued and (req.model or req.effort or req.fast ~= nil or req.options) then
 						local all = table.clone(shared.picks:peek())
 						-- (By what it holds, not which table: a state's snapshot
 						-- read again needn't be the same table.)
@@ -927,7 +1033,7 @@ local function Composer(): Node
 				end, function(e: any)
 					own_notice:set { tone = "danger", key = "chat.composer.didnt_send", dismissable = true }
 					if shared.text:peek() == "" then
-						shared.text:set(text_out)
+						ComposerAtoms.apply(shared.text, shared.atoms, if #raw_atoms > 0 then raw_draft else text_out, raw_atoms)
 					end
 					-- Its files too, before any added since.
 					shared.restore_cargo_of(id, carried)
@@ -948,6 +1054,9 @@ local function Composer(): Node
 			-- engine's) can reach the list before the glide is ready, and
 			-- the prompt is there once, whoever adds it first.
 			local mid = store.new_id()
+			local catalog = store.catalog:peek()
+			local from_h = T.session_harness(catalog, store.session:peek())
+			local sw = T.switch_row(catalog, from_h, req.harness, mid)
 			-- (To the transcript at its foot: in a split, the focused pane's,
 			-- which shows its lane's list, the prompt joining it there too.)
 			local lane = foot_lane(id)
@@ -958,6 +1067,12 @@ local function Composer(): Node
 			T.send(function()
 				for _, list in lists do
 					if list:index_of("id", mid) == nil then
+						if sw and list:len() > 0 then
+							local tail = list:at(list:len())
+							if (not tail or tail.role ~= "switch") and list:index_of("id", sw.id) == nil then
+								list:push(sw)
+							end
+						end
 						list:push {
 							id = mid,
 							role = "user",
@@ -1003,7 +1118,7 @@ local function Composer(): Node
 		local failed = function(why: string?)
 			own_notice:set { tone = "danger", text = why, key = if why then nil else "chat.composer.didnt_start", dismissable = true }
 			if shared.text:peek() == "" then
-				shared.text:set(text_out)
+				ComposerAtoms.apply(shared.text, shared.atoms, if #raw_atoms > 0 then raw_draft else text_out, raw_atoms)
 			end
 		end
 		-- On Cloud, as the shipping app starts one: the chat opens at once
@@ -1012,6 +1127,7 @@ local function Composer(): Node
 		-- steps are); Cloud makes it meanwhile, and the message goes once it
 		-- has. Refused, back to the new chat with the words and why.
 		if plan.cloud then
+			warm.stop()
 			local chat_id = store.new_id()
 			req.project = plan.project
 			req.device = plan.device
@@ -1028,10 +1144,12 @@ local function Composer(): Node
 			slide_to = chat_id
 			route.open_session(chat_id)
 			sessions
-				.create({ id = chat_id, project = plan.project, branch = plan.branch, cloud = true })
+				.create({ id = chat_id, project = plan.project, branch = plan.branch, cloud = true, reach = reach:peek() })
 				:after(function(made: any)
 					local cwd = if type(made) == "table" then made.cwd else nil
 					req.cwd = if type(cwd) == "string" and cwd ~= "" then cwd else nil
+					-- (The next new chat starts from the default again.)
+					reach:set(nil)
 					store.created(chat_id)
 					store.send(req):after(function() end, function(_e: any) end)
 				end, function(e: any)
@@ -1063,8 +1181,12 @@ local function Composer(): Node
 		req.project = plan.project
 		req.device = plan.device
 		req.branch = plan.branch
+		-- (The id its agent was started early for, if it was: the send goes
+		-- into that agent.)
+		local warmed = warm.take()
 		sessions
 			.create({
+				id = warmed,
 				project = plan.project,
 				device = if plan.project then nil else plan.device,
 				branch = plan.branch,
@@ -1074,6 +1196,9 @@ local function Composer(): Node
 			:after(function(made: any)
 				local id = if plan.cloud and type(made) == "table" then made.id else made
 				if type(id) ~= "string" then
+					if warmed then
+						store.unwarm(warmed)
+					end
 					failed()
 					return
 				end
@@ -1101,6 +1226,10 @@ local function Composer(): Node
 				route.open_session(id)
 				store.send(req):after(function() end, function(_e: any) end)
 			end, function(e: any)
+				-- (Never made: the agent started for it goes.)
+				if warmed then
+					store.unwarm(warmed)
+				end
 				-- (A Cloud chat's reason is said in words; an outcome word isn't.)
 				local why = if plan.cloud and type(e) == "table" and type(e.message) == "string" and string.find(e.message, " ", 1, true)
 					then e.message
@@ -1163,9 +1292,13 @@ local function Composer(): Node
 				on = d.name
 			end
 		end
+		-- On Cloud: its machine's session (a side chat shares its parent's).
+		local machine = if cloud.on_device((s :: any).device) then cloud.session_for(s.id, (s :: any).device) else nil
 		return {
 			device = on,
 			name = name,
+			cloud = cloud.on_device((s :: any).device),
+			reach = if machine then machine.reach else nil,
 			worktree = path ~= nil and s.cwd ~= nil and s.cwd ~= path,
 			project = project,
 			hue = if project and s.project then (route.look(s.project) or { hue = route.hue(s.project) }).hue else nil,
@@ -1192,6 +1325,9 @@ local function Composer(): Node
 				if math.abs(shared.dock_h:peek() - sizes.presented) > 0.01 then
 					shared.dock_h:set(sizes.presented)
 				end
+				if math.abs(shared.dock_target:peek() - sizes.target) > 0.01 then
+					shared.dock_target:set(sizes.target)
+				end
 			end,
 			-- Its measures, fold and open tray kept across a reload, so it
 			-- is laid out as it was from the first frame.
@@ -1208,12 +1344,16 @@ local function Composer(): Node
 			end,
 			on_pill_width = shared.pill_teller("waiting", "window"),
 			value = shared.text,
+			atoms = shared.atoms,
 			placeholder = ui.t("chat.composer.placeholder"),
 			expanded = shown_new,
 			snap = snap,
 			menus_below = shown_new,
 			running = running,
 			access = access,
+			access_auto = function(): boolean
+				return store.offers_auto(model:get())
+			end,
 			plan = plan,
 			model = model,
 			effort = effort,
@@ -1285,8 +1425,19 @@ local function Composer(): Node
 			branches = where.branches,
 			branches_empty = where.branches_empty,
 			branch_fixed = branch_fixed,
+			-- (Only ever the person's: the engine takes it from this app alone.)
+			on_reach = function(r: string)
+				local s = open()
+				local machine = if s then cloud.session_for(s.id, (s :: any).device) else nil
+				if machine then
+					cloud.set_session_reach(machine.chat, r)
+				end
+			end,
+			reach = reach,
+			reach_default = cloud.reach,
 			cargo = shared.cargo,
 			on_remove_cargo = shared.remove_cargo,
+			cargo_chip = Carried.chip_spec,
 			on_attach = function()
 				ui.open_files({ title = ui.t("chat.composer.attach_files"):get(), multiple = true }):after(function(files: any)
 					if files and #files > 0 then
@@ -1297,7 +1448,7 @@ local function Composer(): Node
 			-- (A drop on the pill: the chat's overlay goes with it.)
 			on_files = function(files: { any })
 				shared.dropping:set({})
-				shared.attach_files(files)
+				shared.drop_files(files)
 			end,
 			-- A picture pasted (a screenshot): written out by the host, then
 			-- carried as an image, as one dropped is, named as Zeron names
@@ -1305,7 +1456,7 @@ local function Composer(): Node
 			on_paste_image = function(): boolean
 				store.paste_image():after(function(path: string?)
 					if type(path) == "string" and path ~= "" then
-						shared.attach_files({ { name = "image.png", path = path } })
+						shared.attach_pasted_image(path)
 					end
 				end, function() end)
 				return true
@@ -1325,7 +1476,13 @@ local function Composer(): Node
 			end,
 			on_escape = store.escape,
 			queue = shown_queue,
+			-- (Steer only where its agent takes a word mid-turn: else the row's
+			-- Send now stops the turn, as the host does.)
 			can_steer = function(): boolean
+				local s = open()
+				return running:get() and s ~= nil and s.steers == true
+			end,
+			turn_running = function(): boolean
 				return running:get()
 			end,
 			-- (A held row is the hold's: it goes on its own, or is let go.)

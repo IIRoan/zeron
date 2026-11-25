@@ -1596,6 +1596,8 @@ async fn agent_dispatch_prepares_only_worktrees_zeron_created() {
                         attachments: Vec::new(),
                         resume: None,
                         worktree: None,
+                        code_mode: false,
+                        zeron_mcp_only: false,
                     },
                     message_id: format!("{chat}-message"),
                 },

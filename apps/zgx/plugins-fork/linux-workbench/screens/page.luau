@@ -2041,6 +2041,7 @@ return function(props: Props): Node
 			window_x = function(): number
 				return 44
 			end,
+			width = props.width,
 			-- (Past the tools panel at the left while it's open, whose own band
 			-- the top of it is, else past the rail.)
 			start = function(): number

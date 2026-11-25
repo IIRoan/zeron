@@ -77,50 +77,16 @@ const STAGING_PORT: u16 = 27871;
 const STAGING_DATA: &str = ".zeron-staging";
 
 const BETA: bool = cfg!(feature = "beta");
-pub const LINUX_BETA: bool = cfg!(all(feature = "beta", target_os = "linux"));
-pub const LINUX_BETA_PORT: u16 = 27946;
-pub fn linux_beta_data(home: &Path) -> PathBuf {
-    home.join(".local/share/zeron-beta/profile/engine")
-}
-
-// Resolve existing ancestors too: a new child of a symlink into regular
-// Zeron must not escape the side-by-side profile boundary.
-fn resolved(path: &Path) -> PathBuf {
-    let mut clean=PathBuf::new();
-    for part in path.components() {
-        match part {
-            std::path::Component::CurDir => {},
-            std::path::Component::ParentDir => { clean.pop(); },
-            other => clean.push(other.as_os_str()),
-        }
-    }
-    let mut tail=Vec::new();let mut parent=clean.as_path();
-    while !parent.exists() {
-        if let Some(name)=parent.file_name() { tail.push(name.to_owned()); }
-        let Some(next)=parent.parent() else { return clean };
-        parent=next;
-    }
-    let mut result=std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
-    for part in tail.into_iter().rev() { result.push(part); }
-    result
-}
-
-fn beta_profile(port: u16, data: &Path, home: &Path) -> Result<(),Refusal> {
-    if [0,zeron_cli::DEFAULT_IPC_PORT,STAGING_PORT,27936].contains(&port) {
-        return Err(format!("port {port} belongs to another Zeron installation"));
-    }
-    if !data.is_absolute() { return Err("Zeron Beta needs an absolute data directory".into()); }
-    let data=resolved(data);
-    for root in [home.join(".zeron"),home.join(".comet-native"),home.join(STAGING_DATA),home.join(".local/share/zeron-zgx-demo")] {
-        let root=resolved(&root);
-        if data.starts_with(&root) || root.starts_with(&data) { return Err("Zeron Beta needs a profile separate from regular Zeron and the demo".into()); }
-    }
-    Ok(())
-}
+/// (Linux fork) The fork's Linux app: Zeron itself, a window on the engine
+/// `zeron-host.service` runs on the regular profile (`~/.zeron`, port 27654),
+/// which it never starts or manages, installed and updated by the fork's own
+/// installer.
+pub const LINUX_FORK: bool = cfg!(all(feature = "beta", target_os = "linux"));
 
 /// The soonest a second engine is started after the first.
 const SPAWN_SPACING: Duration = Duration::from_secs(10);
 
+#[derive(Clone)]
 pub struct Config {
     pub port: u16,
     pub data_dir: PathBuf,
@@ -216,20 +182,11 @@ impl Config {
         if (edge, client, callback_port) != (production.edge.as_str(), production.client.as_str(), production.port) {
             return Err(format!("{edge} isn't production's edge and sign-in"));
         }
-        // (Linux fork) `ZERON_BETA_PROFILE=regular`: the beta as a window on
-        // regular Zeron's profile and engine (`~/.zeron`, its port unless
-        // said), which the person's zeron-host service keeps running: never
-        // an engine of the beta's own, so no side-by-side profile either.
-        let regular = LINUX_BETA && var("ZERON_BETA_PROFILE").as_deref() == Some("regular");
-        let port = if LINUX_BETA && !regular {
-            var("ZERON_IPC_PORT").map(|s| s.parse::<u16>().map_err(|_| "Invalid Zeron Beta IPC port".to_string())).transpose()?.unwrap_or(LINUX_BETA_PORT)
-        } else { zeron_cli::ipc_port_from(var("ZERON_IPC_PORT").as_deref()) };
+        let port = zeron_cli::ipc_port_from(var("ZERON_IPC_PORT").as_deref());
         let data_dir = zeron_cli::paths::resolve_data_dir(|key| match key {
             "HOME" => Some(home.as_os_str().to_owned()),
-            "ZERON_DATA_DIR" if LINUX_BETA && !regular => Some(var(key).map(PathBuf::from).unwrap_or_else(|| linux_beta_data(home)).into_os_string()),
             key => var(key).map(Into::into),
         });
-        if LINUX_BETA && !regular { beta_profile(port,&data_dir,home)?; }
         if port == STAGING_PORT {
             return Err(format!("port {STAGING_PORT} is the staging engine's"));
         }
@@ -240,12 +197,13 @@ impl Config {
             port,
             data_dir,
             bin: exe.and_then(zeron_launch::engine_executable),
-            home: if LINUX_BETA { var("ZERON_ZGX_ENGINE_HOME").map(|p| expand(&p,home)) } else { None },
-            spawn: !regular,
+            home: if LINUX_FORK { var("ZERON_ZGX_ENGINE_HOME").map(|p| expand(&p,home)) } else { None },
+            // (Linux fork) The engine is zeron-host.service's, never this app's.
+            spawn: !LINUX_FORK,
             edge: edge.into(),
             client: client.into(),
             callback_port,
-            managed: !LINUX_BETA,
+            managed: !LINUX_FORK,
         })
     }
 
@@ -327,6 +285,13 @@ impl Spawner {
         self.said_held
     }
 
+    /// Whether an engine this app started is likely still coming up: started
+    /// less than [`SPAWN_SPACING`] ago, so it's dialled again soon rather
+    /// than less and less often.
+    pub fn starting(&self) -> bool {
+        self.last.is_some_and(|at| at.elapsed() < SPAWN_SPACING)
+    }
+
     /// Nothing answers on the port: start an engine, if this app may and
     /// it's been long enough since the last. Whether one was started. An
     /// engine that holds the data dir without serving yet is on its way in or
@@ -360,17 +325,24 @@ impl Spawner {
         }
         self.said_held = false;
         self.last = Some(Instant::now());
-        let started = if config.managed { launch(config) } else { spawn(config, bin) };
-        match started {
-            Ok(()) => {
-                eprintln!("zeron-zgx: engine: started {} ({})", bin.display(), config.describe());
-                true
+        // Started on a thread of its own: creating the process waits for the
+        // system to map (and Windows' antivirus to scan) the engine's
+        // executable, a few hundred milliseconds the first time a new
+        // version runs, which the window's first frame shouldn't wait for.
+        let (config, bin) = (config.clone(), bin.clone());
+        let started = std::thread::Builder::new().name("engine-start".into()).spawn(move || {
+            let started = if config.managed { launch(&config) } else { spawn(&config, &bin) };
+            match started {
+                Ok(()) => eprintln!("zeron-zgx: engine: started {} ({})", bin.display(), config.describe()),
+                Err(error) => eprintln!("zeron-zgx: engine: {} didn't start: {error}", bin.display()),
             }
-            Err(error) => {
-                eprintln!("zeron-zgx: engine: {} didn't start: {error}", bin.display());
-                false
-            }
+        });
+        if let Err(error) = started {
+            eprintln!("zeron-zgx: engine: couldn't start a thread to start it: {error}");
+            self.last = None;
+            return false;
         }
+        true
     }
 }
 
@@ -451,9 +423,15 @@ fn spawn(config: &Config, bin: &Path) -> std::io::Result<()> {
 
 /// Whether the engine has to start again to follow its session: signed in
 /// (or choosing an organization) while its workspace is still the local
-/// one it opened signed out.
-pub fn needs_restart(scope: Option<&str>, signed_in: bool) -> bool {
-    signed_in && scope == Some("local")
+/// one it opened signed out, unless this device keeps its chats local; or
+/// synced while it now keeps them local.
+pub fn needs_restart(scope: Option<&str>, signed_in: bool, keep_local: bool) -> bool {
+    signed_in
+        && match scope {
+            Some("local") => !keep_local,
+            Some("synced") => keep_local,
+            _ => false,
+        }
 }
 
 #[cfg(test)]
@@ -475,11 +453,23 @@ mod tests {
 
     #[test]
     fn a_signed_in_session_on_a_local_workspace_restarts() {
-        assert!(needs_restart(Some("local"), true));
-        assert!(!needs_restart(Some("local"), false));
-        assert!(!needs_restart(Some("synced"), true));
-        assert!(!needs_restart(Some("development"), true));
-        assert!(!needs_restart(None, true));
+        assert!(needs_restart(Some("local"), true, false));
+        assert!(!needs_restart(Some("local"), false, false));
+        assert!(!needs_restart(Some("synced"), true, false));
+        assert!(!needs_restart(Some("development"), true, false));
+        assert!(!needs_restart(None, true, false));
+    }
+
+    #[test]
+    fn keeping_chats_local_holds_a_signed_in_engine_local() {
+        // Signed in and kept local: the local workspace stays.
+        assert!(!needs_restart(Some("local"), true, true));
+        // Kept local after it synced: back to the local workspace.
+        assert!(needs_restart(Some("synced"), true, true));
+        // Signed out, it changes nothing.
+        assert!(!needs_restart(Some("local"), false, true));
+        assert!(!needs_restart(Some("development"), true, true));
+        assert!(!needs_restart(None, true, true));
     }
 
     /// A development build never touches the production engine: its port,
@@ -523,10 +513,10 @@ mod tests {
         let home = Path::new("/Users/someone");
         let prod = crate::auth::production();
         let beta = config_of(&[], home, Some(&exe), &prod.edge).unwrap();
-        assert_eq!((beta.port, beta.data_dir.clone()), if LINUX_BETA { (LINUX_BETA_PORT,linux_beta_data(home)) } else { (27654, home.join(".zeron")) });
-        assert_eq!(beta.startable(), Some(helper.as_path()));
+        assert_eq!((beta.port, beta.data_dir.clone()), (27654, home.join(".zeron")));
+        assert_eq!(beta.startable(), if LINUX_FORK { None } else { Some(helper.as_path()) });
         assert_eq!((beta.edge.as_str(), beta.client.as_str(), beta.callback_port), (prod.edge.as_str(), prod.client.as_str(), 27641));
-        assert_eq!(beta.follows_bundle(), !LINUX_BETA);
+        assert_eq!(beta.follows_bundle(), !LINUX_FORK);
         // As Zeron.app: ZERON_DATA_DIR and ZERON_IPC_PORT move it; the
         // development variables don't.
         let moved = config_of(&[("ZERON_DATA_DIR", "/tmp/z"), ("ZERON_IPC_PORT", "27700"), ("ZERON_ZGX_ENGINE_PORT", "1")], home, Some(&exe), &prod.edge).unwrap();
@@ -535,41 +525,7 @@ mod tests {
         assert!(config_of(&[("ZERON_IPC_PORT", "27871")], home, Some(&exe), &prod.edge).is_err());
         assert!(config_of(&[("ZERON_DATA_DIR", "/Users/someone/.zeron-staging")], home, Some(&exe), &prod.edge).is_err());
         assert!(config_of(&[], home, Some(&exe), "https://staging.zeron.sh").is_err());
-        // (Linux fork) The Linux beta keeps to its own profile unless told
-        // it's a window on regular Zeron's, whose engine it never starts.
-        if LINUX_BETA {
-            assert!(config_of(&[("ZERON_DATA_DIR", "/Users/someone/.zeron")], home, Some(&exe), &prod.edge).is_err());
-            let regular = config_of(&[("ZERON_BETA_PROFILE", "regular")], home, Some(&exe), &prod.edge).unwrap();
-            assert_eq!((regular.port, regular.data_dir.clone()), (27654, home.join(".zeron")));
-            assert_eq!(regular.startable(), None);
-            let moved = config_of(&[("ZERON_BETA_PROFILE", "regular"), ("ZERON_DATA_DIR", "/tmp/copy"), ("ZERON_IPC_PORT", "27701")], home, Some(&exe), &prod.edge).unwrap();
-            assert_eq!((moved.port, moved.data_dir), (27701, PathBuf::from("/tmp/copy")));
-        }
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(all(feature="beta",target_os="linux"))]
-    #[test]
-    fn linux_beta_refuses_other_profiles_and_ports() {
-        let home=std::env::temp_dir().join(format!("zgx-beta-profile-{}",std::process::id()));
-        std::fs::create_dir_all(home.join(".zeron")).unwrap();
-        let prod=crate::auth::production();
-        for port in ["0","27654","27871","27936","invalid"] {
-            assert!(config_of(&[("ZERON_IPC_PORT",port)],&home,None,&prod.edge).is_err(),"{port}");
-        }
-        for root in [".zeron/profiles/local",".zeron-staging/child",".comet-native",".local/share/zeron-zgx-demo/profile/engine","."] {
-            let dir=home.join(root).to_string_lossy().into_owned();
-            assert!(config_of(&[("ZERON_DATA_DIR",&dir)],&home,None,&prod.edge).is_err(),"{root}");
-        }
-        let alias=home.join("alias");
-        std::os::unix::fs::symlink(home.join(".zeron"),&alias).unwrap();
-        let linked=alias.join("new-child").to_string_lossy().into_owned();
-        assert!(config_of(&[("ZERON_DATA_DIR",&linked)],&home,None,&prod.edge).is_err());
-        assert!(config_of(&[("ZERON_DATA_DIR","relative/path")],&home,None,&prod.edge).is_err());
-        let beta=config_of(&[],&home,None,&prod.edge).unwrap();
-        assert_eq!(beta.data_dir,linux_beta_data(&home));
-        assert!(!beta.follows_bundle());
-        std::fs::remove_dir_all(home).unwrap();
     }
 
     /// An engine holding the data dir is on its way in or out: no second one
@@ -601,6 +557,34 @@ mod tests {
         assert!(!spawner.start_if_due(&config), "held: nothing started");
         lock.unlock().unwrap();
         assert!(spawner.start_if_due(&config), "let go: started at once");
+    }
+
+    /// A start returns at once (the process is made on a thread of its own),
+    /// and the engine it started counts as coming up until a second could
+    /// be started: one start, not two, however soon it's asked again.
+    #[test]
+    fn a_start_returns_at_once_and_is_coming_up_until_the_next_is_due() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            port: 1,
+            data_dir: dir.path().join("data"),
+            bin: Some(dir.path().join("no-such-engine")),
+            home: None,
+            spawn: true,
+            edge: String::new(),
+            client: String::new(),
+            callback_port: 0,
+            managed: false,
+        };
+        let mut spawner = Spawner::new();
+        assert!(!spawner.starting());
+        let asked = Instant::now();
+        assert!(spawner.start_if_due(&config));
+        assert!(asked.elapsed() < Duration::from_secs(1), "not waiting for the process");
+        assert!(spawner.starting());
+        assert!(!spawner.start_if_due(&config), "one start per SPAWN_SPACING");
+        let never = Config { spawn: false, ..config };
+        assert!(!Spawner::new().start_if_due(&never));
     }
 
     #[test]

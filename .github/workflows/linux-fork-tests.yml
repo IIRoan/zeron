@@ -68,7 +68,7 @@ jobs:
           python3 scripts/tests/test_fork_workflows.py
           python3 scripts/check-fork-workflows.py
 
-  ui-tests:
+  desktop-build:
     if: github.repository == 'IIRoan/zeron'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -78,16 +78,9 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/linux-ci
         with:
-          rust-cache: ui
+          rust-cache: desktop
           save-rust-cache: 'true'
-          apt-cache: gpui
-          apt-packages: >-
-            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev
-            libx11-dev libxcb1-dev libx11-xcb-dev
-            libfontconfig1-dev libfreetype-dev libasound2-dev
-            libvulkan-dev pkg-config cmake libwebkit2gtk-4.1-dev libjson-glib-dev
-      - name: UI, source control, editor and headless layout regressions
-        # Orb geometry is covered by core-tests through zeron-orb's geometry target.
-        run: cargo nextest run --config-file scripts/ci/nextest.toml --locked --no-fail-fast -p zeron-ui --lib
-      - name: Build the Linux desktop
+      # The old GPUI app is retired (upstream #1499): `zeron` is the command
+      # line with the engine linked in, and apps/zgx the app.
+      - name: Build the Linux command line and engine
         run: cargo build --locked -p zeron

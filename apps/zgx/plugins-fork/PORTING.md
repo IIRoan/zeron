@@ -204,7 +204,7 @@ scripts/update-upstream.sh v0.3.8     # or a given one
 
 It needs a clean tree. It makes a rollback branch
 (`backup/pre-upstream-<release>-<time>`), merges the release without
-committing, snapshots the release notes, and then brings Zeron Beta along
+committing, snapshots the release notes, and then brings the fork's app along
 with `scripts/sync-zgx-fork.py --to <release>`, because a git merge leaves
 the beta's copies alone:
 
@@ -280,18 +280,19 @@ for example `target/install-beta-picker-*/build.sh`):
 
 ```sh
 source scripts/linux-env.sh
-export PKG_CONFIG_PATH="$PWD/target/pr-external-release/browser-runtime/pkgconfig:$PKG_CONFIG_PATH"
-export PATH="$PWD/target/pr-external-release/native-tools:$PATH" ZERON_WPE=1 LUAU_CXXFLAGS=-DNDEBUG
+export LUAU_CXXFLAGS=-DNDEBUG
 touch crates/engine/build.rs   # else --build-id keeps the previous commit
 cargo build --locked --release -p zeron --bin zeron-engine
-(cd apps/zgx && ZERON_BETA_VERSION=0.3.8-beta.1 cargo build --locked --release --features beta)
+cargo build --locked --release -p zeron-rpc --bin zeron-remote
+(cd apps/zgx && cargo build --locked --release --features beta)
 scripts/build-sandbox-helper.sh   # target/sandbox-helper/zeron-sandbox
-python3 -c 'import hashlib, json, pathlib; print(json.dumps({str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(pathlib.Path("apps/zgx/src").rglob("*.rs"))}, indent=2))' > target/beta-native-source.json
-python3 scripts/install-zgx-beta.py --frontend apps/zgx/target/release/zeron-zgx \
-  --native-source target/beta-native-source.json --engine target/release/zeron-engine \
-  --sandbox-helper target/sandbox-helper/zeron-sandbox
+python3 -c 'import hashlib, json, pathlib; print(json.dumps({str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(pathlib.Path("apps/zgx/src").rglob("*.rs"))}, indent=2))' > target/app-native-source.json
+python3 scripts/install-linux-fork.py --app apps/zgx/target/release/zeron-zgx \
+  --native-source target/app-native-source.json --engine target/release/zeron-engine \
+  --remote target/release/zeron-remote --sandbox-helper target/sandbox-helper/zeron-sandbox
 ```
 
 The last command only checks. Run it again with `--apply` to install the
-release beside the earlier ones, then restart Zeron Beta
-(`zeron-beta --stop`, then open it).
+release beside the earlier ones, then restart the engine and the phone
+gateway (`systemctl --user restart zeron-host.service zeron-remote.service`:
+running agent turns stop) and open Zeron again (`zeron --stop`, then open it).

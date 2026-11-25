@@ -141,7 +141,7 @@ class UpdateUpstreamTests(unittest.TestCase):
         self.assertNotEqual(self.update().returncode, 0)
 
     def beta(self, sync_exit=0):
-        """Zeron Beta's sync and notes snapshot as stubs that record their calls."""
+        """The app's sync and notes snapshot as stubs that record their calls."""
         calls = self.root / "beta-calls"
         self.env["BETA_CALLS"] = str(calls)
         stub = ("#!/usr/bin/env python3\nimport os, sys\n"
