@@ -42,9 +42,14 @@ for attempt in $(seq 0 11); do
   # A run just made can answer 404 for a little while.
   for _ in $(seq 30); do gh run view "$RUN" -R "$REPO" --json status >/dev/null 2>&1 && break; sleep 5; done
 
-  ok=0
-  gh run watch "$RUN" -R "$REPO" --exit-status --interval 60 || ok=$?
-  [ "$ok" = 0 ] && break
+  # The run's own result decides, not the watch: an API error (a 502) ends
+  # `gh run watch` while the build goes on.
+  until STATE=$(gh run view "$RUN" -R "$REPO" --json status,conclusion -q '.status + " " + .conclusion' 2>/dev/null) \
+      && [ "${STATE%% *}" = completed ]; do
+    gh run watch "$RUN" -R "$REPO" --interval 60 || sleep 30
+  done
+  ok=1
+  [ "$STATE" = "completed success" ] && { ok=0; break; }
   [ "$(gh run view "$RUN" -R "$REPO" --json jobs -q '.jobs[0].steps | length')" = 0 ] \
     || { echo "error: build failed, see https://github.com/$REPO/actions/runs/$RUN" >&2; exit 1; }
   echo "No $POOL runner was free, trying again"
