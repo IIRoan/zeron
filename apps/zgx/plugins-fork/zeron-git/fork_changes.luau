@@ -27,14 +27,18 @@ local function status(row: any,repository: any): (string,string)
         elseif value=="renamed" or value=="copied" then "$accent" else "$warning"
     return letter,color
 end
+-- A diff is read to its first MAX_LINES lines, never split whole: a
+-- lockfile's, split whole twice, ran the plugin out of memory.
+local MAX_LINES=10000
 local function patch_lines(text: string): {any}
-    local lines={};local started=false
-    for line in string.gmatch(text .. "\n","([^\n]*)\n") do
-        if string.sub(line,1,2)=="@@" then started=true end
-        if started then table.insert(lines,line) end
+    local lines={}
+    local at=if string.sub(text,1,2)=="@@" then 1 else (string.find(text,"\n@@",1,true) or #text)+1
+    while at<=#text and #lines<MAX_LINES do
+        local stop=string.find(text,"\n",at,true) or #text+1
+        table.insert(lines,string.sub(text,at,stop-1))
+        at=stop+1
     end
-    if lines[#lines]=="" then table.remove(lines) end
-    return git.parse(lines,10000)
+    return git.parse(lines,MAX_LINES)
 end
 -- Two patches' lines alike, their hunks' headers aside: the engine writes
 -- a one-line side's count (`+1,1`) where git leaves it out (`+1`).
@@ -78,7 +82,7 @@ return function(zeron: any,Repo: any)
                 remote=s.remote,remote_url=s.remote_url,pushed=s.pushed,ahead=s.ahead,behind=s.behind,base=s.base,base_ahead=s.base_ahead,head=s.oid} else nil)
         end)
         local paint_status=ui.state(`git.{m.id}.highlight_status`,"idle")
-        local diff_cache: any=nil;local diff_version=ui.use_state(0);local last=""
+        local diff_cache: any=nil;local diff_version=ui.use_state(0);local last="";local diff_row=""
         ui.after(0,function() w.refresh();w.load_details() end)
         local previous_repository=w.repository:peek()
         ui.effect(function()
@@ -187,9 +191,15 @@ return function(zeron: any,Repo: any)
             if not row then last="";diff:set(nil);diff_cache=nil;return end
             if w.staging_pending(row.file.path)~=nil then last="";diff:set(nil);diff_cache=nil;diff_version:add(1);return end
             local key=`{repo}:{row.key}:{w.revision:peek()}`;last=key
+            -- (Another file's long diff let go of as this one is asked for:
+            -- held while the reply came, the two ran the plugin out of memory.)
+            if diff_cache and #diff_cache>2000 and diff_row~=row.key then diff_cache=nil;diff_version:add(1) end
             w.call("GetCheckoutChangeDiff",{path=row.file.path,staged=row.group=="staged"}):after(function(result: any)
                 if last~=key then return end
+                diff_row=row.key
                 diff_cache=patch_lines(result.patch or "");diff:set({truncated=result.truncated,checksum=result.checksum});diff_version:add(1)
+                -- (A conflict has no index side to read: Git refuses it.)
+                if conflict(row.file) then paint_status:set("plain");return end
                 -- Optional full texts come from the same captured tree pair.
                 -- A racing change leaves the engine patch intact and falls
                 -- back to independent old/new line lexers.

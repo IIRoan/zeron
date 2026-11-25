@@ -67,8 +67,21 @@ end
 
 -- Called for both optimistic moves and Git's authoritative reply. Keep
 -- focus and the range anchor on the destination, and prune vanished files.
+-- Rows are made only for the paths kept: a merge's thousands of files,
+-- each made a row on every refresh, ran past the plugin's time budget.
 function M.reconcile(repository: any, selected: any, chosen: any?, anchor: string?, move: any?): (any, any?, string?)
-    local rows = M.rows(repository)
+    local wanted = {}
+    for _,key in {chosen and chosen.key, anchor} do wanted[string.match(key, ":(.*)$") or ""] = true end
+    for key in selected do wanted[string.match(key, ":(.*)$") or ""] = true end
+    local rows = {}
+    for _,file in (if next(wanted) then repository and repository.files else nil) or {} do
+        if wanted[file.path] then
+            for _,group in M.groups(file) do
+                local key = `{group}:{file.path}`
+                rows[key] = {key=key, group=group, file=file}
+            end
+        end
+    end
     local function destination(key: string): string?
         local group,path = string.match(key,"^([^:]+):(.*)$")
         if move and move.paths[path] then

@@ -7792,7 +7792,7 @@ dependencies = [
 [[package]]
 name = "zgx"
 version = "0.1.10"
-source = "git+file:///var/home/roan/Documents/zgx?rev=912ef32461f0bf8ff9b3c9388eb0e178f80ff860#912ef32461f0bf8ff9b3c9388eb0e178f80ff860"
+source = "git+file:///var/home/roan/Documents/zgx?rev=63589db0511d1200968d2136522509d8cfaa3cfb#63589db0511d1200968d2136522509d8cfaa3cfb"
 dependencies = [
  "fixed_decimal",
  "foldhash 0.2.0",
@@ -7821,7 +7821,7 @@ dependencies = [
 [[package]]
 name = "zgx-3d"
 version = "0.1.10"
-source = "git+file:///var/home/roan/Documents/zgx?rev=912ef32461f0bf8ff9b3c9388eb0e178f80ff860#912ef32461f0bf8ff9b3c9388eb0e178f80ff860"
+source = "git+file:///var/home/roan/Documents/zgx?rev=63589db0511d1200968d2136522509d8cfaa3cfb#63589db0511d1200968d2136522509d8cfaa3cfb"
 dependencies = [
  "bytemuck",
  "zgx",
@@ -7831,7 +7831,7 @@ dependencies = [
 [[package]]
 name = "zgx-alacritty-terminal"
 version = "0.26.8"
-source = "git+file:///var/home/roan/Documents/zgx?rev=912ef32461f0bf8ff9b3c9388eb0e178f80ff860#912ef32461f0bf8ff9b3c9388eb0e178f80ff860"
+source = "git+file:///var/home/roan/Documents/zgx?rev=63589db0511d1200968d2136522509d8cfaa3cfb#63589db0511d1200968d2136522509d8cfaa3cfb"
 dependencies = [
  "base64 0.22.1",
  "bitflags 2.13.2",
@@ -7856,7 +7856,7 @@ dependencies = [
 [[package]]
 name = "zgx-components"
 version = "0.1.10"
-source = "git+file:///var/home/roan/Documents/zgx?rev=912ef32461f0bf8ff9b3c9388eb0e178f80ff860#912ef32461f0bf8ff9b3c9388eb0e178f80ff860"
+source = "git+file:///var/home/roan/Documents/zgx?rev=63589db0511d1200968d2136522509d8cfaa3cfb#63589db0511d1200968d2136522509d8cfaa3cfb"
 dependencies = [
  "zgx",
 ]
@@ -7864,7 +7864,7 @@ dependencies = [
 [[package]]
 name = "zgx-cosmic-text"
 version = "0.19.14"
-source = "git+file:///var/home/roan/Documents/zgx?rev=912ef32461f0bf8ff9b3c9388eb0e178f80ff860#912ef32461f0bf8ff9b3c9388eb0e178f80ff860"
+source = "git+file:///var/home/roan/Documents/zgx?rev=63589db0511d1200968d2136522509d8cfaa3cfb#63589db0511d1200968d2136522509d8cfaa3cfb"
 dependencies = [
  "bitflags 2.13.2",
  "fontdb",
@@ -7888,7 +7888,7 @@ dependencies = [
 [[package]]
 name = "zgx-desktop"
 version = "0.1.10"
-source = "git+file:///var/home/roan/Documents/zgx?rev=912ef32461f0bf8ff9b3c9388eb0e178f80ff860#912ef32461f0bf8ff9b3c9388eb0e178f80ff860"
+source = "git+file:///var/home/roan/Documents/zgx?rev=63589db0511d1200968d2136522509d8cfaa3cfb#63589db0511d1200968d2136522509d8cfaa3cfb"
 dependencies = [
  "accesskit",
  "accesskit_consumer",
@@ -7939,12 +7939,12 @@ dependencies = [
 [[package]]
 name = "zgx-ghostty-sys"
 version = "0.1.10"
-source = "git+file:///var/home/roan/Documents/zgx?rev=912ef32461f0bf8ff9b3c9388eb0e178f80ff860#912ef32461f0bf8ff9b3c9388eb0e178f80ff860"
+source = "git+file:///var/home/roan/Documents/zgx?rev=63589db0511d1200968d2136522509d8cfaa3cfb#63589db0511d1200968d2136522509d8cfaa3cfb"
 
 [[package]]
 name = "zgx-gpu"
 version = "0.1.10"
-source = "git+file:///var/home/roan/Documents/zgx?rev=912ef32461f0bf8ff9b3c9388eb0e178f80ff860#912ef32461f0bf8ff9b3c9388eb0e178f80ff860"
+source = "git+file:///var/home/roan/Documents/zgx?rev=63589db0511d1200968d2136522509d8cfaa3cfb#63589db0511d1200968d2136522509d8cfaa3cfb"
 dependencies = [
  "ash",
  "block2 0.6.2",
@@ -7984,7 +7984,7 @@ dependencies = [
 [[package]]
 name = "zgx-harfrust"
 version = "0.5.4"
-source = "git+file:///var/home/roan/Documents/zgx?rev=912ef32461f0bf8ff9b3c9388eb0e178f80ff860#912ef32461f0bf8ff9b3c9388eb0e178f80ff860"
+source = "git+file:///var/home/roan/Documents/zgx?rev=63589db0511d1200968d2136522509d8cfaa3cfb#63589db0511d1200968d2136522509d8cfaa3cfb"
 dependencies = [
  "bitflags 2.13.2",
  "bytemuck",
@@ -7996,7 +7996,7 @@ dependencies = [
 [[package]]
 name = "zgx-mlua"
 version = "0.12.9"
-source = "git+file:///var/home/roan/Documents/zgx?rev=912ef32461f0bf8ff9b3c9388eb0e178f80ff860#912ef32461f0bf8ff9b3c9388eb0e178f80ff860"
+source = "git+file:///var/home/roan/Documents/zgx?rev=63589db0511d1200968d2136522509d8cfaa3cfb#63589db0511d1200968d2136522509d8cfaa3cfb"
 dependencies = [
  "bstr",
  "either",
@@ -8011,7 +8011,7 @@ dependencies = [
 [[package]]
 name = "zgx-run"
 version = "0.1.10"
-source = "git+file:///var/home/roan/Documents/zgx?rev=912ef32461f0bf8ff9b3c9388eb0e178f80ff860#912ef32461f0bf8ff9b3c9388eb0e178f80ff860"
+source = "git+file:///var/home/roan/Documents/zgx?rev=63589db0511d1200968d2136522509d8cfaa3cfb#63589db0511d1200968d2136522509d8cfaa3cfb"
 dependencies = [
  "serde_json",
  "ureq 3.5.0",
@@ -8023,7 +8023,7 @@ dependencies = [
 [[package]]
 name = "zgx-script"
 version = "0.1.10"
-source = "git+file:///var/home/roan/Documents/zgx?rev=912ef32461f0bf8ff9b3c9388eb0e178f80ff860#912ef32461f0bf8ff9b3c9388eb0e178f80ff860"
+source = "git+file:///var/home/roan/Documents/zgx?rev=63589db0511d1200968d2136522509d8cfaa3cfb#63589db0511d1200968d2136522509d8cfaa3cfb"
 dependencies = [
  "base64 0.22.1",
  "icu_locale_core",
@@ -8049,7 +8049,7 @@ dependencies = [
 [[package]]
 name = "zgx-swash"
 version = "0.2.11"
-source = "git+file:///var/home/roan/Documents/zgx?rev=912ef32461f0bf8ff9b3c9388eb0e178f80ff860#912ef32461f0bf8ff9b3c9388eb0e178f80ff860"
+source = "git+file:///var/home/roan/Documents/zgx?rev=63589db0511d1200968d2136522509d8cfaa3cfb#63589db0511d1200968d2136522509d8cfaa3cfb"
 dependencies = [
  "skrifa",
  "yazi",
@@ -8059,7 +8059,7 @@ dependencies = [
 [[package]]
 name = "zgx-taffy"
 version = "0.9.2"
-source = "git+file:///var/home/roan/Documents/zgx?rev=912ef32461f0bf8ff9b3c9388eb0e178f80ff860#912ef32461f0bf8ff9b3c9388eb0e178f80ff860"
+source = "git+file:///var/home/roan/Documents/zgx?rev=63589db0511d1200968d2136522509d8cfaa3cfb#63589db0511d1200968d2136522509d8cfaa3cfb"
 dependencies = [
  "arrayvec",
  "grid",
@@ -8070,7 +8070,7 @@ dependencies = [
 [[package]]
 name = "zgx-terminal"
 version = "0.1.10"
-source = "git+file:///var/home/roan/Documents/zgx?rev=912ef32461f0bf8ff9b3c9388eb0e178f80ff860#912ef32461f0bf8ff9b3c9388eb0e178f80ff860"
+source = "git+file:///var/home/roan/Documents/zgx?rev=63589db0511d1200968d2136522509d8cfaa3cfb#63589db0511d1200968d2136522509d8cfaa3cfb"
 dependencies = [
  "base64 0.22.1",
  "flate2",
@@ -8086,7 +8086,7 @@ dependencies = [
 [[package]]
 name = "zgx-vte"
 version = "0.15.4"
-source = "git+file:///var/home/roan/Documents/zgx?rev=912ef32461f0bf8ff9b3c9388eb0e178f80ff860#912ef32461f0bf8ff9b3c9388eb0e178f80ff860"
+source = "git+file:///var/home/roan/Documents/zgx?rev=63589db0511d1200968d2136522509d8cfaa3cfb#63589db0511d1200968d2136522509d8cfaa3cfb"
 dependencies = [
  "arrayvec",
  "bitflags 2.13.2",
@@ -8098,7 +8098,7 @@ dependencies = [
 [[package]]
 name = "zgx-zune-jpeg"
 version = "0.5.15"
-source = "git+file:///var/home/roan/Documents/zgx?rev=912ef32461f0bf8ff9b3c9388eb0e178f80ff860#912ef32461f0bf8ff9b3c9388eb0e178f80ff860"
+source = "git+file:///var/home/roan/Documents/zgx?rev=63589db0511d1200968d2136522509d8cfaa3cfb#63589db0511d1200968d2136522509d8cfaa3cfb"
 dependencies = [
  "zune-core",
 ]
