@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Package and install the Linux fork's Zeron. Check-only without --apply.
+"""Package and install the Linux fork's Zeron. Check-only without --prepare
+(build the release folder only) or --apply (install it).
 
 Build these from this commit first:
   apps/zgx:  cargo build --release --features beta          (the app)
@@ -73,6 +74,7 @@ def main():
     parser.add_argument('--remote', type=Path, required=True, help='zeron-remote built from this commit')
     parser.add_argument('--sandbox-helper', type=Path, required=True, help='zeron-sandbox from scripts/build-sandbox-helper.sh')
     parser.add_argument('--label', default='fork', help='a word in the release folder name')
+    parser.add_argument('--prepare', action='store_true', help='only build the release folder (to try it first)')
     parser.add_argument('--apply', action='store_true')
     args = parser.parse_args()
     if os.uname().sysname != 'Linux':
@@ -112,7 +114,7 @@ def main():
             'binaries': binaries, 'engine_build_id': build_id, 'source_revision': head,
             'source_fingerprint': fingerprint, 'applied': args.apply}
     print(json.dumps(plan, indent=2))
-    if not args.apply:
+    if not args.apply and not args.prepare:
         return
     (BASE / 'releases').mkdir(parents=True, exist_ok=True, mode=0o700)
     if not release.exists():
@@ -149,6 +151,9 @@ def main():
                 shutil.rmtree(temporary)
     elif json.loads((release / 'build.json').read_text())['binaries'] != binaries:
         raise SystemExit('Existing immutable release differs; left untouched.')
+    if not args.apply:
+        print(f'Prepared {release}; nothing else changed. Install it with --apply.')
+        return
 
     # What changes outside the release, kept first.
     stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
@@ -185,7 +190,10 @@ def main():
         following.unlink()
     following.symlink_to(release)
     os.replace(following, current)
-    atomic(launcher, (ROOT / 'scripts/launch-zeron.py').read_bytes(), 0o755)
+    script = (ROOT / 'scripts/launch-zeron.py').read_text()
+    assert script.count('\nINSTALLED = None\n') == 1
+    script = script.replace('\nINSTALLED = None\n', f'\nINSTALLED = {str(BASE)!r}\n')
+    atomic(launcher, script.encode(), 0o755)
     desktop = f'''[Desktop Entry]
 Type=Application
 Name=Zeron

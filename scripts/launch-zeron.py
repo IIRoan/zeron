@@ -18,7 +18,10 @@ import subprocess
 import sys
 
 home = Path.home()
-base = home / '.local/share/zeron-linux-fork'
+# Where it was installed (scripts/install-linux-fork.py writes it here), so
+# the engine host and agents find it whatever HOME they run with.
+INSTALLED = None
+base = Path(INSTALLED) if INSTALLED else home / '.local/share/zeron-linux-fork'
 release = (base / 'current').resolve(strict=True)
 app = release / 'zeron'
 data = home / '.zeron'
