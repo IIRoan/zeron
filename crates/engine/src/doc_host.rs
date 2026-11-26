@@ -7190,17 +7190,21 @@ impl DocHost {
         request: zeron_proto::RunRequest,
         message_id: Option<String>,
     ) -> Result<String, EngineError> {
+        // A failed setup leaves the checkout usable and shows in the
+        // Environment panel; it never keeps the agent from starting (it used
+        // to reject the run, and the chat sat on "Sending…").
         if let Some(repos) = self.inner.repos.get()
             && let Some(root) =
                 crate::workspace_host::linked_worktree_root(std::path::Path::new(&request.cwd))
-        {
-            repos
+            && let Err(error) = repos
                 .worktree_settings()
                 .prepare_managed(
                     std::path::Path::new(&root),
                     std::path::Path::new(&request.cwd),
                 )
-                .await?;
+                .await
+        {
+            tracing::warn!(%error, chat = %chat_id, cwd = %request.cwd, "worktree environment needs attention; starting the agent anyway");
         }
         // Stamped on a task of its own: the drain resolves the command as
         // soon as the run is dispatched, never behind the `git` processes.
