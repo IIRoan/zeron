@@ -1765,7 +1765,14 @@ impl Bridge {
             None => {}
         }
         self.publish_templates();
-        self.publish_page();
+        // A timed look on Linux normally finds the same interface. Its
+        // plugin metadata hasn't changed either; rebuilding it reads and
+        // tokenizes every UI script on the UI thread. Plugin changes and
+        // errors publish through their own paths, and a changed template
+        // still refreshes the report here.
+        if compose || kept || retry {
+            self.publish_page();
+        }
         if (kept || (changed > 0 && template))
             && let Err(error) = self.host.reload()
         {
@@ -1974,6 +1981,10 @@ impl Bridge {
         if !ids.is_empty() {
             write_elements(&elements::describe(&ids, &classes, tree));
         }
+        // Scanning the scripts allocates large temporary token buffers.
+        // A busy chat's animations may keep the window from going idle,
+        // so return those freed pages now instead of retaining that peak.
+        zgx_desktop::release_thread_heap();
     }
 
     /// zgx's report of the window's elements, once its view is known.

@@ -8,7 +8,7 @@ The guest never sees this machine's localhost. Ports cross only through `--to-vm
 that the guest reaches on its own localhost) and `--from-vm` (a guest port this machine reaches on its
 localhost), carried by one SSH connection.
 """
-import argparse, base64, json, os, re, shutil, signal, socket, struct, subprocess, sys, time
+import argparse, base64, hashlib, json, os, re, shutil, signal, socket, struct, subprocess, sys, tempfile, time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -20,6 +20,7 @@ DEFAULTS = {
     'memory': '8G',
     'ssh_port': 2222,     # this machine's 127.0.0.1 port for the guest's SSH server
     'clip_port': 8766,    # the viewer's port for text copied in the guest
+    'clipboard': True,   # share text with the host; the viewer follows changes live
     'user': 'dev',
 }
 
@@ -58,7 +59,62 @@ def spawn(name, args, log, env=None):
     with open(RUN / log, 'ab') as out:
         p = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=out, stderr=out, start_new_session=True, env=env, cwd='/')
     (RUN / f'{name}.pid').write_text(str(p.pid))
+    protect_processes([p.pid])
     return p
+
+
+def resource_scope():
+    return 'winvm-desktop.scope' if 'WINVM_HOME' not in os.environ else 'winvm-' + hashlib.sha256(str(HOME).encode()).hexdigest()[:12] + '-desktop.scope'
+
+
+def protect_processes(pids):
+    """Keep the VM and its helpers separate from the engine's build/agent processes, without restarting them."""
+    live = []
+    for pid in sorted(set(pids)):
+        try:
+            if Path(f'/proc/{pid}').stat().st_uid == os.getuid(): live.append(pid)
+        except OSError: pass
+    pids = live
+    if not pids: return True
+    scope = resource_scope()
+    bus = ['busctl', '--user', 'call', 'org.freedesktop.systemd1', '/org/freedesktop/systemd1', 'org.freedesktop.systemd1.Manager']
+    attach = bus + ['AttachProcessesToUnit', 'ssau', scope, '', str(len(pids)), *map(str, pids)]
+    try:
+        state = subprocess.run(['systemctl', '--user', 'is-active', scope], capture_output=True, text=True, timeout=5)
+        if state.stdout.strip() == 'active':
+            result = subprocess.run(attach, capture_output=True, text=True, timeout=5)
+        else:
+            result = subprocess.run(bus + ['StartTransientUnit', 'ssa(sv)a(sa(sv))', scope, 'fail', '7',
+                'Description', 's', 'Windows VM and viewer', 'Slice', 's', 'session.slice',
+                'CPUWeight', 't', '500', 'MemorySwapMax', 't', '0', 'CollectMode', 's', 'inactive-or-failed',
+                'Delegate', 'b', 'true',
+                'PIDs', 'au', str(len(pids)), *map(str, pids), '0'], capture_output=True, text=True, timeout=5)
+            if result.returncode:  # Another VM action may have created the scope meanwhile.
+                result = subprocess.run(attach, capture_output=True, text=True, timeout=5)
+        if result.returncode: raise RuntimeError(result.stderr.strip())
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if all(not Path(f'/proc/{pid}/cgroup').exists() or
+                   Path(f'/proc/{pid}/cgroup').read_text().strip().endswith('/' + scope) for pid in pids): return True
+            time.sleep(.05)
+        raise RuntimeError('the resource group did not activate')
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as e:
+        print(f'winvm: could not prioritize the VM: {e}', file=sys.stderr)
+        return False
+
+
+def cmd_protect(a):
+    roots = {pid for name in ('qemu', 'viewer', 'tunnel', 'passt', 'swtpm') if (pid := pid_of(name))}
+    # Existing children do not follow a parent moved between cgroups.
+    pids, pending = set(roots), list(roots)
+    while pending:
+        pid = pending.pop()
+        try: children = Path(f'/proc/{pid}/task/{pid}/children').read_text().split()
+        except OSError: continue
+        for child in map(int, children):
+            if child not in pids: pids.add(child); pending.append(child)
+    if not protect_processes(pids): die('the VM is running, but its resource group could not be applied')
+    print(json.dumps({'scope': resource_scope(), 'pids': sorted(pids)}) if a.json else 'VM resource group applied')
 
 
 # ---- QEMU monitor ---------------------------------------------------------------------------------------------------
@@ -326,7 +382,7 @@ def status():
     state = 'stopped'
     if running(): state = 'running' if ssh_ready() else 'starting'
     ports = ports_file() if state != 'stopped' else {'toVm': [], 'fromVm': []}
-    out = {'state': state, 'home': str(HOME), 'viewer': pid_of('viewer') is not None, **ports}
+    out = {'state': state, 'home': str(HOME), 'viewer': pid_of('viewer') is not None, 'clipboard': config()['clipboard'], **ports}
     if state == 'running':
         error = tunnel_error()
         if error: out['tunnelError'] = error
@@ -341,6 +397,23 @@ def cmd_status(a):
         if s['state'] != 'stopped':
             print(f"  into the VM: {s['toVm'] or 'no ports'}   from the VM: {s['fromVm'] or 'no ports'}   viewer: {'open' if s['viewer'] else 'closed'}")
             if s.get('tunnelError'): print(f"  tunnel: {s['tunnelError']}")
+
+
+def cmd_clipboard(a):
+    """One shared VM: persist its clipboard policy without changing project ports or restarting Windows."""
+    if a.sharing is not None:
+        HOME.mkdir(parents=True, exist_ok=True)
+        try: saved = json.loads((HOME / 'config.json').read_text())
+        except FileNotFoundError: saved = {}
+        saved['clipboard'] = a.sharing == 'on'
+        fd, name = tempfile.mkstemp(prefix='.config-', dir=HOME)
+        try:
+            with os.fdopen(fd, 'w') as out: json.dump(saved, out); out.write('\n')
+            os.replace(name, HOME / 'config.json')
+        finally:
+            if os.path.exists(name): os.unlink(name)
+    enabled = config()['clipboard']
+    print(json.dumps({'clipboard': enabled}) if a.json else f"Clipboard sharing {'on' if enabled else 'off'}")
 
 
 def cmd_up(a):
@@ -626,6 +699,10 @@ def main():
     p.add_argument('--to-vm', type=ports, default=[]); p.add_argument('--from-vm', type=ports, default=[]); p.add_argument('--json', action='store_true')
     p = add('down', cmd_down, 'shut Windows down and stop the VM'); p.add_argument('--wait', type=int, default=300)
     p = add('status', cmd_status, 'stopped, starting or running; connected ports'); p.add_argument('--json', action='store_true')
+    p = add('clipboard', cmd_clipboard, 'share text with the host: on or off (applies to every project immediately)')
+    p.add_argument('sharing', choices=['on', 'off'], nargs='?'); p.add_argument('--json', action='store_true')
+    p = add('protect', cmd_protect, 'move the running VM and viewer into their own desktop resource group')
+    p.add_argument('--json', action='store_true')
     p = add('exec', cmd_exec, 'run a PowerShell command in the VM as its administrator (no desktop)')
     p.add_argument('--cwd'); p.add_argument('--timeout', type=int, default=120); p.add_argument('command', nargs='+')
     add('diag', cmd_diag, "the guest's health as JSON: load, memory, disk, processes, listening ports, recent errors")
@@ -645,7 +722,7 @@ def main():
     a = ap.parse_args()
     if a.cmd == 'snapshot' and a.action != 'list' and not a.name: ap.error('snapshot needs a name')
     if a.cmd == 'copy' and len(a.paths) < 2: ap.error('copy needs a source and a destination')
-    for tool in ('qemu-system-x86_64', 'ssh', 'passt', 'swtpm'):
+    for tool in (() if a.cmd in ('clipboard', 'protect', '_check') else ('qemu-system-x86_64', 'ssh', 'passt', 'swtpm')):
         if not shutil.which(tool): die(f'{tool} is not installed')
     try: a.fn(a)
     except (OSError, RuntimeError) as e: die(str(e))

@@ -203,16 +203,17 @@ accesskit_windows = { git = "https://github.com/zeronsh/zgx", rev = "7a8d5a4298c
 # (OSC 52) to your input (src/main.rs), and scripts' collection and the
 # conversion cache's sweeps kept off a call's time budget, the sweep collecting
 # in a window that never goes idle (Zeron Git was withdrawn after a few hours
-# of agents at work). Upstream's lines above stay as upstream
+# of agents at work), and empty Wayland frames paced by the refresh timer.
+# Upstream's lines above stay as upstream
 # has them, so its zgx moves merge cleanly; scripts/sync-zgx-fork.py then
 # rebases the branch onto the new pin and puts its commit here, and build.rs
 # refuses a commit here that doesn't contain upstream's pin.
 [patch."https://github.com/zeronsh/zgx"]
-zgx = { git = "file:///var/home/roan/Documents/zgx", rev = "b87b941ba2d79c3d8a3b63968efc55e1ac9b2fc0" }
-zgx-desktop = { git = "file:///var/home/roan/Documents/zgx", rev = "b87b941ba2d79c3d8a3b63968efc55e1ac9b2fc0" }
-zgx-script = { git = "file:///var/home/roan/Documents/zgx", rev = "b87b941ba2d79c3d8a3b63968efc55e1ac9b2fc0" }
-zgx-gpu = { git = "file:///var/home/roan/Documents/zgx", rev = "b87b941ba2d79c3d8a3b63968efc55e1ac9b2fc0" }
-zgx-run = { git = "file:///var/home/roan/Documents/zgx", rev = "b87b941ba2d79c3d8a3b63968efc55e1ac9b2fc0" }
+zgx = { git = "file:///var/home/roan/Documents/zgx", rev = "0df642cd954865b21de75c3145dbb482ff85b28f" }
+zgx-desktop = { git = "file:///var/home/roan/Documents/zgx", rev = "0df642cd954865b21de75c3145dbb482ff85b28f" }
+zgx-script = { git = "file:///var/home/roan/Documents/zgx", rev = "0df642cd954865b21de75c3145dbb482ff85b28f" }
+zgx-gpu = { git = "file:///var/home/roan/Documents/zgx", rev = "0df642cd954865b21de75c3145dbb482ff85b28f" }
+zgx-run = { git = "file:///var/home/roan/Documents/zgx", rev = "0df642cd954865b21de75c3145dbb482ff85b28f" }
 
 # zgx is slow unoptimized (its own setting): optimize dependencies, keep
 # this crate quick to build.

@@ -6,6 +6,7 @@ local ContextMenu=require("./ui/context_menu")
 local Dialog=require("@ds/dialog").Dialog
 local Changes=require("./ui/git_changes")
 local FadeText=require("@ds/fade_text")
+local FileIcon=require("@ds/file_icons")
 local git=require("./ui/git")
 local Icon=require("@ds/icon")
 local IconButton=require("@ds/icon_button").IconButton
@@ -365,9 +366,10 @@ return function(zeron: any,Repo: any)
                             ui.row {class="git-file-row",w_full=true,h=32,gap="$space.1",items="center",rounded="$radius.sm",
                                 bg=function() return if selected:get()[row.key] then "$zeron.secondary.bg" else "#00000000" end,
                                 hover={bg="$hover"},
-                                ui.button {label=`{row.group} {row.file.path}`,grow=1,min_w=0,h_full=true,items="center",justify="start",
+                                ui.button {label=`{row.group} {row.file.path}`,grow=1,min_w=0,h_full=true,gap="$space.2",items="center",justify="start",
                                     bg="#00000000",on_key=list_key,on_click=function(e: any) select(row,e) end,
                                     on_mount=function(el: any) row_els[row.key]=el end,
+                                    FileIcon {name=string.match(row.file.path,"[^/]+$") or row.file.path,dir=letter=="S",size=16},
                                     FadeText {if row.file.oldPath then `{row.file.oldPath} → {row.file.path}` else row.file.path,grow=1,color="$text.primary"},
                                 },
                                 fm.fade(function() return w.staging_pending(row.file.path)~=nil end,

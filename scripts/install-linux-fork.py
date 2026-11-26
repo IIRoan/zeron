@@ -125,6 +125,7 @@ def main():
                 (temporary / name).chmod(0o755)
             shutil.copytree(ROOT / 'apps/zgx/ui', temporary / 'ui', ignore=shutil.ignore_patterns('.zgx', 'tests', '.lock', '.DS_Store'))
             shutil.copytree(ROOT / 'apps/zgx/plugins-builtin', temporary / 'plugins-builtin', ignore=shutil.ignore_patterns('.zgx', '.DS_Store'))
+            shutil.copytree(ROOT / 'scripts/winvm', temporary / 'winvm', ignore=shutil.ignore_patterns('__pycache__'))
             subprocess.run(['python3', str(ROOT / 'apps/zgx/scripts/bundle-fork-plugins.py'), '--resources', str(temporary), '--apply'],
                            check=True, stdout=subprocess.DEVNULL)
             shutil.copy2(ROOT / 'apps/zgx/plugins-fork/PORTING.md', temporary / 'FORK-PORTING.md')
@@ -161,10 +162,13 @@ def main():
     backup.mkdir(parents=True, mode=0o700)
     launcher = HOME / '.local/bin/zeron'
     entries = HOME / '.local/share/applications'
-    for path in [launcher, HOME / '.local/bin/zeron-beta', entries / 'zeron.desktop', entries / 'sh.zeron.beta.desktop']:
+    vm_launcher = HOME / '.local/bin/winvm'
+    for path in [launcher, vm_launcher, HOME / '.local/bin/zeron-beta', entries / 'zeron.desktop', entries / 'sh.zeron.beta.desktop']:
         if path.is_file():
             shutil.copy2(path, backup / path.name)
     (backup / 'previous-current.txt').write_text(f'{previous}\n')
+    if vm_launcher.is_symlink():
+        (backup / 'previous-winvm-target.txt').write_text(os.readlink(vm_launcher) + '\n')
 
     # The profile: Zeron Git and the stock Git and GitHub plugins aren't
     # both on (a profile without decisions only).
@@ -194,6 +198,13 @@ def main():
     assert script.count('\nINSTALLED = None\n') == 1
     script = script.replace('\nINSTALLED = None\n', f'\nINSTALLED = {str(BASE)!r}\n')
     atomic(launcher, script.encode(), 0o755)
+    vm_following = vm_launcher.with_name('.winvm-next')
+    if vm_following.is_symlink():
+        vm_following.unlink()
+    # Pin to the immutable release: rolling the app back to a release that
+    # predates bundled VM tools must not break an already running VM.
+    vm_following.symlink_to(release / 'winvm/winvm')
+    os.replace(vm_following, vm_launcher)
     desktop = f'''[Desktop Entry]
 Type=Application
 Name=Zeron

@@ -80,6 +80,8 @@ The stock Git and GitHub plugins are disabled to avoid duplicate controls.
 
 For a new release, `scripts/bundle-fork-plugins.py --resources <release>`
 checks its bundle (the folder holding `ui/`, beside the app); add `--apply` to copy these separate plugin folders.
+The bundler also includes the shared file-icon SVGs and their licence in
+Zeron Git's folder, so its file icons can load inside the plugin's snapshot.
 Keep the stock Git/GitHub plugin switches off. Their implementations remain
 available for switching back.
 

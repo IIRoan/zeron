@@ -73,6 +73,15 @@ project's ports (after a change, or after another project used it);
 (`GetProjectWindowsVm`, `SetProjectWindowsVm` and `ControlProjectWindowsVm` are
 app-only).
 
+**Share clipboard with Windows VM** applies immediately and is shared by
+every project using that VM. Turn it off to keep the host and Windows
+clipboards independent: the viewer stops its host clipboard watcher,
+unregisters QEMU clipboard forwarding and closes the guest-copy receiver.
+Windows, its applications and the project's ports keep running. The switch
+saves separately from **Apply**, and is also available as `winvm clipboard
+off` / `winvm clipboard on`. The preference persists in the VM's
+`config.json`; existing installations default to sharing enabled.
+
 The workbench's left rail has an **Environment** entry (also under All
 views and the tab strip's +). It opens a panel beside the chat with the
 project's Windows VM and sandbox as cards, read again every five seconds
@@ -149,11 +158,20 @@ with its snapshots, the SSH key and password of its `dev` administrator, and
 `config.json`:
 
 ```json
-{ "vcpus": 12, "pin": "0-11", "memory": "8G" }
+{ "vcpus": 12, "pin": "0-11", "memory": "8G", "clipboard": false }
 ```
 
 `pin` names the host CPUs the VM may use, as `taskset` takes them. The
 defaults are 8 virtual CPUs (fewer on small machines), no pinning and 8 GB.
+
+The VM and viewer run in a separate user `winvm-desktop.scope` under
+`session.slice`, with CPU weight 500 and swapping disabled for newly
+charged memory. This keeps them separate from Zeron's agents and builds.
+`winvm protect` moves an already running VM and its helpers into that group
+without restarting Windows. Existing memory charges and swapped pages do
+not move with the processes; full memory isolation takes effect on the
+next normal VM start. If the user service manager is unavailable, startup
+continues and reports that resource grouping could not be applied.
 
 ```sh
 winvm up --to-vm 3000,3001 --view   # start, wait for Windows, connect ports, open the viewer

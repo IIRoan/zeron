@@ -22,6 +22,7 @@
 local Badge = require("@ds/badge")
 local material = require("@ds/material")
 local Icon = require("@ds/icon")
+local FileIcon = require("@ds/file_icons")
 local Text = require("@ds/text")
 local Tabs = require("@ds/tabs")
 local Select = require("@ds/select")
@@ -203,6 +204,7 @@ function M.file_row(f: File, check: Node?, label: string?, opts: { h: number?, p
 		items = "center",
 		check,
 		Badge.FileStatus { status = f.status :: any },
+		FileIcon { name = string.match(f.path, "[^/]+$") or f.path, size = 16 },
 		FadeText {
 			label or f.path,
 			grow = 1,
@@ -1001,6 +1003,7 @@ function M.diff_head(f: File, actions: Node?): Node
 		gap = "$space.2",
 		items = "center",
 		Badge.FileStatus { status = f.status :: any },
+		FileIcon { name = string.match(f.path, "[^/]+$") or f.path, size = 16 },
 		FadeText { f.path, grow = 1, text_size = "$font.size.md", color = "$text.primary" },
 		Badge.DiffStat { added = f.add, removed = f.del },
 		actions,

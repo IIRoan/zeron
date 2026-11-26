@@ -2,8 +2,9 @@
 """viewer.py — window onto the VM through QEMU's D-Bus display (start the VM with DISPLAY_MODE=dbus).
 
 Frames arrive as dma-bufs (GPU, no copies) or shared memory; the guest resolution follows this window,
-never above MAX_W x MAX_H; text clipboard is shared both ways; the guest's cursor shape becomes the pointer."""
+never above MAX_W x MAX_H; text clipboard sharing follows config.json; the guest's cursor shape becomes the pointer."""
 import http.server, json, mmap, os, signal, socket, subprocess, sys, threading, time
+from pathlib import Path
 import gi
 gi.require_version('Gtk', '4.0'); gi.require_version('Gdk', '4.0'); gi.require_version('Graphene', '1.0')
 from gi.repository import Gdk, Gio, GLib, GObject, Graphene, Gtk
@@ -13,7 +14,8 @@ try:
 except (ValueError, ImportError):          # GLib before 2.80
     on_signal = GLib.unix_signal_add
 
-RUN = os.path.join(os.environ.get('XDG_RUNTIME_DIR', '/tmp'), 'winvm')
+VM_HOME = Path(os.environ.get('WINVM_HOME') or Path.home() / '.local/share/winvm').absolute()
+RUN = os.path.join(os.environ.get('XDG_RUNTIME_DIR', '/tmp'), 'winvm' if 'WINVM_HOME' not in os.environ else 'winvm-' + VM_HOME.name)
 MAX_W, MAX_H = int(os.environ.get('MAX_W', 1920)), int(os.environ.get('MAX_H', 1080))
 STEP = int(os.environ.get('RES_STEP', 8))          # guest driver only takes sizes on this grid
 CON, CLIP = '/org/qemu/Display1/Console_0', '/org/qemu/Display1/Clipboard'
@@ -104,6 +106,8 @@ class Viewer(Gtk.Application):
         self.fd = -1; self.builder = None; self.map = None; self.mapinfo = None
         self.pressed = set(); self.serial = 0; self.want = None; self.resize_gen = 0; self.scroll_acc = 0.0
         self.frames = 0; self.dumped = False; self.clip_ready = False; self.reconnecting = False
+        self.clipboard_enabled = False; self.clip_generation = 0; self.clip_registering = False
+        self.watch = None; self.clip_server = None; self.clip_monitor = None
 
     # ---- wiring -------------------------------------------------------------------------------------------------
     def do_activate(self):
@@ -116,11 +120,18 @@ class Viewer(Gtk.Application):
         leg = Gtk.EventControllerLegacy(); leg.connect('event', self.legacy); self.screen.add_controller(leg)
         self.win.connect('notify::is-active', lambda *a: self.win.is_active() or self.release_all())
         self.win.present(); GLib.idle_add(lambda: self.connect_qemu() and False)
-        GLib.timeout_add_seconds(5, self.stats); self.serve_guest_clipboard()
+        GLib.timeout_add_seconds(5, self.stats); self.monitor_clipboard_settings()
         GLib.timeout_add_seconds(2, self.health)
         on_signal(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, self.shot)   # kill -USR1: save what the window shows
+        on_signal(GLib.PRIORITY_DEFAULT, signal.SIGTERM, lambda: self.quit() or False)
+
+    def do_shutdown(self):
+        self.set_clipboard_enabled(False)
+        if self.clip_monitor: self.clip_monitor.cancel()
+        Gtk.Application.do_shutdown(self)
 
     def connect_qemu(self):
+        self.clip_generation += 1; self.clip_ready = False; self.clip_registering = False
         a0, a1 = socket.socketpair(); qmp_add_client(a1.fileno()); a1.close()
         self.conn = dbus_over(a0)
         self.conn.register_object(CLIP, Gio.DBusNodeInfo.new_for_xml(CLIP_XML).interfaces[0], self.clip_call, lambda *a: GLib.Variant('as', []), None)
@@ -285,20 +296,60 @@ class Viewer(Gtk.Application):
         return False
 
     # ---- clipboard (text) ---------------------------------------------------------------------------------------
+    def monitor_clipboard_settings(self):
+        # Watch the directory: the CLI atomically replaces config.json.
+        self.clip_monitor = Gio.File.new_for_path(str(VM_HOME)).monitor_directory(Gio.FileMonitorFlags.WATCH_MOVES, None)
+        self.clip_monitor.connect('changed', lambda _m, file, other, _event:
+                                  self.refresh_clipboard_settings() if any(p and p.get_basename() == 'config.json' for p in (file, other)) else None)
+        self.refresh_clipboard_settings()
+
+    def refresh_clipboard_settings(self):
+        try:
+            try: settings = json.loads((VM_HOME / 'config.json').read_text())
+            except FileNotFoundError: settings = {}
+            enabled = settings.get('clipboard', True)
+            if not isinstance(enabled, bool): raise ValueError('clipboard must be true or false')
+        except (OSError, ValueError) as e:
+            log('clipboard settings unreadable:', e); return
+        self.set_clipboard_enabled(enabled)
+
+    def set_clipboard_enabled(self, enabled):
+        if enabled == self.clipboard_enabled: return
+        self.clipboard_enabled = enabled; self.clip_generation += 1
+        self.clip_ready = False; self.clip_registering = False
+        if enabled:
+            self.from_guest = None
+            self.serve_guest_clipboard()
+            if getattr(self, 'conn', None): self.register_clipboard()
+        else:
+            if self.watch: self.watch.force_exit(); self.watch = None
+            if self.clip_server:
+                self.clip_server.shutdown(); self.clip_server.server_close(); self.clip_server = None
+            if getattr(self, 'conn', None) and not self.conn.is_closed():
+                self.conn.call(None, CLIP, 'org.qemu.Display1.Clipboard', 'Unregister', None, None, 0, 1000, None, None, None)
+            log('clipboard sharing off')
+
     def serve_guest_clipboard(self):
+        if not self.clipboard_enabled or self.clip_server: return
         # guest -> host: the watcher in Windows (clipwatch.ps1) posts copied text here; loopback only
         app = self
         class H(http.server.BaseHTTPRequestHandler):
             def do_POST(self):
+                generation = app.clip_generation
+                if not app.clipboard_enabled:
+                    self.send_response(403); self.end_headers(); return
                 text = self.rfile.read(min(int(self.headers.get('content-length', 0)), 1 << 20)).decode('utf-8', 'replace').replace('\r\n', '\n')
-                self.send_response(204); self.end_headers(); GLib.idle_add(lambda: app.guest_copied(text) and False)
+                self.send_response(204); self.end_headers()
+                GLib.idle_add(lambda: app.guest_copied(text) and False if generation == app.clip_generation else False)
             def log_message(self, *a): pass
         try: srv = http.server.ThreadingHTTPServer(('127.0.0.1', int(os.environ.get('CLIP_PORT', 8766))), H)
         except OSError as e: return log('guest->host clipboard off:', e)
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        srv.daemon_threads = True; self.clip_server = srv
+        threading.Thread(target=lambda: srv.serve_forever(poll_interval=.05), daemon=True).start()
 
     # The host clipboard goes through wl-copy / wl-paste: unlike a normal Wayland client they work while unfocused.
     def guest_copied(self, text):
+        if not self.clipboard_enabled: return
         log('guest copied', len(text), 'chars'); self.from_guest = text
         subprocess.run(['wl-copy'], input=text.encode(), timeout=3)
 
@@ -309,45 +360,61 @@ class Viewer(Gtk.Application):
             return r.stdout.decode('utf-8', 'replace')
         except Exception as e: log('wl-paste failed:', repr(e)); return ''
 
-    def clip_registered(self, conn, res, _):
+    def clip_registered(self, conn, res, generation):
+        current = generation == self.clip_generation and conn is self.conn and self.clipboard_enabled
+        if current: self.clip_registering = False
         try: conn.call_finish(res)
         except GLib.Error as e:
+            if not current: return
             # QEMU only offers its clipboard object once the guest agent channel is up: keep trying
             if not getattr(self, 'clip_retry_logged', False): self.clip_retry_logged = True; log('clipboard not available yet, retrying:', e.message)
             GLib.timeout_add_seconds(3, lambda: self.register_clipboard() and False); return
+        if not current: return
         self.clip_ready = True; log('clipboard sharing on')
         if getattr(self, 'watch', None): return self.host_clip_changed()
         self.watch = Gio.Subprocess.new(['wl-paste', '--watch', 'echo', 'changed'], Gio.SubprocessFlags.STDOUT_PIPE)   # one line per host copy
+        watch = self.watch
         lines = Gio.DataInputStream.new(self.watch.get_stdout_pipe())
         def got(stream, res):
             if stream.read_line_finish(res)[0] is None: return
+            if not self.clipboard_enabled or watch is not self.watch: return
             self.host_clip_changed(); stream.read_line_async(0, None, got)
         lines.read_line_async(0, None, got)
 
     def register_clipboard(self):
-        self.conn.call(None, CLIP, 'org.qemu.Display1.Clipboard', 'Register', None, None, 0, -1, None, self.clip_registered, None)
+        if not self.clipboard_enabled or self.clip_ready or self.clip_registering: return
+        self.clip_registering = True
+        self.conn.call(None, CLIP, 'org.qemu.Display1.Clipboard', 'Register', None, None, 0, -1, None, self.clip_registered, self.clip_generation)
 
-    def clip_grab_done(self, conn, res, _):
+    def clip_grab_done(self, conn, res, generation):
         try: conn.call_finish(res)
         except GLib.Error as e:   # e.g. the guest restarted and QEMU dropped our registration
+            if not self.clipboard_enabled or generation != self.clip_generation or conn is not self.conn: return
             log('clipboard offer failed, registering again:', e.message); self.clip_ready = False
             GLib.timeout_add_seconds(2, lambda: self.register_clipboard() and False)
 
     def host_clip_changed(self):
+        if not self.clipboard_enabled or not self.clip_ready: return
         text = self.host_text()
         if not self.clip_ready or not text or text == getattr(self, 'from_guest', None): return     # not connected, empty, or our own echo of a guest copy
         self.serial += 1; log('host copied', len(text), 'chars -> offering to guest')
-        self.conn.call(None, CLIP, 'org.qemu.Display1.Clipboard', 'Grab', GLib.Variant('(uuas)', (0, self.serial, [TEXT])), None, 0, -1, None, self.clip_grab_done, None)
+        self.conn.call(None, CLIP, 'org.qemu.Display1.Clipboard', 'Grab', GLib.Variant('(uuas)', (0, self.serial, [TEXT])), None, 0, -1, None, self.clip_grab_done, self.clip_generation)
 
     def clip_call(self, conn, sender, path, iface, method, params, inv):
+        if not self.clipboard_enabled or conn is not self.conn:
+            if method == 'Request': inv.return_dbus_error('org.qemu.Display1.Error.Failed', 'clipboard sharing is off')
+            else: inv.return_value(None)
+            return
         if method == 'Grab':
             sel, serial, mimes = params.unpack(); inv.return_value(None)
             log('guest offers clipboard, serial', serial, mimes)
             if sel != 0 or not any(m.startswith('text/plain') for m in mimes): return
             self.serial = max(self.serial, serial)
+            generation = self.clip_generation
             def got(c, res, _):
                 try: data = c.call_finish(res).get_child_value(1).get_data_as_bytes().get_data() or b''
                 except GLib.Error as e: return log('guest clipboard read failed:', e.message)
+                if not self.clipboard_enabled or generation != self.clip_generation or conn is not self.conn: return
                 text = data.decode('utf-8', 'replace').rstrip('\0').replace('\r\n', '\n')
                 self.guest_copied(text)
             conn.call(None, CLIP, 'org.qemu.Display1.Clipboard', 'Request', GLib.Variant('(uas)', (0, [TEXT])), None, 0, 5000, None, got, None)

@@ -81,21 +81,31 @@ return function(zeron: any)
 			capturing = false,
 		}
 		models[key] = m
+		local clipboard_revision = 0
 
 		function m.call(method: string, params: any?): any
 			return zeron.workbench(method, context, params or {})
 		end
 
 		function m.refresh()
-			if m.loading then
+			if m.loading or m.busy:peek() == "clipboard" then
 				return
 			end
 			m.loading = true
+			local revision = clipboard_revision
 			m.call("GetProjectWindowsVm", { brief = false }):after(function(reply: any)
 				m.loading = false
+				if revision ~= clipboard_revision then
+					m.refresh()
+					return
+				end
 				m.reply:set(reply)
 			end, function(err: any)
 				m.loading = false
+				if revision ~= clipboard_revision then
+					m.refresh()
+					return
+				end
 				m.error:set(M.message(err))
 			end)
 		end
@@ -103,6 +113,30 @@ return function(zeron: any)
 		function m.connected(): boolean
 			local r = m.reply:get()
 			return r ~= nil and r.settings ~= nil
+		end
+
+		function m.share_clipboard(enabled: boolean)
+			if m.busy:peek() ~= "" then
+				return
+			end
+			m.busy:set("clipboard")
+			clipboard_revision += 1
+			m.error:set("")
+			zeron.service(context.scope.device):call("clipboard", { enabled = enabled }):after(function(reply: any)
+				local previous = m.reply:peek()
+				if previous then
+					local now = table.clone(previous)
+					now.vm = table.clone(previous.vm or {})
+					now.vm.clipboard = reply.clipboard
+					m.reply:set(now)
+				end
+				m.busy:set("")
+				m.refresh()
+			end, function(err: any)
+				m.busy:set("")
+				m.error:set(M.message(err))
+				m.refresh()
+			end)
 		end
 
 		-- The VM's state: "none" (not this project's), "checking",

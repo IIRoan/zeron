@@ -16,6 +16,7 @@ local BUSY = {
 	start = "Connecting this project's ports (starting the VM first if it is stopped)…",
 	stop = "Shutting Windows down…",
 	view = "Opening the viewer…",
+	clipboard = "Saving clipboard sharing…",
 }
 
 return function(zeron: any, Model: any)
@@ -59,6 +60,7 @@ return function(zeron: any, Model: any)
 		local from_vm = ui.use_state("")
 		local start_with = ui.use_state("")
 		local viewer = ui.use_state(true)
+		local clipboard = ui.use_state(true)
 		local problem = ui.use_state("")
 		-- Filled once the reply comes (and after a save answers), never
 		-- under the person's typing.
@@ -78,6 +80,9 @@ return function(zeron: any, Model: any)
 		end)
 		ui.effect(function()
 			local r = m.reply:get()
+			if r and r.vm and m.busy:get() ~= "clipboard" then
+				clipboard:set(r.vm.clipboard ~= false)
+			end
 			if r and not filled then
 				filled = true
 				fill(r.settings)
@@ -145,6 +150,22 @@ return function(zeron: any, Model: any)
 					text_size = "$font.size.sm",
 				},
 				Settings.Group {
+					Settings.Row {
+						label = "Share clipboard with Windows VM",
+						description = "Share copied text and URLs in both directions. Applies immediately to this machine's shared VM for every project.",
+						control = Switch {
+							value = clipboard,
+							label = "Share clipboard with Windows VM",
+							on_change = function(on: boolean)
+								if m.busy:peek() ~= "" then
+									local r = m.reply:peek()
+									clipboard:set(not r or not r.vm or r.vm.clipboard ~= false)
+									return
+								end
+								m.share_clipboard(on)
+							end,
+						},
+					},
 					switch(
 						"Connect this project's servers automatically",
 						auto_ports,
